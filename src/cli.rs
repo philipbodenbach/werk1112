@@ -765,19 +765,15 @@ fn target_default_order() -> &'static [BackendChoice] {
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         &[
             BackendChoice::Mlx,
-            BackendChoice::Candle(CandleDeviceMode::Metal),
             BackendChoice::Candle(CandleDeviceMode::Cpu),
         ]
     } else if cfg!(target_os = "macos") {
-        &[
-            BackendChoice::Candle(CandleDeviceMode::Metal),
-            BackendChoice::Candle(CandleDeviceMode::Cpu),
-        ]
+        &[BackendChoice::Candle(CandleDeviceMode::Cpu)]
     } else {
         &[
-            BackendChoice::Vulkan,
-            BackendChoice::Candle(CandleDeviceMode::Cuda),
             BackendChoice::Candle(CandleDeviceMode::Cpu),
+            BackendChoice::Candle(CandleDeviceMode::Cuda),
+            BackendChoice::Vulkan,
         ]
     }
 }

@@ -27,10 +27,11 @@ mod tests {
         let plain = strip_ansi(BANNER);
 
         assert!(plain.contains("Any Model. Anywhere."));
-        assert!(plain.contains("__          __"));
-        assert!(plain.contains("|______|"));
-        assert!(plain.contains("| |__) |"));
-        assert!(plain.contains("|_||_||_|____|"));
+        assert!(plain.contains("__        __"));
+        assert!(plain.contains("\\ \\      / /"));
+        assert!(plain.contains("/ //_/"));
+        assert!(plain.contains("<  / <  / <  / |__ \\"));
+        assert!(plain.contains("/_/  /_/  /_/  /____/"));
 
         assert!(BANNER.contains("\x1b[38;2;0;220;255m"));
         assert!(BANNER.contains("\x1b[38;2;255;79;195m"));

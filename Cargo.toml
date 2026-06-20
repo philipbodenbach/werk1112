@@ -34,10 +34,8 @@ mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 # Vulkan/llama.cpp and MLX are discovered by the binary and do not require
 # Cargo features in this crate.
 release-windows = ["cuda"]
-release-linux = []
-release-linux-cuda = ["cuda"]
-release-macos-apple-silicon = ["metal"]
-release-macos-intel = ["metal"]
+release-linux = ["cuda"]
+release-macos-apple-silicon = []
 
 [profile.release]
 lto = "thin"

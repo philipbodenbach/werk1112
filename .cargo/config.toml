@@ -2,9 +2,7 @@
 build-cpu = "build --release --locked --no-default-features"
 build-windows = "build --release --locked --target x86_64-pc-windows-msvc --features release-windows"
 build-linux = "build --release --locked --target x86_64-unknown-linux-gnu --features release-linux"
-build-linux-cuda = "build --release --locked --target x86_64-unknown-linux-gnu --features release-linux-cuda"
 build-macos-apple-silicon = "build --release --locked --target aarch64-apple-darwin --features release-macos-apple-silicon"
-build-macos-intel = "build --release --locked --target x86_64-apple-darwin --features release-macos-intel"
 
 [env]
 CUDA_COMPUTE_CAP = { value = "86", force = false }

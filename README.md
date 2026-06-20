@@ -41,7 +41,7 @@ Current generation support includes Candle-native GGUF/safetensors paths plus ex
 
 ## Build
 
-The default development build is CPU-only. Release builds use target-specific Cargo aliases. Linux has a portable default build and a separate CUDA build because Candle CUDA kernels require a recent CUDA toolkit at compile time.
+The default development build is CPU-only. Release builds use one target-specific Cargo alias per deployed end-user artifact. Each artifact includes the supported backends for that platform, and users choose the active backend at runtime with `--backend`.
 
 ```bash
 cargo check --locked --no-default-features
@@ -53,29 +53,23 @@ Target release builds:
 ```bash
 cargo build-windows
 cargo build-linux
-cargo build-linux-cuda
 cargo build-macos-apple-silicon
-cargo build-macos-intel
 ```
 
 Run target release aliases on the matching build OS when GPU acceleration is involved. In practice:
 
 - Run `cargo build-windows` from native Windows PowerShell with the MSVC Rust toolchain and Windows CUDA installed.
-- Run `cargo build-linux` from Linux or WSL for the portable Linux artifact.
-- Run `cargo build-linux-cuda` from Linux or WSL only when the active Linux CUDA toolkit is new enough for Candle.
+- Run `cargo build-linux` from Linux or WSL with Linux CUDA installed.
 - Run `cargo build-macos-apple-silicon` on Apple Silicon macOS.
-- Run `cargo build-macos-intel` on Intel macOS.
 
-Do not use WSL to produce the Windows CUDA artifact. WSL can build the Linux artifact.
+Do not use WSL to produce the Windows artifact. WSL can build the Linux artifact.
 
 These aliases expand to normal Cargo target builds:
 
 ```text
 cargo build-windows              -> x86_64-pc-windows-msvc + release-windows
 cargo build-linux                -> x86_64-unknown-linux-gnu + release-linux
-cargo build-linux-cuda           -> x86_64-unknown-linux-gnu + release-linux-cuda
 cargo build-macos-apple-silicon  -> aarch64-apple-darwin + release-macos-apple-silicon
-cargo build-macos-intel          -> x86_64-apple-darwin + release-macos-intel
 ```
 
 Cargo aliases are subcommands, so the command is `cargo build-windows`, not `cargo build windows`.
@@ -86,23 +80,19 @@ Release backend bundles:
 
 | Bundle | Compiled backend support | Companion backend support |
 | --- | --- | --- |
-| `release-windows` | CPU, CUDA | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
-| `release-linux` | CPU | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
-| `release-linux-cuda` | CPU, CUDA | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
-| `release-macos-apple-silicon` | CPU, Metal | MLX via `mlx-lm`; VLM through a capable external backend |
-| `release-macos-intel` | CPU, Metal where available | VLM through a capable external backend |
+| `release-windows` | CPU, CUDA | AMD/Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
+| `release-linux` | CPU, CUDA | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
+| `release-macos-apple-silicon` | CPU | MLX via `mlx-lm`; VLM through a capable external backend |
 
 Raw Cargo equivalents:
 
 ```bash
 cargo build --release --locked --target x86_64-pc-windows-msvc --features release-windows
 cargo build --release --locked --target x86_64-unknown-linux-gnu --features release-linux
-cargo build --release --locked --target x86_64-unknown-linux-gnu --features release-linux-cuda
 cargo build --release --locked --target aarch64-apple-darwin --features release-macos-apple-silicon
-cargo build --release --locked --target x86_64-apple-darwin --features release-macos-intel
 ```
 
-CUDA release builds require a working NVIDIA driver and CUDA toolkit on the build machine. The portable Linux build does not compile Candle CUDA and avoids this requirement. If `cargo build-linux-cuda` fails with `fatal error: cuda_fp8.h: No such file or directory`, the active CUDA toolkit is too old or the wrong `nvcc` is first in `PATH`. Candle CUDA kernels may require headers that are not present in CUDA 11.x. Point the build at a newer installed toolkit:
+Windows and Linux release builds compile Candle CUDA, so they require a working NVIDIA driver and CUDA toolkit on the build machine. If `cargo build-windows` fails with ``nvcc --version` failed` / `program not found`, the CUDA toolkit is not on `PATH` in that PowerShell session. If a CUDA build fails with `fatal error: cuda_fp8.h: No such file or directory`, the active CUDA toolkit is too old or the wrong `nvcc` is first in `PATH`. Candle CUDA kernels may require headers that are not present in CUDA 11.x. Point the build at a newer installed toolkit:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-13.0
@@ -113,14 +103,14 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
 nvcc --version
-cargo build-linux-cuda
+cargo build-linux
 ```
 
 If the CUDA build then fails because NVML cannot query the GPU, set the compute capability manually. For example, an RTX 30xx/Ampere `sm_86` GPU uses:
 
 ```bash
 export CUDA_COMPUTE_CAP=86
-cargo build-linux-cuda
+cargo build-linux
 ```
 
 For a local install, use the same rule. `--locked` keeps the checked-in dependency graph, and `--force` replaces an existing `werk` install. For the portable CPU/Vulkan-capable binary:
@@ -170,7 +160,6 @@ cd C:\dev\werk1112
 rustup default stable-x86_64-pc-windows-msvc
 git lfs install
 nvidia-smi
-nvcc --version
 
 $env:CUDA_HOME = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0"
 $env:CUDA_ROOT = $env:CUDA_HOME
@@ -179,6 +168,7 @@ $env:CUDA_TOOLKIT_ROOT_DIR = $env:CUDA_HOME
 $env:CUDA_COMPUTE_CAP = "86"
 $env:Path = "$env:CUDA_HOME\bin;$env:Path"
 
+nvcc --version
 cargo build-windows
 ```
 
@@ -211,7 +201,7 @@ werk --backend mlx chat mlx-model
 werk --backend cuda serve --model gemma-2b-it
 ```
 
-`--backend auto` uses the target default order: Windows tries CUDA first, macOS Apple Silicon tries MLX first, and Linux tries Vulkan first. If that backend is unavailable, it falls back through the other target backends and then CPU.
+`--backend auto` uses the target default order: Windows tries CUDA first, Linux tries CPU first, and macOS Apple Silicon tries MLX first. If that backend is unavailable, it falls back through the other target backends.
 
 `--backend cuda` and `--backend metal` use Candle devices and require binaries built with the matching Cargo features. `--backend mlx` and `--backend vulkan` are backend choices, not Candle devices. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
 
@@ -219,17 +209,15 @@ werk --backend cuda serve --model gemma-2b-it
 
 Release artifacts should be produced with the target Cargo alias on the target platform. A complete artifact is the Cargo-built `werk` binary plus the companion backend files for that platform, such as `llama-cli` for Vulkan or an MLX environment for Apple Silicon. End users should not need Rust, Cargo, Visual Studio, or `nvcc`; those are build-machine requirements only.
 
-Do not ship one artifact per backend. Ship one artifact per target platform that can run the portable backends for that target, then let the user choose with `--backend`. Linux CUDA is the exception: publish the CUDA artifact only when it is built on a validated CUDA toolchain.
+Do not ship one artifact per backend. Ship one artifact per target platform that can run all supported backends for that target, then let the user choose with `--backend`.
 
 Each target artifact should include the supported backends for that build, and users can select one explicitly with `--backend`:
 
 | Platform | Cargo command | Included backend support | Auto default |
 | --- | --- | --- | --- |
-| Windows 10/11 x64 | `cargo build-windows` | CPU, CUDA, Vulkan via llama.cpp | CUDA |
-| Linux x64 | `cargo build-linux` | CPU, Vulkan via llama.cpp | Vulkan |
-| Linux x64 CUDA | `cargo build-linux-cuda` | CPU, CUDA, Vulkan via llama.cpp | Vulkan |
-| macOS Apple Silicon | `cargo build-macos-apple-silicon` | CPU, Metal, MLX-LM, VLM request support | MLX |
-| macOS Intel | `cargo build-macos-intel` | CPU, Metal where available | Metal, then CPU |
+| Windows 10/11 x64 | `cargo build-windows` | CPU, CUDA, AMD/Vulkan via llama.cpp | CUDA |
+| Linux x64 | `cargo build-linux` | CPU, CUDA, Vulkan via llama.cpp | CPU |
+| macOS Apple Silicon | `cargo build-macos-apple-silicon` | CPU, MLX-LM, VLM request support | MLX |
 
 Backend selection is per process. There is no persisted setup step.
 
@@ -242,7 +230,7 @@ werk --backend metal chat model-id
 werk --backend cpu chat model-id
 ```
 
-`auto` prefers the most common backend for the target: Windows uses CUDA first, macOS Apple Silicon uses MLX first, and Linux uses Vulkan first. If the preferred backend is unavailable, `auto` falls back through the target's other supported backends and then CPU.
+`auto` prefers the platform default: Windows uses CUDA first, Linux uses CPU first, and macOS Apple Silicon uses MLX first. If the preferred backend is unavailable, `auto` falls back through the target's other supported backends.
 
 MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. Vulkan is implemented as an external llama.cpp backend for GGUF models. Release artifacts should bundle the external backend pieces they need. During development, `WERK_LLAMA_CLI` can point to a specific llama.cpp binary, and `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
 
