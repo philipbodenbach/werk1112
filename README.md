@@ -1,5 +1,9 @@
 # Werk1112
 
+<p align="center">
+  <img src="docs/assets/werk1112-banner.svg" alt="Werk1112 startup banner: WERK1112 - Any Model. Anywhere." />
+</p>
+
 Werk1112 is a headless local model server in the spirit of Ollama, built around a Rust-first toolchain and an OpenAI-compatible HTTP API. It is intended for external clients such as Open WebUI, LM Studio, and agent tooling.
 
 The app does not provide its own GUI chat. Use the CLI to import/list/inspect models and start the server, then connect a client to the HTTP API.
