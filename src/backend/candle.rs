@@ -163,7 +163,7 @@ fn select_device(mode: CandleDeviceMode) -> Result<Device> {
             .unwrap_or(Device::Cpu)),
         CandleDeviceMode::Cpu => Ok(Device::Cpu),
         CandleDeviceMode::Cuda => Device::new_cuda(0).context(
-            "CUDA was requested but is unavailable; build with --features cuda and check the NVIDIA driver/toolkit",
+            "CUDA was requested but is unavailable; build with CUDA support, for example cargo build-linux-cuda or --features cuda, and check the NVIDIA driver/toolkit",
         ),
         CandleDeviceMode::Metal => Device::new_metal(0).context(
             "Metal was requested but is unavailable; build with --features metal on macOS/Apple Silicon",

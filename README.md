@@ -10,7 +10,7 @@ This is an early V1 skeleton:
 
 - Development builds are CPU-only by default.
 - CUDA, CUDNN, Metal, and MKL are opt-in Cargo features for source builds.
-- Release artifacts should enable and bundle every backend supported by their target OS.
+- Release artifacts should bundle companion backends for their target OS; compiled GPU backends are enabled only by the target aliases that require that toolchain.
 - `/v1/models` returns installed model manifests in an OpenAI-style model list.
 - `/v1/chat/completions` accepts OpenAI-style chat requests.
 - Streaming uses `text/event-stream` with `chat.completion.chunk` payloads and a final `data: [DONE]`.
@@ -37,7 +37,7 @@ Current generation support includes Candle-native GGUF/safetensors paths plus ex
 
 ## Build
 
-The default development build is CPU-only. Release builds use target-specific Cargo aliases that enable every compiled backend supported by that target.
+The default development build is CPU-only. Release builds use target-specific Cargo aliases. Linux has a portable default build and a separate CUDA build because Candle CUDA kernels require a recent CUDA toolkit at compile time.
 
 ```bash
 cargo check --locked --no-default-features
@@ -49,6 +49,7 @@ Target release builds:
 ```bash
 cargo build-windows
 cargo build-linux
+cargo build-linux-cuda
 cargo build-macos-apple-silicon
 cargo build-macos-intel
 ```
@@ -56,7 +57,8 @@ cargo build-macos-intel
 Run target release aliases on the matching build OS when GPU acceleration is involved. In practice:
 
 - Run `cargo build-windows` from native Windows PowerShell with the MSVC Rust toolchain and Windows CUDA installed.
-- Run `cargo build-linux` from Linux or WSL with Linux CUDA installed.
+- Run `cargo build-linux` from Linux or WSL for the portable Linux artifact.
+- Run `cargo build-linux-cuda` from Linux or WSL only when the active Linux CUDA toolkit is new enough for Candle.
 - Run `cargo build-macos-apple-silicon` on Apple Silicon macOS.
 - Run `cargo build-macos-intel` on Intel macOS.
 
@@ -67,6 +69,7 @@ These aliases expand to normal Cargo target builds:
 ```text
 cargo build-windows              -> x86_64-pc-windows-msvc + release-windows
 cargo build-linux                -> x86_64-unknown-linux-gnu + release-linux
+cargo build-linux-cuda           -> x86_64-unknown-linux-gnu + release-linux-cuda
 cargo build-macos-apple-silicon  -> aarch64-apple-darwin + release-macos-apple-silicon
 cargo build-macos-intel          -> x86_64-apple-darwin + release-macos-intel
 ```
@@ -80,7 +83,8 @@ Release backend bundles:
 | Bundle | Compiled backend support | Companion backend support |
 | --- | --- | --- |
 | `release-windows` | CPU, CUDA | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
-| `release-linux` | CPU, CUDA | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
+| `release-linux` | CPU | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
+| `release-linux-cuda` | CPU, CUDA | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
 | `release-macos-apple-silicon` | CPU, Metal | MLX via `mlx-lm`; VLM through a capable external backend |
 | `release-macos-intel` | CPU, Metal where available | VLM through a capable external backend |
 
@@ -89,11 +93,12 @@ Raw Cargo equivalents:
 ```bash
 cargo build --release --locked --target x86_64-pc-windows-msvc --features release-windows
 cargo build --release --locked --target x86_64-unknown-linux-gnu --features release-linux
+cargo build --release --locked --target x86_64-unknown-linux-gnu --features release-linux-cuda
 cargo build --release --locked --target aarch64-apple-darwin --features release-macos-apple-silicon
 cargo build --release --locked --target x86_64-apple-darwin --features release-macos-intel
 ```
 
-CUDA release builds require a working NVIDIA driver and CUDA toolkit on the build machine. If the CUDA build fails with `fatal error: cuda_fp8.h: No such file or directory`, the active CUDA toolkit is too old or the wrong `nvcc` is first in `PATH`. Candle CUDA kernels may require headers that are not present in CUDA 11.x. Point the build at a newer installed toolkit:
+CUDA release builds require a working NVIDIA driver and CUDA toolkit on the build machine. The portable Linux build does not compile Candle CUDA and avoids this requirement. If `cargo build-linux-cuda` fails with `fatal error: cuda_fp8.h: No such file or directory`, the active CUDA toolkit is too old or the wrong `nvcc` is first in `PATH`. Candle CUDA kernels may require headers that are not present in CUDA 11.x. Point the build at a newer installed toolkit:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-13.0
@@ -104,14 +109,33 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
 nvcc --version
-cargo build-linux
+cargo build-linux-cuda
 ```
 
 If the CUDA build then fails because NVML cannot query the GPU, set the compute capability manually. For example, an RTX 30xx/Ampere `sm_86` GPU uses:
 
 ```bash
 export CUDA_COMPUTE_CAP=86
-cargo build-linux
+cargo build-linux-cuda
+```
+
+For a local install, use the same rule. `--locked` keeps the checked-in dependency graph, and `--force` replaces an existing `werk` install. For the portable CPU/Vulkan-capable binary:
+
+```bash
+cargo install --path . --locked --force
+```
+
+For a CUDA-enabled local install, make sure the newer CUDA toolkit is first:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.0
+export CUDA_ROOT=/usr/local/cuda-13.0
+export CUDA_PATH=/usr/local/cuda-13.0
+export CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+
+cargo install --path . --locked --force --features cuda
 ```
 
 Native Windows CUDA / PowerShell:
@@ -191,14 +215,15 @@ werk --backend cuda serve --model gemma-2b-it
 
 Release artifacts should be produced with the target Cargo alias on the target platform. A complete artifact is the Cargo-built `werk` binary plus the companion backend files for that platform, such as `llama-cli` for Vulkan or an MLX environment for Apple Silicon. End users should not need Rust, Cargo, Visual Studio, or `nvcc`; those are build-machine requirements only.
 
-Do not ship one artifact per backend. Ship one artifact per target platform that can run all supported backends for that target, then let the user choose with `--backend`.
+Do not ship one artifact per backend. Ship one artifact per target platform that can run the portable backends for that target, then let the user choose with `--backend`. Linux CUDA is the exception: publish the CUDA artifact only when it is built on a validated CUDA toolchain.
 
-Each target artifact should include every backend supported on that target, and users can select one explicitly with `--backend`:
+Each target artifact should include the supported backends for that build, and users can select one explicitly with `--backend`:
 
 | Platform | Cargo command | Included backend support | Auto default |
 | --- | --- | --- | --- |
 | Windows 10/11 x64 | `cargo build-windows` | CPU, CUDA, Vulkan via llama.cpp | CUDA |
-| Linux x64 | `cargo build-linux` | CPU, CUDA, Vulkan via llama.cpp | Vulkan |
+| Linux x64 | `cargo build-linux` | CPU, Vulkan via llama.cpp | Vulkan |
+| Linux x64 CUDA | `cargo build-linux-cuda` | CPU, CUDA, Vulkan via llama.cpp | Vulkan |
 | macOS Apple Silicon | `cargo build-macos-apple-silicon` | CPU, Metal, MLX-LM, VLM request support | MLX |
 | macOS Intel | `cargo build-macos-intel` | CPU, Metal where available | Metal, then CPU |
 
