@@ -127,6 +127,7 @@ async fn chat_completions_handler(
         seed: request.seed,
         stream_granularity: StreamGranularity::Chunk,
         verbose: false,
+        debug: false,
     };
 
     if request.stream.unwrap_or(false) {

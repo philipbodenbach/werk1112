@@ -79,6 +79,7 @@ struct ServerCompletion {
     completion_tokens: usize,
     prompt_seconds: f64,
     decode_seconds: f64,
+    first_token_seconds: f64,
     finish_reason: String,
 }
 
@@ -200,7 +201,7 @@ impl LlamaServerBackend {
             timings: GenerationTimings {
                 load_seconds,
                 warmup_seconds: 0.0,
-                first_token_seconds: 0.0,
+                first_token_seconds: completion.first_token_seconds,
                 prompt_seconds: completion.prompt_seconds,
                 decode_seconds: completion.decode_seconds,
                 total_seconds: total_started.elapsed().as_secs_f64(),
@@ -258,7 +259,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
             timings: GenerationTimings {
                 load_seconds: 0.0,
                 warmup_seconds: 0.0,
-                first_token_seconds: 0.0,
+                first_token_seconds: completion.first_token_seconds,
                 prompt_seconds: completion.prompt_seconds,
                 decode_seconds: completion.decode_seconds,
                 total_seconds: total_started.elapsed().as_secs_f64(),
@@ -282,7 +283,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                     timings: GenerationTimings {
                         load_seconds: 0.0,
                         warmup_seconds: 0.0,
-                        first_token_seconds: 0.0,
+                        first_token_seconds: completion.first_token_seconds,
                         prompt_seconds: completion.prompt_seconds,
                         decode_seconds: completion.decode_seconds,
                         total_seconds: total_started.elapsed().as_secs_f64(),
@@ -373,6 +374,9 @@ impl LlamaServerProcess {
                 if let Some(chunk) = value.get("content").and_then(Value::as_str)
                     && !chunk.is_empty()
                 {
+                    if completion.first_token_seconds <= 0.0 {
+                        completion.first_token_seconds = started.elapsed().as_secs_f64();
+                    }
                     completion.text.push_str(chunk);
                     send_text_chunk(&tx, chunk.to_string())?;
                 }
@@ -380,12 +384,7 @@ impl LlamaServerProcess {
             })
         })?;
 
-        if completion.decode_seconds <= 0.0 {
-            completion.decode_seconds = started.elapsed().as_secs_f64();
-        }
-        if completion.completion_tokens == 0 {
-            completion.completion_tokens = estimate_tokens(&completion.text);
-        }
+        finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
         Ok(completion)
     }
 
@@ -441,7 +440,7 @@ impl LlamaServerProcess {
     }
 
     fn print_debug(&self, request: &GenerateRequest, reused: bool) {
-        if !request.verbose {
+        if !request.debug {
             return;
         }
         eprintln!("selected backend: {}", label(self.mode));
@@ -623,22 +622,85 @@ fn update_completion_from_event(completion: &mut ServerCompletion, value: &Value
         completion.completion_tokens += 1;
     }
 
-    if let Some(value) = number_field(value, &["tokens_predicted", "predicted_n", "n_predicted"]) {
-        completion.completion_tokens = value as usize;
+    if let Some(value) = usize_field_any(
+        value,
+        &[
+            &["tokens_predicted"],
+            &["predicted_n"],
+            &["n_predicted"],
+            &["timings", "predicted_n"],
+            &["timings", "n_predicted"],
+            &["timings", "tokens_predicted"],
+        ],
+    ) && should_update_count(completion.completion_tokens, value)
+    {
+        completion.completion_tokens = value;
     }
-    if let Some(value) = number_field(value, &["tokens_evaluated", "prompt_n", "n_prompt"]) {
-        completion.prompt_tokens = value as usize;
+    if let Some(value) = usize_field_any(
+        value,
+        &[
+            &["tokens_evaluated"],
+            &["prompt_n"],
+            &["n_prompt"],
+            &["timings", "prompt_n"],
+            &["timings", "n_prompt"],
+            &["timings", "tokens_evaluated"],
+        ],
+    ) && should_update_count(completion.prompt_tokens, value)
+    {
+        completion.prompt_tokens = value;
     }
-    if let Some(ms) = number_field(value, &["timings", "prompt_ms"])
-        .or_else(|| number_field(value, &["prompt_ms"]))
+    if let Some(ms) = number_field_any(value, &[&["timings", "prompt_ms"], &["prompt_ms"]])
+        && should_update_seconds(completion.prompt_seconds, ms / 1000.0)
     {
         completion.prompt_seconds = ms / 1000.0;
     }
-    if let Some(ms) = number_field(value, &["timings", "predicted_ms"])
-        .or_else(|| number_field(value, &["predicted_ms"]))
+    if let Some(ms) = number_field_any(value, &[&["timings", "predicted_ms"], &["predicted_ms"]])
+        && should_update_seconds(completion.decode_seconds, ms / 1000.0)
     {
         completion.decode_seconds = ms / 1000.0;
     }
+}
+
+fn finalize_completion_stats(
+    completion: &mut ServerCompletion,
+    request: &GenerateRequest,
+    elapsed_seconds: f64,
+) {
+    if completion.prompt_tokens == 0 && !request.prompt.trim().is_empty() {
+        completion.prompt_tokens = estimate_tokens(&request.prompt);
+    }
+    if completion.prompt_seconds <= 0.0 && completion.first_token_seconds > 0.0 {
+        completion.prompt_seconds = completion.first_token_seconds;
+    }
+    if completion.decode_seconds <= 0.0 {
+        completion.decode_seconds = if completion.first_token_seconds > 0.0
+            && elapsed_seconds > completion.first_token_seconds
+        {
+            elapsed_seconds - completion.first_token_seconds
+        } else {
+            elapsed_seconds
+        };
+    }
+    if completion.completion_tokens == 0 {
+        completion.completion_tokens = estimate_tokens(&completion.text);
+    }
+}
+
+fn should_update_count(current: usize, next: usize) -> bool {
+    next > 0 || current == 0
+}
+
+fn should_update_seconds(current: f64, next: f64) -> bool {
+    next > 0.0 || current <= 0.0
+}
+
+fn usize_field_any(value: &Value, paths: &[&[&str]]) -> Option<usize> {
+    number_field_any(value, paths).map(|value| value as usize)
+}
+
+fn number_field_any(value: &Value, paths: &[&[&str]]) -> Option<f64> {
+    paths.iter().find_map(|path| number_field(value, path))
 }
 
 fn number_field(value: &Value, path: &[&str]) -> Option<f64> {
@@ -1681,6 +1743,103 @@ mod tests {
         assert!(message.contains("PATH: llama-server"));
         assert!(message.contains("managed cache"));
         assert!(message.contains("werk backend install llama-cuda"));
+    }
+
+    #[test]
+    fn completion_event_parses_nested_timings_object() {
+        let mut completion = ServerCompletion::default();
+        update_completion_from_event(
+            &mut completion,
+            &json!({
+                "timings": {
+                    "prompt_n": 46,
+                    "prompt_ms": 214.738,
+                    "predicted_n": 745,
+                    "predicted_ms": 16418.107
+                }
+            }),
+        );
+
+        assert_eq!(completion.prompt_tokens, 46);
+        assert_eq!(completion.completion_tokens, 745);
+        assert!((completion.prompt_seconds - 0.214738).abs() < 0.000001);
+        assert!((completion.decode_seconds - 16.418107).abs() < 0.000001);
+    }
+
+    #[test]
+    fn completion_event_parses_top_level_legacy_fields() {
+        let mut completion = ServerCompletion::default();
+        update_completion_from_event(
+            &mut completion,
+            &json!({
+                "prompt_n": 12,
+                "prompt_ms": 50.0,
+                "predicted_n": 34,
+                "predicted_ms": 700.0
+            }),
+        );
+
+        assert_eq!(completion.prompt_tokens, 12);
+        assert_eq!(completion.completion_tokens, 34);
+        assert!((completion.prompt_seconds - 0.05).abs() < 0.000001);
+        assert!((completion.decode_seconds - 0.7).abs() < 0.000001);
+    }
+
+    #[test]
+    fn completion_event_does_not_overwrite_good_values_with_zero_or_missing_fields() {
+        let mut completion = ServerCompletion {
+            prompt_tokens: 46,
+            completion_tokens: 745,
+            prompt_seconds: 0.214738,
+            decode_seconds: 16.418107,
+            ..Default::default()
+        };
+        update_completion_from_event(
+            &mut completion,
+            &json!({
+                "timings": {
+                    "prompt_n": 0,
+                    "prompt_ms": 0.0,
+                    "predicted_n": 0,
+                    "predicted_ms": 0.0
+                }
+            }),
+        );
+        update_completion_from_event(&mut completion, &json!({ "stop": true }));
+
+        assert_eq!(completion.prompt_tokens, 46);
+        assert_eq!(completion.completion_tokens, 745);
+        assert!((completion.prompt_seconds - 0.214738).abs() < 0.000001);
+        assert!((completion.decode_seconds - 16.418107).abs() < 0.000001);
+        assert_eq!(completion.finish_reason, "stop");
+    }
+
+    #[test]
+    fn completion_stats_fallback_estimates_non_empty_prompt_tokens() {
+        let mut completion = ServerCompletion {
+            text: "hello from llama".to_string(),
+            first_token_seconds: 0.123,
+            ..Default::default()
+        };
+        let request = GenerateRequest {
+            prompt: "Write a sentence about Rust.".to_string(),
+            image_urls: Vec::new(),
+            max_tokens: 32,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        finalize_completion_stats(&mut completion, &request, 0.5);
+
+        assert!(completion.prompt_tokens > 0);
+        assert_eq!(completion.prompt_seconds, 0.123);
+        assert!((completion.decode_seconds - 0.377).abs() < 0.000001);
+        assert!(completion.completion_tokens > 0);
     }
 
     #[test]

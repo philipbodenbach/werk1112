@@ -312,6 +312,9 @@ pub enum Commands {
 
         #[arg(long, help = "Print Ollama-style timing and throughput stats")]
         verbose: bool,
+
+        #[arg(long, help = "Print backend internals and resolved runtime details")]
+        debug: bool,
     },
 
     #[command(about = "Start an interactive terminal chat with an installed model")]
@@ -352,6 +355,9 @@ pub enum Commands {
 
         #[arg(long, help = "Print Ollama-style timing and throughput stats")]
         verbose: bool,
+
+        #[arg(long, help = "Print backend internals and resolved runtime details")]
+        debug: bool,
     },
 
     #[command(about = "Benchmark an installed model backend")]
@@ -397,6 +403,9 @@ pub enum Commands {
 
         #[arg(long, help = "Print machine-readable benchmark JSON")]
         json: bool,
+
+        #[arg(long, help = "Print backend internals during benchmark runs")]
+        debug: bool,
     },
 
     #[command(about = "Inspect Werk runtime diagnostics")]
@@ -530,11 +539,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             seed,
             images,
             verbose,
+            debug,
         } => {
             let prompt = prompt.join(" ");
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
+            let selected_backend =
+                selected_backend_for_manifest(&store, backend_choice, &manifest)?;
             let backend = build_generation_backend(store, backend_choice, llama_options.clone())?;
             let prompt = messages_to_prompt_for_model(
                 &manifest,
@@ -554,6 +566,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 seed,
                 stream_granularity: StreamGranularity::Chunk,
                 verbose,
+                debug,
             };
             let response = backend.generate(&manifest, request)?;
             println!("{}", response.text.trim());
@@ -562,6 +575,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 writeln!(stderr)?;
                 write_verbose_stats(
                     &mut stderr,
+                    Some(verbose_backend_label(selected_backend)),
                     response.prompt_tokens,
                     response.completion_tokens,
                     response.timings,
@@ -578,14 +592,18 @@ pub async fn run(cli: Cli) -> Result<()> {
             images,
             stream_granularity,
             verbose,
+            debug,
         } => {
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
+            let selected_backend =
+                selected_backend_for_manifest(&store, backend_choice, &manifest)?;
             let backend = build_generation_backend(store, backend_choice, llama_options.clone())?;
             chat_loop(
                 backend,
                 manifest,
+                verbose_backend_label(selected_backend),
                 max_tokens,
                 temperature,
                 top_p,
@@ -593,6 +611,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 images,
                 stream_granularity.into(),
                 verbose,
+                debug,
             )
             .await
         }
@@ -608,6 +627,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             compare,
             print_native_info,
             json,
+            debug,
         } => {
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
@@ -625,6 +645,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 top_p,
                 seed,
                 compare,
+                debug,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -760,6 +781,7 @@ fn should_print_startup_banner_for(
 async fn chat_loop(
     backend: Arc<dyn GenerationBackend>,
     manifest: ModelManifest,
+    backend_name: &'static str,
     max_tokens: usize,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -767,6 +789,7 @@ async fn chat_loop(
     images: Vec<String>,
     stream_granularity: StreamGranularity,
     verbose: bool,
+    debug: bool,
 ) -> Result<()> {
     let chat_session = backend.start_chat_session(&manifest, seed)?;
     if chat_session.is_none() {
@@ -815,6 +838,7 @@ async fn chat_loop(
             seed,
             stream_granularity,
             verbose,
+            debug,
         };
 
         print!("assistant> ");
@@ -862,7 +886,13 @@ async fn chat_loop(
         if verbose && let Some(timings) = timings {
             let mut stdout = io::stdout().lock();
             writeln!(stdout)?;
-            write_verbose_stats(&mut stdout, prompt_tokens, completion_tokens, timings)?;
+            write_verbose_stats(
+                &mut stdout,
+                Some(backend_name),
+                prompt_tokens,
+                completion_tokens,
+                timings,
+            )?;
         }
 
         if !assistant.trim().is_empty() {
@@ -928,6 +958,7 @@ fn bench_model(
     top_p: Option<f64>,
     seed: u64,
     compare: BenchCompareArg,
+    debug: bool,
 ) -> Result<BenchReport> {
     if runs == 0 {
         bail!("--runs must be greater than 0");
@@ -960,6 +991,7 @@ fn bench_model(
             temperature,
             top_p,
             seed,
+            debug,
         );
         results.push(match result {
             Ok(samples) => BenchBackendReport {
@@ -1022,6 +1054,7 @@ fn run_benchmark_choice(
     temperature: f64,
     top_p: Option<f64>,
     seed: u64,
+    debug: bool,
 ) -> Result<Vec<BenchSample>> {
     let backend = build_concrete_backend(store, choice, runtime_options)?;
     backend.prepare(manifest)?;
@@ -1039,6 +1072,7 @@ fn run_benchmark_choice(
             seed: Some(seed),
             stream_granularity: StreamGranularity::Chunk,
             verbose: false,
+            debug,
         };
         let response = if let Some(session) = session.as_ref() {
             session.generate(request)?
@@ -1280,10 +1314,14 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
 
 fn write_verbose_stats<W: Write>(
     writer: &mut W,
+    backend: Option<&str>,
     prompt_tokens: usize,
     completion_tokens: usize,
     timings: GenerationTimings,
 ) -> io::Result<()> {
+    if let Some(backend) = backend {
+        writeln!(writer, "{:<22}{}", "backend:", backend)?;
+    }
     writeln!(
         writer,
         "{:<22}{}",
@@ -1836,6 +1874,38 @@ fn backend_label(backend: BackendChoice) -> &'static str {
     }
 }
 
+fn verbose_backend_label(backend: BackendChoice) -> &'static str {
+    match backend {
+        BackendChoice::Auto => "auto",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Cuda,
+            ..
+        } => "llama.cpp server CUDA",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Cpu,
+            ..
+        } => "llama.cpp server CPU",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Vulkan,
+            ..
+        } => "llama.cpp server Vulkan",
+        BackendChoice::Candle(CandleDeviceMode::Auto) => "Candle auto",
+        BackendChoice::Candle(CandleDeviceMode::Cpu) => "Candle CPU",
+        BackendChoice::Candle(CandleDeviceMode::Cuda) => "Candle CUDA",
+        BackendChoice::Candle(CandleDeviceMode::Metal) => "Candle Metal",
+        BackendChoice::Mlx => "MLX",
+        BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama.cpp server CUDA",
+        BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => "llama.cpp server Vulkan",
+        BackendChoice::LlamaServer(LlamaCppMode::Cpu) => "llama.cpp server CPU",
+        BackendChoice::LlamaFast(LlamaCppMode::Cuda) => "llama.cpp legacy FFI CUDA",
+        BackendChoice::LlamaFast(LlamaCppMode::Vulkan) => "llama.cpp legacy FFI Vulkan",
+        BackendChoice::LlamaFast(LlamaCppMode::Cpu) => "llama.cpp legacy FFI CPU",
+        BackendChoice::LlamaHighlevel(LlamaCppMode::Cuda) => "llama.cpp high-level CUDA",
+        BackendChoice::LlamaHighlevel(LlamaCppMode::Vulkan) => "llama.cpp high-level Vulkan",
+        BackendChoice::LlamaHighlevel(LlamaCppMode::Cpu) => "llama.cpp high-level CPU",
+    }
+}
+
 fn display_llama_mode(mode: LlamaCppMode) -> &'static str {
     match mode {
         LlamaCppMode::Cuda => "CUDA",
@@ -2021,6 +2091,7 @@ mod tests {
             "hello",
             "--image",
             "image.png",
+            "--debug",
         ])
         .unwrap();
         match cli.command.unwrap() {
@@ -2028,11 +2099,13 @@ mod tests {
                 model,
                 prompt,
                 images,
+                debug,
                 ..
             } => {
                 assert_eq!(model, "gemma-2b-it");
                 assert_eq!(prompt, vec!["hello"]);
                 assert_eq!(images, vec!["image.png"]);
+                assert!(debug);
             }
             command => panic!("unexpected command: {command:?}"),
         }
@@ -2043,16 +2116,19 @@ mod tests {
             "gemma-2b-it",
             "--stream-granularity",
             "chunk",
+            "--debug",
         ])
         .unwrap();
         match cli.command.unwrap() {
             Commands::Chat {
                 model,
                 stream_granularity,
+                debug,
                 ..
             } => {
                 assert_eq!(model, "gemma-2b-it");
                 assert_eq!(stream_granularity, StreamGranularityArg::Chunk);
+                assert!(debug);
             }
             command => panic!("unexpected command: {command:?}"),
         }
@@ -2208,6 +2284,7 @@ mod tests {
             seed: None,
             images: Vec::new(),
             verbose: false,
+            debug: false,
         };
         assert!(should_print_startup_banner_for(&run, true, true));
         assert!(!should_print_startup_banner_for(&run, false, true));
@@ -2221,6 +2298,7 @@ mod tests {
             images: Vec::new(),
             stream_granularity: StreamGranularityArg::Token,
             verbose: false,
+            debug: false,
         };
         assert!(should_print_startup_banner_for(&chat, true, true));
         assert!(!should_print_startup_banner_for(&chat, true, false));
@@ -2237,6 +2315,7 @@ mod tests {
             compare: BenchCompareArg::None,
             print_native_info: false,
             json: true,
+            debug: false,
         };
         assert!(!should_print_startup_banner_for(&bench, true, true));
 

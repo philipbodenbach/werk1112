@@ -28,6 +28,7 @@ pub struct GenerateRequest {
     pub seed: Option<u64>,
     pub stream_granularity: StreamGranularity,
     pub verbose: bool,
+    pub debug: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
