@@ -345,6 +345,28 @@ impl ModelStore {
             .ok_or_else(|| anyhow!("model '{id}' is not installed"))
     }
 
+    pub fn remove(&self, id: &str) -> Result<ModelManifest> {
+        self.ensure()?;
+        validate_id(id)?;
+        let manifest = self.get(id)?;
+        let dir = self.model_dir(&manifest.id);
+        if !dir.is_dir() {
+            bail!(
+                "model '{}' is not installed at {}",
+                manifest.id,
+                dir.display()
+            );
+        }
+        fs::remove_dir_all(&dir).with_context(|| {
+            format!(
+                "failed to remove model '{}' at {}",
+                manifest.id,
+                dir.display()
+            )
+        })?;
+        Ok(manifest)
+    }
+
     pub fn absolute_model_file(&self, manifest: &ModelManifest, relative_path: &str) -> PathBuf {
         self.model_dir(&manifest.id).join(relative_path)
     }
@@ -1140,6 +1162,27 @@ mod tests {
         assert_eq!(manifest.architecture.as_deref(), Some("llama"));
         assert!(store.model_dir("test-model").join(MANIFEST_FILE).is_file());
         assert!(store.list().unwrap().iter().any(|m| m.id == "test-model"));
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn remove_deletes_managed_model_directory() {
+        let tmp = test_dir("store-remove");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("model.gguf"), b"gguf").unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        store.import_path(&source, "test-model").unwrap();
+        let model_dir = store.model_dir("test-model");
+        assert!(model_dir.is_dir());
+
+        let removed = store.remove("test-model").unwrap();
+        assert_eq!(removed.id, "test-model");
+        assert!(!model_dir.exists());
+        assert!(store.get("test-model").is_err());
+        assert!(source.join("model.gguf").is_file());
 
         let _ = fs::remove_dir_all(tmp);
     }

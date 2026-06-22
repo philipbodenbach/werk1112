@@ -484,6 +484,16 @@ pub enum Commands {
         file: Option<String>,
     },
 
+    #[command(
+        about = "Remove an installed model from the managed model store",
+        alias = "rm",
+        alias = "delete"
+    )]
+    Remove {
+        #[arg(help = "Installed model id")]
+        id: String,
+    },
+
     #[command(about = "List installed models")]
     List,
 
@@ -779,6 +789,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             print_manifest_summary("Pulled", &manifest);
             Ok(())
         }
+        Commands::Remove { id } => {
+            let store = ModelStore::resolve(model_home)?;
+            let manifest = store.remove(&id)?;
+            println!(
+                "Removed {} ({:?}) from {}",
+                manifest.id,
+                manifest.format,
+                store.model_dir(&manifest.id).display()
+            );
+            Ok(())
+        }
         Commands::List => {
             let store = ModelStore::resolve(model_home)?;
             let manifests = store.list()?;
@@ -842,6 +863,7 @@ fn should_print_startup_banner_for(
         Commands::Chat { .. } => stdin_is_terminal,
         Commands::Import { .. }
         | Commands::Pull { .. }
+        | Commands::Remove { .. }
         | Commands::Bench { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
@@ -2233,7 +2255,7 @@ fn unavailable_backend_message(
 ) -> String {
     match (backend, &manifest.format) {
         (BackendChoice::Candle(CandleDeviceMode::Cuda), ModelFormat::SafeTensors) => {
-            "CUDA backend requested for safetensors model, but Candle CUDA is unavailable. Build Werk with CUDA support or choose --backend auto / --backend cpu.".to_string()
+            candle_cuda_unavailable_message()
         }
         (BackendChoice::Candle(CandleDeviceMode::Metal), ModelFormat::SafeTensors) => {
             "Metal backend requested for safetensors model, but Candle Metal is unavailable. Build with Metal support on macOS or choose --backend cpu.".to_string()
@@ -2372,11 +2394,7 @@ fn availability_rejection_reason(
 ) -> String {
     match candidate {
         BackendChoice::LlamaServer(mode) => LlamaServerBackend::missing_message(store, mode),
-        BackendChoice::Candle(CandleDeviceMode::Cuda)
-            if manifest.format == ModelFormat::SafeTensors =>
-        {
-            "Candle CUDA is unavailable".to_string()
-        }
+        BackendChoice::Candle(CandleDeviceMode::Cuda) => candle_cuda_rejection_reason(),
         BackendChoice::Candle(CandleDeviceMode::Metal)
             if manifest.format == ModelFormat::SafeTensors =>
         {
@@ -2384,6 +2402,22 @@ fn availability_rejection_reason(
         }
         BackendChoice::Mlx => "mlx-lm is unavailable".to_string(),
         _ => "backend is unavailable".to_string(),
+    }
+}
+
+fn candle_cuda_unavailable_message() -> String {
+    if cfg!(feature = "candle-cuda") {
+        "CUDA backend requested for safetensors model, but Candle CUDA is unavailable. Check the NVIDIA driver/CUDA runtime, or use: werk --backend auto / --backend cpu.".to_string()
+    } else {
+        "CUDA backend requested for safetensors model. This Werk binary was built without Candle CUDA support. Rebuild with: cargo install --path . --locked --force --features cuda. Or use: werk --backend auto / --backend cpu.".to_string()
+    }
+}
+
+fn candle_cuda_rejection_reason() -> String {
+    if cfg!(feature = "candle-cuda") {
+        "Candle CUDA is unavailable".to_string()
+    } else {
+        "This Werk binary was built without Candle CUDA support. Rebuild with: cargo install --path . --locked --force --features cuda".to_string()
     }
 }
 
@@ -2750,6 +2784,12 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("repo"));
                 assert_eq!(file.as_deref(), Some("model.Q4_K_M.gguf"));
             }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "rm", "repo"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Remove { id } => assert_eq!(id, "repo"),
             command => panic!("unexpected command: {command:?}"),
         }
 

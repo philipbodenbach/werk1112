@@ -12,7 +12,7 @@ The app does not provide its own GUI chat. Use the CLI to import/list/inspect mo
 
 This is an early V1 skeleton:
 
-- Development builds are CPU-only by default.
+- Default local installs build the recommended runtime stack for the current Windows/Linux CUDA-first workflow.
 - CUDA, CUDNN, Metal, and MKL are opt-in Cargo features for source builds.
 - Release artifacts are one binary per target OS; the default Windows/Linux artifacts are CUDA-first because the current Rust llama.cpp binding cannot compile CUDA and Vulkan into the same binary.
 - `/v1/models` returns installed model manifests in an OpenAI-style model list.
@@ -56,7 +56,13 @@ Werk routes by requested backend, model format, model architecture, input capabi
 
 ## Build
 
-The default development build is CPU-only. Release builds use one target-specific Cargo alias per deployed end-user artifact. Each artifact includes the supported backends for that platform, and users choose the active backend at runtime with `--backend`.
+Default local installs build the recommended runtime stack so users do not need to know which internal runtime powers each model format. For the current Windows/Linux workflow that means CUDA support for llama.cpp and Candle. Release builds use one target-specific Cargo alias per deployed end-user artifact. Each artifact includes the supported backends for that platform, and users choose the active backend at runtime with `--backend`.
+
+```bash
+cargo install --path . --locked --force
+```
+
+For a portable CPU-only development binary, opt out of default features:
 
 ```bash
 cargo check --locked --no-default-features
@@ -82,9 +88,9 @@ Do not use WSL to produce the Windows artifact. WSL can build the Linux artifact
 These aliases expand to normal Cargo target builds:
 
 ```text
-cargo build-windows              -> x86_64-pc-windows-msvc + release-windows
-cargo build-linux                -> x86_64-unknown-linux-gnu + release-linux
-cargo build-macos-apple-silicon  -> aarch64-apple-darwin + release-macos-apple-silicon
+cargo build-windows              -> no default features + x86_64-pc-windows-msvc + release-windows
+cargo build-linux                -> no default features + x86_64-unknown-linux-gnu + release-linux
+cargo build-macos-apple-silicon  -> no default features + aarch64-apple-darwin + release-macos-apple-silicon
 ```
 
 Cargo aliases are subcommands, so the command is `cargo build-windows`, not `cargo build windows`.
@@ -102,9 +108,9 @@ Release backend bundles:
 Raw Cargo equivalents:
 
 ```bash
-cargo build --release --locked --target x86_64-pc-windows-msvc --features release-windows
-cargo build --release --locked --target x86_64-unknown-linux-gnu --features release-linux
-cargo build --release --locked --target aarch64-apple-darwin --features release-macos-apple-silicon
+cargo build --release --locked --no-default-features --target x86_64-pc-windows-msvc --features release-windows
+cargo build --release --locked --no-default-features --target x86_64-unknown-linux-gnu --features release-linux
+cargo build --release --locked --no-default-features --target aarch64-apple-darwin --features release-macos-apple-silicon
 ```
 
 Windows and Linux release builds compile llama.cpp CUDA, so they require a working NVIDIA driver, CUDA toolkit, C/C++ toolchain, and libclang on the build machine. If `cargo build-windows` fails with ``nvcc --version` failed` / `program not found`, the CUDA toolkit is not on `PATH` in that PowerShell session. On Windows with CUDA 13.x, CCCL can fail with `MSVC/cl.exe with traditional preprocessor is used`; the native Windows setup below passes `/Zc:preprocessor` to MSVC through the `CL` environment variable. Point the build at the intended installed toolkit:
@@ -128,13 +134,13 @@ export CUDA_COMPUTE_CAP=86
 cargo build-linux
 ```
 
-For a local install, use the same rule. `--locked` keeps the checked-in dependency graph, and `--force` replaces an existing `werk` install. For the portable CPU-only development binary:
+For a local install, use the same rule. `--locked` keeps the checked-in dependency graph, and `--force` replaces an existing `werk` install. The default install builds the recommended stack:
 
 ```bash
 cargo install --path . --locked --force
 ```
 
-For a CUDA-enabled local install, make sure the newer CUDA toolkit is first:
+For a CUDA-enabled local install with an explicit feature selection, make sure the newer CUDA toolkit is first:
 
 ```bash
 sudo apt-get update
@@ -159,6 +165,8 @@ cargo install --path . --locked --force --features cuda
 ```
 
 To override that default, set `CC_x86_64_unknown_linux_gnu` or `CXX_x86_64_unknown_linux_gnu` in your shell before running Cargo.
+
+If the build fails in `candle-kernels` with `fatal error: cuda_fp8.h: No such file or directory`, the active CUDA toolkit is too old for Candle CUDA. Install a newer CUDA toolkit and make sure its `bin` and `include` directories come before Ubuntu's `/usr` CUDA package. For a CPU-only development build, use `cargo install --path . --locked --force --no-default-features`.
 
 Native Windows CUDA / Developer PowerShell:
 
@@ -244,10 +252,17 @@ Additional low-level acceleration features are available for custom builds:
 
 ```bash
 cargo build --release --locked --features mkl
-cargo build --release --locked --features cuda,candle-cuda,cudnn
+cargo build --release --locked --features candle-cuda
+cargo build --release --locked --features cuda,cudnn
 ```
 
-The `candle-cuda` and `cudnn` features are only for Candle experiments and non-GGUF CUDA fallback. They compile Candle CUDA kernels and may require CUDA headers such as `cuda_fp8.h`, which are not present in Ubuntu's CUDA 11.5 package. Normal GGUF CUDA builds should use only `--features cuda`.
+The top-level `cuda` feature means CUDA support across Werk: llama.cpp CUDA plus Candle CUDA. It is included by the default `recommended` feature and can still be requested explicitly:
+
+```bash
+cargo install --path . --locked --force --features cuda
+```
+
+The lower-level `candle-cuda` feature is still available for custom builds that only need Candle CUDA without llama.cpp CUDA. `cudnn` builds on Candle CUDA. These features may require CUDA headers such as `cuda_fp8.h`, which are not present in Ubuntu's CUDA 11.5 package.
 
 Build features decide what Candle and llama.cpp acceleration support is compiled into the binary. Backend selection is a separate CLI option and is the preferred way to choose how a process runs:
 
@@ -335,7 +350,7 @@ For GGUF repositories that contain many quantizations, new imports prefer a bala
 
 ## CLI
 
-Install the CLI from this checkout:
+Install the CLI from this checkout with the recommended runtime stack:
 
 ```bash
 cargo install --path . --locked
@@ -354,7 +369,7 @@ werk --help
 werk serve --help
 ```
 
-During development, you can also run the local binary without installing:
+During development, you can also run the local CPU-only binary without installing:
 
 ```bash
 cargo run --no-default-features -- <command>
@@ -407,6 +422,13 @@ werk pull TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
 ```
 
 Pull shows live status for each phase. The first phase clones Git metadata with `GIT_LFS_SKIP_SMUDGE=1`; the second phase runs `git lfs pull` and shows `downloading` with either Git LFS percent/speed or a running local bytes/s estimate while Git LFS is quiet. After the download completes, the CLI shows an import step while files are copied into the managed model store.
+
+Remove an installed model from Werk's managed store. This deletes the managed copy under `WERK_HOME`; it does not delete the original local import source or any upstream Hugging Face repository:
+
+```bash
+werk remove model-local
+werk rm model-local
+```
 
 List installed models:
 

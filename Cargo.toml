@@ -27,7 +27,8 @@ llama_cpp = { version = "0.3.2", optional = true }
 llama_cpp_sys = { version = "0.3.2", default-features = false, optional = true }
 
 [features]
-default = []
+default = ["recommended"]
+recommended = ["cuda"]
 llama-cpp = ["dep:llama_cpp"]
 llama-fast = ["dep:llama_cpp_sys"]
 cuda = [
@@ -35,6 +36,7 @@ cuda = [
     "llama-cpp",
     "llama_cpp_sys/cuda",
     "llama_cpp/cuda",
+    "candle-cuda",
 ]
 # Compatibility alias only. Do not enable llama_cpp_sys/cuda_mmq here:
 # llama_cpp_sys 0.3.2 hardcodes nvcc -arch=all, and forced MMQ fails device-link

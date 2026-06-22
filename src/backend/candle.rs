@@ -166,13 +166,25 @@ fn select_device(mode: CandleDeviceMode) -> Result<Device> {
             .or_else(|_| Device::new_metal(0))
             .unwrap_or(Device::Cpu)),
         CandleDeviceMode::Cpu => Ok(Device::Cpu),
-        CandleDeviceMode::Cuda => Device::new_cuda(0).context(
-            "CUDA was requested but is unavailable; build with CUDA support, for example cargo build-windows, cargo build-linux, or --features cuda, and check the NVIDIA driver/toolkit",
-        ),
+        CandleDeviceMode::Cuda => select_cuda_device(),
         CandleDeviceMode::Metal => Device::new_metal(0).context(
             "Metal was requested but is unavailable; build with --features metal on macOS/Apple Silicon",
         ),
     }
+}
+
+#[cfg(feature = "candle-cuda")]
+fn select_cuda_device() -> Result<Device> {
+    Device::new_cuda(0).context(
+        "Candle CUDA was requested but is unavailable; check the NVIDIA driver, CUDA runtime, and visible GPU",
+    )
+}
+
+#[cfg(not(feature = "candle-cuda"))]
+fn select_cuda_device() -> Result<Device> {
+    bail!(
+        "This Werk binary was built without Candle CUDA support. Rebuild with: cargo install --path . --locked --force --features cuda"
+    )
 }
 
 fn candle_backend_name(device: &Device) -> &'static str {
