@@ -21,13 +21,16 @@ use crate::{
         LlamaRuntimeOptions, LlamaServerBackend, LlamaServerDiscovery, MlxBackend, RuntimeId,
         StreamGranularity, backend_doctor_checks, backend_supports_accelerator,
         backend_supports_format, backend_supports_images as runtime_supports_images,
-        explain_backend_rejection, install_managed_llama_server, llama_server_help_ok,
-        managed_backend_dir, probe_device, runtime_descriptor, runtime_registry,
-        runtime_supports_model,
+        install_managed_llama_server, llama_server_help_ok, managed_backend_dir, probe_device,
+        runtime_descriptor, runtime_registry, runtime_supports_model,
     },
     banner::print_banner,
     model_store::{ModelFormat, ModelManifest, ModelStore, PullProgress},
     openai::{ChatMessage, MessageContent, messages_to_prompt_for_model},
+    runtime_planner::{
+        RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
+        plan_runtime, runtime_candidate_ids, select_runtime,
+    },
 };
 
 #[derive(Debug, Clone, Parser)]
@@ -59,7 +62,7 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value_t = BackendArg::Auto,
-        help = "Backend for this process: auto, cpu, cuda, llama-highlevel, llama-legacy, metal, mlx, or vulkan"
+        help = "Backend for this process: auto, cpu, cuda, vulkan, metal, mlx, candle, llama-highlevel, or llama-legacy"
     )]
     pub backend: BackendArg,
 
@@ -87,6 +90,7 @@ pub enum StreamGranularityArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendArg {
     Auto,
+    Candle,
     Cpu,
     Cuda,
     LlamaHighlevel,
@@ -240,9 +244,15 @@ pub enum BackendInstallArg {
     LlamaCuda,
     LlamaVulkan,
     LlamaCpu,
+    #[value(name = "burn")]
+    Burn,
     BurnCuda,
     BurnWgpu,
     BurnCpu,
+    #[value(name = "vllm")]
+    Vllm,
+    #[value(name = "sglang")]
+    Sglang,
     #[value(name = "onnxruntime")]
     Onnxruntime,
     #[value(name = "mlx")]
@@ -261,9 +271,12 @@ impl BackendInstallArg {
             Self::LlamaCuda => Some(LlamaCppMode::Cuda),
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaCpu => Some(LlamaCppMode::Cpu),
-            Self::BurnCuda
+            Self::Burn
+            | Self::BurnCuda
             | Self::BurnWgpu
             | Self::BurnCpu
+            | Self::Vllm
+            | Self::Sglang
             | Self::Onnxruntime
             | Self::Mlx
             | Self::TensorRt
@@ -277,9 +290,12 @@ impl BackendInstallArg {
             Self::LlamaCuda => "llama-cuda",
             Self::LlamaVulkan => "llama-vulkan",
             Self::LlamaCpu => "llama-cpu",
+            Self::Burn => "burn",
             Self::BurnCuda => "burn-cuda",
             Self::BurnWgpu => "burn-wgpu",
             Self::BurnCpu => "burn-cpu",
+            Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
             Self::Onnxruntime => "onnxruntime",
             Self::Mlx => "mlx",
             Self::TensorRt => "tensorrt",
@@ -1588,42 +1604,9 @@ impl AutoBackend {
         manifest: &ModelManifest,
         has_images: bool,
     ) -> Result<Arc<dyn GenerationBackend>> {
-        let mut unavailable = Vec::new();
-        let candidates = auto_candidates_for_manifest(manifest);
-        for backend in candidates.iter().copied() {
-            if !backend_supports_manifest(backend, manifest) {
-                continue;
-            }
-            if has_images && !backend_supports_images(backend) {
-                unavailable.push(format!("{} is text-only", backend_label(backend)));
-                continue;
-            }
-            if !backend_available_for_store(&self.store, backend) {
-                unavailable.push(format!("{} unavailable", backend_label(backend)));
-                continue;
-            }
-            return self.cached_backend(backend);
-        }
-
-        let format = format!("{:?}", manifest.format);
-        if unavailable.is_empty() {
-            bail!(
-                "no backend in this build supports model '{}' with format {format}",
-                manifest.id
-            );
-        }
-        if has_images {
-            bail!(
-                "VLM input requires an image-capable backend; current candidates for model '{}' with format {format} were rejected: {}",
-                manifest.id,
-                unavailable.join(", ")
-            );
-        }
-        bail!(
-            "no available backend for model '{}' with format {format}; unavailable candidates: {}",
-            manifest.id,
-            unavailable.join(", ")
-        );
+        let selected =
+            selected_backend_for_request(&self.store, BackendChoice::Auto, manifest, has_images)?;
+        self.cached_backend(selected)
     }
 
     fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
@@ -1700,18 +1683,21 @@ impl GgufPreferredBackend {
     }
 
     fn backend_for(&self, manifest: &ModelManifest) -> Result<Arc<dyn GenerationBackend>> {
-        let selected = selected_backend_for_preferred(
-            &self.store,
-            self.gguf_backend,
-            self.fallback_backend,
-            manifest,
-        )?;
-        if let BackendChoice::LlamaServer(LlamaCppMode::Cpu) = selected
-            && !backend_available_for_store(&self.store, selected)
-            && backend_supports_manifest(self.fallback_backend, manifest)
-        {
-            return self.cached_backend(self.fallback_backend);
-        }
+        self.backend_for_request(manifest, false)
+    }
+
+    fn backend_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        let requested = match (self.gguf_backend, self.fallback_backend) {
+            (BackendChoice::LlamaServer(llama), BackendChoice::Candle(candle)) => {
+                BackendChoice::GgufPreferred { llama, candle }
+            }
+            _ => self.gguf_backend,
+        };
+        let selected = selected_backend_for_request(&self.store, requested, manifest, has_images)?;
         self.cached_backend(selected)
     }
 
@@ -1756,7 +1742,8 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for(manifest)?.generate(manifest, request)
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .generate(manifest, request)
     }
 
     fn generate_stream(
@@ -1764,7 +1751,7 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for(&manifest) {
+        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
             Ok(backend) => backend.generate_stream(manifest, request),
             Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
         }
@@ -1774,6 +1761,7 @@ impl GenerationBackend for GgufPreferredBackend {
 fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
     match backend {
         BackendArg::Auto => BackendChoice::Auto,
+        BackendArg::Candle => BackendChoice::Candle(CandleDeviceMode::Auto),
         BackendArg::Cpu => BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Cpu,
             candle: CandleDeviceMode::Cpu,
@@ -1856,6 +1844,7 @@ fn build_concrete_backend(
     }
 }
 
+#[cfg(test)]
 fn auto_candidates_for_manifest(manifest: &ModelManifest) -> Vec<BackendChoice> {
     auto_runtime_candidates_for_manifest(manifest)
         .iter()
@@ -1864,78 +1853,9 @@ fn auto_candidates_for_manifest(manifest: &ModelManifest) -> Vec<BackendChoice> 
         .collect()
 }
 
+#[cfg(test)]
 fn auto_runtime_candidates_for_manifest(manifest: &ModelManifest) -> Vec<RuntimeId> {
-    match manifest.format {
-        ModelFormat::Gguf => auto_gguf_runtime_candidates(),
-        ModelFormat::SafeTensors => auto_safetensors_runtime_candidates(manifest),
-        ModelFormat::Mlx => vec![RuntimeId::Mlx],
-        ModelFormat::Onnx => vec![
-            RuntimeId::OnnxRuntimeCuda,
-            RuntimeId::OnnxRuntimeDirectMl,
-            RuntimeId::OnnxRuntimeCpu,
-        ],
-        ModelFormat::TensorRt => vec![RuntimeId::TensorRt],
-        ModelFormat::OpenVino => vec![RuntimeId::OpenVino],
-        ModelFormat::CoreMl => vec![RuntimeId::CoreMl],
-        ModelFormat::PyTorch | ModelFormat::TensorFlow | ModelFormat::Unknown => Vec::new(),
-    }
-}
-
-fn auto_gguf_runtime_candidates() -> Vec<RuntimeId> {
-    if cfg!(any(windows, target_os = "linux")) {
-        vec![
-            RuntimeId::LlamaServerCuda,
-            RuntimeId::LlamaServerVulkan,
-            RuntimeId::LlamaServerCpu,
-            RuntimeId::CandleCuda,
-            RuntimeId::CandleCpu,
-        ]
-    } else if cfg!(target_os = "macos") {
-        vec![
-            RuntimeId::LlamaServerCpu,
-            RuntimeId::CandleMetal,
-            RuntimeId::CandleCpu,
-        ]
-    } else {
-        vec![RuntimeId::LlamaServerCpu, RuntimeId::CandleCpu]
-    }
-}
-
-fn auto_safetensors_runtime_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        vec![
-            RuntimeId::Mlx,
-            RuntimeId::CandleMetal,
-            RuntimeId::BurnCuda,
-            RuntimeId::BurnWgpu,
-            RuntimeId::CandleCpu,
-        ]
-    } else if cfg!(any(windows, target_os = "linux")) {
-        if matches_architecture(manifest.architecture.as_deref(), &["phi3"]) {
-            vec![
-                RuntimeId::BurnCuda,
-                RuntimeId::CandleCuda,
-                RuntimeId::BurnWgpu,
-                RuntimeId::CandleCpu,
-            ]
-        } else {
-            vec![
-                RuntimeId::CandleCuda,
-                RuntimeId::BurnCuda,
-                RuntimeId::BurnWgpu,
-                RuntimeId::CandleCpu,
-            ]
-        }
-    } else if cfg!(target_os = "macos") {
-        vec![
-            RuntimeId::CandleMetal,
-            RuntimeId::BurnCuda,
-            RuntimeId::BurnWgpu,
-            RuntimeId::CandleCpu,
-        ]
-    } else {
-        vec![RuntimeId::BurnCpu, RuntimeId::CandleCpu]
-    }
+    runtime_candidate_ids(manifest, RequestedBackend::Auto)
 }
 
 fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
@@ -1955,7 +1875,9 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         | RuntimeId::OnnxRuntimeCpu
         | RuntimeId::TensorRt
         | RuntimeId::OpenVino
-        | RuntimeId::CoreMl => None,
+        | RuntimeId::CoreMl
+        | RuntimeId::ExternalVllm
+        | RuntimeId::ExternalSglang => None,
     }
 }
 
@@ -1976,41 +1898,13 @@ fn backend_to_runtime_id(backend: BackendChoice) -> Option<RuntimeId> {
     }
 }
 
-fn explicit_preferred_runtime_candidates(
-    llama: LlamaCppMode,
-    candle: CandleDeviceMode,
-    manifest: &ModelManifest,
-) -> Vec<RuntimeId> {
-    match manifest.format {
-        ModelFormat::Gguf => match llama {
-            LlamaCppMode::Cuda => vec![RuntimeId::LlamaServerCuda],
-            LlamaCppMode::Vulkan => vec![RuntimeId::LlamaServerVulkan],
-            LlamaCppMode::Cpu => vec![RuntimeId::LlamaServerCpu, RuntimeId::CandleCpu],
-        },
-        ModelFormat::SafeTensors => match candle {
-            CandleDeviceMode::Cuda => vec![RuntimeId::BurnCuda, RuntimeId::CandleCuda],
-            CandleDeviceMode::Metal => vec![RuntimeId::CandleMetal],
-            CandleDeviceMode::Cpu => vec![RuntimeId::BurnCpu, RuntimeId::CandleCpu],
-            CandleDeviceMode::Auto => {
-                if llama == LlamaCppMode::Vulkan {
-                    vec![RuntimeId::BurnWgpu]
-                } else {
-                    auto_safetensors_runtime_candidates(manifest)
-                }
-            }
-        },
-        _ => Vec::new(),
+fn candle_runtime_candidates(mode: CandleDeviceMode, manifest: &ModelManifest) -> Vec<RuntimeId> {
+    match mode {
+        CandleDeviceMode::Auto => runtime_candidate_ids(manifest, RequestedBackend::Candle),
+        CandleDeviceMode::Cpu => vec![RuntimeId::CandleCpu],
+        CandleDeviceMode::Cuda => vec![RuntimeId::CandleCuda],
+        CandleDeviceMode::Metal => vec![RuntimeId::CandleMetal],
     }
-}
-
-fn matches_architecture(architecture: Option<&str>, names: &[&str]) -> bool {
-    architecture
-        .map(|architecture| {
-            names
-                .iter()
-                .any(|name| architecture.eq_ignore_ascii_case(name))
-        })
-        .unwrap_or(false)
 }
 
 fn select_backend_from_runtime_candidates(
@@ -2133,47 +2027,7 @@ fn selected_backend_for_manifest(
     backend: BackendChoice,
     manifest: &ModelManifest,
 ) -> Result<BackendChoice> {
-    match backend {
-        BackendChoice::Auto => {
-            let mut unavailable = Vec::new();
-            for candidate in auto_candidates_for_manifest(manifest).iter().copied() {
-                if !backend_supports_manifest(candidate, manifest) {
-                    continue;
-                }
-                if backend_available_for_store(store, candidate) {
-                    return Ok(candidate);
-                }
-                unavailable.push(backend_label(candidate));
-            }
-            if unavailable.is_empty() {
-                bail!(
-                    "model '{}' is {:?}: {}; generation for this format is not implemented by the selected backend policy",
-                    manifest.id,
-                    manifest.format,
-                    manifest.format.backend_status()
-                );
-            }
-            bail!(
-                "no available backend for model '{}' with format {:?}; unavailable candidates: {}",
-                manifest.id,
-                manifest.format,
-                unavailable.join(", ")
-            )
-        }
-        BackendChoice::GgufPreferred { llama, candle } => selected_backend_for_preferred(
-            store,
-            BackendChoice::LlamaServer(llama),
-            BackendChoice::Candle(candle),
-            manifest,
-        ),
-        selected => {
-            if backend_supports_manifest(selected, manifest) {
-                Ok(selected)
-            } else {
-                bail!("{}", unsupported_backend_message(selected, manifest))
-            }
-        }
-    }
+    selected_backend_for_request(store, backend, manifest, false)
 }
 
 fn selected_backend_for_request(
@@ -2182,36 +2036,144 @@ fn selected_backend_for_request(
     manifest: &ModelManifest,
     has_images: bool,
 ) -> Result<BackendChoice> {
-    if has_images && matches!(backend, BackendChoice::Auto) {
-        let mut rejected = Vec::new();
-        for candidate in auto_candidates_for_manifest(manifest).iter().copied() {
-            if !backend_supports_manifest(candidate, manifest) {
-                continue;
-            }
-            if !backend_supports_images(candidate) {
-                rejected.push(format!("{} is text-only", backend_label(candidate)));
-                continue;
-            }
-            if !backend_available_for_store(store, candidate) {
-                rejected.push(format!("{} unavailable", backend_label(candidate)));
-                continue;
-            }
-            return Ok(candidate);
+    let capabilities = request_capabilities(has_images);
+    match backend {
+        BackendChoice::Auto
+        | BackendChoice::GgufPreferred { .. }
+        | BackendChoice::Candle(CandleDeviceMode::Auto) => {
+            select_backend_with_planner(store, backend, manifest, capabilities)
         }
-        bail!(
-            "VLM input requires an image-capable backend; rejected candidates: {}",
-            rejected.join(", ")
+        BackendChoice::Candle(mode) => {
+            let candidates = candle_runtime_candidates(mode, manifest);
+            let selected = select_backend_from_runtime_candidates(store, &candidates, manifest)?;
+            ensure_backend_supports_images(selected, has_images)?;
+            Ok(selected)
+        }
+        BackendChoice::LlamaServer(_) | BackendChoice::Mlx => {
+            let Some(runtime_id) = backend_to_runtime_id(backend) else {
+                bail!(
+                    "backend {} is not represented in the runtime planner",
+                    backend_label(backend)
+                );
+            };
+            let selected = select_backend_from_runtime_candidates(store, &[runtime_id], manifest)?;
+            ensure_backend_supports_images(selected, has_images)?;
+            Ok(selected)
+        }
+        BackendChoice::LlamaFast(_) | BackendChoice::LlamaHighlevel(_) => {
+            if !backend_supports_manifest(backend, manifest) {
+                bail!("{}", unsupported_backend_message(backend, manifest));
+            }
+            ensure_backend_supports_images(backend, has_images)?;
+            if !backend_available_for_store(store, backend) {
+                bail!("{}", unavailable_backend_message(store, backend, manifest));
+            }
+            Ok(backend)
+        }
+    }
+}
+
+fn select_backend_with_planner(
+    store: &ModelStore,
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    capabilities: RequestCapabilities,
+) -> Result<BackendChoice> {
+    let requested = requested_backend_for_choice(backend);
+    let availability = runtime_availabilities_for_request(store, manifest);
+    let selected = select_runtime(manifest, requested, capabilities, &availability)
+        .map_err(|err| anyhow!("{}", format_runtime_plan_error(manifest, &err)))?;
+    runtime_id_to_backend(selected.runtime_id).ok_or_else(|| {
+        anyhow!(
+            "selected runtime {} has no executable backend yet",
+            selected.display_name
+        )
+    })
+}
+
+fn runtime_availabilities_for_request(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+) -> Vec<RuntimeAvailability> {
+    runtime_registry()
+        .iter()
+        .map(|runtime| {
+            if let Some(backend) = runtime_id_to_backend(runtime.id) {
+                let available = backend_available_for_store(store, backend);
+                RuntimeAvailability {
+                    runtime_id: runtime.id,
+                    available,
+                    reason: (!available)
+                        .then(|| availability_rejection_reason(store, backend, manifest)),
+                }
+            } else {
+                RuntimeAvailability {
+                    runtime_id: runtime.id,
+                    available: false,
+                    reason: Some(
+                        if runtime.implemented {
+                            "runtime has no executable backend yet"
+                        } else {
+                            "runtime integration is not implemented yet"
+                        }
+                        .to_string(),
+                    ),
+                }
+            }
+        })
+        .collect()
+}
+
+fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
+    match backend {
+        BackendChoice::Auto => RequestedBackend::Auto,
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Cuda,
+            ..
+        }
+        | BackendChoice::LlamaServer(LlamaCppMode::Cuda) => RequestedBackend::Cuda,
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Vulkan,
+            ..
+        }
+        | BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => RequestedBackend::Vulkan,
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Cpu,
+            ..
+        }
+        | BackendChoice::LlamaServer(LlamaCppMode::Cpu) => RequestedBackend::Cpu,
+        BackendChoice::Candle(_) => RequestedBackend::Candle,
+        BackendChoice::Mlx => RequestedBackend::Mlx,
+        BackendChoice::LlamaFast(_) => RequestedBackend::LlamaLegacy,
+        BackendChoice::LlamaHighlevel(_) => RequestedBackend::LlamaHighlevel,
+    }
+}
+
+fn request_capabilities(has_images: bool) -> RequestCapabilities {
+    RequestCapabilities::text_with_images(true, has_images)
+}
+
+fn format_runtime_plan_error(
+    manifest: &ModelManifest,
+    err: &crate::runtime_planner::RuntimePlanError,
+) -> String {
+    let architecture = manifest.architecture.as_deref().unwrap_or("unknown");
+    if err.decisions.is_empty() {
+        return format!(
+            "no runtime candidates for model '{}' ({:?}, architecture: {architecture})",
+            manifest.id, manifest.format
         );
     }
-
-    let selected = selected_backend_for_manifest(store, backend, manifest)?;
-    ensure_backend_supports_images(selected, has_images)?;
-    if requires_explicit_availability_check(backend, selected, manifest)
-        && !backend_available_for_store(store, selected)
-    {
-        bail!("{}", unavailable_backend_message(store, selected, manifest));
-    }
-    Ok(selected)
+    let tried = err
+        .decisions
+        .iter()
+        .map(|decision| format!("{}: {}", decision.display_name, decision.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "no available runtime for model '{}' ({:?}, architecture: {architecture}); tried: {tried}",
+        manifest.id, manifest.format
+    )
 }
 
 fn ensure_backend_supports_images(backend: BackendChoice, has_images: bool) -> Result<()> {
@@ -2222,30 +2184,6 @@ fn ensure_backend_supports_images(backend: BackendChoice, has_images: bool) -> R
         "Image input requires a VLM-capable backend. Current backend {} is text-only. Try --backend mlx with a compatible VLM model.",
         verbose_backend_label(backend)
     )
-}
-
-fn requires_explicit_availability_check(
-    requested: BackendChoice,
-    selected: BackendChoice,
-    manifest: &ModelManifest,
-) -> bool {
-    if matches!(requested, BackendChoice::Auto) {
-        return false;
-    }
-    if matches!(
-        (requested, selected, manifest.format.clone()),
-        (
-            BackendChoice::GgufPreferred {
-                llama: LlamaCppMode::Cpu,
-                ..
-            },
-            BackendChoice::LlamaServer(LlamaCppMode::Cpu),
-            ModelFormat::Gguf
-        )
-    ) {
-        return false;
-    }
-    true
 }
 
 fn unavailable_backend_message(
@@ -2305,86 +2243,60 @@ fn print_routing_debug(
     if !debug {
         return;
     }
+    let capabilities = request_capabilities(has_images);
+    let requested_backend = requested_backend_for_choice(requested_choice);
+    let availability = runtime_availabilities_for_request(store, manifest);
+    let plan = plan_runtime(manifest, requested_backend, capabilities, &availability);
+
     eprintln!("requested backend: {}", requested_backend_label(requested));
     eprintln!("model format: {:?}", manifest.format);
     eprintln!(
         "architecture: {}",
         manifest.architecture.as_deref().unwrap_or("unknown")
     );
-    eprintln!("image inputs: {}", yes_no(has_images));
-    for candidate in routing_candidates_for_debug(requested_choice, manifest) {
-        let (status, reason) =
-            explain_candidate_decision(store, candidate, manifest, has_images, selected);
+    eprintln!("request capabilities:");
+    eprintln!("  text_generation: yes");
+    eprintln!(
+        "  image_input: {}",
+        yes_no(plan.request_capabilities.image_input)
+    );
+    eprintln!(
+        "  embeddings: {}",
+        yes_no(plan.request_capabilities.embeddings)
+    );
+    eprintln!(
+        "  streaming: {}",
+        yes_no(plan.request_capabilities.streaming)
+    );
+    eprintln!("candidate runtimes:");
+    for decision in &plan.candidates {
+        let status = match decision.status {
+            RuntimeDecisionStatus::Accepted => "accepted",
+            RuntimeDecisionStatus::Rejected => "rejected",
+        };
         eprintln!(
-            "candidate backend: {} -> {status}: {reason}",
-            runtime_descriptor(candidate).display_name
+            "- {}: {status}, reason: {}",
+            decision.display_name, decision.reason
         );
     }
-    eprintln!("selected backend: {}", verbose_backend_label(selected));
-    eprintln!("reason: {}", selection_reason(manifest, selected));
+    eprintln!("selected runtime: {}", verbose_backend_label(selected));
+    if let Some(selected) = plan.selected {
+        eprintln!("reason: {}", selected.reason);
+    }
 }
 
+#[cfg(test)]
 fn routing_candidates_for_debug(
     requested: BackendChoice,
     manifest: &ModelManifest,
 ) -> Vec<RuntimeId> {
     match requested {
-        BackendChoice::Auto => auto_runtime_candidates_for_manifest(manifest).to_vec(),
-        BackendChoice::GgufPreferred { llama, candle } => {
-            explicit_preferred_runtime_candidates(llama, candle, manifest)
+        BackendChoice::Candle(mode) => candle_runtime_candidates(mode, manifest),
+        BackendChoice::Auto | BackendChoice::GgufPreferred { .. } => {
+            runtime_candidate_ids(manifest, requested_backend_for_choice(requested))
         }
         concrete => backend_to_runtime_id(concrete).into_iter().collect(),
     }
-}
-
-fn explain_candidate_decision(
-    store: &ModelStore,
-    candidate: RuntimeId,
-    manifest: &ModelManifest,
-    has_images: bool,
-    selected: BackendChoice,
-) -> (&'static str, String) {
-    let descriptor = runtime_descriptor(candidate);
-    if !runtime_supports_model(
-        descriptor,
-        &manifest.format,
-        manifest.architecture.as_deref(),
-    ) {
-        return (
-            "rejected",
-            "model format or architecture is not supported".to_string(),
-        );
-    }
-    if let Some(reason) =
-        explain_backend_rejection(descriptor.runtime, &manifest.format, has_images)
-    {
-        return ("rejected", reason.to_string());
-    }
-    if !descriptor.implemented {
-        return (
-            "rejected",
-            "runtime integration is not implemented yet".to_string(),
-        );
-    }
-    let Some(backend) = runtime_id_to_backend(candidate) else {
-        return (
-            "rejected",
-            "runtime has no executable backend yet".to_string(),
-        );
-    };
-    if !backend_available_for_store(store, backend) {
-        return (
-            "rejected",
-            availability_rejection_reason(store, backend, manifest),
-        );
-    }
-    if backend_label(backend) == backend_label(selected) {
-        return ("accepted", selection_reason(manifest, backend).to_string());
-    }
-    (
-        "rejected",
-        "lower-priority fallback not selected".to_string(),
-    )
 }
 
 fn availability_rejection_reason(
@@ -2424,6 +2336,7 @@ fn candle_cuda_rejection_reason() -> String {
 fn requested_backend_label(backend: BackendArg) -> &'static str {
     match backend {
         BackendArg::Auto => "auto",
+        BackendArg::Candle => "candle",
         BackendArg::Cpu => "cpu",
         BackendArg::Cuda => "cuda",
         BackendArg::LlamaHighlevel => "llama-highlevel",
@@ -2432,70 +2345,6 @@ fn requested_backend_label(backend: BackendArg) -> &'static str {
         BackendArg::Mlx => "mlx",
         BackendArg::Vulkan => "vulkan",
     }
-}
-
-fn selection_reason(manifest: &ModelManifest, selected: BackendChoice) -> &'static str {
-    match (manifest.format.clone(), selected) {
-        (ModelFormat::Gguf, BackendChoice::LlamaServer(LlamaCppMode::Cuda)) => "GGUF CUDA hot path",
-        (ModelFormat::Gguf, BackendChoice::LlamaServer(LlamaCppMode::Vulkan)) => {
-            "GGUF Vulkan hot path"
-        }
-        (ModelFormat::Gguf, BackendChoice::LlamaServer(LlamaCppMode::Cpu)) => {
-            "GGUF CPU execution uses llama.cpp server"
-        }
-        (ModelFormat::SafeTensors, BackendChoice::Candle(CandleDeviceMode::Cuda)) => {
-            "safetensors CUDA execution uses Candle"
-        }
-        (ModelFormat::SafeTensors, BackendChoice::Candle(CandleDeviceMode::Cpu)) => {
-            "safetensors CPU execution uses Candle"
-        }
-        (ModelFormat::SafeTensors, BackendChoice::Candle(CandleDeviceMode::Metal)) => {
-            "safetensors Metal execution uses Candle"
-        }
-        (ModelFormat::Mlx, BackendChoice::Mlx) | (ModelFormat::SafeTensors, BackendChoice::Mlx) => {
-            "MLX execution uses mlx-lm"
-        }
-        _ => "selected backend supports the model format",
-    }
-}
-
-fn selected_backend_for_preferred(
-    store: &ModelStore,
-    gguf_backend: BackendChoice,
-    safetensors_backend: BackendChoice,
-    manifest: &ModelManifest,
-) -> Result<BackendChoice> {
-    let candidates = match (gguf_backend, safetensors_backend) {
-        (BackendChoice::LlamaServer(llama), BackendChoice::Candle(candle)) => {
-            explicit_preferred_runtime_candidates(llama, candle, manifest)
-        }
-        _ => Vec::new(),
-    };
-    select_backend_from_runtime_candidates(store, &candidates, manifest).or_else(|err| match manifest.format {
-            ModelFormat::Gguf => Ok(gguf_backend),
-            ModelFormat::SafeTensors
-                if matches!(gguf_backend, BackendChoice::LlamaServer(LlamaCppMode::Vulkan)) =>
-            {
-                bail!(
-                    "Vulkan requested for safetensors model '{}', but no Vulkan-capable safetensors runtime is available. {err}",
-                    manifest.id
-                )
-            }
-            ModelFormat::SafeTensors => {
-                if backend_supports_manifest(safetensors_backend, manifest) {
-                    Ok(safetensors_backend)
-                } else {
-                    bail!(
-                        "{}",
-                        unsupported_backend_message(safetensors_backend, manifest)
-                    )
-                }
-            }
-            _ => bail!(
-                "{}",
-                unsupported_backend_message(safetensors_backend, manifest)
-            ),
-        })
 }
 
 fn unsupported_backend_message(backend: BackendChoice, manifest: &ModelManifest) -> String {
@@ -2739,6 +2588,7 @@ fn format_bytes_f64(bytes: f64) -> String {
 mod tests {
     use super::*;
     use crate::model_store::ModelSource;
+    use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2858,6 +2708,14 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "burn"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Backend {
+                command: BackendCommands::Install { target },
+            } => assert_eq!(target, BackendInstallArg::Burn),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
         let cli = Cli::try_parse_from(["werk", "backend", "install", "tensorrt"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
@@ -2876,6 +2734,13 @@ mod tests {
 
         let cli = Cli::try_parse_from(["werk", "--backend", "vulkan", "chat", "tiny"]).unwrap();
         assert_eq!(cli.backend, BackendArg::Vulkan);
+        match cli.command.unwrap() {
+            Commands::Chat { model, .. } => assert_eq!(model, "tiny"),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "--backend", "candle", "chat", "tiny"]).unwrap();
+        assert_eq!(cli.backend, BackendArg::Candle);
         match cli.command.unwrap() {
             Commands::Chat { model, .. } => assert_eq!(model, "tiny"),
             command => panic!("unexpected command: {command:?}"),
@@ -2972,6 +2837,10 @@ mod tests {
                 candle: CandleDeviceMode::Cuda
             }
         ));
+        assert!(matches!(
+            backend_arg_to_choice(BackendArg::Candle),
+            BackendChoice::Candle(CandleDeviceMode::Auto)
+        ));
     }
 
     #[test]
@@ -3035,8 +2904,19 @@ mod tests {
         if cfg!(any(windows, target_os = "linux")) {
             let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
             let candidates = auto_runtime_candidates_for_manifest(&manifest);
-            assert_eq!(candidates[0], RuntimeId::BurnCuda);
-            assert_eq!(candidates[1], RuntimeId::CandleCuda);
+            assert_eq!(candidates[0], RuntimeId::OnnxRuntimeCuda);
+            assert_eq!(candidates[1], RuntimeId::TensorRt);
+            assert_eq!(candidates[2], RuntimeId::BurnCuda);
+            assert!(
+                candidates
+                    .iter()
+                    .position(|id| *id == RuntimeId::CandleCuda)
+                    .unwrap()
+                    > candidates
+                        .iter()
+                        .position(|id| *id == RuntimeId::BurnCuda)
+                        .unwrap()
+            );
 
             let concrete = auto_candidates_for_manifest(&manifest);
             assert!(matches!(
@@ -3057,13 +2937,14 @@ mod tests {
 
         let store = test_store("safetensors-vulkan-runtime");
         let err = selected_backend_for_manifest(&store, requested, &manifest).unwrap_err();
-        assert!(err.to_string().contains("Vulkan requested"));
+        assert!(err.to_string().contains("Burn WGPU/Vulkan"));
         assert!(!err.to_string().contains("Candle CPU"));
     }
 
     #[test]
     fn backend_selection_routes_gguf_cuda_to_llama_server() {
         let store = test_store("gguf-cuda");
+        install_fake_managed_llama_server(&store, LlamaCppMode::Cuda);
         let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
         let selected = selected_backend_for_manifest(
             &store,
@@ -3083,6 +2964,7 @@ mod tests {
     #[test]
     fn backend_selection_routes_gguf_vulkan_to_llama_server() {
         let store = test_store("gguf-vulkan");
+        install_fake_managed_llama_server(&store, LlamaCppMode::Vulkan);
         let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
         let selected = selected_backend_for_manifest(
             &store,
@@ -3100,24 +2982,31 @@ mod tests {
     fn backend_selection_routes_safetensors_cuda_to_candle_cuda() {
         let store = test_store("safetensors-cuda");
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
-        let selected = selected_backend_for_manifest(
+        let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {
                 llama: LlamaCppMode::Cuda,
                 candle: CandleDeviceMode::Cuda,
             },
             &manifest,
-        )
-        .unwrap();
-        assert!(matches!(
-            selected,
-            BackendChoice::Candle(CandleDeviceMode::Cuda)
-        ));
+        );
+        match result {
+            Ok(selected) => assert!(matches!(
+                selected,
+                BackendChoice::Candle(CandleDeviceMode::Cuda)
+            )),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("Candle CUDA"));
+                assert!(!message.contains("Candle CPU"));
+            }
+        }
     }
 
     #[test]
     fn explicit_cuda_selection_never_selects_cpu_fallback() {
         let store = test_store("explicit-cuda");
+        install_fake_managed_llama_server(&store, LlamaCppMode::Cuda);
         let gguf = test_manifest(ModelFormat::Gguf, Some("llama"));
         let selected = selected_backend_for_manifest(
             &store,
@@ -3134,19 +3023,25 @@ mod tests {
         ));
 
         let safetensors = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
-        let selected = selected_backend_for_manifest(
+        let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {
                 llama: LlamaCppMode::Cuda,
                 candle: CandleDeviceMode::Cuda,
             },
             &safetensors,
-        )
-        .unwrap();
-        assert!(matches!(
-            selected,
-            BackendChoice::Candle(CandleDeviceMode::Cuda)
-        ));
+        );
+        match result {
+            Ok(selected) => assert!(matches!(
+                selected,
+                BackendChoice::Candle(CandleDeviceMode::Cuda)
+            )),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("Candle CUDA"));
+                assert!(!message.contains("Candle CPU"));
+            }
+        }
     }
 
     #[test]
@@ -3155,14 +3050,12 @@ mod tests {
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
         let err = selected_backend_for_manifest(
             &store,
-            BackendChoice::LlamaServer(LlamaCppMode::Vulkan),
+            backend_arg_to_choice(BackendArg::Vulkan),
             &manifest,
         )
         .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Safetensors Vulkan execution is not implemented")
-        );
+        assert!(err.to_string().contains("Burn WGPU/Vulkan"));
+        assert!(!err.to_string().contains("Candle CPU"));
     }
 
     #[test]
@@ -3188,9 +3081,11 @@ mod tests {
     fn backend_selection_routes_mlx_format_to_mlx() {
         let store = test_store("mlx");
         let manifest = test_manifest(ModelFormat::Mlx, Some("llama"));
-        let selected =
-            selected_backend_for_manifest(&store, BackendChoice::Mlx, &manifest).unwrap();
-        assert!(matches!(selected, BackendChoice::Mlx));
+        let result = selected_backend_for_manifest(&store, BackendChoice::Mlx, &manifest);
+        match result {
+            Ok(selected) => assert!(matches!(selected, BackendChoice::Mlx)),
+            Err(err) => assert!(err.to_string().contains("mlx-lm is unavailable")),
+        }
     }
 
     #[test]
@@ -3347,5 +3242,11 @@ mod tests {
             created_unix: 1,
             files: Vec::new(),
         }
+    }
+
+    fn install_fake_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) {
+        let path = managed_backend_dir(store, mode).join("llama-server");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
     }
 }

@@ -30,6 +30,8 @@ pub enum BackendRuntime {
     TensorRt,
     OpenVino,
     CoreMl,
+    ExternalVllm,
+    ExternalSglang,
     Mlx,
 }
 
@@ -46,6 +48,7 @@ pub enum BackendAccelerator {
     TensorRt,
     OpenVino,
     CoreMl,
+    External,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,6 +69,8 @@ pub enum RuntimeId {
     TensorRt,
     OpenVino,
     CoreMl,
+    ExternalVllm,
+    ExternalSglang,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +130,7 @@ const CANDLE_ARCHES: &[&str] = &[
     "llama", "gemma", "gemma2", "gemma3", "qwen2", "mistral", "phi", "phi2", "phi3",
 ];
 const BURN_PLACEHOLDER_ARCHES: &[&str] = &["phi3", "qwen2", "gemma", "gemma2"];
+const EXTERNAL_LLM_ARCHES: &[&str] = &["llama", "qwen2", "qwen3", "mistral", "mixtral"];
 
 pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
     RuntimeDescriptor {
@@ -248,6 +254,30 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         install_target: Some("mlx"),
     },
     RuntimeDescriptor {
+        id: RuntimeId::ExternalVllm,
+        runtime: BackendRuntime::ExternalVllm,
+        display_name: "vLLM",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: EXTERNAL_LLM_ARCHES,
+        accelerators: &[BackendAccelerator::Cuda],
+        capabilities: TEXT_STREAMING,
+        priority: 950,
+        implemented: false,
+        install_target: Some("vllm"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::ExternalSglang,
+        runtime: BackendRuntime::ExternalSglang,
+        display_name: "SGLang",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: EXTERNAL_LLM_ARCHES,
+        accelerators: &[BackendAccelerator::Cuda],
+        capabilities: TEXT_STREAMING,
+        priority: 940,
+        implemented: false,
+        install_target: Some("sglang"),
+    },
+    RuntimeDescriptor {
         id: RuntimeId::OnnxRuntimeCuda,
         runtime: BackendRuntime::OnnxRuntime,
         display_name: "ONNX Runtime CUDA",
@@ -354,7 +384,7 @@ pub fn runtime_supports_model(
                 .iter()
                 .any(|supported| supported.eq_ignore_ascii_case(architecture))
         })
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) -> bool {
@@ -368,6 +398,9 @@ pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) ->
         BackendRuntime::TensorRt => matches!(format, ModelFormat::TensorRt),
         BackendRuntime::OpenVino => matches!(format, ModelFormat::OpenVino),
         BackendRuntime::CoreMl => matches!(format, ModelFormat::CoreMl),
+        BackendRuntime::ExternalVllm | BackendRuntime::ExternalSglang => {
+            matches!(format, ModelFormat::SafeTensors)
+        }
         BackendRuntime::Mlx => matches!(format, ModelFormat::Mlx | ModelFormat::SafeTensors),
     }
 }
@@ -416,6 +449,9 @@ pub fn backend_supports_accelerator(
                 BackendAccelerator::CoreMl | BackendAccelerator::Metal
             )
         }
+        BackendRuntime::ExternalVllm | BackendRuntime::ExternalSglang => {
+            matches!(accelerator, BackendAccelerator::Cuda)
+        }
         BackendRuntime::Mlx => matches!(accelerator, BackendAccelerator::Mlx),
     }
 }
@@ -437,6 +473,8 @@ pub fn explain_backend_rejection(
             BackendRuntime::TensorRt => "TensorRT supports TensorRT engine files only",
             BackendRuntime::OpenVino => "OpenVINO supports OpenVINO IR only",
             BackendRuntime::CoreMl => "CoreML supports CoreML models only",
+            BackendRuntime::ExternalVllm => "vLLM supports selected HF safetensors models only",
+            BackendRuntime::ExternalSglang => "SGLang supports selected HF safetensors models only",
             BackendRuntime::Mlx => "MLX supports MLX and HF-style safetensors only",
         });
     }
