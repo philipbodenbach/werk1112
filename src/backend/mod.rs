@@ -1,6 +1,7 @@
 mod candle;
 mod external;
 mod llama_fast;
+mod llama_server;
 
 use anyhow::Result;
 use std::pin::Pin;
@@ -9,6 +10,10 @@ use tokio_stream::Stream;
 pub use candle::{CandleBackend, CandleDeviceMode, probe_device};
 pub use external::{LlamaCppBackend, LlamaCppMode, MlxBackend};
 pub use llama_fast::{LlamaFastBackend, LlamaFastRuntimeReport};
+pub use llama_server::{
+    BackendDoctorCheck, LlamaServerBackend, LlamaServerDiscovery, backend_doctor_checks,
+    install_managed_llama_server, llama_server_help_ok, managed_backend_dir,
+};
 
 use crate::model_store::ModelManifest;
 
@@ -22,6 +27,7 @@ pub struct GenerateRequest {
     pub stop: Vec<String>,
     pub seed: Option<u64>,
     pub stream_granularity: StreamGranularity,
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

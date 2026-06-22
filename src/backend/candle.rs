@@ -56,7 +56,7 @@ impl CandleBackend {
 
     pub fn new_with_device(store: ModelStore, device_mode: CandleDeviceMode) -> Result<Self> {
         let device = select_device(device_mode)?;
-        eprintln!("Using Candle device: {device:?}");
+        eprintln!("Using {} backend", candle_backend_name(&device));
         Ok(Self {
             store,
             device,
@@ -168,6 +168,14 @@ fn select_device(mode: CandleDeviceMode) -> Result<Device> {
         CandleDeviceMode::Metal => Device::new_metal(0).context(
             "Metal was requested but is unavailable; build with --features metal on macOS/Apple Silicon",
         ),
+    }
+}
+
+fn candle_backend_name(device: &Device) -> &'static str {
+    match device {
+        Device::Cpu => "Candle CPU",
+        Device::Cuda(_) => "Candle CUDA",
+        Device::Metal(_) => "Candle Metal",
     }
 }
 

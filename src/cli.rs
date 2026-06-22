@@ -18,7 +18,9 @@ use crate::{
         CandleBackend, CandleDeviceMode, ChatGenerationSession, GenerateRequest,
         GenerateStreamEvent, GenerationBackend, GenerationTimings, LlamaCppBackend, LlamaCppMode,
         LlamaFastBackend, LlamaFastRuntimeReport, LlamaKvCacheType, LlamaRuntimeOptions,
-        MlxBackend, StreamGranularity, probe_device,
+        LlamaServerBackend, LlamaServerDiscovery, MlxBackend, StreamGranularity,
+        backend_doctor_checks, install_managed_llama_server, llama_server_help_ok,
+        managed_backend_dir, probe_device,
     },
     banner::print_banner,
     model_store::{ModelFormat, ModelManifest, ModelStore, PullProgress},
@@ -54,7 +56,7 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value_t = BackendArg::Auto,
-        help = "Backend for this process: auto, cpu, cuda, llama-highlevel, metal, mlx, or vulkan"
+        help = "Backend for this process: auto, cpu, cuda, llama-highlevel, llama-legacy, metal, mlx, or vulkan"
     )]
     pub backend: BackendArg,
 
@@ -85,6 +87,7 @@ pub enum BackendArg {
     Cpu,
     Cuda,
     LlamaHighlevel,
+    LlamaLegacy,
     Metal,
     Mlx,
     Vulkan,
@@ -227,6 +230,23 @@ impl LlamaRuntimeArgs {
 pub enum BenchCompareArg {
     None,
     Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BackendInstallArg {
+    LlamaCuda,
+    LlamaVulkan,
+    LlamaCpu,
+}
+
+impl BackendInstallArg {
+    fn mode(self) -> LlamaCppMode {
+        match self {
+            Self::LlamaCuda => LlamaCppMode::Cuda,
+            Self::LlamaVulkan => LlamaCppMode::Vulkan,
+            Self::LlamaCpu => LlamaCppMode::Cpu,
+        }
+    }
 }
 
 impl From<StreamGranularityArg> for StreamGranularity {
@@ -385,6 +405,12 @@ pub enum Commands {
         command: DoctorCommands,
     },
 
+    #[command(about = "Manage local runtime backends")]
+    Backend {
+        #[command(subcommand)]
+        command: BackendCommands,
+    },
+
     #[command(about = "Copy a local model file or directory into the managed model store")]
     Import {
         #[arg(help = "Model file or directory to copy")]
@@ -435,6 +461,25 @@ pub enum DoctorCommands {
         #[arg(help = "Installed model id")]
         model: String,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum BackendCommands {
+    #[command(about = "Install a managed llama.cpp server backend")]
+    Install {
+        #[arg(
+            value_enum,
+            value_name = "BACKEND",
+            help = "Backend to install, for example llama-cuda"
+        )]
+        target: BackendInstallArg,
+    },
+
+    #[command(about = "List discovered llama-server backends")]
+    List,
+
+    #[command(about = "Check tools required for managed backend builds")]
+    Doctor,
 }
 
 pub async fn run_from_env() -> Result<()> {
@@ -508,6 +553,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 stop: prompt.stop,
                 seed,
                 stream_granularity: StreamGranularity::Chunk,
+                verbose,
             };
             let response = backend.generate(&manifest, request)?;
             println!("{}", response.text.trim());
@@ -595,6 +641,29 @@ pub async fn run(cli: Cli) -> Result<()> {
                 print_perf_doctor(&store, &manifest, backend_choice, &llama_options)
             }
         },
+        Commands::Backend { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            match command {
+                BackendCommands::Install { target } => {
+                    let mode = target.mode();
+                    let executable = install_managed_llama_server(&store, mode)?;
+                    println!(
+                        "Installed {} llama-server: {}",
+                        display_llama_mode(mode),
+                        executable.display()
+                    );
+                    Ok(())
+                }
+                BackendCommands::List => {
+                    print_backend_list(&store);
+                    Ok(())
+                }
+                BackendCommands::Doctor => {
+                    print_backend_doctor(&store);
+                    Ok(())
+                }
+            }
+        }
         Commands::Import { path, name } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.import_path(&path, &name)?;
@@ -681,6 +750,7 @@ fn should_print_startup_banner_for(
         | Commands::Pull { .. }
         | Commands::Bench { .. }
         | Commands::Doctor { .. }
+        | Commands::Backend { .. }
         | Commands::List
         | Commands::Inspect { .. }
         | Commands::SelectFile { .. } => false,
@@ -744,6 +814,7 @@ async fn chat_loop(
             stop: prompt.stop,
             seed,
             stream_granularity,
+            verbose,
         };
 
         print!("assistant> ");
@@ -967,6 +1038,7 @@ fn run_benchmark_choice(
             stop: stop.to_vec(),
             seed: Some(seed),
             stream_granularity: StreamGranularity::Chunk,
+            verbose: false,
         };
         let response = if let Some(session) = session.as_ref() {
             session.generate(request)?
@@ -1008,18 +1080,18 @@ fn benchmark_choices(
             let mode = preferred_llama_mode();
             benchmark_llama_choices(mode, compare)
         }
-        BackendChoice::GgufPreferred { llama, .. } | BackendChoice::LlamaFast(llama) => {
+        BackendChoice::GgufPreferred { llama, .. } | BackendChoice::LlamaServer(llama) => {
             benchmark_llama_choices(llama, compare)
         }
-        BackendChoice::LlamaHighlevel(_) => vec![choice],
+        BackendChoice::LlamaFast(_) | BackendChoice::LlamaHighlevel(_) => vec![choice],
         _ => vec![choice],
     }
 }
 
 fn benchmark_llama_choices(mode: LlamaCppMode, compare: BenchCompareArg) -> Vec<BackendChoice> {
-    let mut choices = vec![BackendChoice::LlamaFast(mode)];
+    let mut choices = vec![BackendChoice::LlamaServer(mode)];
     if compare == BenchCompareArg::Legacy {
-        choices.push(BackendChoice::LlamaHighlevel(mode));
+        choices.push(BackendChoice::LlamaFast(mode));
     }
     choices
 }
@@ -1067,7 +1139,7 @@ fn runtime_report_for_choice(
     runtime_options: &LlamaRuntimeOptions,
 ) -> Option<LlamaFastRuntimeReport> {
     match choice {
-        BackendChoice::LlamaFast(mode) | BackendChoice::GgufPreferred { llama: mode, .. } => {
+        BackendChoice::LlamaFast(mode) => {
             Some(LlamaFastBackend::runtime_report(mode, runtime_options))
         }
         _ => None,
@@ -1094,10 +1166,70 @@ fn print_perf_doctor(
         print_runtime_report(&report);
     } else {
         println!("runtime: {}", backend_label(selected));
-        println!("note: detailed llama.cpp diagnostics are available only for llama-fast backends");
+        println!(
+            "note: detailed legacy FFI diagnostics are available only for llama-legacy backends"
+        );
     }
 
     Ok(())
+}
+
+fn print_backend_list(store: &ModelStore) {
+    println!(
+        "{:<8} {:<16} {:<7} {:<7} PATH",
+        "BACKEND", "SOURCE", "EXISTS", "HELP"
+    );
+    for mode in [LlamaCppMode::Cuda, LlamaCppMode::Vulkan, LlamaCppMode::Cpu] {
+        let discovery = LlamaServerBackend::discover(store, mode);
+        print_backend_discovery(&discovery);
+    }
+}
+
+fn print_backend_discovery(discovery: &LlamaServerDiscovery) {
+    let path = discovery
+        .path
+        .as_ref()
+        .or_else(|| {
+            discovery
+                .attempts
+                .iter()
+                .find(|attempt| attempt.label == "managed cache")
+                .and_then(|attempt| attempt.path.as_ref())
+        })
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let exists = discovery.path.is_some();
+    let help = discovery
+        .path
+        .as_deref()
+        .map(llama_server_help_ok)
+        .unwrap_or(false);
+    println!(
+        "{:<8} {:<16} {:<7} {:<7} {}",
+        display_llama_mode(discovery.mode),
+        discovery.source,
+        yes_no(exists),
+        yes_no(help),
+        path
+    );
+}
+
+fn print_backend_doctor(store: &ModelStore) {
+    println!("Werk1112 backend diagnostics");
+    println!("managed cache: {}", store.home().join("backends").display());
+    println!(
+        "CUDA cache: {}",
+        managed_backend_dir(store, LlamaCppMode::Cuda).display()
+    );
+    println!();
+    for check in backend_doctor_checks(store) {
+        println!(
+            "{:<24} {:<7} {}",
+            check.name,
+            if check.ok { "ok" } else { "missing" },
+            check.detail
+        );
+    }
 }
 
 fn print_runtime_report(report: &LlamaFastRuntimeReport) {
@@ -1253,6 +1385,7 @@ enum BackendChoice {
         candle: CandleDeviceMode,
     },
     Candle(CandleDeviceMode),
+    LlamaServer(LlamaCppMode),
     LlamaFast(LlamaCppMode),
     LlamaHighlevel(LlamaCppMode),
     Mlx,
@@ -1373,7 +1506,7 @@ impl GgufPreferredBackend {
     ) -> Self {
         Self {
             store,
-            gguf_backend: BackendChoice::LlamaFast(llama),
+            gguf_backend: BackendChoice::LlamaServer(llama),
             fallback_backend: BackendChoice::Candle(candle),
             runtime_options,
             backends: Mutex::new(HashMap::new()),
@@ -1381,20 +1514,32 @@ impl GgufPreferredBackend {
     }
 
     fn backend_for(&self, manifest: &ModelManifest) -> Result<Arc<dyn GenerationBackend>> {
-        let backend = if manifest.format == ModelFormat::Gguf {
-            self.gguf_backend
-        } else {
-            self.fallback_backend
-        };
-        if !backend_supports_manifest(backend, manifest) {
+        if manifest.format == ModelFormat::Gguf {
+            if backend_supports_manifest(self.gguf_backend, manifest)
+                && backend_available_for_store(&self.store, self.gguf_backend)
+            {
+                return self.cached_backend(self.gguf_backend);
+            }
+            if backend_supports_manifest(self.fallback_backend, manifest)
+                && backend_available_for_store(&self.store, self.fallback_backend)
+            {
+                return self.cached_backend(self.fallback_backend);
+            }
+            if let BackendChoice::LlamaServer(mode) = self.gguf_backend {
+                bail!("{}", LlamaServerBackend::missing_message(&self.store, mode));
+            }
+            bail!("no available GGUF backend for model '{}'", manifest.id);
+        }
+
+        if !backend_supports_manifest(self.fallback_backend, manifest) {
             bail!(
                 "backend {} does not support model '{}' with format {:?}",
-                backend_label(backend),
+                backend_label(self.fallback_backend),
                 manifest.id,
                 manifest.format
             );
         }
-        self.cached_backend(backend)
+        self.cached_backend(self.fallback_backend)
     }
 
     fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
@@ -1462,12 +1607,13 @@ fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
         },
         BackendArg::Cuda => BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Cuda,
-            candle: candle_cuda_fallback_mode(),
+            candle: CandleDeviceMode::Cuda,
         },
         BackendArg::Metal => BackendChoice::Candle(CandleDeviceMode::Metal),
         BackendArg::Mlx => BackendChoice::Mlx,
-        BackendArg::Vulkan => BackendChoice::LlamaFast(LlamaCppMode::Vulkan),
+        BackendArg::Vulkan => BackendChoice::LlamaServer(LlamaCppMode::Vulkan),
         BackendArg::LlamaHighlevel => BackendChoice::LlamaHighlevel(preferred_llama_mode()),
+        BackendArg::LlamaLegacy => BackendChoice::LlamaFast(preferred_llama_mode()),
     }
 }
 
@@ -1478,14 +1624,6 @@ fn preferred_llama_mode() -> LlamaCppMode {
         LlamaCppMode::Vulkan
     } else {
         LlamaCppMode::Cpu
-    }
-}
-
-fn candle_cuda_fallback_mode() -> CandleDeviceMode {
-    if cfg!(feature = "candle-cuda") {
-        CandleDeviceMode::Cuda
-    } else {
-        CandleDeviceMode::Cpu
     }
 }
 
@@ -1527,6 +1665,11 @@ fn build_concrete_backend(
             runtime_options,
         ))),
         BackendChoice::Candle(mode) => Ok(Arc::new(CandleBackend::new_with_device(store, mode)?)),
+        BackendChoice::LlamaServer(mode) => Ok(Arc::new(LlamaServerBackend::new(
+            store,
+            mode,
+            runtime_options,
+        ))),
         BackendChoice::LlamaFast(mode) => Ok(Arc::new(LlamaFastBackend::new_with_options(
             store,
             mode,
@@ -1540,11 +1683,9 @@ fn build_concrete_backend(
 fn target_default_order() -> &'static [BackendChoice] {
     if cfg!(any(windows, target_os = "linux")) {
         &[
-            BackendChoice::LlamaFast(LlamaCppMode::Cuda),
-            BackendChoice::LlamaFast(LlamaCppMode::Vulkan),
-            BackendChoice::LlamaFast(LlamaCppMode::Cpu),
-            BackendChoice::LlamaHighlevel(LlamaCppMode::Cuda),
-            BackendChoice::LlamaHighlevel(LlamaCppMode::Cpu),
+            BackendChoice::LlamaServer(LlamaCppMode::Cuda),
+            BackendChoice::LlamaServer(LlamaCppMode::Vulkan),
+            BackendChoice::LlamaServer(LlamaCppMode::Cpu),
             BackendChoice::Candle(CandleDeviceMode::Cuda),
             BackendChoice::Candle(CandleDeviceMode::Cpu),
         ]
@@ -1559,8 +1700,7 @@ fn target_default_order() -> &'static [BackendChoice] {
         &[
             BackendChoice::Candle(CandleDeviceMode::Cpu),
             BackendChoice::Candle(CandleDeviceMode::Cuda),
-            BackendChoice::LlamaFast(LlamaCppMode::Vulkan),
-            BackendChoice::LlamaHighlevel(LlamaCppMode::Vulkan),
+            BackendChoice::LlamaServer(LlamaCppMode::Vulkan),
         ]
     }
 }
@@ -1579,13 +1719,13 @@ fn backend_supports_manifest(backend: BackendChoice, manifest: &ModelManifest) -
         BackendChoice::Mlx => {
             matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors)
         }
-        BackendChoice::LlamaFast(_) | BackendChoice::LlamaHighlevel(_) => {
-            manifest.format == ModelFormat::Gguf
-        }
+        BackendChoice::LlamaServer(_)
+        | BackendChoice::LlamaFast(_)
+        | BackendChoice::LlamaHighlevel(_) => manifest.format == ModelFormat::Gguf,
     }
 }
 
-fn backend_available_for_store(_store: &ModelStore, backend: BackendChoice) -> bool {
+fn backend_available_for_store(store: &ModelStore, backend: BackendChoice) -> bool {
     match backend {
         BackendChoice::Auto => true,
         BackendChoice::GgufPreferred { .. } => true,
@@ -1593,6 +1733,7 @@ fn backend_available_for_store(_store: &ModelStore, backend: BackendChoice) -> b
         BackendChoice::Candle(CandleDeviceMode::Cpu) => true,
         BackendChoice::Candle(mode) => probe_device(mode).is_ok(),
         BackendChoice::Mlx => MlxBackend::probe().is_ok(),
+        BackendChoice::LlamaServer(mode) => LlamaServerBackend::probe(store, mode).is_ok(),
         BackendChoice::LlamaFast(mode) => LlamaFastBackend::probe(mode).is_ok(),
         BackendChoice::LlamaHighlevel(mode) => LlamaCppBackend::probe(mode).is_ok(),
     }
@@ -1623,21 +1764,32 @@ fn selected_backend_for_manifest(
             )
         }
         BackendChoice::GgufPreferred { llama, candle } => {
-            let selected = if manifest.format == ModelFormat::Gguf {
-                BackendChoice::LlamaFast(llama)
-            } else {
-                BackendChoice::Candle(candle)
-            };
-            if backend_supports_manifest(selected, manifest) {
-                Ok(selected)
-            } else {
+            if manifest.format == ModelFormat::Gguf {
+                let server = BackendChoice::LlamaServer(llama);
+                if backend_supports_manifest(server, manifest)
+                    && backend_available_for_store(store, server)
+                {
+                    return Ok(server);
+                }
+                let fallback = BackendChoice::Candle(candle);
+                if backend_supports_manifest(fallback, manifest)
+                    && backend_available_for_store(store, fallback)
+                {
+                    return Ok(fallback);
+                }
+                bail!("{}", LlamaServerBackend::missing_message(store, llama));
+            }
+
+            let selected = BackendChoice::Candle(candle);
+            if !backend_supports_manifest(selected, manifest) {
                 bail!(
                     "backend {} does not support model '{}' with format {:?}",
                     backend_label(selected),
                     manifest.id,
                     manifest.format
-                )
+                );
             }
+            Ok(selected)
         }
         selected => {
             if backend_supports_manifest(selected, manifest) {
@@ -1674,11 +1826,26 @@ fn backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Cuda) => "candle-cuda",
         BackendChoice::Candle(CandleDeviceMode::Metal) => "metal",
         BackendChoice::Mlx => "mlx",
-        BackendChoice::LlamaFast(LlamaCppMode::Cuda) => "llama-fast-cuda",
-        BackendChoice::LlamaFast(LlamaCppMode::Vulkan) => "llama-fast-vulkan",
-        BackendChoice::LlamaFast(LlamaCppMode::Cpu) => "llama-fast-cpu",
+        BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama-server-cuda",
+        BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => "llama-server-vulkan",
+        BackendChoice::LlamaServer(LlamaCppMode::Cpu) => "llama-server-cpu",
+        BackendChoice::LlamaFast(LlamaCppMode::Cuda) => "llama-legacy-cuda",
+        BackendChoice::LlamaFast(LlamaCppMode::Vulkan) => "llama-legacy-vulkan",
+        BackendChoice::LlamaFast(LlamaCppMode::Cpu) => "llama-legacy-cpu",
         BackendChoice::LlamaHighlevel(mode) => mode.label(),
     }
+}
+
+fn display_llama_mode(mode: LlamaCppMode) -> &'static str {
+    match mode {
+        LlamaCppMode::Cuda => "CUDA",
+        LlamaCppMode::Vulkan => "Vulkan",
+        LlamaCppMode::Cpu => "CPU",
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn print_manifest_summary(action: &str, manifest: &ModelManifest) {
@@ -1890,6 +2057,22 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "llama-cuda"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Backend {
+                command: BackendCommands::Install { target },
+            } => assert_eq!(target, BackendInstallArg::LlamaCuda),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "backend", "list"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Backend {
+                command: BackendCommands::List,
+            } => {}
+            command => panic!("unexpected command: {command:?}"),
+        }
+
         let cli = Cli::try_parse_from(["werk", "--backend", "vulkan", "chat", "tiny"]).unwrap();
         assert_eq!(cli.backend, BackendArg::Vulkan);
         match cli.command.unwrap() {
@@ -1968,36 +2151,40 @@ mod tests {
         ));
         assert!(matches!(
             backend_arg_to_choice(BackendArg::Vulkan),
-            BackendChoice::LlamaFast(LlamaCppMode::Vulkan)
+            BackendChoice::LlamaServer(LlamaCppMode::Vulkan)
         ));
         assert!(matches!(
             backend_arg_to_choice(BackendArg::LlamaHighlevel),
             BackendChoice::LlamaHighlevel(_)
         ));
         assert!(matches!(
+            backend_arg_to_choice(BackendArg::LlamaLegacy),
+            BackendChoice::LlamaFast(_)
+        ));
+        assert!(matches!(
             backend_arg_to_choice(BackendArg::Cuda),
             BackendChoice::GgufPreferred {
                 llama: LlamaCppMode::Cuda,
-                candle
-            } if candle == candle_cuda_fallback_mode()
+                candle: CandleDeviceMode::Cuda
+            }
         ));
     }
 
     #[test]
-    fn linux_and_windows_auto_prefer_llama_fast_for_gguf() {
+    fn linux_and_windows_auto_prefer_llama_server_for_gguf() {
         if cfg!(any(windows, target_os = "linux")) {
             let order = target_default_order();
             assert!(matches!(
                 order[0],
-                BackendChoice::LlamaFast(LlamaCppMode::Cuda)
+                BackendChoice::LlamaServer(LlamaCppMode::Cuda)
             ));
             assert!(matches!(
                 order[1],
-                BackendChoice::LlamaFast(LlamaCppMode::Vulkan)
+                BackendChoice::LlamaServer(LlamaCppMode::Vulkan)
             ));
             assert!(matches!(
                 order[2],
-                BackendChoice::LlamaFast(LlamaCppMode::Cpu)
+                BackendChoice::LlamaServer(LlamaCppMode::Cpu)
             ));
         }
     }

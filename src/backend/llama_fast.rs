@@ -148,7 +148,7 @@ mod imp {
             if !compiled(mode) {
                 bail!("{}", unavailable_message(mode));
             }
-            Ok(format!("llama.cpp fast {}", display_name(mode)))
+            Ok(format!("llama.cpp legacy FFI {}", display_name(mode)))
         }
 
         pub fn runtime_report(
@@ -196,7 +196,7 @@ mod imp {
         fn cached_model(&self, manifest: &ModelManifest) -> Result<(Arc<LlamaFastModel>, f64)> {
             if manifest.format != ModelFormat::Gguf {
                 bail!(
-                    "llama.cpp fast {} backend supports GGUF models only",
+                    "llama.cpp legacy FFI {} backend supports GGUF models only",
                     display_name(self.mode)
                 );
             }
@@ -217,7 +217,7 @@ mod imp {
             if let Some(model) = self
                 .models
                 .lock()
-                .map_err(|_| anyhow!("llama.cpp fast model cache mutex poisoned"))?
+                .map_err(|_| anyhow!("llama.cpp legacy FFI model cache mutex poisoned"))?
                 .get(&cache_key)
                 .cloned()
             {
@@ -230,7 +230,7 @@ mod imp {
 
             let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
             eprintln!(
-                "Loading model '{}' with llama.cpp fast {}",
+                "Loading model '{}' with llama.cpp legacy FFI {}",
                 manifest.id,
                 display_name(self.mode)
             );
@@ -241,7 +241,7 @@ mod imp {
             drop(stderr_guard);
             let load_seconds = started.elapsed().as_secs_f64();
             eprintln!(
-                "Loaded model '{}' with llama.cpp fast {} in {:.2}s",
+                "Loaded model '{}' with llama.cpp legacy FFI {} in {:.2}s",
                 manifest.id,
                 display_name(self.mode),
                 load_seconds
@@ -250,7 +250,7 @@ mod imp {
             let model = Arc::new(model);
             self.models
                 .lock()
-                .map_err(|_| anyhow!("llama.cpp fast model cache mutex poisoned"))?
+                .map_err(|_| anyhow!("llama.cpp legacy FFI model cache mutex poisoned"))?
                 .insert(cache_key, model.clone());
             Ok((model, load_seconds))
         }
@@ -274,7 +274,7 @@ mod imp {
         ) -> Result<GenerateResponse> {
             if !request.image_urls.is_empty() {
                 bail!(
-                    "llama.cpp fast backend is text-only for now; use a VLM-capable backend/model for image inputs"
+                    "llama.cpp legacy FFI backend is text-only for now; use a VLM-capable backend/model for image inputs"
                 );
             }
 
@@ -335,7 +335,7 @@ mod imp {
         fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
             self.state
                 .lock()
-                .map_err(|_| anyhow!("llama.cpp fast chat session mutex poisoned"))
+                .map_err(|_| anyhow!("llama.cpp legacy FFI chat session mutex poisoned"))
                 .and_then(|mut state| state.generate(request, None))
         }
 
@@ -345,7 +345,7 @@ mod imp {
             tokio::task::spawn_blocking(move || {
                 let result = state
                     .lock()
-                    .map_err(|_| anyhow!("llama.cpp fast chat session mutex poisoned"))
+                    .map_err(|_| anyhow!("llama.cpp legacy FFI chat session mutex poisoned"))
                     .and_then(|mut state| state.generate(request, Some(tx.clone())));
                 send_stream_result(tx, result);
             });
@@ -369,7 +369,7 @@ mod imp {
             let ptr = unsafe { llama_load_model_from_file(c_path.as_ptr(), params) };
             if ptr.is_null() {
                 bail!(
-                    "failed to load GGUF model with llama.cpp fast: {}",
+                    "failed to load GGUF model with llama.cpp legacy FFI: {}",
                     path.display()
                 );
             }
@@ -421,7 +421,7 @@ mod imp {
             }
 
             if written < 0 {
-                bail!("failed to tokenize prompt with llama.cpp fast");
+                bail!("failed to tokenize prompt with llama.cpp legacy FFI");
             }
             tokens.truncate(written as usize);
             Ok(tokens)
@@ -451,7 +451,7 @@ mod imp {
             }
 
             if written < 0 {
-                bail!("failed to decode token piece with llama.cpp fast");
+                bail!("failed to decode token piece with llama.cpp legacy FFI");
             }
             buffer.truncate(written as usize);
             Ok(buffer)
@@ -482,7 +482,7 @@ mod imp {
 
             let ctx = unsafe { llama_new_context_with_model(model.ptr, context_params) };
             if ctx.is_null() {
-                bail!("failed to create llama.cpp fast context");
+                bail!("failed to create llama.cpp legacy FFI context");
             }
             params.n_ctx = unsafe { llama_n_ctx(ctx) } as usize;
             params.n_batch = unsafe { llama_n_batch(ctx) } as usize;
@@ -519,7 +519,7 @@ mod imp {
         ) -> Result<GenerateResponse> {
             if !request.image_urls.is_empty() {
                 bail!(
-                    "llama.cpp fast backend is text-only for now; use a VLM-capable backend/model for image inputs"
+                    "llama.cpp legacy FFI backend is text-only for now; use a VLM-capable backend/model for image inputs"
                 );
             }
 
@@ -1055,9 +1055,9 @@ mod imp {
 
     fn label(mode: LlamaCppMode) -> &'static str {
         match mode {
-            LlamaCppMode::Cuda => "llama-fast-cuda",
-            LlamaCppMode::Vulkan => "llama-fast-vulkan",
-            LlamaCppMode::Cpu => "llama-fast-cpu",
+            LlamaCppMode::Cuda => "llama-legacy-cuda",
+            LlamaCppMode::Vulkan => "llama-legacy-vulkan",
+            LlamaCppMode::Cpu => "llama-legacy-cpu",
         }
     }
 
@@ -1071,13 +1071,13 @@ mod imp {
     fn unavailable_message(mode: LlamaCppMode) -> String {
         match mode {
             LlamaCppMode::Cuda => {
-                "llama.cpp fast CUDA backend is not compiled into this binary; build/install with --features cuda".to_string()
+                "llama.cpp legacy FFI CUDA backend is not compiled into this binary; build/install with --features cuda".to_string()
             }
             LlamaCppMode::Vulkan => {
-                "llama.cpp fast Vulkan backend is not compiled into this binary; build/install with --features vulkan".to_string()
+                "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features vulkan".to_string()
             }
             LlamaCppMode::Cpu => {
-                "llama.cpp fast CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()
+                "llama.cpp legacy FFI CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()
             }
         }
     }
@@ -1256,9 +1256,9 @@ mod imp {
         ) -> LlamaFastRuntimeReport {
             LlamaFastRuntimeReport {
                 backend: match mode {
-                    LlamaCppMode::Cuda => "llama-fast-cuda",
-                    LlamaCppMode::Vulkan => "llama-fast-vulkan",
-                    LlamaCppMode::Cpu => "llama-fast-cpu",
+                    LlamaCppMode::Cuda => "llama-legacy-cuda",
+                    LlamaCppMode::Vulkan => "llama-legacy-vulkan",
+                    LlamaCppMode::Cpu => "llama-legacy-cpu",
                 },
                 compiled: false,
                 runtime: "llama_cpp_sys",
@@ -1328,13 +1328,13 @@ mod imp {
     fn unavailable_message(mode: LlamaCppMode) -> String {
         match mode {
             LlamaCppMode::Cuda => {
-                "llama.cpp fast CUDA backend is not compiled into this binary; build/install with --features cuda".to_string()
+                "llama.cpp legacy FFI CUDA backend is not compiled into this binary; build/install with --features cuda".to_string()
             }
             LlamaCppMode::Vulkan => {
-                "llama.cpp fast Vulkan backend is not compiled into this binary; build/install with --features vulkan".to_string()
+                "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features vulkan".to_string()
             }
             LlamaCppMode::Cpu => {
-                "llama.cpp fast CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()
+                "llama.cpp legacy FFI CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()
             }
         }
     }

@@ -1312,11 +1312,17 @@ mod tests {
         assert_eq!(manifest.format, ModelFormat::SafeTensors);
         assert_eq!(manifest.backend, "candle");
         assert_eq!(manifest.architecture.as_deref(), Some("llama"));
-        assert_eq!(manifest.model_path.as_deref(), Some("files/model.safetensors"));
+        assert_eq!(
+            manifest.model_path.as_deref(),
+            Some("files/model.safetensors")
+        );
 
         let manifest = store.set_model_file("mixed", "model.Q4_0.gguf").unwrap();
         assert_eq!(manifest.format, ModelFormat::Gguf);
-        assert_eq!(manifest.model_path.as_deref(), Some("files/model.Q4_0.gguf"));
+        assert_eq!(
+            manifest.model_path.as_deref(),
+            Some("files/model.Q4_0.gguf")
+        );
 
         let _ = fs::remove_dir_all(tmp);
     }
