@@ -105,18 +105,18 @@ impl LlamaCppMode {
     fn compiled(self) -> bool {
         match self {
             Self::Cpu => cfg!(feature = "llama-cpp"),
-            Self::Cuda => cfg!(all(feature = "llama-cpp", feature = "cuda")),
-            Self::Vulkan => cfg!(all(feature = "llama-cpp", feature = "vulkan")),
+            Self::Cuda => cfg!(feature = "llama-legacy-cuda"),
+            Self::Vulkan => cfg!(feature = "llama-legacy-vulkan"),
         }
     }
 
     fn unavailable_message(self) -> String {
         match self {
             Self::Cuda => {
-                "llama.cpp CUDA backend is not compiled into this binary; build/install with --features cuda".to_string()
+                "llama.cpp CUDA backend is not compiled into this binary; build/install with --features llama-legacy-cuda".to_string()
             }
             Self::Vulkan => {
-                "llama.cpp Vulkan backend is not compiled into this binary; build/install with --features vulkan".to_string()
+                "llama.cpp Vulkan backend is not compiled into this binary; build/install with --features llama-legacy-vulkan".to_string()
             }
             Self::Cpu => {
                 "llama.cpp CPU backend is not compiled into this binary; build/install with --features llama-cpp".to_string()

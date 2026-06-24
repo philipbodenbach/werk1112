@@ -10,9 +10,7 @@ use anyhow::Result;
 use std::pin::Pin;
 use tokio_stream::Stream;
 
-pub use burn::{
-    BurnBackend, BurnDiscovery, BurnMode, managed_runner_path as managed_burn_runner_path,
-};
+pub use burn::{BurnBackend, BurnMode, BurnProbeReport, BurnRuntimeStatus, burn_doctor_checks};
 pub use candle::{CandleBackend, CandleDeviceMode, probe_device};
 pub use external::{LlamaCppBackend, LlamaCppMode, MlxBackend};
 pub use llama_fast::{LlamaFastBackend, LlamaFastRuntimeReport};
@@ -62,7 +60,8 @@ pub enum BackendAccelerator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeId {
-    Burn,
+    BurnCuda,
+    BurnCpu,
     LlamaServerCuda,
     LlamaServerVulkan,
     LlamaServerCpu,
@@ -123,14 +122,26 @@ const VLLM_ARCHES: &[&str] = &[
 ];
 pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
     RuntimeDescriptor {
-        id: RuntimeId::Burn,
+        id: RuntimeId::BurnCuda,
         runtime: BackendRuntime::Burn,
-        display_name: "Burn",
+        display_name: "Burn CUDA",
         supported_formats: SAFETENSORS_FORMATS,
         supported_architectures: ANY_ARCH,
-        accelerators: &[BackendAccelerator::Cuda, BackendAccelerator::Cpu],
+        accelerators: &[BackendAccelerator::Cuda],
         capabilities: TEXT_STREAMING,
         priority: 980,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::BurnCpu,
+        runtime: BackendRuntime::Burn,
+        display_name: "Burn CPU",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Cpu],
+        capabilities: TEXT_STREAMING,
+        priority: 780,
         implemented: true,
         install_target: None,
     },

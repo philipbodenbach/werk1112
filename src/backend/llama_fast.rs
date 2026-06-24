@@ -164,7 +164,7 @@ mod imp {
             }
             if cfg!(feature = "cuda-mmq") {
                 warnings.push(
-                    "Werk's cuda-mmq feature is a compatibility alias to cuda; forced MMQ is disabled because llama_cpp_sys 0.3.2 builds CUDA with -arch=all and fails device-link before sm_86".to_string(),
+                    "Werk's cuda-mmq feature is a compatibility alias to llama-legacy-cuda; forced MMQ is disabled because llama_cpp_sys 0.3.2 builds CUDA with -arch=all and fails device-link before sm_86".to_string(),
                 );
             }
             warnings.push(
@@ -1040,8 +1040,8 @@ mod imp {
     fn compiled(mode: LlamaCppMode) -> bool {
         match mode {
             LlamaCppMode::Cpu => cfg!(feature = "llama-fast"),
-            LlamaCppMode::Cuda => cfg!(all(feature = "llama-fast", feature = "cuda")),
-            LlamaCppMode::Vulkan => cfg!(all(feature = "llama-fast", feature = "vulkan")),
+            LlamaCppMode::Cuda => cfg!(feature = "llama-legacy-cuda"),
+            LlamaCppMode::Vulkan => cfg!(feature = "llama-legacy-vulkan"),
         }
     }
 
@@ -1071,10 +1071,10 @@ mod imp {
     fn unavailable_message(mode: LlamaCppMode) -> String {
         match mode {
             LlamaCppMode::Cuda => {
-                "llama.cpp legacy FFI CUDA backend is not compiled into this binary; build/install with --features cuda".to_string()
+                "llama.cpp legacy FFI CUDA backend is not compiled into this binary; build/install with --features llama-legacy-cuda".to_string()
             }
             LlamaCppMode::Vulkan => {
-                "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features vulkan".to_string()
+                "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features llama-legacy-vulkan".to_string()
             }
             LlamaCppMode::Cpu => {
                 "llama.cpp legacy FFI CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()
@@ -1328,10 +1328,10 @@ mod imp {
     fn unavailable_message(mode: LlamaCppMode) -> String {
         match mode {
             LlamaCppMode::Cuda => {
-                "llama.cpp legacy FFI CUDA backend is not compiled into this binary; build/install with --features cuda".to_string()
+                "llama.cpp legacy FFI CUDA backend is not compiled into this binary; build/install with --features llama-legacy-cuda".to_string()
             }
             LlamaCppMode::Vulkan => {
-                "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features vulkan".to_string()
+                "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features llama-legacy-vulkan".to_string()
             }
             LlamaCppMode::Cpu => {
                 "llama.cpp legacy FFI CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()

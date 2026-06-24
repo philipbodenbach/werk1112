@@ -210,7 +210,7 @@ pub fn runtime_candidate_ids(
         RequestedBackend::Vulkan => vulkan_candidates(manifest),
         RequestedBackend::Metal => metal_candidates(manifest),
         RequestedBackend::Mlx => vec![RuntimeId::Mlx],
-        RequestedBackend::Burn => vec![RuntimeId::Burn],
+        RequestedBackend::Burn => burn_candidates(),
         RequestedBackend::Candle => candle_candidates(manifest),
         RequestedBackend::Vllm => vec![RuntimeId::VllmCuda],
         RequestedBackend::LlamaLegacy | RequestedBackend::LlamaHighlevel => Vec::new(),
@@ -267,26 +267,35 @@ fn gguf_auto_candidates() -> Vec<RuntimeId> {
 }
 
 fn safetensors_auto_candidates() -> Vec<RuntimeId> {
-    append_candle_fallbacks(vec![RuntimeId::Burn])
-}
-
-fn append_candle_fallbacks(mut candidates: Vec<RuntimeId>) -> Vec<RuntimeId> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        candidates.extend([RuntimeId::Mlx, RuntimeId::CandleMetal, RuntimeId::CandleCpu]);
+        vec![
+            RuntimeId::BurnCpu,
+            RuntimeId::Mlx,
+            RuntimeId::CandleMetal,
+            RuntimeId::CandleCpu,
+        ]
     } else if cfg!(target_os = "macos") {
-        candidates.extend([RuntimeId::CandleMetal, RuntimeId::CandleCpu]);
+        vec![
+            RuntimeId::BurnCpu,
+            RuntimeId::CandleMetal,
+            RuntimeId::CandleCpu,
+        ]
     } else if cfg!(any(windows, target_os = "linux")) {
-        candidates.extend([RuntimeId::CandleCuda, RuntimeId::CandleCpu]);
+        vec![
+            RuntimeId::BurnCuda,
+            RuntimeId::CandleCuda,
+            RuntimeId::BurnCpu,
+            RuntimeId::CandleCpu,
+        ]
     } else {
-        candidates.push(RuntimeId::CandleCpu);
+        vec![RuntimeId::BurnCpu, RuntimeId::CandleCpu]
     }
-    dedupe(candidates)
 }
 
 fn cpu_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::Gguf => vec![RuntimeId::LlamaServerCpu, RuntimeId::CandleCpu],
-        ModelFormat::SafeTensors => vec![RuntimeId::Burn, RuntimeId::CandleCpu],
+        ModelFormat::SafeTensors => vec![RuntimeId::BurnCpu, RuntimeId::CandleCpu],
         ModelFormat::Onnx => vec![RuntimeId::OnnxRuntimeCpu],
         _ => Vec::new(),
     }
@@ -295,9 +304,17 @@ fn cpu_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
 fn cuda_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::Gguf => vec![RuntimeId::LlamaServerCuda],
-        ModelFormat::SafeTensors => vec![RuntimeId::Burn, RuntimeId::CandleCuda],
+        ModelFormat::SafeTensors => vec![RuntimeId::BurnCuda, RuntimeId::CandleCuda],
         ModelFormat::Onnx => vec![RuntimeId::OnnxRuntimeCuda],
         _ => Vec::new(),
+    }
+}
+
+fn burn_candidates() -> Vec<RuntimeId> {
+    if cfg!(any(windows, target_os = "linux")) {
+        vec![RuntimeId::BurnCuda]
+    } else {
+        vec![RuntimeId::BurnCpu]
     }
 }
 
@@ -474,16 +491,6 @@ fn availability_map(
         .collect()
 }
 
-fn dedupe(runtime_ids: Vec<RuntimeId>) -> Vec<RuntimeId> {
-    let mut out = Vec::with_capacity(runtime_ids.len());
-    for runtime_id in runtime_ids {
-        if !out.contains(&runtime_id) {
-            out.push(runtime_id);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,16 +510,17 @@ mod tests {
     fn safetensors_cuda_uses_burn_then_candle_without_cpu_fallback() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
         let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Cuda);
-        assert_eq!(candidates[0], RuntimeId::Burn);
+        assert_eq!(candidates[0], RuntimeId::BurnCuda);
         assert!(candidates.contains(&RuntimeId::CandleCuda));
         assert!(!candidates.contains(&RuntimeId::CandleCpu));
+        assert!(!candidates.contains(&RuntimeId::BurnCpu));
     }
 
     #[test]
     fn safetensors_auto_tries_burn_before_candle_for_any_architecture() {
         let qwen = manifest(ModelFormat::SafeTensors, Some("qwen2"));
         let candidates = runtime_candidate_ids(&qwen, RequestedBackend::Auto);
-        assert_eq!(candidates[0], RuntimeId::Burn);
+        assert_eq!(candidates[0], RuntimeId::BurnCuda);
         assert!(
             candidates
                 .iter()
@@ -520,12 +528,12 @@ mod tests {
                 .unwrap()
                 > candidates
                     .iter()
-                    .position(|id| *id == RuntimeId::Burn)
+                    .position(|id| *id == RuntimeId::BurnCuda)
                     .unwrap()
         );
         let unknown = manifest(ModelFormat::SafeTensors, Some("unknown"));
         let candidates = runtime_candidate_ids(&unknown, RequestedBackend::Auto);
-        assert_eq!(candidates[0], RuntimeId::Burn);
+        assert_eq!(candidates[0], RuntimeId::BurnCuda);
         assert!(candidates.contains(&RuntimeId::CandleCuda));
     }
 
@@ -540,7 +548,11 @@ mod tests {
     fn explicit_burn_request_has_no_candle_fallback_candidates() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("unknown"));
         let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Burn);
-        assert_eq!(candidates, vec![RuntimeId::Burn]);
+        if cfg!(any(windows, target_os = "linux")) {
+            assert_eq!(candidates, vec![RuntimeId::BurnCuda]);
+        } else {
+            assert_eq!(candidates, vec![RuntimeId::BurnCpu]);
+        }
     }
 
     #[test]
