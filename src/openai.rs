@@ -152,6 +152,16 @@ pub fn messages_to_prompt_for_model(
     manifest: &ModelManifest,
     messages: &[ChatMessage],
 ) -> PromptSpec {
+    if uses_qwen_chat_template(manifest) {
+        return PromptSpec {
+            prompt: messages_to_qwen_chatml_prompt(
+                messages,
+                uses_qwen3_non_thinking_prompt(manifest),
+            ),
+            stop: qwen_stop_strings(),
+        };
+    }
+
     if uses_tinyllama_chat_template(manifest) {
         return PromptSpec {
             prompt: messages_to_chatml_prompt(messages),
@@ -177,16 +187,77 @@ pub fn image_urls_from_messages(messages: &[ChatMessage]) -> Vec<String> {
         .collect()
 }
 
+fn uses_qwen_chat_template(manifest: &ModelManifest) -> bool {
+    manifest_text_contains(manifest, "qwen")
+}
+
+fn uses_qwen3_non_thinking_prompt(manifest: &ModelManifest) -> bool {
+    manifest_text_contains(manifest, "qwen3")
+}
+
 fn uses_tinyllama_chat_template(manifest: &ModelManifest) -> bool {
-    let id = manifest.id.to_ascii_lowercase();
-    if id.contains("tinyllama") {
+    manifest_text_contains(manifest, "tinyllama")
+}
+
+fn manifest_text_contains(manifest: &ModelManifest, needle: &str) -> bool {
+    if manifest.id.to_ascii_lowercase().contains(needle) {
         return true;
     }
-
-    match &manifest.source {
-        ModelSource::HuggingFace { repo } => repo.to_ascii_lowercase().contains("tinyllama"),
-        ModelSource::LocalPath { path } => path.to_ascii_lowercase().contains("tinyllama"),
+    if manifest
+        .architecture
+        .as_deref()
+        .map(|architecture| architecture.to_ascii_lowercase().contains(needle))
+        .unwrap_or(false)
+    {
+        return true;
     }
+    match &manifest.source {
+        ModelSource::HuggingFace { repo } => repo.to_ascii_lowercase().contains(needle),
+        ModelSource::LocalPath { path } => path.to_ascii_lowercase().contains(needle),
+    }
+}
+
+fn qwen_stop_strings() -> Vec<String> {
+    vec![
+        "<|im_end|>".to_string(),
+        "<|endoftext|>".to_string(),
+        "</s>".to_string(),
+        "<|im_start|>user".to_string(),
+        "<|im_start|>system".to_string(),
+        "\nHuman:".to_string(),
+        "\nUser:".to_string(),
+        "\nAssistant:".to_string(),
+    ]
+}
+
+fn messages_to_qwen_chatml_prompt(messages: &[ChatMessage], non_thinking: bool) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let content = message
+            .content
+            .as_ref()
+            .map(MessageContent::as_text)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            continue;
+        }
+
+        let role = match message.role.trim() {
+            "system" => "system",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(content.trim());
+        prompt.push_str("<|im_end|>\n");
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    if non_thinking {
+        prompt.push_str("<think>\n\n</think>\n\n");
+    }
+    prompt
 }
 
 fn messages_to_chatml_prompt(messages: &[ChatMessage]) -> String {
@@ -347,5 +418,49 @@ mod tests {
         assert!(prompt.prompt.contains("<|user|>\nWrite one sentence.</s>"));
         assert!(prompt.prompt.ends_with("<|assistant|>"));
         assert!(prompt.stop.contains(&"<|user|>".to_string()));
+    }
+
+    #[test]
+    fn qwen3_uses_chatml_prompt_shape_and_stops() {
+        let manifest = ModelManifest {
+            id: "Qwen3-14B".to_string(),
+            source: ModelSource::HuggingFace {
+                repo: "Qwen/Qwen3-14B".to_string(),
+            },
+            format: ModelFormat::SafeTensors,
+            architecture: Some("qwen3".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: Some("files/model.safetensors".to_string()),
+            backend: "candle".to_string(),
+            created_unix: 1,
+            files: Vec::<ModelFile>::new(),
+            artifacts: Vec::new(),
+        };
+        let prompt = messages_to_prompt_for_model(
+            &manifest,
+            &[
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(MessageContent::Text("Be accurate.".to_string())),
+                    name: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Text("Write one sentence.".to_string())),
+                    name: None,
+                },
+            ],
+        );
+
+        assert!(prompt.prompt.contains("<|im_start|>user"));
+        assert!(prompt.prompt.contains("<|im_end|>"));
+        assert!(
+            prompt
+                .prompt
+                .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        );
+        assert!(prompt.stop.contains(&"<|im_end|>".to_string()));
+        assert!(prompt.stop.contains(&"\nHuman:".to_string()));
     }
 }

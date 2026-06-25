@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use candle_core::{
-    DType, Device, IndexOp, Tensor,
+    D, DType, Device, IndexOp, Tensor,
     quantized::gguf_file::{self, Value as GgufValue},
 };
 use candle_nn::VarBuilder;
@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::{fs, path::PathBuf};
 use std::{
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokenizers::{
     AddedToken, DecoderWrapper, Tokenizer,
@@ -280,14 +280,19 @@ fn generate_with_loaded_model(
     let prompt_tokens = tokens.len();
 
     let eos_token = eos_token_id(&tokenizer);
-    let mut logits_processor = LogitsProcessor::new(
+    let mut token_selector = TokenSelector::new(
         request.seed.unwrap_or(299792458),
         request.temperature,
         request.top_p,
     );
     let mut generated = Vec::new();
     let mut generated_text = String::new();
+    let mut decode_stream = tokenizer.decode_stream(true);
+    let mut streamed_len = 0usize;
     let mut finish_reason = "length".to_string();
+    let mut matched_stop_string = false;
+    let max_stop_len = max_stop_len(&request.stop);
+    let mut profile = request.debug.then(DecodeLoopProfile::default);
 
     let prompt_started = Instant::now();
     let mut input = Tensor::new(tokens.as_slice(), device)?.unsqueeze(0)?;
@@ -298,7 +303,9 @@ fn generate_with_loaded_model(
 
     let decode_started = Instant::now();
     for _ in 0..request.max_tokens {
-        let next_token = logits_processor.sample(&last_logits(&logits)?)?;
+        let next_logits = last_logits(&logits)?;
+        let next_token =
+            select_next_token(&mut token_selector, &next_logits, device, &mut profile)?;
         if Some(next_token) == eos_token {
             finish_reason = "stop".to_string();
             break;
@@ -307,38 +314,72 @@ fn generate_with_loaded_model(
         tokens.push(next_token);
         generated.push(next_token);
 
-        let decoded = tokenizer
-            .decode(&generated, true)
-            .unwrap_or_else(|_| String::new());
-        let previous_text = generated_text.clone();
-        generated_text = decoded;
-        let reached_stop = stop_reached(&mut generated_text, &request.stop);
-        let safe_piece = if generated_text.starts_with(&previous_text)
-            && generated_text.len() > previous_text.len()
-        {
-            generated_text[previous_text.len()..].to_string()
-        } else if previous_text != generated_text && !reached_stop {
-            generated_text.clone()
-        } else {
-            String::new()
-        };
+        let tokenizer_started = profile.as_ref().map(|_| Instant::now());
+        let piece = decode_stream
+            .step(next_token)
+            .map_err(|err| anyhow!("incremental token decode failed: {err}"))?
+            .unwrap_or_default();
+        if let (Some(profile), Some(started)) = (profile.as_mut(), tokenizer_started) {
+            profile.tokenizer += started.elapsed();
+        }
+        let stop_check_from = stop_check_start(generated_text.len(), max_stop_len);
+        generated_text.push_str(&piece);
 
+        let stop_started = profile.as_ref().map(|_| Instant::now());
+        let reached_stop = stop_reached_from(&mut generated_text, &request.stop, stop_check_from);
+        let safe_len = if reached_stop {
+            generated_text.len()
+        } else {
+            stop_guard_emit_len(&generated_text, &request.stop, max_stop_len)
+        };
+        if let (Some(profile), Some(started)) = (profile.as_mut(), stop_started) {
+            profile.stop_check += started.elapsed();
+        }
+
+        let callback_started = profile.as_ref().map(|_| Instant::now());
         if let Some(callback) = on_token.as_mut()
-            && !safe_piece.is_empty()
+            && safe_len > streamed_len
         {
+            let safe_piece = generated_text[streamed_len..safe_len].to_string();
             callback(safe_piece);
+            streamed_len = safe_len;
+        }
+        if let (Some(profile), Some(started)) = (profile.as_mut(), callback_started) {
+            profile.callback += started.elapsed();
         }
 
         if reached_stop {
             finish_reason = "stop".to_string();
+            matched_stop_string = true;
             break;
         }
 
+        let forward_started = profile.as_ref().map(|_| Instant::now());
         input = Tensor::new(&[next_token], device)?.unsqueeze(0)?;
         logits = model.forward(&input, index_pos)?;
+        if profile.is_some() {
+            device.synchronize()?;
+        }
         index_pos += 1;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), forward_started) {
+            profile.forward += started.elapsed();
+        }
     }
     let decode_seconds = decode_started.elapsed().as_secs_f64();
+    if !matched_stop_string
+        && let Some(callback) = on_token.as_mut()
+        && generated_text.len() > streamed_len
+    {
+        let callback_started = profile.as_ref().map(|_| Instant::now());
+        callback(generated_text[streamed_len..].to_string());
+        if let (Some(profile), Some(started)) = (profile.as_mut(), callback_started) {
+            profile.callback += started.elapsed();
+        }
+    }
+    if let Some(mut profile) = profile {
+        profile.total = Duration::from_secs_f64(decode_seconds);
+        profile.print(generated.len());
+    }
 
     Ok(GenerateResponse {
         text: generated_text,
@@ -361,17 +402,219 @@ struct CachedModel {
     model: CandleModel,
 }
 
-fn stop_reached(text: &mut String, stops: &[String]) -> bool {
+#[derive(Default)]
+struct DecodeLoopProfile {
+    forward: Duration,
+    greedy_argmax_launch: Duration,
+    greedy_argmax_sync: Duration,
+    greedy_scalar_transfer: Duration,
+    greedy_total: Duration,
+    stochastic_sample: Duration,
+    tokenizer: Duration,
+    stop_check: Duration,
+    callback: Duration,
+    total: Duration,
+}
+
+impl DecodeLoopProfile {
+    fn print(&self, tokens: usize) {
+        eprintln!(
+            "Candle decode profile\n\
+             \n\
+             tokens: {tokens}\n\
+             \n\
+             forward:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             deterministic selection:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             argmax launch:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             argmax sync:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             scalar transfer:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             stochastic sampling:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             tokenizer:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             stop check:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             callback:\n\
+               total: {}\n\
+               avg/token: {}\n\
+             \n\
+             total:\n\
+               total: {}\n\
+               avg/token: {}",
+            format_duration(self.forward),
+            format_average_duration(self.forward, tokens),
+            format_duration(self.greedy_total),
+            format_average_duration(self.greedy_total, tokens),
+            format_duration(self.greedy_argmax_launch),
+            format_average_duration(self.greedy_argmax_launch, tokens),
+            format_duration(self.greedy_argmax_sync),
+            format_average_duration(self.greedy_argmax_sync, tokens),
+            format_duration(self.greedy_scalar_transfer),
+            format_average_duration(self.greedy_scalar_transfer, tokens),
+            format_duration(self.stochastic_sample),
+            format_average_duration(self.stochastic_sample, tokens),
+            format_duration(self.tokenizer),
+            format_average_duration(self.tokenizer, tokens),
+            format_duration(self.stop_check),
+            format_average_duration(self.stop_check, tokens),
+            format_duration(self.callback),
+            format_average_duration(self.callback, tokens),
+            format_duration(self.total),
+            format_average_duration(self.total, tokens),
+        );
+    }
+}
+
+enum TokenSelector {
+    Greedy,
+    Stochastic(LogitsProcessor),
+}
+
+impl TokenSelector {
+    fn new(seed: u64, temperature: Option<f64>, top_p: Option<f64>) -> Self {
+        if is_deterministic_temperature(temperature) {
+            Self::Greedy
+        } else {
+            Self::Stochastic(LogitsProcessor::new(seed, temperature, top_p))
+        }
+    }
+}
+
+fn is_deterministic_temperature(temperature: Option<f64>) -> bool {
+    temperature
+        .map(|temperature| temperature < 1e-7)
+        .unwrap_or(true)
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{:.6}s", duration.as_secs_f64())
+}
+
+fn format_average_duration(duration: Duration, tokens: usize) -> String {
+    if tokens == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{:.3}ms", duration.as_secs_f64() * 1000.0 / tokens as f64)
+    }
+}
+
+fn select_next_token(
+    selector: &mut TokenSelector,
+    logits: &Tensor,
+    device: &Device,
+    profile: &mut Option<DecodeLoopProfile>,
+) -> Result<u32> {
+    match selector {
+        TokenSelector::Greedy => select_greedy_token(logits, device, profile.as_mut()),
+        TokenSelector::Stochastic(logits_processor) => {
+            let started = profile.as_ref().map(|_| Instant::now());
+            let next_token = logits_processor.sample(logits)?;
+            if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+                profile.stochastic_sample += started.elapsed();
+            }
+            Ok(next_token)
+        }
+    }
+}
+
+fn select_greedy_token(
+    logits: &Tensor,
+    device: &Device,
+    profile: Option<&mut DecodeLoopProfile>,
+) -> Result<u32> {
+    if let Some(profile) = profile {
+        let total_started = Instant::now();
+
+        let argmax_started = Instant::now();
+        let next_token = logits.argmax(D::Minus1)?;
+        profile.greedy_argmax_launch += argmax_started.elapsed();
+
+        let sync_started = Instant::now();
+        device.synchronize()?;
+        profile.greedy_argmax_sync += sync_started.elapsed();
+
+        let scalar_started = Instant::now();
+        let next_token = next_token.to_scalar::<u32>()?;
+        profile.greedy_scalar_transfer += scalar_started.elapsed();
+        profile.greedy_total += total_started.elapsed();
+
+        return Ok(next_token);
+    }
+
+    Ok(logits.argmax(D::Minus1)?.to_scalar::<u32>()?)
+}
+
+fn stop_reached_from(text: &mut String, stops: &[String], start: usize) -> bool {
+    let start = floor_char_boundary(text, start);
     for stop in stops {
         if stop.is_empty() {
             continue;
         }
-        if let Some(index) = text.find(stop) {
-            text.truncate(index);
+        if let Some(index) = text[start..].find(stop) {
+            text.truncate(start + index);
             return true;
         }
     }
     false
+}
+
+fn max_stop_len(stops: &[String]) -> usize {
+    stops.iter().map(String::len).max().unwrap_or(0)
+}
+
+fn stop_check_start(previous_len: usize, max_stop_len: usize) -> usize {
+    previous_len.saturating_sub(max_stop_len.saturating_sub(1))
+}
+
+fn stop_guard_emit_len(text: &str, stops: &[String], max_stop_len: usize) -> usize {
+    let holdback = stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| stop_prefix_suffix_len(text, stop, max_stop_len))
+        .max()
+        .unwrap_or(0);
+    text.len().saturating_sub(holdback)
+}
+
+fn stop_prefix_suffix_len(text: &str, stop: &str, max_stop_len: usize) -> Option<usize> {
+    let suffix_start = text
+        .len()
+        .saturating_sub(max_stop_len.saturating_sub(1).min(text.len()));
+    let suffix_start = floor_char_boundary(text, suffix_start);
+    text[suffix_start..]
+        .char_indices()
+        .map(|(index, _)| &text[suffix_start + index..])
+        .find(|suffix| suffix.len() < stop.len() && stop.starts_with(*suffix))
+        .map(str::len)
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn eos_token_id(tokenizer: &Tokenizer) -> Option<u32> {
@@ -921,4 +1164,57 @@ fn should_flush_chunk(buffer: &str, latest_piece: &str) -> bool {
             .last()
             .map(|ch| matches!(ch, '.' | '!' | '?' | ':' | ';'))
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_guard_holds_partial_stop_prefix() {
+        let stops = vec!["\nHuman:".to_string()];
+        let text = "Rust is fast.\nHum";
+
+        assert_eq!(
+            &text[..stop_guard_emit_len(text, &stops, max_stop_len(&stops))],
+            "Rust is fast."
+        );
+    }
+
+    #[test]
+    fn stop_guard_releases_newline_when_not_stop_prefix() {
+        let stops = vec!["\nHuman:".to_string()];
+        let text = "Rust is fast.\nNext sentence.";
+
+        assert_eq!(
+            stop_guard_emit_len(text, &stops, max_stop_len(&stops)),
+            text.len()
+        );
+    }
+
+    #[test]
+    fn stop_reached_from_finds_stop_spanning_previous_suffix() {
+        let stops = vec!["\nHuman:".to_string()];
+        let mut text = "Rust is fast.\nHuman: next".to_string();
+        let start = stop_check_start("Rust is fast.\nHum".len(), max_stop_len(&stops));
+
+        assert!(stop_reached_from(&mut text, &stops, start));
+        assert_eq!(text, "Rust is fast.");
+    }
+
+    #[test]
+    fn token_selector_uses_greedy_for_zero_temperature() {
+        assert!(matches!(
+            TokenSelector::new(42, Some(0.0), None),
+            TokenSelector::Greedy
+        ));
+    }
+
+    #[test]
+    fn token_selector_uses_stochastic_for_nonzero_temperature() {
+        assert!(matches!(
+            TokenSelector::new(42, Some(0.8), None),
+            TokenSelector::Stochastic(_)
+        ));
+    }
 }
