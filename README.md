@@ -714,11 +714,3 @@ werk --backend mlx chat vlm-model --image ./image.png
 ```
 
 OpenAI-style API image inputs are accepted from `image_url` and `input_image` content parts. Text-only backends return a clear error when image inputs are provided.
-
-## Next Work
-
-- Keep Burn behind `burn-experimental` until architecture coverage, correctness, and speed gates justify normal routing.
-- Add richer chat template support from tokenizer/model metadata.
-- Keep improving GGUF performance through persistent llama.cpp server defaults and runtime tuning.
-- Add real generation backends for TensorRT, OpenVINO, TensorFlow, CoreML, and direct PyTorch checkpoint execution/conversion when they can execute end-to-end.
-- Add embeddings and tool-call response support after the chat/models baseline is stable.
