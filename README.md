@@ -4,13 +4,79 @@
   <img src="docs/assets/banner_werk.png" alt="Werk1112 startup banner: WERK1112 - Native AI runtime management." />
 </p>
 
-Werk1112 is a headless local model server in the spirit of Ollama, built around a Rust-first toolchain and an OpenAI-compatible HTTP API. It is intended for external clients such as Open WebUI, LM Studio, and agent tooling.
+Werk1112 is a local-first AI runtime written in Rust.
 
-The app does not provide its own GUI chat. Use the CLI to import/list/inspect models and start the server, then connect a client to the HTTP API.
+It provides a unified inference router for modern language models through a stable CLI and an HTTP API compatible with the OpenAI API.
+
+Applications target Werk1112. 
+
+Werk1112 targets inference backends.
+
+Modern AI applications should not need to care whether a model executes through llama.cpp, vLLM, Candle, MLX, or another runtime.
+
+Werk1112 abstracts runtime selection while remaining predictable, transparent, and local-first.
+
+## Why Werk1112?
+
+Applications should depend on a stable AI runtime, not on individual inference engines.
+
+Werk1112 provides a single runtime abstraction for model management, backend selection and inference while remaining compatible with existing AI tooling.
+
+## What Werk1112 Is
+
+Werk1112 is infrastructure for running local models with predictable routing:
+
+- native CLI workflows for chat, inference, model management and serving
+- a managed model store for copied local models and pulled Hugging Face repositories
+- a runtime planner that chooses between llama.cpp server, vLLM, ONNX Runtime, Candle, and MLX based on model format and requested backend
+- an HTTP API compatible with the OpenAI API for existing tools and integrations
+- a stable runtime abstraction for local AI applications
+
+Werk1112 does not ship a built-in GUI. CLI chat is a first-class workflow, and Graphical interfaces can be provided by any client compatible with the OpenAI API.
+
+## What Werk1112 Is Not
+
+Werk1112 is intentionally narrow. It is not an agent framework, workflow engine, sandbox manager, IDE integration layer, or enterprise control plane.
+
+Werk1112 intentionally focuses on model management, runtime selection and inference. Higher-level concerns belong in applications built on top of the runtime, not inside it.
+
+## Product Scope
+
+Werk1112 is responsible for:
+
+- model import and model store management
+- model listing and inspection
+- backend and runtime selection
+- local and companion-runtime inference
+- OpenAI-compatible chat completion API
+- CLI `chat`, `run`, and `serve` workflows
+
+Werk1112 is not responsible for:
+
+- agent orchestration
+- long-running task planning
+- sandbox orchestration
+- workflow modelling
+- IDE integrations
+- enterprise management planes
+
+This narrow scope keeps the runtime predictable, composable and easy to integrate into other applications.
+
+## Design Philosophy
+
+Werk1112 deliberately separates model management, runtime selection and inference from higher-level application logic.
+
+Instead of becoming another monolithic AI platform, Werk1112 focuses on doing one job well: providing a reliable runtime abstraction for local AI workloads.
+
+The goal is to let applications depend on a stable runtime abstraction instead of coupling themselves to backend-specific inference engines.
+
+Werk1112 composes inference runtimes. It does not compete with them.
 
 ## Status
 
-This is an early V1 skeleton:
+Current capabilities include:
+
+The project focuses on stability, predictable runtime behaviour and long-term compatibility rather than rapidly expanding feature scope.
 
 - Default local installs build the recommended runtime stack for the current Windows/Linux CUDA-first workflow.
 - CUDA, CUDNN, Metal, and MKL are opt-in Cargo features for source builds.
@@ -23,7 +89,41 @@ This is an early V1 skeleton:
 - Local GGUF and safetensors model imports are copied into a managed model store.
 - Hugging Face pulls use `git clone` for now, so install `git` and `git-lfs` for real model repos.
 
-Current generation support is selected through the Werk1112 Runtime Planner. Werk is an inference router, not a Candle wrapper: GGUF uses a persistent llama.cpp `llama-server` process as the hot path, so decode, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. Supported HF safetensors directories prefer vLLM on CUDA, may use vLLM ROCm through `--backend rocm`, and use Candle as the compatibility fallback. MLX model directories can run through an external `mlx-lm` backend.
+Current generation support is selected through the Werk1112 Runtime Planner. Werk1112 is an inference router, not a Candle wrapper: GGUF uses a persistent llama.cpp `llama-server` process as the hot path, so decode, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. Supported HF safetensors directories prefer vLLM on CUDA, may use vLLM ROCm through `--backend rocm`, and use Candle as the compatibility fallback. MLX model directories can run through an external `mlx-lm` backend.
+
+## Quick Start
+
+Install the CLI from this checkout with the recommended runtime stack:
+
+```bash
+cargo install --path . --locked --force
+```
+
+Import or pull a model:
+
+```bash
+werk import /path/to/model-dir --name local-model
+werk pull org/model-repo --name hf-model
+```
+
+Run one prompt or start an interactive terminal chat:
+
+```bash
+werk run local-model "Write one sentence about Rust."
+werk chat local-model
+```
+
+Start the OpenAI-compatible HTTP server:
+
+```bash
+werk serve --model local-model
+```
+
+Then point compatible clients at:
+
+```text
+http://127.0.0.1:11434/v1
+```
 
 ## Format Support
 
@@ -322,49 +422,6 @@ werk --backend cuda serve --model gemma-2b-it
 
 For GGUF models, `--backend cuda`, `--backend rocm`, `--backend vulkan`, and `--backend cpu` use the matching persistent llama.cpp server backend when that server is available. For safetensors models, CUDA tries vLLM CUDA for supported architectures and then Candle CUDA; ROCm tries only vLLM ROCm and verifies the discovered vLLM environment is ROCm/HIP-capable. CPU uses Candle CPU. `--backend onnx` is strict ONNX Runtime only: it never falls back to Candle and fails with actionable diagnostics if no runner is installed. `--backend vllm` remains a strict vLLM-only route with the existing default vLLM accelerator behavior and fails clearly if vLLM is missing, broken, or cannot load the model. Explicit GPU backend requests do not silently fall back to CPU; they fail with an actionable error if the requested runtime is unavailable. `--backend candle` is available for debugging or fallback verification. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
 
-## End-User Releases
-
-Release artifacts should be produced with the target Cargo alias on the target platform. A complete GGUF release includes the Cargo-built `werk` binary plus the platform llama.cpp server companion that Werk discovers or bundles for that artifact. End users should not need Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc`; those are build-machine/source-install requirements only.
-
-Do not ship one artifact per backend unless a backend cannot be co-compiled. The current Windows/Linux release artifact is CUDA-first for the supported server/Candle paths. Legacy in-process llama.cpp FFI CUDA/Vulkan builds are debug/developer features, not the normal GGUF route.
-
-Each target artifact should include the supported backends for that build, and users can select one explicitly with `--backend`:
-
-| Platform | Cargo command | Included backend support | Auto default |
-| --- | --- | --- | --- |
-| Windows 10/11 x64 | `cargo build-windows` | CPU, CUDA via llama.cpp server, Candle CUDA | llama.cpp server CUDA for GGUF; vLLM/Candle for safetensors |
-| Linux x64 | `cargo build-linux` | CPU, CUDA via llama.cpp server, Candle CUDA | llama.cpp server CUDA for GGUF; vLLM/Candle for safetensors |
-| macOS Apple Silicon | `cargo build-macos-apple-silicon` | CPU, MLX-LM, VLM request support | MLX |
-
-Backend selection is per process. Managed runtime provisioning and generated artifacts are cached under `WERK_HOME` when needed.
-
-```bash
-werk --backend auto chat model-id
-werk --backend cuda chat model-id
-werk --backend rocm chat model-id
-werk --backend vulkan chat model-id
-werk --backend mlx chat model-id
-werk --backend metal chat model-id
-werk --backend cpu chat model-id
-werk --backend candle chat model-id
-werk --backend onnx chat model-id
-werk --backend vllm chat model-id
-```
-
-`auto` is format-aware: GGUF uses llama.cpp server CUDA, ROCm only when discoverable, Vulkan, CPU, then Candle legacy GPU/CPU fallback; safetensors uses vLLM for supported CUDA architectures, then Candle CUDA/CPU fallback; MLX-format models use MLX. Explicit `onnx`, `vllm`, and GPU requests do not fallback to CPU. `--backend rocm` is strict ROCm/HIP for compatible formats.
-
-MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. CUDA, Vulkan, and CPU GGUF hot paths are implemented through persistent llama.cpp server backends. `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
-
-VLM support means multimodal model/request support, not a separate backend. Today image inputs should be routed to an image-capable MLX/VLM backend. Candle is text-only, and llama.cpp VLM support is pending until mmproj/image argument handling is wired.
-
-CLI image inputs use repeatable `--image` flags:
-
-```bash
-werk --backend mlx chat vlm-model --image ./image.png
-```
-
-OpenAI-style API image inputs are accepted from `image_url` and `input_image` content parts. Text-only backends return a clear error when image inputs are provided.
-
 ## Model Store
 
 The model store is resolved in this order:
@@ -429,7 +486,7 @@ Start the server:
 werk serve
 ```
 
-`serve` starts the OpenAI-compatible API. It exposes all installed models through `/v1/models`; each API request normally chooses the model with its JSON `model` field.
+`serve` starts the OpenAI API compatible API. It exposes all installed models through `/v1/models`; each API request normally chooses the model with its JSON `model` field.
 
 Set a default model for requests that omit `model`:
 
@@ -534,7 +591,7 @@ Terminal chat prints decoded token-pieces as soon as the backend produces them, 
 werk chat gemma-2b-it --stream-granularity chunk
 ```
 
-Timing and throughput stats are quiet by default. Add `--verbose` to `run` or `chat` for Ollama-style stats:
+Timing and throughput stats are quiet by default. Add `--verbose` to `run` or `chat` for runtime timing stats:
 
 ```bash
 werk chat TinyLlama-1B-GGUF --max-tokens 128 --verbose
@@ -555,7 +612,7 @@ eval rate:            86.81 tokens/s
 
 `prompt eval` is prompt/prefill time. `eval` is assistant-token decode time. `total` also includes model load and tokenizer overhead for that turn. For TinyLlama GGUF on a CUDA build, use `Q4_K_M` as the default balance of speed and quality; `Q2_K` is smaller but noticeably worse, and larger quants can be slower.
 
-The CLI chat is only a terminal workflow. The project still does not ship a GUI; external tools should use the HTTP API.
+CLI chat is a first-class workflow. The HTTP API allows existing OpenAI API compatible applications to integrate with Werk1112 without additional adapters.
 
 ## OpenAI-Compatible API
 
@@ -614,6 +671,49 @@ data: [DONE]
 ```
 
 Text deltas are intentionally chunked. They are not one event per token.
+
+## End-User Releases
+
+Release artifacts should be produced with the target Cargo alias on the target platform. A complete GGUF release includes the Cargo-built `werk` binary plus the platform llama.cpp server companion that Werk discovers or bundles for that artifact. End users should not need Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc`; those are build-machine/source-install requirements only.
+
+Do not ship one artifact per backend unless a backend cannot be co-compiled. The current Windows/Linux release artifact is CUDA-first for the supported server/Candle paths. Legacy in-process llama.cpp FFI CUDA/Vulkan builds are debug/developer features, not the normal GGUF route.
+
+Each target artifact should include the supported backends for that build, and users can select one explicitly with `--backend`:
+
+| Platform | Cargo command | Included backend support | Auto default |
+| --- | --- | --- | --- |
+| Windows 10/11 x64 | `cargo build-windows` | CPU, CUDA via llama.cpp server, Candle CUDA | llama.cpp server CUDA for GGUF; vLLM/Candle for safetensors |
+| Linux x64 | `cargo build-linux` | CPU, CUDA via llama.cpp server, Candle CUDA | llama.cpp server CUDA for GGUF; vLLM/Candle for safetensors |
+| macOS Apple Silicon | `cargo build-macos-apple-silicon` | CPU, MLX-LM, VLM request support | MLX |
+
+Backend selection is per process. Managed runtime provisioning and generated artifacts are cached under `WERK_HOME` when needed.
+
+```bash
+werk --backend auto chat model-id
+werk --backend cuda chat model-id
+werk --backend rocm chat model-id
+werk --backend vulkan chat model-id
+werk --backend mlx chat model-id
+werk --backend metal chat model-id
+werk --backend cpu chat model-id
+werk --backend candle chat model-id
+werk --backend onnx chat model-id
+werk --backend vllm chat model-id
+```
+
+`auto` is format-aware: GGUF uses llama.cpp server CUDA, ROCm only when discoverable, Vulkan, CPU, then Candle legacy GPU/CPU fallback; safetensors uses vLLM for supported CUDA architectures, then Candle CUDA/CPU fallback; MLX-format models use MLX. Explicit `onnx`, `vllm`, and GPU requests do not fallback to CPU. `--backend rocm` is strict ROCm/HIP for compatible formats.
+
+MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. CUDA, Vulkan, and CPU GGUF hot paths are implemented through persistent llama.cpp server backends. `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
+
+VLM support means multimodal model/request support, not a separate backend. Today image inputs should be routed to an image-capable MLX/VLM backend. Candle is text-only, and llama.cpp VLM support is pending until mmproj/image argument handling is wired.
+
+CLI image inputs use repeatable `--image` flags:
+
+```bash
+werk --backend mlx chat vlm-model --image ./image.png
+```
+
+OpenAI-style API image inputs are accepted from `image_url` and `input_image` content parts. Text-only backends return a clear error when image inputs are provided.
 
 ## Next Work
 
