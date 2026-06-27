@@ -78,9 +78,10 @@ Current capabilities include:
 
 The project focuses on stability, predictable runtime behaviour and long-term compatibility rather than rapidly expanding feature scope.
 
-- Default local installs build the recommended runtime stack for the current Windows/Linux CUDA-first workflow.
-- CUDA, CUDNN, Metal, and MKL are opt-in Cargo features for source builds.
-- Release artifacts are one binary per target OS; the default Windows/Linux artifacts are CUDA-first because the current Rust llama.cpp binding cannot compile CUDA and Vulkan into the same binary.
+- Release artifacts are universal runtime-router binaries, one binary per supported OS/architecture.
+- Prebuilt artifacts can start without CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, or Cargo installed.
+- Backend acceleration is discovered at runtime from the host system and installed companion runtimes.
+- CUDA, CUDNN, Metal, MKL, Vulkan, Burn, and legacy llama.cpp are opt-in Cargo features for source/developer builds.
 - `/v1/models` returns installed model manifests in an OpenAI-style model list.
 - `/v1/chat/completions` accepts OpenAI-style chat requests.
 - Streaming uses `text/event-stream` with `chat.completion.chunk` payloads and a final `data: [DONE]`.
@@ -93,7 +94,7 @@ Current generation support is selected through the Werk1112 Runtime Planner. Wer
 
 ## Install
 
-End users should prefer the installer scripts and prebuilt release artifacts. The installers are binary-only: they install the Werk1112 CLI binary and do not require Rust or Cargo. They do not install models, CUDA, vLLM, MLX, Python, or companion runtimes. Companion runtimes are used only if already installed or provisioned later by Werk commands.
+End users should prefer the installer scripts and prebuilt release artifacts. The installers are binary-only: they install the Werk1112 CLI binary and do not require Rust or Cargo. They do not install models, CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, or other runtime dependencies. Companion runtimes are used only if already installed or provisioned later by Werk commands.
 
 ### Linux / macOS
 
@@ -198,13 +199,13 @@ Planner policy:
 
 ## Build
 
-Default local installs build the recommended runtime stack so users do not need to know which internal runtime powers each model format. For the current Windows/Linux workflow that means persistent llama.cpp server discovery/provisioning for GGUF and Candle CUDA for compatibility. Burn and the old in-process llama.cpp FFI CUDA path are explicit developer features until they can be shipped without surprising system-link requirements. Release builds use one target-specific Cargo alias per deployed end-user artifact. Each artifact includes the supported backends for that platform, and users choose the active backend at runtime with `--backend`.
+Release builds use one target-specific Cargo alias per deployed end-user artifact. Those aliases build with `--no-default-features` and the target `release-*` feature bundle, producing universal runtime-router binaries. Prebuilt artifacts can start without CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, or Cargo installed. Backend-specific acceleration is discovered at runtime from the host system and installed companion runtimes, and users can choose the active backend with `--backend`.
 
 ```bash
-cargo install --path . --locked --force
+cargo install --path . --locked --force --no-default-features
 ```
 
-Use `--locked` for source installs. Without it, Cargo may resolve newer CUDA-related crates than the checked-in lockfile and require a different binding surface than the one this repo was verified with.
+Use `--locked` for source installs. Without it, Cargo may resolve newer crates than the checked-in lockfile and require a different binding surface than the one this repo was verified with.
 
 If a linker error still mentions a feature that is no longer enabled, such as `-lnccl` or `llama_cpp_sys`, clear the release build artifacts, not the global Cargo registry:
 
@@ -227,10 +228,10 @@ cargo build-linux
 cargo build-macos-apple-silicon
 ```
 
-Run target release aliases on the matching build OS when GPU acceleration is involved. In practice:
+Run target release aliases on the matching build OS/toolchain when cross-compilation is unavailable. In practice:
 
-- Run `cargo build-windows` from native Windows PowerShell with the MSVC Rust toolchain and Windows CUDA installed.
-- Run `cargo build-linux` from Linux or WSL with Linux CUDA installed.
+- Run `cargo build-windows` from native Windows PowerShell with the MSVC Rust toolchain.
+- Run `cargo build-linux` from Linux or WSL.
 - Run `cargo build-macos-apple-silicon` on Apple Silicon macOS.
 
 Do not use WSL to produce the Windows artifact. WSL can build the Linux artifact.
@@ -245,15 +246,15 @@ cargo build-macos-apple-silicon  -> no default features + aarch64-apple-darwin +
 
 Cargo aliases are subcommands, so the command is `cargo build-windows`, not `cargo build windows`.
 
-If a target build fails with `E0463` / `can't find crate for core` or many dependencies fail immediately, the Rust standard library for that target is not installed in the active toolchain. For CPU-only cross-checks you can install it with `rustup target add <target-triple>`, but CUDA/Metal release artifacts should still be built natively on their target OS.
+If a target build fails with `E0463` / `can't find crate for core` or many dependencies fail immediately, the Rust standard library for that target is not installed in the active toolchain. The checked-in `rust-toolchain.toml` lists the supported release targets, but native target OS builds may still be required when cross-compilation tooling is unavailable.
 
-Release backend bundles:
+Release feature bundles:
 
-| Bundle | Compiled backend support | Companion backend support |
+| Bundle | Release binary model | Runtime-discovered acceleration |
 | --- | --- | --- |
-| `release-windows` | CPU, CUDA | GGUF via persistent llama.cpp server; VLM through a capable backend integration |
-| `release-linux` | CPU, CUDA | GGUF via persistent llama.cpp server; VLM through a capable backend integration |
-| `release-macos-apple-silicon` | CPU | MLX via `mlx-lm`; VLM through a capable external backend |
+| `release-windows` | Universal router, no backend-specific Cargo features | CUDA, ROCm, vLLM, ONNX Runtime, and llama.cpp server when available on the host |
+| `release-linux` | Universal router, no backend-specific Cargo features | CUDA, ROCm, vLLM, ONNX Runtime, and llama.cpp server when available on the host |
+| `release-macos-apple-silicon` | Universal router, no backend-specific Cargo features | MLX, ONNX Runtime, and llama.cpp server when available on the host |
 
 Raw Cargo equivalents:
 
@@ -263,7 +264,7 @@ cargo build --release --locked --no-default-features --target x86_64-unknown-lin
 cargo build --release --locked --no-default-features --target aarch64-apple-darwin --features release-macos-apple-silicon
 ```
 
-Windows and Linux release builds compile llama.cpp CUDA, so they require a working NVIDIA driver, CUDA toolkit, C/C++ toolchain, and libclang on the build machine. If `cargo build-windows` fails with ``nvcc --version` failed` / `program not found`, the CUDA toolkit is not on `PATH` in that PowerShell session. On Windows with CUDA 13.x, CCCL can fail with `MSVC/cl.exe with traditional preprocessor is used`; the native Windows setup below passes `/Zc:preprocessor` to MSVC through the `CL` environment variable. Point the build at the intended installed toolkit:
+Universal release builds do not compile CUDA, ROCm, Metal, or other backend-specific Cargo features, so they do not require NVIDIA drivers, CUDA toolkits, `nvcc`, Python, or companion runtimes just to start. Those requirements apply only to explicit custom source builds. For a CUDA-enabled source build, point Cargo at the intended installed toolkit:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-13.0
@@ -274,20 +275,14 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
 nvcc --version
-cargo build-linux
+cargo install --path . --locked --force --features cuda
 ```
 
 If the CUDA build then fails because NVML cannot query the GPU, set the compute capability manually. For example, an RTX 30xx/Ampere `sm_86` GPU uses:
 
 ```bash
 export CUDA_COMPUTE_CAP=86
-cargo build-linux
-```
-
-For a local install, use the same rule. `--locked` keeps the checked-in dependency graph, and `--force` replaces an existing `werk` install. The default install builds the recommended stack:
-
-```bash
-cargo install --path . --locked --force
+cargo install --path . --locked --force --features cuda
 ```
 
 For a CUDA-enabled local install with an explicit feature selection, make sure the newer CUDA toolkit is first:
@@ -318,7 +313,7 @@ To override that default, set `CC_x86_64_unknown_linux_gnu` or `CXX_x86_64_unkno
 
 If the build fails in `candle-kernels` with `fatal error: cuda_fp8.h: No such file or directory`, the active CUDA toolkit is too old for Candle CUDA. Install a newer CUDA toolkit and make sure its `bin` and `include` directories come before Ubuntu's `/usr` CUDA package. For a CPU-only development build, use `cargo install --path . --locked --force --no-default-features`.
 
-Native Windows CUDA / Developer PowerShell:
+Native Windows CUDA source build / Developer PowerShell:
 
 1. Install Rust for Windows with `rustup`.
 2. Install Visual Studio Build Tools with the `Desktop development with C++` workload.
@@ -326,7 +321,7 @@ Native Windows CUDA / Developer PowerShell:
 4. Open native Windows Developer PowerShell, not a WSL shell.
 5. Build from a Windows filesystem path such as `C:\dev\werk1112`, not from `\\wsl$\...`.
 
-If `rustup default stable-x86_64-pc-windows-msvc` says the toolchain may not be able to run on this system, the command is being run from WSL/Linux. Close that shell and run the Windows release build from PowerShell on Windows.
+If `rustup default stable-x86_64-pc-windows-msvc` says the toolchain may not be able to run on this system, the command is being run from WSL/Linux. Close that shell and run the Windows source build from PowerShell on Windows.
 
 If PowerShell says `rustup` was not recognized, Rust is not installed for Windows or `%USERPROFILE%\.cargo\bin` is not on `PATH`. Install Rust on Windows, reopen PowerShell, and verify `rustup --version`.
 
@@ -338,7 +333,7 @@ git clone <repo-url> werk1112
 cd C:\dev\werk1112
 ```
 
-Build the native Windows CUDA binary:
+Build a native Windows CUDA source binary:
 
 ```powershell
 cd C:\dev\werk1112
@@ -385,7 +380,7 @@ $env:NVCC_CCBIN = Split-Path $clPath
 cl
 where.exe nvcc
 nvcc --version
-cargo build-windows
+cargo build --release --locked --features cuda
 ```
 
 The release binary is written to Cargo's target directory:
@@ -477,7 +472,7 @@ releases/werk1112-v<VERSION>-windows-x86_64.zip
 releases/werk1112-v<VERSION>-macos-aarch64.tar.gz
 ```
 
-Each artifact has a `.sha256` checksum file. GPU-enabled artifacts should be built on the matching target OS when required.
+Each artifact has a `.sha256` checksum file. Release artifacts are universal runtime-router binaries, one per supported OS/architecture. Build them on the matching target OS/toolchain when cross-compilation is unavailable.
 
 ## Model Store
 
@@ -731,19 +726,19 @@ Text deltas are intentionally chunked. They are not one event per token.
 
 ## End-User Releases
 
-Release artifacts should be produced with the target Cargo alias on the target platform. A complete GGUF release includes the Cargo-built `werk` binary plus the platform llama.cpp server companion that Werk discovers or bundles for that artifact. End users should not need Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc`; those are build-machine/source-install requirements only.
+Release artifacts should be produced with the target Cargo alias on the target platform. Each release contains the Cargo-built `werk` binary and documentation, not backend-specific companion runtime packages. End users should not need CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc` for the binary to start.
 
-Do not ship one artifact per backend unless a backend cannot be co-compiled. The current Windows/Linux release artifact is CUDA-first for the supported server/Candle paths. Legacy in-process llama.cpp FFI CUDA/Vulkan builds are debug/developer features, not the normal GGUF route.
+Do not ship one artifact per backend. Release artifacts are universal runtime-router binaries; backend-specific acceleration is discovered from the host system and installed companion runtimes. Legacy in-process llama.cpp FFI CUDA/Vulkan builds are debug/developer features, not the normal release route.
 
-Each target artifact should include the supported backends for that build, and users can select one explicitly with `--backend`:
+Each target artifact keeps the same artifact name regardless of available host acceleration:
 
-| Platform | Cargo command | Included backend support | Auto default |
-| --- | --- | --- | --- |
-| Windows 10/11 x64 | `cargo build-windows` | CPU, CUDA via llama.cpp server, Candle CUDA | llama.cpp server CUDA for GGUF; vLLM/Candle for safetensors |
-| Linux x64 | `cargo build-linux` | CPU, CUDA via llama.cpp server, Candle CUDA | llama.cpp server CUDA for GGUF; vLLM/Candle for safetensors |
-| macOS Apple Silicon | `cargo build-macos-apple-silicon` | CPU, MLX-LM, VLM request support | MLX |
+| Platform | Cargo command | Artifact |
+| --- | --- | --- |
+| Windows 10/11 x64 | `cargo build-windows` | `werk1112-v<VERSION>-windows-x86_64.zip` |
+| Linux x64 | `cargo build-linux` | `werk1112-v<VERSION>-linux-x86_64.tar.gz` |
+| macOS Apple Silicon | `cargo build-macos-apple-silicon` | `werk1112-v<VERSION>-macos-aarch64.tar.gz` |
 
-Backend selection is per process. Managed runtime provisioning and generated artifacts are cached under `WERK_HOME` when needed.
+Backend selection is per process. If CUDA, ROCm, MLX, vLLM, ONNX Runtime, or llama.cpp server support is available on the host, Werk may use it. If not, Werk continues to run and follows the runtime planner fallback policy. Managed runtime provisioning and generated artifacts are cached under `WERK_HOME` when users explicitly invoke those Werk workflows.
 
 ```bash
 werk --backend auto chat model-id
@@ -758,7 +753,7 @@ werk --backend onnx chat model-id
 werk --backend vllm chat model-id
 ```
 
-`auto` is format-aware: GGUF uses llama.cpp server CUDA, ROCm only when discoverable, Vulkan, CPU, then Candle legacy GPU/CPU fallback; safetensors uses vLLM for supported CUDA architectures, then Candle CUDA/CPU fallback; MLX-format models use MLX. Explicit `onnx`, `vllm`, and GPU requests do not fallback to CPU. `--backend rocm` is strict ROCm/HIP for compatible formats.
+`auto` is format-aware: GGUF uses llama.cpp server acceleration when discoverable, then CPU and legacy fallbacks according to the planner; safetensors can use vLLM or Candle according to host capabilities and compiled source-build features; MLX-format models use MLX when available. Explicit `onnx`, `vllm`, and GPU requests do not fallback to CPU. `--backend rocm` is strict ROCm/HIP for compatible formats.
 
 MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. CUDA, Vulkan, and CPU GGUF hot paths are implemented through persistent llama.cpp server backends. `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
 

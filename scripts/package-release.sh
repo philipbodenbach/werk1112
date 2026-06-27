@@ -16,7 +16,7 @@ usage() {
 Usage: ./scripts/package-release.sh <linux|windows|macos|all>
 
 Builds release artifacts into releases/.
-GPU-enabled release artifacts should be built on the matching target OS when required.
+Artifacts are universal runtime-router binaries, one per supported OS/architecture.
 USAGE
 }
 
@@ -84,11 +84,12 @@ package_target() {
     artifact="$REPO_ROOT/releases/$artifact_name"
 
     printf '\n==> Building %s release artifact\n' "$platform"
-    printf '    Note: GPU-enabled release artifacts should be built on the matching target OS when required.\n'
+    printf '    Note: release artifacts are universal runtime-router binaries.\n'
+    printf '    Build on the matching target OS/toolchain when cross-compilation is unavailable.\n'
     printf '    Running: cargo %s\n' "$cargo_alias"
 
     if ! cargo "$cargo_alias"; then
-        die "cargo $cargo_alias failed for $platform. Build this artifact on the matching target OS/toolchain when GPU support is required."
+        die "cargo $cargo_alias failed for $platform. Build this artifact on the matching target OS/toolchain if cross-compilation is unavailable."
     fi
 
     [ -f "$binary_path" ] || die "expected build output not found: $binary_path"

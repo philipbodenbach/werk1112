@@ -78,10 +78,10 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 vulkan = ["llama-legacy-vulkan"]
 
-# Release backend bundles. CPU is always available. External backends such as
-# MLX are discovered by the binary and do not require Cargo features in this crate.
-release-windows = ["cuda"]
-release-linux = ["cuda"]
+# Release artifacts are universal runtime-router binaries. Backend-specific
+# acceleration is discovered from the host system or installed companion runtimes.
+release-windows = []
+release-linux = []
 release-macos-apple-silicon = []
 
 [profile.release]
