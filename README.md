@@ -91,15 +91,51 @@ The project focuses on stability, predictable runtime behaviour and long-term co
 
 Current generation support is selected through the Werk1112 Runtime Planner. Werk1112 is an inference router, not a Candle wrapper: GGUF uses a persistent llama.cpp `llama-server` process as the hot path, so decode, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. Supported HF safetensors directories prefer vLLM on CUDA, may use vLLM ROCm through `--backend rocm`, and use Candle as the compatibility fallback. MLX model directories can run through an external `mlx-lm` backend.
 
-## Quick Start
+## Install
 
-Install the CLI from this checkout with the recommended runtime stack:
+End users should prefer the installer scripts and prebuilt release artifacts. The installers are binary-only: they install the Werk1112 CLI binary and do not require Rust or Cargo. They do not install models, CUDA, vLLM, MLX, Python, or companion runtimes. Companion runtimes are used only if already installed or provisioned later by Werk commands.
+
+### Linux / macOS
 
 ```bash
-cargo install --path . --locked --force
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.sh)"
 ```
 
-Import or pull a model:
+Install a specific version:
+
+```bash
+WERK_VERSION=1.0.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.sh)"
+```
+
+Custom install directory:
+
+```bash
+WERK_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.sh)"
+```
+
+### Windows PowerShell
+
+```powershell
+irm https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.ps1 | iex
+```
+
+Install a specific version:
+
+```powershell
+$env:WERK_VERSION="1.0.0"; irm https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.ps1 | iex
+```
+
+Add the install directory to the user PATH:
+
+```powershell
+$env:WERK_ADD_TO_PATH="1"; irm https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.ps1 | iex
+```
+
+Source builds remain available for developers in the Build section.
+
+## Quick Start
+
+After installing `werk`, import or pull a model. The installer does not download models.
 
 ```bash
 werk import /path/to/model-dir --name local-model
@@ -422,6 +458,27 @@ werk --backend cuda serve --model gemma-2b-it
 
 For GGUF models, `--backend cuda`, `--backend rocm`, `--backend vulkan`, and `--backend cpu` use the matching persistent llama.cpp server backend when that server is available. For safetensors models, CUDA tries vLLM CUDA for supported architectures and then Candle CUDA; ROCm tries only vLLM ROCm and verifies the discovered vLLM environment is ROCm/HIP-capable. CPU uses Candle CPU. `--backend onnx` is strict ONNX Runtime only: it never falls back to Candle and fails with actionable diagnostics if no runner is installed. `--backend vllm` remains a strict vLLM-only route with the existing default vLLM accelerator behavior and fails clearly if vLLM is missing, broken, or cannot load the model. Explicit GPU backend requests do not silently fall back to CPU; they fail with an actionable error if the requested runtime is unavailable. `--backend candle` is available for debugging or fallback verification. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
 
+## Packaging Release Artifacts
+
+Release artifacts are written to `releases/`.
+
+```bash
+./scripts/package-release.sh linux
+./scripts/package-release.sh windows
+./scripts/package-release.sh macos
+./scripts/package-release.sh all
+```
+
+Artifacts:
+
+```text
+releases/werk1112-v<VERSION>-linux-x86_64.tar.gz
+releases/werk1112-v<VERSION>-windows-x86_64.zip
+releases/werk1112-v<VERSION>-macos-aarch64.tar.gz
+```
+
+Each artifact has a `.sha256` checksum file. GPU-enabled artifacts should be built on the matching target OS when required.
+
 ## Model Store
 
 The model store is resolved in this order:
@@ -486,7 +543,7 @@ Start the server:
 werk serve
 ```
 
-`serve` starts the OpenAI API compatible API. It exposes all installed models through `/v1/models`; each API request normally chooses the model with its JSON `model` field.
+`serve` starts an OpenAI-compatible API. It exposes all installed models through `/v1/models`; each API request normally chooses the model with its JSON `model` field.
 
 Set a default model for requests that omit `model`:
 
@@ -612,7 +669,7 @@ eval rate:            86.81 tokens/s
 
 `prompt eval` is prompt/prefill time. `eval` is assistant-token decode time. `total` also includes model load and tokenizer overhead for that turn. For TinyLlama GGUF on a CUDA build, use `Q4_K_M` as the default balance of speed and quality; `Q2_K` is smaller but noticeably worse, and larger quants can be slower.
 
-CLI chat is a first-class workflow. The HTTP API allows existing OpenAI API compatible applications to integrate with Werk1112 without additional adapters.
+CLI chat is a first-class workflow. The HTTP API allows existing applications compatible with the OpenAI API to integrate with Werk1112 without additional adapters.
 
 ## OpenAI-Compatible API
 

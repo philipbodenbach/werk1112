@@ -1,5 +1,7 @@
 /target
 /models
+/releases/*
+!/releases/.gitkeep
 
 .agents
 .codex
