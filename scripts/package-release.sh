@@ -85,7 +85,7 @@ package_target() {
 
     printf '\n==> Building %s release artifact\n' "$platform"
     printf '    Note: release artifacts are universal runtime-router binaries.\n'
-    printf '    Build on the matching target OS/toolchain when cross-compilation is unavailable.\n'
+    printf '    If cross-compilation is unavailable for your environment, build this artifact on the matching target OS.\n'
     printf '    Running: cargo %s\n' "$cargo_alias"
 
     if ! cargo "$cargo_alias"; then

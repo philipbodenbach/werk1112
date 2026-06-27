@@ -78,10 +78,10 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 vulkan = ["llama-legacy-vulkan"]
 
-# Release artifacts are universal runtime-router binaries. Backend-specific
-# acceleration is discovered from the host system or installed companion runtimes.
-release-windows = []
+# Release bundles intentionally remain backend-neutral.
+# Backend acceleration is opt-in for source/developer builds.
 release-linux = []
+release-windows = []
 release-macos-apple-silicon = []
 
 [profile.release]

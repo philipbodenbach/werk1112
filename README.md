@@ -32,7 +32,7 @@ Werk1112 is infrastructure for running local models with predictable routing:
 - an HTTP API compatible with the OpenAI API for existing tools and integrations
 - a stable runtime abstraction for local AI applications
 
-Werk1112 does not ship a built-in GUI. CLI chat is a first-class workflow, and Graphical interfaces can be provided by any client compatible with the OpenAI API.
+Werk1112 does not ship a built-in GUI. CLI chat is a first-class workflow, and graphical interfaces can be provided by any client compatible with the OpenAI API.
 
 ## What Werk1112 Is Not
 
