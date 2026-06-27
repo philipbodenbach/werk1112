@@ -134,6 +134,22 @@ $env:WERK_ADD_TO_PATH="1"; irm https://raw.githubusercontent.com/phildenbo/werk1
 
 Source builds remain available for developers in the Build section.
 
+## Uninstall
+
+The uninstaller removes the Werk1112 CLI and can optionally remove the model store. It does not remove model data automatically without confirmation.
+
+### Linux / macOS
+
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/master/scripts/uninstall.sh)"
+```
+
+### Windows PowerShell
+
+```powershell
+irm https://raw.githubusercontent.com/phildenbo/werk1112/master/scripts/uninstall.ps1 | iex
+```
+
 ## Quick Start
 
 After installing `werk`, import or pull a model. The installer does not download models.
