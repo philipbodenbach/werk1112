@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 #[cfg(feature = "llama-cpp")]
 use std::{
     collections::HashMap,
@@ -8,7 +10,7 @@ use std::{
     env, fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Output, Stdio},
     thread,
     time::Instant,
 };
@@ -630,7 +632,7 @@ impl MlxBackend {
             bail!("mlx backend supports MLX or Hugging Face-style safetensors model directories");
         }
         let model_dir = resolve_mlx_model_dir(&self.store, manifest)?;
-        let use_gemma4_unified_compat = is_gemma4_unified_compat_dir(&model_dir);
+        let chat_template_config = mlx_chat_template_config(manifest, &model_dir)?;
 
         let mut command = self.mlx_generate_command();
         command
@@ -640,10 +642,8 @@ impl MlxBackend {
             .arg(&request.prompt)
             .arg("--max-tokens")
             .arg(request.max_tokens.to_string());
-        if use_gemma4_unified_compat {
-            command
-                .arg("--chat-template-config")
-                .arg(r#"{"enable_thinking":false}"#);
+        if let Some(config) = chat_template_config {
+            command.arg("--chat-template-config").arg(config);
         }
         if let Some(temperature) = request.temperature {
             command.arg("--temp").arg(format_float(temperature));
@@ -803,6 +803,46 @@ fn is_gemma4_unified_compat_dir(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some(GEMMA4_UNIFIED_MLX_COMPAT_DIR)
 }
 
+fn mlx_chat_template_config(
+    manifest: &ModelManifest,
+    model_dir: &Path,
+) -> Result<Option<&'static str>> {
+    if is_gemma4_unified_compat_dir(model_dir) || is_qwen3_mlx_model(manifest, model_dir)? {
+        return Ok(Some(r#"{"enable_thinking":false}"#));
+    }
+    Ok(None)
+}
+
+fn is_qwen3_mlx_model(manifest: &ModelManifest, model_dir: &Path) -> Result<bool> {
+    if manifest_text_matches(manifest, "qwen3") {
+        return Ok(true);
+    }
+
+    let config_path = model_dir.join("config.json");
+    if !config_path.is_file() {
+        return Ok(false);
+    }
+    let config: Value =
+        serde_json::from_slice(&fs::read(&config_path).with_context(|| {
+            format!("failed to read MLX model config {}", config_path.display())
+        })?)?;
+    Ok(config
+        .get("model_type")
+        .and_then(Value::as_str)
+        .map(|value| value.to_ascii_lowercase().contains("qwen3"))
+        .unwrap_or(false))
+}
+
+fn manifest_text_matches(manifest: &ModelManifest, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    manifest.id.to_ascii_lowercase().contains(&needle)
+        || manifest
+            .architecture
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase().contains(&needle))
+            .unwrap_or(false)
+}
+
 fn ensure_gemma4_unified_compat_dir(
     store: &ModelStore,
     manifest: &ModelManifest,
@@ -956,7 +996,7 @@ impl GenerationBackend for MlxBackend {
         if !output.status.success() {
             bail!(
                 "mlx generation failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                mlx_output_failure_detail(&output)
             );
         }
         let raw_text = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1018,7 +1058,7 @@ impl GenerationBackend for MlxVlmBackend {
         if !output.status.success() {
             bail!(
                 "mlx-vlm generation failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                mlx_output_failure_detail(&output)
             );
         }
         let raw_text = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1108,7 +1148,10 @@ impl MlxBackend {
             .join()
             .unwrap_or_else(|_| "failed to read mlx stderr".to_string());
         if !status.success() {
-            bail!("mlx generation failed: {}", stderr.trim());
+            bail!(
+                "mlx generation failed: {}",
+                mlx_failure_detail(status, &String::from_utf8_lossy(&raw), &stderr)
+            );
         }
 
         let raw_text = String::from_utf8_lossy(&raw);
@@ -1201,7 +1244,10 @@ impl MlxVlmBackend {
             .join()
             .unwrap_or_else(|_| "failed to read mlx-vlm stderr".to_string());
         if !status.success() {
-            bail!("mlx-vlm generation failed: {}", stderr.trim());
+            bail!(
+                "mlx-vlm generation failed: {}",
+                mlx_failure_detail(status, &String::from_utf8_lossy(&raw), &stderr)
+            );
         }
 
         let raw_text = String::from_utf8_lossy(&raw);
@@ -1458,6 +1504,78 @@ fn parse_mlx_stat_line(line: &str, prefix: &str) -> Option<(usize, Option<f64>)>
         .next()
         .and_then(|value| value.parse().ok());
     Some((tokens, rate))
+}
+
+fn mlx_output_failure_detail(output: &Output) -> String {
+    mlx_failure_detail(
+        output.status,
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+fn mlx_failure_detail(status: ExitStatus, stdout: &str, stderr: &str) -> String {
+    let stderr = trim_output_tail(stderr);
+    let stdout = trim_output_tail(stdout);
+    let mut parts = vec![format!("process exited with {}", mlx_status_detail(status))];
+
+    if !stderr.is_empty() {
+        parts.push(format!("stderr: {stderr}"));
+    }
+    if !stdout.is_empty() {
+        parts.push(format!("stdout: {stdout}"));
+    }
+    if stderr.is_empty() && stdout.is_empty() {
+        parts.push("no stdout or stderr was captured".to_string());
+    }
+    if likely_mlx_memory_failure(status, &stdout, &stderr) {
+        parts.push(
+            "possible macOS memory pressure/OOM: try a smaller or quantized MLX model, close other memory-heavy apps, or reduce --max-tokens"
+                .to_string(),
+        );
+    }
+
+    parts.join("; ")
+}
+
+fn mlx_status_detail(status: ExitStatus) -> String {
+    #[cfg(unix)]
+    if let Some(signal) = status.signal() {
+        return format!("{status} (signal {signal})");
+    }
+    status.to_string()
+}
+
+fn likely_mlx_memory_failure(status: ExitStatus, stdout: &str, stderr: &str) -> bool {
+    #[cfg(unix)]
+    if matches!(status.signal(), Some(9)) {
+        return true;
+    }
+    if matches!(status.code(), Some(137)) {
+        return true;
+    }
+
+    let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    text.contains("out of memory")
+        || text.contains("oom")
+        || text.contains("memory pressure")
+        || text.contains("cannot allocate memory")
+        || text.contains("std::bad_alloc")
+        || text.contains("killed")
+}
+
+fn trim_output_tail(text: &str) -> String {
+    const MAX_CHARS: usize = 4000;
+    let text = text.trim();
+    let char_count = text.chars().count();
+    if char_count <= MAX_CHARS {
+        return text.to_string();
+    }
+    let tail = text
+        .chars()
+        .skip(char_count.saturating_sub(MAX_CHARS))
+        .collect::<String>();
+    format!("...{tail}")
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -1926,6 +2044,51 @@ mod tests {
     }
 
     #[test]
+    fn qwen3_mlx_command_disables_template_thinking() {
+        let store = test_store("qwen3-command");
+        let manifest = test_manifest("Qwen/Qwen3-4B", "qwen3");
+        let model_dir = store.model_dir(&manifest.id).join("files");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
+
+        let backend = MlxBackend {
+            store,
+            python: PathBuf::from("python3"),
+            module: "mlx_lm.generate".to_string(),
+        };
+        let command = backend
+            .command_for(&manifest, &test_request("write a story"))
+            .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let config_index = args
+            .iter()
+            .position(|arg| arg == "--chat-template-config")
+            .expect("Qwen3 MLX command should set chat template config");
+
+        assert_eq!(
+            args.get(config_index + 1).map(String::as_str),
+            Some(r#"{"enable_thinking":false}"#)
+        );
+    }
+
+    #[test]
+    fn qwen3_mlx_detection_can_use_config_model_type() {
+        let store = test_store("qwen3-config-detect");
+        let manifest = test_manifest("local-model", "unknown");
+        let model_dir = store.model_dir(&manifest.id).join("files");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
+
+        assert_eq!(
+            mlx_chat_template_config(&manifest, &model_dir).unwrap(),
+            Some(r#"{"enable_thinking":false}"#)
+        );
+    }
+
+    #[test]
     fn mlx_vlm_command_uses_original_model_dir_and_single_image_list() {
         let store = test_store("mlx-vlm-command");
         let manifest = test_manifest("Gemma4-12B-JANG", "gemma4_unified");
@@ -2119,6 +2282,24 @@ mod tests {
     }
 
     #[test]
+    fn mlx_failure_detail_reports_empty_backend_output() {
+        let detail = mlx_failure_detail(test_exit_status(42), "", "");
+
+        assert!(detail.contains("process exited"));
+        assert!(detail.contains("no stdout or stderr was captured"));
+        assert!(!detail.contains("possible macOS memory pressure"));
+    }
+
+    #[test]
+    fn mlx_failure_detail_adds_memory_hint_for_oom_text() {
+        let detail = mlx_failure_detail(test_exit_status(42), "", "RuntimeError: out of memory");
+
+        assert!(detail.contains("stderr: RuntimeError: out of memory"));
+        assert!(detail.contains("possible macOS memory pressure"));
+        assert!(detail.contains("quantized MLX model"));
+    }
+
+    #[test]
     fn mlx_finish_reason_uses_generation_token_count() {
         let mut stopped = "Answer".to_string();
         let stop_output = "Answer\nGeneration: 12 tokens, 10.000 tokens-per-sec";
@@ -2181,6 +2362,20 @@ mod tests {
             stream_granularity: StreamGranularity::Token,
             verbose: false,
             debug: false,
+        }
+    }
+
+    fn test_exit_status(code: i32) -> ExitStatus {
+        if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", &format!("exit {code}")])
+                .status()
+                .unwrap()
+        } else {
+            Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .status()
+                .unwrap()
         }
     }
 }

@@ -146,15 +146,72 @@ pub fn messages_to_prompt(messages: &[ChatMessage]) -> String {
 pub struct PromptSpec {
     pub prompt: String,
     pub stop: Vec<String>,
-    pub chat_template: &'static str,
-    pub chat_template_applied: bool,
+    pub chat_template: ChatTemplateConfig,
     pub assistant_end_token: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplateSource {
+    Model,
+    Werk,
+    None,
+}
+
+impl ChatTemplateSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Werk => "werk",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTemplateConfig {
+    pub source: ChatTemplateSource,
+    pub name: String,
+    pub applied_by_werk: bool,
+    pub override_from_cli: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChatTemplateOptions<'a> {
+    pub default_source: ChatTemplateSource,
+    pub model_template_preferred: bool,
+    pub override_name: Option<&'a str>,
+}
+
+impl Default for ChatTemplateOptions<'_> {
+    fn default() -> Self {
+        Self {
+            default_source: ChatTemplateSource::Werk,
+            model_template_preferred: false,
+            override_name: None,
+        }
+    }
 }
 
 pub fn messages_to_prompt_for_model(
     manifest: &ModelManifest,
     messages: &[ChatMessage],
 ) -> PromptSpec {
+    messages_to_prompt_for_model_with_template(manifest, messages, ChatTemplateOptions::default())
+}
+
+pub fn messages_to_prompt_for_model_with_template(
+    manifest: &ModelManifest,
+    messages: &[ChatMessage],
+    options: ChatTemplateOptions<'_>,
+) -> PromptSpec {
+    if let Some(template) = options.override_name {
+        return messages_to_prompt_with_template_override(messages, template);
+    }
+
+    if options.model_template_preferred && options.default_source == ChatTemplateSource::Model {
+        return model_template_prompt(messages, None);
+    }
+
     if uses_qwen_chat_template(manifest) {
         return PromptSpec {
             prompt: messages_to_qwen_chatml_prompt(
@@ -162,8 +219,7 @@ pub fn messages_to_prompt_for_model(
                 uses_qwen3_non_thinking_prompt(manifest),
             ),
             stop: qwen_stop_strings(),
-            chat_template: "qwen-chatml",
-            chat_template_applied: true,
+            chat_template: werk_template_config("qwen-chatml", None),
             assistant_end_token: Some("<|im_end|>"),
         };
     }
@@ -172,9 +228,26 @@ pub fn messages_to_prompt_for_model(
         return PromptSpec {
             prompt: messages_to_phi3_prompt(messages),
             stop: phi3_stop_strings(),
-            chat_template: "phi3",
-            chat_template_applied: true,
+            chat_template: werk_template_config("phi3", None),
             assistant_end_token: Some("<|end|>"),
+        };
+    }
+
+    if uses_llama3_chat_template(manifest) {
+        return PromptSpec {
+            prompt: messages_to_llama3_prompt(messages),
+            stop: llama3_stop_strings(),
+            chat_template: werk_template_config("llama3", None),
+            assistant_end_token: Some("<|eot_id|>"),
+        };
+    }
+
+    if uses_gemma_chat_template(manifest) {
+        return PromptSpec {
+            prompt: messages_to_gemma_prompt(messages),
+            stop: gemma_stop_strings(),
+            chat_template: werk_template_config("gemma", None),
+            assistant_end_token: Some("<end_of_turn>"),
         };
     }
 
@@ -186,19 +259,136 @@ pub fn messages_to_prompt_for_model(
                 "<|system|>".to_string(),
                 "</s>".to_string(),
             ],
-            chat_template: "chatml",
-            chat_template_applied: true,
+            chat_template: werk_template_config("chatml", None),
             assistant_end_token: Some("</s>"),
         };
     }
 
+    if options.default_source == ChatTemplateSource::Model {
+        return model_template_prompt(messages, None);
+    }
+
+    if options.default_source == ChatTemplateSource::None {
+        return no_template_prompt(messages, None);
+    }
+
+    generic_template_prompt(messages, None)
+}
+
+fn messages_to_prompt_with_template_override(
+    messages: &[ChatMessage],
+    template: &str,
+) -> PromptSpec {
+    let normalized = normalize_template_name(template);
+    match normalized.as_str() {
+        "model" => model_template_prompt(messages, Some(template)),
+        "none" => no_template_prompt(messages, Some(template)),
+        "generic" => generic_template_prompt(messages, Some(template)),
+        "phi3" | "phi-3" => PromptSpec {
+            prompt: messages_to_phi3_prompt(messages),
+            stop: phi3_stop_strings(),
+            chat_template: werk_template_config("phi3", Some(template)),
+            assistant_end_token: Some("<|end|>"),
+        },
+        "llama3" | "llama-3" => PromptSpec {
+            prompt: messages_to_llama3_prompt(messages),
+            stop: llama3_stop_strings(),
+            chat_template: werk_template_config("llama3", Some(template)),
+            assistant_end_token: Some("<|eot_id|>"),
+        },
+        "gemma" => PromptSpec {
+            prompt: messages_to_gemma_prompt(messages),
+            stop: gemma_stop_strings(),
+            chat_template: werk_template_config("gemma", Some(template)),
+            assistant_end_token: Some("<end_of_turn>"),
+        },
+        "chatml" => PromptSpec {
+            prompt: messages_to_chatml_prompt(messages),
+            stop: vec![
+                "<|user|>".to_string(),
+                "<|system|>".to_string(),
+                "</s>".to_string(),
+            ],
+            chat_template: werk_template_config("chatml", Some(template)),
+            assistant_end_token: Some("</s>"),
+        },
+        "qwen" | "qwen-chatml" => PromptSpec {
+            prompt: messages_to_qwen_chatml_prompt(messages, false),
+            stop: qwen_stop_strings(),
+            chat_template: werk_template_config("qwen-chatml", Some(template)),
+            assistant_end_token: Some("<|im_end|>"),
+        },
+        _ => generic_template_prompt(messages, Some(template)),
+    }
+}
+
+fn normalize_template_name(template: &str) -> String {
+    template.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn werk_template_config(name: &str, override_from_cli: Option<&str>) -> ChatTemplateConfig {
+    ChatTemplateConfig {
+        source: ChatTemplateSource::Werk,
+        name: name.to_string(),
+        applied_by_werk: true,
+        override_from_cli: override_from_cli.map(str::to_string),
+    }
+}
+
+fn model_template_prompt(messages: &[ChatMessage], override_from_cli: Option<&str>) -> PromptSpec {
+    PromptSpec {
+        prompt: messages_to_last_user_text(messages),
+        stop: Vec::new(),
+        chat_template: ChatTemplateConfig {
+            source: ChatTemplateSource::Model,
+            name: "model".to_string(),
+            applied_by_werk: false,
+            override_from_cli: override_from_cli.map(str::to_string),
+        },
+        assistant_end_token: None,
+    }
+}
+
+fn no_template_prompt(messages: &[ChatMessage], override_from_cli: Option<&str>) -> PromptSpec {
+    PromptSpec {
+        prompt: messages_to_last_user_text(messages),
+        stop: Vec::new(),
+        chat_template: ChatTemplateConfig {
+            source: ChatTemplateSource::None,
+            name: "none".to_string(),
+            applied_by_werk: false,
+            override_from_cli: override_from_cli.map(str::to_string),
+        },
+        assistant_end_token: None,
+    }
+}
+
+fn generic_template_prompt(
+    messages: &[ChatMessage],
+    override_from_cli: Option<&str>,
+) -> PromptSpec {
     PromptSpec {
         prompt: messages_to_prompt(messages),
         stop: vec!["\nuser:".to_string()],
-        chat_template: "generic",
-        chat_template_applied: false,
+        chat_template: werk_template_config("generic", override_from_cli),
         assistant_end_token: None,
     }
+}
+
+fn messages_to_last_user_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role.trim().eq_ignore_ascii_case("user"))
+        .or_else(|| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.content.is_some())
+        })
+        .and_then(|message| message.content.as_ref())
+        .map(MessageContent::as_text)
+        .unwrap_or_default()
 }
 
 pub fn image_urls_from_messages(messages: &[ChatMessage]) -> Vec<String> {
@@ -223,6 +413,14 @@ fn uses_tinyllama_chat_template(manifest: &ModelManifest) -> bool {
 
 fn uses_phi3_chat_template(manifest: &ModelManifest) -> bool {
     manifest_text_contains(manifest, "phi3") || manifest_text_contains(manifest, "phi-3")
+}
+
+fn uses_llama3_chat_template(manifest: &ModelManifest) -> bool {
+    manifest_text_contains(manifest, "llama-3") || manifest_text_contains(manifest, "llama3")
+}
+
+fn uses_gemma_chat_template(manifest: &ModelManifest) -> bool {
+    manifest_text_contains(manifest, "gemma")
 }
 
 fn manifest_text_contains(manifest: &ModelManifest, needle: &str) -> bool {
@@ -267,6 +465,23 @@ fn qwen_stop_strings() -> Vec<String> {
     ]
 }
 
+fn llama3_stop_strings() -> Vec<String> {
+    vec![
+        "<|eot_id|>".to_string(),
+        "<|end_of_text|>".to_string(),
+        "<|start_header_id|>user<|end_header_id|>".to_string(),
+        "<|start_header_id|>system<|end_header_id|>".to_string(),
+    ]
+}
+
+fn gemma_stop_strings() -> Vec<String> {
+    vec![
+        "<end_of_turn>".to_string(),
+        "<start_of_turn>user".to_string(),
+        "<start_of_turn>model".to_string(),
+    ]
+}
+
 fn messages_to_phi3_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for message in messages {
@@ -291,6 +506,59 @@ fn messages_to_phi3_prompt(messages: &[ChatMessage]) -> String {
         prompt.push_str("<|end|>\n");
     }
     prompt.push_str("<|assistant|>\n");
+    prompt
+}
+
+fn messages_to_llama3_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::from("<|begin_of_text|>");
+    for message in messages {
+        let content = message
+            .content
+            .as_ref()
+            .map(MessageContent::as_text)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            continue;
+        }
+
+        let role = match message.role.trim() {
+            "system" => "system",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        prompt.push_str("<|start_header_id|>");
+        prompt.push_str(role);
+        prompt.push_str("<|end_header_id|>\n\n");
+        prompt.push_str(content.trim());
+        prompt.push_str("<|eot_id|>");
+    }
+    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    prompt
+}
+
+fn messages_to_gemma_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let content = message
+            .content
+            .as_ref()
+            .map(MessageContent::as_text)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            continue;
+        }
+
+        let role = match message.role.trim() {
+            "assistant" => "model",
+            _ => "user",
+        };
+        prompt.push_str("<start_of_turn>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(content.trim());
+        prompt.push_str("<end_of_turn>\n");
+    }
+    prompt.push_str("<start_of_turn>model\n");
     prompt
 }
 
@@ -572,8 +840,9 @@ mod tests {
             ],
         );
 
-        assert!(prompt.chat_template_applied);
-        assert_eq!(prompt.chat_template, "phi3");
+        assert!(prompt.chat_template.applied_by_werk);
+        assert_eq!(prompt.chat_template.source, ChatTemplateSource::Werk);
+        assert_eq!(prompt.chat_template.name, "phi3");
         assert_eq!(prompt.assistant_end_token, Some("<|end|>"));
         assert!(
             prompt.prompt.contains(

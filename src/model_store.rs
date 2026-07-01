@@ -3,6 +3,8 @@ use candle_core::quantized::gguf_file;
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::VecDeque,
     env,
@@ -21,6 +23,11 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 #[derive(Debug, Clone)]
 pub struct ModelStore {
     home: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HuggingFaceAuthStatus {
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,6 +181,51 @@ impl ModelStore {
         Ok(())
     }
 
+    pub fn huggingface_auth_status(&self) -> Result<HuggingFaceAuthStatus> {
+        let source = huggingface_token_with_source(&self.huggingface_token_path())?
+            .map(|(_, source)| source);
+        Ok(HuggingFaceAuthStatus { source })
+    }
+
+    pub fn save_huggingface_token(&self, token: &str) -> Result<PathBuf> {
+        let token = token.trim();
+        if token.is_empty() {
+            bail!("Hugging Face token cannot be empty");
+        }
+
+        let path = self.huggingface_token_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create Hugging Face auth directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::write(&path, format!("{token}\n"))
+            .with_context(|| format!("failed to write Hugging Face token {}", path.display()))?;
+        restrict_file_permissions(&path)?;
+        Ok(path)
+    }
+
+    pub fn delete_huggingface_token(&self) -> Result<bool> {
+        let path = self.huggingface_token_path();
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove Hugging Face token {}", path.display()))?;
+        Ok(true)
+    }
+
+    pub fn huggingface_token_path(&self) -> PathBuf {
+        self.home.join("auth").join("huggingface.token")
+    }
+
+    fn huggingface_token(&self) -> Result<Option<String>> {
+        Ok(huggingface_token_with_source(&self.huggingface_token_path())?.map(|(token, _)| token))
+    }
+
     pub fn models_dir(&self) -> PathBuf {
         self.home.join("models")
     }
@@ -258,7 +310,8 @@ impl ModelStore {
         }
 
         let url = format!("https://huggingface.co/{repo}");
-        ensure_huggingface_repo_reachable(repo, &url)?;
+        let auth_token = self.huggingface_token()?;
+        ensure_huggingface_repo_reachable(repo, &url, auth_token.as_deref())?;
 
         let tmp = self
             .tmp_dir()
@@ -274,11 +327,14 @@ impl ModelStore {
 
         progress(PullProgress::Started { url: url.clone() });
 
+        let mut clone_command = Command::new("git");
+        clone_command
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .args(["clone", "--progress", "--depth", "1", &url])
+            .arg(&tmp);
+        configure_huggingface_git_auth(&mut clone_command, auth_token.as_deref());
         run_git_with_progress(
-            Command::new("git")
-                .env("GIT_LFS_SKIP_SMUDGE", "1")
-                .args(["clone", "--progress", "--depth", "1", &url])
-                .arg(&tmp),
+            &mut clone_command,
             &format!("git clone failed for {url}"),
             None,
             None,
@@ -311,6 +367,7 @@ impl ModelStore {
                 .arg("-C")
                 .arg(&tmp)
                 .args(["lfs", "install", "--local"]);
+            configure_huggingface_git_auth(&mut lfs_install_command, auth_token.as_deref());
             run_git_with_progress(
                 &mut lfs_install_command,
                 "git lfs install --local failed; install git-lfs and run `git lfs install`",
@@ -330,6 +387,7 @@ impl ModelStore {
                 .arg("-C")
                 .arg(&tmp)
                 .args(["lfs", "pull"]);
+            configure_huggingface_git_auth(&mut lfs_command, auth_token.as_deref());
             if let Some(include_file) = include_file.as_deref() {
                 lfs_command
                     .arg("--include")
@@ -361,6 +419,7 @@ impl ModelStore {
                 .arg("-C")
                 .arg(&tmp)
                 .args(["lfs", "checkout"]);
+            configure_huggingface_git_auth(&mut lfs_checkout_command, auth_token.as_deref());
             run_git_with_progress(
                 &mut lfs_checkout_command,
                 "git lfs checkout failed after pull",
@@ -697,11 +756,15 @@ fn validate_hf_repo(repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_huggingface_repo_reachable(repo: &str, url: &str) -> Result<()> {
+fn ensure_huggingface_repo_reachable(repo: &str, url: &str, token: Option<&str>) -> Result<()> {
+    let metadata = fetch_huggingface_model_metadata(repo, token);
+    if metadata.as_ref().map(|metadata| metadata.gated) == Some(true) && token.is_none() {
+        bail!("{}", hf_gated_repo_message(repo, url, false, ""));
+    }
+
     let mut command = Command::new("git");
-    command
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["ls-remote", "--exit-code", url, "HEAD"]);
+    configure_noninteractive_git(&mut command).args(["ls-remote", "--exit-code", url, "HEAD"]);
+    configure_huggingface_git_auth(&mut command, token);
     let output = run_command_with_timeout(&mut command, Duration::from_secs(20))
         .context("failed to execute git; install git and git-lfs for Hugging Face pulls")?;
 
@@ -717,9 +780,168 @@ fn ensure_huggingface_repo_reachable(repo: &str, url: &str) -> Result<()> {
         } else {
             output.stderr.trim()
         };
-        bail!("{}", hf_repo_unreachable_message(repo, url, detail));
+        bail!(
+            "{}",
+            hf_repo_unreachable_message(repo, url, detail, metadata.as_ref(), token.is_some())
+        );
     }
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HuggingFaceModelMetadata {
+    gated: bool,
+}
+
+fn fetch_huggingface_model_metadata(
+    repo: &str,
+    token: Option<&str>,
+) -> Option<HuggingFaceModelMetadata> {
+    let _ = token;
+    let api_url = format!("https://huggingface.co/api/models/{repo}");
+    let mut command = Command::new("curl");
+    command.args(["-fsSL", "--max-time", "8", "-A", "werk1112", &api_url]);
+    let output = run_command_with_timeout(&mut command, Duration::from_secs(10)).ok()?;
+    if output.timed_out
+        || !output
+            .status
+            .map(|status| status.success())
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(&output.stdout).ok()?;
+    Some(parse_huggingface_model_metadata(&value))
+}
+
+fn parse_huggingface_model_metadata(value: &Value) -> HuggingFaceModelMetadata {
+    HuggingFaceModelMetadata {
+        gated: value_is_gated(value.get("gated")),
+    }
+}
+
+fn value_is_gated(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(gated)) => *gated,
+        Some(Value::String(gated)) => !matches!(gated.as_str(), "" | "false" | "False" | "none"),
+        _ => false,
+    }
+}
+
+fn configure_noninteractive_git(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("GCM_INTERACTIVE", "never")
+}
+
+fn configure_huggingface_git_auth(command: &mut Command, token: Option<&str>) {
+    let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) else {
+        return;
+    };
+    let basic_auth = base64_encode(format!("hf_user:{token}").as_bytes());
+    command
+        .env("GIT_CONFIG_COUNT", "1")
+        .env(
+            "GIT_CONFIG_KEY_0",
+            "http.https://huggingface.co/.extraheader",
+        )
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            format!("Authorization: Basic {basic_auth}"),
+        );
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+
+        encoded.push(TABLE[(b0 >> 2) as usize] as char);
+        encoded.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
+}
+
+fn huggingface_token_with_source(store_token_path: &Path) -> Result<Option<(String, String)>> {
+    for name in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
+        if let Ok(token) = env::var(name)
+            && let Some(token) = normalize_huggingface_token(&token)
+        {
+            return Ok(Some((token, format!("environment variable {name}"))));
+        }
+    }
+
+    if let Some(token) = read_token_file(store_token_path)? {
+        return Ok(Some((
+            token,
+            format!("Werk token file {}", store_token_path.display()),
+        )));
+    }
+
+    if let Some(path) = huggingface_cli_token_path()
+        && let Some(token) = read_token_file(&path)?
+    {
+        return Ok(Some((
+            token,
+            format!("Hugging Face CLI token file {}", path.display()),
+        )));
+    }
+
+    Ok(None)
+}
+
+fn normalize_huggingface_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+fn read_token_file(path: &Path) -> Result<Option<String>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let token = fs::read_to_string(path)
+        .with_context(|| format!("failed to read Hugging Face token {}", path.display()))?;
+    Ok(normalize_huggingface_token(&token))
+}
+
+fn huggingface_cli_token_path() -> Option<PathBuf> {
+    if let Ok(hf_home) = env::var("HF_HOME")
+        && !hf_home.trim().is_empty()
+    {
+        return Some(PathBuf::from(hf_home).join("token"));
+    }
+    if let Ok(home) = env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        return Some(PathBuf::from(home).join(".cache/huggingface/token"));
+    }
+    None
+}
+
+fn restrict_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
+    }
+    let _ = path;
     Ok(())
 }
 
@@ -782,12 +1004,40 @@ fn read_child_output(child: &mut std::process::Child) -> Result<(String, String)
     Ok((stdout, stderr))
 }
 
-fn hf_repo_unreachable_message(repo: &str, url: &str, detail: &str) -> String {
+fn hf_repo_unreachable_message(
+    repo: &str,
+    url: &str,
+    detail: &str,
+    metadata: Option<&HuggingFaceModelMetadata>,
+    token_present: bool,
+) -> String {
+    if metadata.map(|metadata| metadata.gated) == Some(true) {
+        return hf_gated_repo_message(repo, url, token_present, detail);
+    }
+
     let mut message = format!(
         "Hugging Face repo not found or inaccessible: {repo} ({url}). Check the repo id and your access."
     );
+    message.push_str(
+        " If this is a gated model, Werk cannot accept the conditions for you through the Hugging Face API. Open the model page in your browser, accept the conditions, then run `werk auth huggingface login` or set HF_TOKEN.",
+    );
     if let Some(rest) = repo.strip_prefix("icrosoft/") {
         message.push_str(&format!(" Did you mean `microsoft/{rest}`?"));
+    }
+    if !detail.trim().is_empty() {
+        message.push_str(&format!(" git said: {}", detail.trim()));
+    }
+    message
+}
+
+fn hf_gated_repo_message(repo: &str, url: &str, token_present: bool, detail: &str) -> String {
+    let mut message = format!(
+        "Hugging Face gated model requires browser agreement: {repo} ({url}). Werk cannot accept model conditions for you through the Hugging Face API."
+    );
+    if token_present {
+        message.push_str(" Your token is configured, but access still failed; open the model page, accept the conditions with the same Hugging Face account, then retry.");
+    } else {
+        message.push_str(" Open the model page, accept the conditions, then run `werk auth huggingface login` or set HF_TOKEN and retry.");
     }
     if !detail.trim().is_empty() {
         message.push_str(&format!(" git said: {}", detail.trim()));
@@ -805,6 +1055,7 @@ fn run_git_with_progress<F>(
 where
     F: FnMut(GitCommandProgress),
 {
+    configure_noninteractive_git(command);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2300,6 +2551,8 @@ mod tests {
             "icrosoft/Phi-3-mini-4k-instruct-onnx",
             "https://huggingface.co/icrosoft/Phi-3-mini-4k-instruct-onnx",
             "Repository not found",
+            None,
+            false,
         );
 
         assert!(message.contains("not found or inaccessible"));
@@ -2313,10 +2566,130 @@ mod tests {
             "unknown/model",
             "https://huggingface.co/unknown/model",
             "",
+            None,
+            false,
         );
 
         assert!(message.contains("unknown/model"));
         assert!(!message.contains("Did you mean"));
+    }
+
+    #[test]
+    fn hf_repo_unreachable_message_mentions_gated_model_login() {
+        let message = hf_repo_unreachable_message(
+            "ai21labs/AI21-Jamba-Mini-1.7",
+            "https://huggingface.co/ai21labs/AI21-Jamba-Mini-1.7",
+            "could not read Username",
+            Some(&HuggingFaceModelMetadata { gated: true }),
+            false,
+        );
+
+        assert!(message.contains("gated model"));
+        assert!(message.contains("cannot accept model conditions"));
+        assert!(message.contains("werk auth huggingface login"));
+        assert!(message.contains("HF_TOKEN"));
+    }
+
+    #[test]
+    fn hf_repo_unreachable_message_mentions_token_account_for_gated_model() {
+        let message = hf_repo_unreachable_message(
+            "ai21labs/AI21-Jamba-Mini-1.7",
+            "https://huggingface.co/ai21labs/AI21-Jamba-Mini-1.7",
+            "Authentication failed",
+            Some(&HuggingFaceModelMetadata { gated: true }),
+            true,
+        );
+
+        assert!(message.contains("Your token is configured"));
+        assert!(message.contains("accept the conditions with the same Hugging Face account"));
+        assert!(message.contains("Authentication failed"));
+    }
+
+    #[test]
+    fn parses_huggingface_gated_metadata() {
+        assert!(
+            parse_huggingface_model_metadata(&serde_json::json!({
+                "gated": true
+            }))
+            .gated
+        );
+        assert!(
+            parse_huggingface_model_metadata(&serde_json::json!({
+                "gated": "auto"
+            }))
+            .gated
+        );
+        assert!(
+            parse_huggingface_model_metadata(&serde_json::json!({
+                "gated": "manual"
+            }))
+            .gated
+        );
+        assert!(
+            !parse_huggingface_model_metadata(&serde_json::json!({
+                "gated": false
+            }))
+            .gated
+        );
+    }
+
+    #[test]
+    fn huggingface_token_round_trips_through_werk_store() {
+        let tmp = test_dir("hf-token-store");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+
+        let path = store.save_huggingface_token("hf_test_token").unwrap();
+        assert_eq!(path, store.huggingface_token_path());
+        assert_eq!(
+            read_token_file(&path).unwrap().as_deref(),
+            Some("hf_test_token")
+        );
+        assert!(store.huggingface_auth_status().unwrap().source.is_some());
+        assert!(store.delete_huggingface_token().unwrap());
+        assert!(!store.delete_huggingface_token().unwrap());
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn huggingface_git_auth_uses_extra_header_env_not_args() {
+        let mut command = Command::new("git");
+        command.args(["ls-remote", "https://huggingface.co/org/repo"]);
+
+        configure_huggingface_git_auth(&mut command, Some("hf_secret"));
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(envs.iter().any(|(key, value)| {
+            key == "GIT_CONFIG_VALUE_0"
+                && value.as_deref()
+                    == Some(&format!(
+                        "Authorization: Basic {}",
+                        base64_encode(b"hf_user:hf_secret")
+                    ))
+        }));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg.contains("hf_secret")));
+    }
+
+    #[test]
+    fn base64_encode_handles_padding() {
+        assert_eq!(
+            base64_encode(b"hf_user:hf_secret"),
+            "aGZfdXNlcjpoZl9zZWNyZXQ="
+        );
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+        assert_eq!(base64_encode(b"abc"), "YWJj");
     }
 
     #[test]

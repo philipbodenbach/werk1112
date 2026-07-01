@@ -37,7 +37,10 @@ use crate::{
     model_store::{
         ArtifactStatus, ModelArtifact, ModelFormat, ModelManifest, ModelStore, PullProgress,
     },
-    openai::{ChatMessage, MessageContent, PromptSpec, messages_to_prompt_for_model},
+    openai::{
+        ChatMessage, ChatTemplateOptions, ChatTemplateSource, MessageContent, PromptSpec,
+        messages_to_prompt_for_model, messages_to_prompt_for_model_with_template,
+    },
     runtime_planner::{
         RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
         plan_runtime, runtime_candidate_ids, select_runtime,
@@ -115,6 +118,34 @@ pub enum DeviceArg {
 pub enum StreamGranularityArg {
     Token,
     Chunk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ChatTemplateArg {
+    Model,
+    Generic,
+    Phi3,
+    Llama3,
+    Gemma,
+    Chatml,
+    #[value(name = "qwen-chatml")]
+    QwenChatml,
+    None,
+}
+
+impl ChatTemplateArg {
+    fn template_name(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Generic => "generic",
+            Self::Phi3 => "phi3",
+            Self::Llama3 => "llama3",
+            Self::Gemma => "gemma",
+            Self::Chatml => "chatml",
+            Self::QwenChatml => "qwen-chatml",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -365,6 +396,13 @@ pub enum Commands {
         seed: Option<u64>,
 
         #[arg(
+            long,
+            value_enum,
+            help = "Override chat templating: model, generic, phi3, llama3, gemma, chatml, qwen-chatml, or none"
+        )]
+        chat_template: Option<ChatTemplateArg>,
+
+        #[arg(
             long = "image",
             value_name = "PATH_OR_URL",
             help = "Attach an image for VLM-capable backends; may be repeated"
@@ -398,6 +436,13 @@ pub enum Commands {
 
         #[arg(long, help = "RNG seed")]
         seed: Option<u64>,
+
+        #[arg(
+            long,
+            value_enum,
+            help = "Override chat templating: model, generic, phi3, llama3, gemma, chatml, qwen-chatml, or none"
+        )]
+        chat_template: Option<ChatTemplateArg>,
 
         #[arg(
             long = "no-history",
@@ -492,6 +537,12 @@ pub enum Commands {
     Artifacts {
         #[command(subcommand)]
         command: ArtifactCommands,
+    },
+
+    #[command(about = "Manage external service authentication")]
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
     },
 
     #[command(about = "Copy a local model file or directory into the managed model store")]
@@ -602,6 +653,37 @@ pub enum ArtifactCommands {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum AuthCommands {
+    #[command(
+        name = "huggingface",
+        about = "Manage Hugging Face authentication",
+        alias = "hf"
+    )]
+    HuggingFace {
+        #[command(subcommand)]
+        command: HuggingFaceAuthCommands,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum HuggingFaceAuthCommands {
+    #[command(about = "Store a Hugging Face access token for gated model pulls")]
+    Login {
+        #[arg(
+            long,
+            help = "Hugging Face access token; omit to enter it interactively"
+        )]
+        token: Option<String>,
+    },
+
+    #[command(about = "Show whether Werk can find a Hugging Face token")]
+    Status,
+
+    #[command(about = "Remove the Werk-stored Hugging Face token")]
+    Logout,
+}
+
 pub async fn run_from_env() -> Result<()> {
     run(Cli::parse()).await
 }
@@ -661,6 +743,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             temperature,
             top_p,
             seed,
+            chat_template,
             images,
             verbose,
             debug,
@@ -706,11 +789,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                 content: Some(MessageContent::Text(prompt)),
                 name: None,
             }];
-            let prompt = messages_to_prompt_for_model(&manifest, &messages);
+            let prompt = prompt_for_backend(&manifest, &messages, selected_backend, chat_template);
             let prompt_diagnostics = prompt_diagnostics(&prompt, messages.len(), None);
+            let request_messages = generation_request_messages(&prompt, &messages);
             let request = GenerateRequest {
                 prompt: prompt.prompt,
-                messages,
+                messages: request_messages,
                 image_urls: images,
                 max_tokens,
                 temperature,
@@ -749,6 +833,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             temperature,
             top_p,
             seed,
+            chat_template,
             no_history,
             images,
             stream_granularity,
@@ -793,12 +878,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             chat_loop(
                 backend,
                 manifest,
-                verbose_backend_label(selected_backend),
+                selected_backend,
                 max_tokens,
                 temperature,
                 top_p,
                 seed,
                 !no_history,
+                chat_template,
                 images,
                 stream_granularity.into(),
                 verbose,
@@ -915,6 +1001,44 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Commands::Auth { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            match command {
+                AuthCommands::HuggingFace { command } => match command {
+                    HuggingFaceAuthCommands::Login { token } => {
+                        let token = match token {
+                            Some(token) => token,
+                            None => prompt_huggingface_token()?,
+                        };
+                        let path = store.save_huggingface_token(&token)?;
+                        println!("Saved Hugging Face token for Werk: {}", path.display());
+                        println!(
+                            "For gated models, also accept the model conditions on Hugging Face before pulling."
+                        );
+                        Ok(())
+                    }
+                    HuggingFaceAuthCommands::Status => {
+                        let status = store.huggingface_auth_status()?;
+                        if let Some(source) = status.source {
+                            println!("Hugging Face token: configured ({source})");
+                        } else {
+                            println!(
+                                "Hugging Face token: not configured. Run `werk auth huggingface login` or set HF_TOKEN."
+                            );
+                        }
+                        Ok(())
+                    }
+                    HuggingFaceAuthCommands::Logout => {
+                        if store.delete_huggingface_token()? {
+                            println!("Removed Werk-stored Hugging Face token.");
+                        } else {
+                            println!("No Werk-stored Hugging Face token was found.");
+                        }
+                        Ok(())
+                    }
+                },
+            }
+        }
         Commands::Import { path, name } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.import_path(&path, &name)?;
@@ -1015,6 +1139,7 @@ fn should_print_startup_banner_for(
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
         | Commands::Artifacts { .. }
+        | Commands::Auth { .. }
         | Commands::List
         | Commands::Inspect { .. }
         | Commands::SelectFile { .. } => false,
@@ -1618,12 +1743,13 @@ impl AssistantPendingSpinner {
 async fn chat_loop(
     backend: Arc<dyn GenerationBackend>,
     manifest: ModelManifest,
-    backend_name: &'static str,
+    selected_backend: BackendChoice,
     max_tokens: usize,
     temperature: Option<f64>,
     top_p: Option<f64>,
     seed: Option<u64>,
     history_enabled: bool,
+    chat_template: Option<ChatTemplateArg>,
     images: Vec<String>,
     stream_granularity: StreamGranularity,
     verbose: bool,
@@ -1661,12 +1787,18 @@ async fn chat_loop(
 
         let request_messages =
             request_messages_for_turn(&mut messages, user_message, history_enabled);
-        let prompt = messages_to_prompt_for_model(&manifest, &request_messages);
+        let prompt = prompt_for_backend(
+            &manifest,
+            &request_messages,
+            selected_backend,
+            chat_template,
+        );
         let prompt_diagnostics =
             prompt_diagnostics(&prompt, request_messages.len(), Some(history_enabled));
+        let generation_messages = generation_request_messages(&prompt, &request_messages);
         let request = GenerateRequest {
             prompt: prompt.prompt,
-            messages: request_messages,
+            messages: generation_messages,
             image_urls: images.clone(),
             max_tokens,
             temperature,
@@ -1759,7 +1891,7 @@ async fn chat_loop(
             writeln!(stdout)?;
             write_verbose_stats(
                 &mut stdout,
-                Some(backend_name),
+                Some(verbose_backend_label(selected_backend)),
                 prompt_tokens,
                 completion_tokens,
                 &finish_reason,
@@ -1793,6 +1925,71 @@ fn request_messages_for_turn(
     }
 }
 
+fn prompt_for_backend(
+    manifest: &ModelManifest,
+    messages: &[ChatMessage],
+    backend: BackendChoice,
+    override_arg: Option<ChatTemplateArg>,
+) -> PromptSpec {
+    messages_to_prompt_for_model_with_template(
+        manifest,
+        messages,
+        chat_template_options_for_backend(manifest, backend, override_arg),
+    )
+}
+
+fn generation_request_messages(prompt: &PromptSpec, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    if prompt.chat_template.source == ChatTemplateSource::Model {
+        messages.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+fn chat_template_options_for_backend(
+    manifest: &ModelManifest,
+    backend: BackendChoice,
+    override_arg: Option<ChatTemplateArg>,
+) -> ChatTemplateOptions<'static> {
+    ChatTemplateOptions {
+        default_source: chat_template_default_source(manifest, backend),
+        model_template_preferred: chat_template_model_preferred(manifest, backend),
+        override_name: override_arg.map(ChatTemplateArg::template_name),
+    }
+}
+
+fn chat_template_default_source(
+    manifest: &ModelManifest,
+    backend: BackendChoice,
+) -> ChatTemplateSource {
+    match backend {
+        BackendChoice::LlamaServer(_)
+        | BackendChoice::LlamaFast(_)
+        | BackendChoice::LlamaHighlevel(_)
+            if manifest.format == ModelFormat::Gguf =>
+        {
+            ChatTemplateSource::Model
+        }
+        BackendChoice::Mlx
+        | BackendChoice::MlxVlm
+        | BackendChoice::Vllm
+        | BackendChoice::VllmRocm => ChatTemplateSource::Model,
+        _ => ChatTemplateSource::Werk,
+    }
+}
+
+fn chat_template_model_preferred(manifest: &ModelManifest, backend: BackendChoice) -> bool {
+    matches!(
+        backend,
+        BackendChoice::LlamaServer(_)
+            | BackendChoice::LlamaFast(_)
+            | BackendChoice::LlamaHighlevel(_)
+            | BackendChoice::Vllm
+            | BackendChoice::VllmRocm
+    ) && manifest.format == ModelFormat::Gguf
+        || matches!(backend, BackendChoice::Vllm | BackendChoice::VllmRocm)
+}
+
 fn prompt_diagnostics(
     prompt: &PromptSpec,
     message_count: usize,
@@ -1801,15 +1998,22 @@ fn prompt_diagnostics(
     let mut diagnostics = vec![
         format!("history messages: {message_count}"),
         format!(
-            "chat template applied: {}",
-            if prompt.chat_template_applied {
+            "chat template source: {}",
+            prompt.chat_template.source.as_str()
+        ),
+        format!("chat template: {}", prompt.chat_template.name),
+        format!(
+            "chat template applied by werk: {}",
+            if prompt.chat_template.applied_by_werk {
                 "yes"
             } else {
                 "no"
             }
         ),
-        format!("chat template: {}", prompt.chat_template),
     ];
+    if let Some(override_name) = &prompt.chat_template.override_from_cli {
+        diagnostics.push(format!("chat template override: {override_name}"));
+    }
     if let Some(token) = prompt.assistant_end_token {
         diagnostics.push(format!("assistant end token: {token}"));
     }
@@ -1826,6 +2030,18 @@ fn merged_diagnostics(first: &[String], second: &[String]) -> Vec<String> {
     let mut merged = first.to_vec();
     merged.extend_from_slice(second);
     merged
+}
+
+fn prompt_huggingface_token() -> Result<String> {
+    print!("Hugging Face token: ");
+    io::stdout().flush()?;
+    let mut token = String::new();
+    io::stdin().read_line(&mut token)?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        bail!("Hugging Face token cannot be empty");
+    }
+    Ok(token)
 }
 
 fn prepare_backend_for_chat(
@@ -4388,6 +4604,30 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli =
+            Cli::try_parse_from(["werk", "auth", "huggingface", "login", "--token", "hf_test"])
+                .unwrap();
+        match cli.command.unwrap() {
+            Commands::Auth {
+                command:
+                    AuthCommands::HuggingFace {
+                        command: HuggingFaceAuthCommands::Login { token },
+                    },
+            } => assert_eq!(token.as_deref(), Some("hf_test")),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "auth", "hf", "status"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Auth {
+                command:
+                    AuthCommands::HuggingFace {
+                        command: HuggingFaceAuthCommands::Status,
+                    },
+            } => {}
+            command => panic!("unexpected command: {command:?}"),
+        }
+
         let cli = Cli::try_parse_from(["werk", "rm", "repo"]).unwrap();
         match cli.command.unwrap() {
             Commands::Remove { id } => assert_eq!(id, "repo"),
@@ -4535,6 +4775,15 @@ mod tests {
         let cli = Cli::try_parse_from(["werk", "chat", "tiny", "--single-turn"]).unwrap();
         match cli.command.unwrap() {
             Commands::Chat { no_history, .. } => assert!(no_history),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["werk", "chat", "tiny", "--chat-template", "generic"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Chat { chat_template, .. } => {
+                assert_eq!(chat_template, Some(ChatTemplateArg::Generic));
+            }
             command => panic!("unexpected command: {command:?}"),
         }
 
@@ -5358,6 +5607,7 @@ mod tests {
             temperature: None,
             top_p: None,
             seed: None,
+            chat_template: None,
             images: Vec::new(),
             verbose: false,
             debug: false,
@@ -5371,6 +5621,7 @@ mod tests {
             temperature: None,
             top_p: None,
             seed: None,
+            chat_template: None,
             no_history: false,
             images: Vec::new(),
             stream_granularity: StreamGranularityArg::Token,
@@ -5438,6 +5689,149 @@ mod tests {
         assert!(output.contains("finish reason:"));
         assert!(output.contains("stop_sequence"));
         assert!(output.contains("effective max new tokens: 256"));
+    }
+
+    #[test]
+    fn gguf_llama_cpp_defaults_to_model_chat_template() {
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            name: None,
+        }];
+        let prompt = prompt_for_backend(
+            &manifest,
+            &messages,
+            BackendChoice::LlamaServer(LlamaCppMode::Metal),
+            None,
+        );
+        let diagnostics = prompt_diagnostics(&prompt, messages.len(), Some(true));
+
+        assert_eq!(prompt.chat_template.source, ChatTemplateSource::Model);
+        assert_eq!(prompt.chat_template.name, "model");
+        assert!(!prompt.chat_template.applied_by_werk);
+        assert_eq!(prompt.prompt, "hello");
+        assert!(diagnostics.contains(&"chat template source: model".to_string()));
+        assert!(diagnostics.contains(&"chat template: model".to_string()));
+        assert!(diagnostics.contains(&"chat template applied by werk: no".to_string()));
+        assert!(!diagnostics.contains(&"chat template: generic".to_string()));
+    }
+
+    #[test]
+    fn gguf_model_chat_template_keeps_structured_generation_messages() {
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            name: None,
+        }];
+        let prompt = prompt_for_backend(
+            &manifest,
+            &messages,
+            BackendChoice::LlamaServer(LlamaCppMode::Metal),
+            None,
+        );
+
+        let request_messages = generation_request_messages(&prompt, &messages);
+
+        assert_eq!(request_messages.len(), 1);
+        assert_eq!(
+            request_messages[0]
+                .content
+                .as_ref()
+                .map(MessageContent::as_text),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_generic_chat_template_overrides_gguf_model_default() {
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            name: None,
+        }];
+        let prompt = prompt_for_backend(
+            &manifest,
+            &messages,
+            BackendChoice::LlamaServer(LlamaCppMode::Metal),
+            Some(ChatTemplateArg::Generic),
+        );
+
+        assert_eq!(prompt.chat_template.source, ChatTemplateSource::Werk);
+        assert_eq!(prompt.chat_template.name, "generic");
+        assert!(prompt.chat_template.applied_by_werk);
+        assert_eq!(
+            prompt.chat_template.override_from_cli.as_deref(),
+            Some("generic")
+        );
+        assert!(prompt.prompt.contains("user: hello"));
+        assert!(prompt.prompt.ends_with("assistant: "));
+    }
+
+    #[test]
+    fn werk_applied_chat_template_uses_rendered_prompt_only_for_generation() {
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            name: None,
+        }];
+        let prompt = prompt_for_backend(
+            &manifest,
+            &messages,
+            BackendChoice::LlamaServer(LlamaCppMode::Metal),
+            Some(ChatTemplateArg::Generic),
+        );
+
+        let request_messages = generation_request_messages(&prompt, &messages);
+
+        assert!(request_messages.is_empty());
+    }
+
+    #[test]
+    fn explicit_none_chat_template_disables_werk_templating() {
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            name: None,
+        }];
+        let prompt = prompt_for_backend(
+            &manifest,
+            &messages,
+            BackendChoice::LlamaServer(LlamaCppMode::Metal),
+            Some(ChatTemplateArg::None),
+        );
+
+        assert_eq!(prompt.chat_template.source, ChatTemplateSource::None);
+        assert_eq!(prompt.chat_template.name, "none");
+        assert!(!prompt.chat_template.applied_by_werk);
+        assert_eq!(prompt.prompt, "hello");
+        assert!(prompt.stop.is_empty());
+    }
+
+    #[test]
+    fn onnx_phi3_still_uses_werk_phi3_chat_template() {
+        let manifest = test_manifest(ModelFormat::Onnx, Some("phi3"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            name: None,
+        }];
+        let prompt = prompt_for_backend(
+            &manifest,
+            &messages,
+            BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu),
+            None,
+        );
+
+        assert_eq!(prompt.chat_template.source, ChatTemplateSource::Werk);
+        assert_eq!(prompt.chat_template.name, "phi3");
+        assert!(prompt.chat_template.applied_by_werk);
+        assert!(prompt.prompt.starts_with("<|user|>"));
+        assert!(prompt.stop.contains(&"<|end|>".to_string()));
     }
 
     #[test]

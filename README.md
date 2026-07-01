@@ -159,6 +159,8 @@ werk import /path/to/model-dir --name local-model
 werk pull org/model-repo --name hf-model
 ```
 
+For gated Hugging Face models, accept the model conditions on Hugging Face first, then run `werk auth huggingface login` or set `HF_TOKEN` before pulling.
+
 Run one prompt or start an interactive terminal chat:
 
 ```bash
@@ -585,6 +587,15 @@ Pull from Hugging Face:
 ```bash
 werk pull org/model-repo --name model-local
 ```
+
+Gated Hugging Face repositories require access before Git can clone their files. Open the model page in a browser, accept the model conditions, then authenticate Werk:
+
+```bash
+werk auth huggingface login
+werk auth huggingface status
+```
+
+Werk also accepts tokens from `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, or the standard Hugging Face CLI token cache. Use `werk auth huggingface logout` to remove the token stored by Werk.
 
 Pull one file from a Hugging Face repository, useful for GGUF repos that contain many quantizations:
 

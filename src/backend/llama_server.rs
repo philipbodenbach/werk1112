@@ -81,6 +81,7 @@ struct ServerCompletion {
     decode_seconds: f64,
     first_token_seconds: f64,
     finish_reason: String,
+    backend_diagnostics: Vec<String>,
 }
 
 impl LlamaServerBackend {
@@ -206,7 +207,7 @@ impl LlamaServerBackend {
                 decode_seconds: completion.decode_seconds,
                 total_seconds: total_started.elapsed().as_secs_f64(),
             },
-            backend_diagnostics: Vec::new(),
+            backend_diagnostics: completion.backend_diagnostics,
         })
     }
 }
@@ -265,7 +266,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                 decode_seconds: completion.decode_seconds,
                 total_seconds: total_started.elapsed().as_secs_f64(),
             },
-            backend_diagnostics: Vec::new(),
+            backend_diagnostics: completion.backend_diagnostics,
         })
     }
 
@@ -290,7 +291,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                         decode_seconds: completion.decode_seconds,
                         total_seconds: total_started.elapsed().as_secs_f64(),
                     },
-                    backend_diagnostics: Vec::new(),
+                    backend_diagnostics: completion.backend_diagnostics,
                 });
             send_stream_result(tx, result);
         });
@@ -357,10 +358,23 @@ impl LlamaServerProcess {
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<ServerCompletion> {
         let started = Instant::now();
-        let body = completion_body(request);
-        let mut stream = post_json(&self.url, "/completion", &body)?;
+        let use_chat_endpoint = !request.messages.is_empty();
+        let (path, body) = if use_chat_endpoint {
+            ("/v1/chat/completions", chat_completion_body(request))
+        } else {
+            ("/completion", completion_body(request))
+        };
+        let mut stream = post_json(&self.url, path, &body)?;
         let mut completion = ServerCompletion {
             finish_reason: "length".to_string(),
+            backend_diagnostics: if use_chat_endpoint {
+                vec![
+                    "llama.cpp request endpoint: /v1/chat/completions".to_string(),
+                    "chat template applied by backend/model: yes".to_string(),
+                ]
+            } else {
+                vec!["llama.cpp request endpoint: /completion".to_string()]
+            },
             ..Default::default()
         };
         let mut sse = SseAccumulator::default();
@@ -373,15 +387,24 @@ impl LlamaServerProcess {
                 }
                 let value: Value = serde_json::from_str(event)
                     .with_context(|| format!("invalid llama-server SSE event: {event}"))?;
-                update_completion_from_event(&mut completion, &value);
-                if let Some(chunk) = value.get("content").and_then(Value::as_str)
+                let chunk = if use_chat_endpoint {
+                    update_chat_completion_from_event(&mut completion, &value);
+                    chat_delta_content(&value)
+                } else {
+                    update_completion_from_event(&mut completion, &value);
+                    value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                };
+                if let Some(chunk) = chunk
                     && !chunk.is_empty()
                 {
                     if completion.first_token_seconds <= 0.0 {
                         completion.first_token_seconds = started.elapsed().as_secs_f64();
                     }
-                    completion.text.push_str(chunk);
-                    send_text_chunk(&tx, chunk.to_string())?;
+                    completion.text.push_str(&chunk);
+                    send_text_chunk(&tx, chunk)?;
                 }
                 Ok(())
             })
@@ -610,6 +633,50 @@ fn completion_body(request: &GenerateRequest) -> Value {
     body
 }
 
+fn chat_completion_body(request: &GenerateRequest) -> Value {
+    let mut body = json!({
+        "messages": llama_chat_messages(request),
+        "max_tokens": request.max_tokens,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if !request.stop.is_empty() {
+        body["stop"] = json!(request.stop);
+    }
+    if let Some(seed) = request.seed {
+        body["seed"] = json!(seed);
+    }
+    body
+}
+
+fn llama_chat_messages(request: &GenerateRequest) -> Vec<Value> {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            let content = message
+                .content
+                .as_ref()
+                .map(|content| content.as_text())
+                .unwrap_or_default();
+            let mut value = json!({
+                "role": message.role.as_str(),
+                "content": content,
+            });
+            if let Some(name) = &message.name {
+                value["name"] = json!(name);
+            }
+            value
+        })
+        .collect()
+}
+
 fn update_completion_from_event(completion: &mut ServerCompletion, value: &Value) {
     if value.get("stop").and_then(Value::as_bool).unwrap_or(false) {
         completion.finish_reason = "stop".to_string();
@@ -663,6 +730,37 @@ fn update_completion_from_event(completion: &mut ServerCompletion, value: &Value
     {
         completion.decode_seconds = ms / 1000.0;
     }
+}
+
+fn update_chat_completion_from_event(completion: &mut ServerCompletion, value: &Value) {
+    if let Some(choice) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        && let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+        && !reason.is_empty()
+    {
+        completion.finish_reason = reason.to_string();
+    }
+    if let Some(usage) = value.get("usage") {
+        if let Some(tokens) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+            completion.prompt_tokens = tokens as usize;
+        }
+        if let Some(tokens) = usage.get("completion_tokens").and_then(Value::as_u64) {
+            completion.completion_tokens = tokens as usize;
+        }
+    }
+}
+
+fn chat_delta_content(value: &Value) -> Option<String> {
+    value
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("delta")?
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn finalize_completion_stats(
@@ -1602,6 +1700,7 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai::{ChatMessage, MessageContent};
     use std::{
         env,
         ffi::OsString,
@@ -1660,6 +1759,54 @@ mod tests {
             managed_backend_dir(&store, LlamaCppMode::Cpu),
             root.join("backends").join("llama-cpu")
         );
+    }
+
+    #[test]
+    fn chat_completion_body_uses_model_side_messages() {
+        let request = GenerateRequest {
+            prompt: "ignored raw prompt".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+                name: None,
+            }],
+            image_urls: Vec::new(),
+            max_tokens: 32,
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            stop: vec!["stop".to_string()],
+            seed: Some(7),
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let body = chat_completion_body(&request);
+
+        assert!(body.get("prompt").is_none());
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hello");
+        assert!(body["messages"][0].get("name").is_none());
+        assert_eq!(body["max_tokens"], 32);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["stop"][0], "stop");
+    }
+
+    #[test]
+    fn chat_completion_event_parses_delta_finish_reason_and_usage() {
+        let mut completion = ServerCompletion::default();
+        let value = json!({
+            "choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2}
+        });
+
+        assert_eq!(chat_delta_content(&value).as_deref(), Some("hello"));
+        update_chat_completion_from_event(&mut completion, &value);
+
+        assert_eq!(completion.prompt_tokens, 4);
+        assert_eq!(completion.completion_tokens, 2);
+        assert_eq!(completion.finish_reason, "stop");
     }
 
     #[test]
