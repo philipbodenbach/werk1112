@@ -99,37 +99,37 @@ End users should prefer the installer scripts and prebuilt release artifacts. Th
 ### Linux / macOS
 
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/master/scripts/install.sh)"
 ```
 
 Install a specific version:
 
 ```bash
-WERK_VERSION=1.0.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.sh)"
+WERK_VERSION=1.0.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/master/scripts/install.sh)"
 ```
 
 Custom install directory:
 
 ```bash
-WERK_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.sh)"
+WERK_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/phildenbo/werk1112/master/scripts/install.sh)"
 ```
 
 ### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/phildenbo/werk1112/master/scripts/install.ps1 | iex
 ```
 
 Install a specific version:
 
 ```powershell
-$env:WERK_VERSION="1.0.0"; irm https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.ps1 | iex
+$env:WERK_VERSION="1.0.0"; irm https://raw.githubusercontent.com/phildenbo/werk1112/master/scripts/install.ps1 | iex
 ```
 
 Add the install directory to the user PATH:
 
 ```powershell
-$env:WERK_ADD_TO_PATH="1"; irm https://raw.githubusercontent.com/phildenbo/werk1112/main/scripts/install.ps1 | iex
+$env:WERK_ADD_TO_PATH="1"; irm https://raw.githubusercontent.com/phildenbo/werk1112/master/scripts/install.ps1 | iex
 ```
 
 Source builds remain available for developers in the Build section.
