@@ -21,16 +21,18 @@ use tokio_stream::StreamExt;
 use crate::backend::burn_doctor_checks;
 use crate::{
     api::{ApiState, serve},
+    api_keys,
     backend::{
         BackendAccelerator, BackendRuntime, BurnBackend, BurnMode, CandleBackend, CandleDeviceMode,
         ChatGenerationSession, GenerateRequest, GenerateStreamEvent, GenerationBackend,
         GenerationTimings, LlamaCppBackend, LlamaCppMode, LlamaFastBackend, LlamaFastRuntimeReport,
         LlamaKvCacheType, LlamaRuntimeOptions, LlamaServerBackend, LlamaServerDiscovery,
-        MlxBackend, MlxVlmBackend, OnnxProvisionOptions, OnnxRuntimeAvailability,
-        OnnxRuntimeBackend, OnnxRuntimeMode, RuntimeId, StreamGranularity,
+        LlamaServerInstallOptions, MlxBackend, MlxVlmBackend, OnnxProvisionOptions,
+        OnnxRuntimeAvailability, OnnxRuntimeBackend, OnnxRuntimeMode, RuntimeId, StreamGranularity,
         TransformersCompatBackend, VllmBackend, backend_doctor_checks,
         backend_supports_accelerator, backend_supports_format,
-        backend_supports_images as runtime_supports_images, install_managed_llama_server,
+        backend_supports_images as runtime_supports_images, candle_gguf_tokenizer_rejection,
+        install_managed_llama_server, install_managed_llama_server_with_options,
         install_managed_onnx_runtime, install_managed_vllm, llama_server_help_ok,
         managed_backend_dir, managed_runner_path as managed_onnx_runner_path, managed_vllm_dir,
         probe_device, runtime_descriptor, runtime_registry, runtime_supports_model,
@@ -382,6 +384,22 @@ pub enum Commands {
         #[arg(long, help = "Default model for API requests that omit model")]
         model: Option<String>,
 
+        #[arg(
+            long,
+            env = "WERK_API_KEY",
+            hide_env_values = true,
+            help = "Require OpenAI-style Authorization: Bearer <key> for /v1 requests"
+        )]
+        api_key: Option<String>,
+
+        #[arg(
+            long = "api-keys",
+            env = "WERK_API_KEYS",
+            value_name = "PATH",
+            help = "Load OpenAI-style bearer keys from an API keys TOML file"
+        )]
+        api_keys: Option<PathBuf>,
+
         #[arg(long, help = "Print HTTP request and generation logs")]
         verbose: bool,
     },
@@ -693,6 +711,39 @@ pub enum AuthCommands {
         #[command(subcommand)]
         command: HuggingFaceAuthCommands,
     },
+
+    #[command(
+        name = "api-key",
+        about = "Generate API keys for the OpenAI-compatible server",
+        alias = "api-keys"
+    )]
+    ApiKey {
+        #[command(subcommand)]
+        command: ApiKeyAuthCommands,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ApiKeyAuthCommands {
+    #[command(about = "Create an API keys TOML file for `werk serve`")]
+    Generate {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "API keys file to create; defaults to ~/.config/werk1112/api-keys.toml"
+        )]
+        path: Option<PathBuf>,
+
+        #[arg(
+            long,
+            default_value = "default",
+            help = "Human-readable name stored next to the generated key"
+        )]
+        name: String,
+
+        #[arg(long, help = "Overwrite an existing API keys file")]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -731,8 +782,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         host: "127.0.0.1".to_string(),
         port: 11434,
         model: None,
+        api_key: None,
+        api_keys: None,
         verbose: false,
     });
+    let selection_options =
+        selection_options.with_backend_install_output(command_backend_install_verbose(&command));
 
     if should_print_startup_banner(&command) {
         print_banner();
@@ -743,10 +798,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             host,
             port,
             model,
+            api_key,
+            api_keys,
             verbose,
         } => {
             let store = ModelStore::resolve(model_home)?;
             store.ensure()?;
+            let api_keys = resolve_api_keys(api_key, api_keys)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let ip: IpAddr = host.parse()?;
             let addr = SocketAddr::new(ip, port);
@@ -792,17 +850,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 )?;
                 println!("Default model available: {model}");
             }
-            serve(
-                addr,
-                ApiState::new_with_default_model_prompt_options_and_verbose(
-                    store,
-                    backend,
-                    model,
-                    Some(prompt_options_resolver),
-                    verbose,
-                ),
+            let api_state = ApiState::new_with_default_model_prompt_options_and_verbose(
+                store,
+                backend,
+                model,
+                Some(prompt_options_resolver),
+                verbose,
             )
-            .await
+            .with_api_keys(api_keys);
+            serve(addr, api_state).await
         }
         Commands::Run {
             model,
@@ -1089,10 +1145,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Commands::Auth { command } => {
-            let store = ModelStore::resolve(model_home)?;
-            match command {
-                AuthCommands::HuggingFace { command } => match command {
+        Commands::Auth { command } => match command {
+            AuthCommands::HuggingFace { command } => {
+                let store = ModelStore::resolve(model_home)?;
+                match command {
                     HuggingFaceAuthCommands::Login { token } => {
                         let token = match token {
                             Some(token) => token,
@@ -1124,9 +1180,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                         }
                         Ok(())
                     }
-                },
+                }
             }
-        }
+            AuthCommands::ApiKey { command } => match command {
+                ApiKeyAuthCommands::Generate { path, name, force } => {
+                    let path = path
+                        .map(Ok)
+                        .unwrap_or_else(api_keys::default_api_keys_path)?;
+                    let entry = api_keys::write_api_keys_file(&path, &name, force)?;
+                    println!("Created Werk API keys file: {}", path.display());
+                    println!("Name: {}", entry.name);
+                    println!("API key: {}", entry.key);
+                    println!(
+                        "Use this value as the OpenAI API key, sent as Authorization: Bearer <key>."
+                    );
+                    Ok(())
+                }
+            },
+        },
         Commands::Import { path, name } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.import_path(&path, &name)?;
@@ -1208,6 +1279,38 @@ fn should_print_startup_banner(command: &Commands) -> bool {
     )
 }
 
+fn resolve_api_keys(
+    api_key: Option<String>,
+    api_keys_path: Option<PathBuf>,
+) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    if let Some(key) = api_key {
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            bail!("--api-key / WERK_API_KEY must not be empty");
+        }
+        keys.push(key);
+    }
+
+    let path = if let Some(path) = api_keys_path {
+        Some(path)
+    } else {
+        api_keys::default_api_keys_path()
+            .ok()
+            .filter(|path| path.is_file())
+    };
+
+    if let Some(path) = path {
+        keys.extend(
+            api_keys::load_api_keys_file(&path)?
+                .into_iter()
+                .map(|entry| entry.key),
+        );
+    }
+
+    Ok(keys)
+}
+
 fn should_print_startup_banner_for(
     command: &Commands,
     stdout_is_terminal: bool,
@@ -1225,6 +1328,27 @@ fn should_print_startup_banner_for(
         | Commands::Remove { .. }
         | Commands::Estimate { .. }
         | Commands::Bench { .. }
+        | Commands::Doctor { .. }
+        | Commands::Backend { .. }
+        | Commands::Artifacts { .. }
+        | Commands::Auth { .. }
+        | Commands::List
+        | Commands::Inspect { .. }
+        | Commands::SelectFile { .. } => false,
+    }
+}
+
+fn command_backend_install_verbose(command: &Commands) -> bool {
+    match command {
+        Commands::Serve { verbose, .. } => *verbose,
+        Commands::Run { verbose, debug, .. } | Commands::Chat { verbose, debug, .. } => {
+            *verbose || *debug
+        }
+        Commands::Bench { debug, .. } => *debug,
+        Commands::Import { .. }
+        | Commands::Pull { .. }
+        | Commands::Remove { .. }
+        | Commands::Estimate { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
         | Commands::Artifacts { .. }
@@ -4537,6 +4661,7 @@ enum BackendChoice {
 #[derive(Debug, Clone, Copy)]
 struct SelectionOptions {
     provision_missing_backends: bool,
+    verbose_backend_installs: bool,
 }
 
 impl SelectionOptions {
@@ -4544,6 +4669,14 @@ impl SelectionOptions {
         let default_provision = matches!(backend, BackendArg::Auto);
         Self {
             provision_missing_backends: !no_auto_install && (auto_install || default_provision),
+            verbose_backend_installs: false,
+        }
+    }
+
+    fn with_backend_install_output(self, verbose: bool) -> Self {
+        Self {
+            verbose_backend_installs: verbose,
+            ..self
         }
     }
 }
@@ -4552,6 +4685,7 @@ impl Default for SelectionOptions {
     fn default() -> Self {
         Self {
             provision_missing_backends: false,
+            verbose_backend_installs: false,
         }
     }
 }
@@ -5140,13 +5274,21 @@ fn backend_unavailability_reason(
     match backend {
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
-        | BackendChoice::Candle(CandleDeviceMode::Auto)
-        | BackendChoice::Candle(CandleDeviceMode::Cpu) => None,
-        BackendChoice::Candle(mode) => probe_device(mode).err().map(|_| match mode {
-            CandleDeviceMode::Cuda => candle_cuda_rejection_reason(),
-            CandleDeviceMode::Metal => "Candle Metal is unavailable".to_string(),
-            CandleDeviceMode::Auto | CandleDeviceMode::Cpu => "Candle is unavailable".to_string(),
-        }),
+        | BackendChoice::Candle(CandleDeviceMode::Auto) => None,
+        BackendChoice::Candle(CandleDeviceMode::Cpu) => {
+            candle_gguf_tokenizer_rejection(store, manifest)
+        }
+        BackendChoice::Candle(mode) => {
+            candle_gguf_tokenizer_rejection(store, manifest).or_else(|| {
+                probe_device(mode).err().map(|_| match mode {
+                    CandleDeviceMode::Cuda => candle_cuda_rejection_reason(),
+                    CandleDeviceMode::Metal => "Candle Metal is unavailable".to_string(),
+                    CandleDeviceMode::Auto | CandleDeviceMode::Cpu => {
+                        "Candle is unavailable".to_string()
+                    }
+                })
+            })
+        }
         BackendChoice::Mlx => MlxBackend::probe()
             .err()
             .map(|_| "mlx-lm is unavailable".to_string()),
@@ -5187,10 +5329,16 @@ fn backend_unavailability_reason(
             } else if selection_options.provision_missing_backends
                 && should_auto_install_llama_server(mode)
             {
-                install_managed_llama_server(store, mode)
-                    .and_then(|_| LlamaServerBackend::probe(store, mode).map(|_| ()))
-                    .err()
-                    .map(|err| compact_reason(&err.to_string()))
+                install_managed_llama_server_with_options(
+                    store,
+                    mode,
+                    LlamaServerInstallOptions {
+                        verbose: selection_options.verbose_backend_installs,
+                    },
+                )
+                .and_then(|_| LlamaServerBackend::probe(store, mode).map(|_| ()))
+                .err()
+                .map(|err| compact_reason(&err.to_string()))
             } else {
                 Some(LlamaServerBackend::missing_message(store, mode))
             }
@@ -6260,11 +6408,15 @@ mod tests {
                 host,
                 port,
                 model,
+                api_key,
+                api_keys,
                 verbose,
             } => {
                 assert_eq!(host, "0.0.0.0");
                 assert_eq!(port, 8080);
                 assert_eq!(model.as_deref(), Some("m"));
+                assert!(api_key.is_none());
+                assert!(api_keys.is_none());
                 assert!(!verbose);
             }
             command => panic!("unexpected command: {command:?}"),
@@ -6273,6 +6425,53 @@ mod tests {
         let cli = Cli::try_parse_from(["werk", "serve", "--verbose"]).unwrap();
         match cli.command.unwrap() {
             Commands::Serve { verbose, .. } => assert!(verbose),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "serve",
+            "--api-key",
+            "sk-test",
+            "--api-keys",
+            "/tmp/api-keys.toml",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Serve {
+                api_key, api_keys, ..
+            } => {
+                assert_eq!(api_key.as_deref(), Some("sk-test"));
+                assert_eq!(api_keys.as_deref(), Some(Path::new("/tmp/api-keys.toml")));
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "auth",
+            "api-key",
+            "generate",
+            "--path",
+            "/tmp/api-keys.toml",
+            "--name",
+            "open-webui",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Auth {
+                command:
+                    AuthCommands::ApiKey {
+                        command:
+                            ApiKeyAuthCommands::Generate {
+                                path, name, force, ..
+                            },
+                    },
+            } => {
+                assert_eq!(path.as_deref(), Some(Path::new("/tmp/api-keys.toml")));
+                assert_eq!(name, "open-webui");
+                assert!(!force);
+            }
             command => panic!("unexpected command: {command:?}"),
         }
 
@@ -6701,6 +6900,20 @@ mod tests {
     }
 
     #[test]
+    fn qwen_gguf_without_tokenizer_json_rejects_candle_fallback() {
+        if cfg!(any(windows, target_os = "linux")) {
+            let store = test_store("qwen-gguf-no-candle-fallback");
+            let manifest = test_manifest(ModelFormat::Gguf, Some("qwen3"));
+            let err =
+                selected_backend_for_manifest(&store, BackendChoice::Auto, &manifest).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("llama.cpp server CUDA"));
+            assert!(message.contains("Candle CUDA"));
+            assert!(message.contains("Candle GGUF fallback requires tokenizer.json"));
+        }
+    }
+
+    #[test]
     fn macos_auto_prefers_llama_server_metal_for_gguf() {
         if cfg!(target_os = "macos") {
             let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
@@ -6935,6 +7148,14 @@ mod tests {
             SelectionOptions::from_cli(BackendArg::Auto, false, false).provision_missing_backends
         );
         assert!(
+            !SelectionOptions::from_cli(BackendArg::Auto, false, false).verbose_backend_installs
+        );
+        assert!(
+            SelectionOptions::from_cli(BackendArg::Auto, false, false)
+                .with_backend_install_output(true)
+                .verbose_backend_installs
+        );
+        assert!(
             !SelectionOptions::from_cli(BackendArg::Onnx, false, false).provision_missing_backends
         );
         assert!(
@@ -6946,6 +7167,65 @@ mod tests {
         assert!(
             !SelectionOptions::from_cli(BackendArg::Auto, false, true).provision_missing_backends
         );
+    }
+
+    #[test]
+    fn managed_backend_install_output_requires_verbose_or_debug_command() {
+        let quiet_chat = Commands::Chat {
+            model: "tiny".to_string(),
+            max_tokens: 256,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            chat_template: None,
+            no_history: false,
+            images: Vec::new(),
+            stream_granularity: StreamGranularityArg::Token,
+            verbose: false,
+            debug: false,
+        };
+        assert!(!command_backend_install_verbose(&quiet_chat));
+
+        let verbose_chat = Commands::Chat {
+            model: "tiny".to_string(),
+            max_tokens: 256,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            chat_template: None,
+            no_history: false,
+            images: Vec::new(),
+            stream_granularity: StreamGranularityArg::Token,
+            verbose: true,
+            debug: false,
+        };
+        assert!(command_backend_install_verbose(&verbose_chat));
+
+        let debug_run = Commands::Run {
+            model: "tiny".to_string(),
+            prompt: vec!["hello".to_string()],
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            chat_template: None,
+            images: Vec::new(),
+            verbose: false,
+            debug: true,
+        };
+        assert!(command_backend_install_verbose(&debug_run));
+    }
+
+    #[test]
+    fn llama_server_auto_install_policy_preserves_macos_metal_only() {
+        assert!(!should_auto_install_llama_server(LlamaCppMode::Cuda));
+        assert!(!should_auto_install_llama_server(LlamaCppMode::Rocm));
+        assert!(!should_auto_install_llama_server(LlamaCppMode::Vulkan));
+        assert_eq!(
+            should_auto_install_llama_server(LlamaCppMode::Metal),
+            cfg!(target_os = "macos")
+        );
+        assert!(!should_auto_install_llama_server(LlamaCppMode::Cpu));
     }
 
     #[test]
@@ -7327,6 +7607,8 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 11434,
             model: None,
+            api_key: None,
+            api_keys: None,
             verbose: false,
         };
         assert!(should_print_startup_banner_for(&serve, true, true));

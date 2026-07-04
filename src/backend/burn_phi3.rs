@@ -273,6 +273,7 @@ impl<B: Backend> Phi3Generator<B> {
                 decode_seconds,
                 total_seconds: started.elapsed().as_secs_f64(),
             },
+            backend_diagnostics: Vec::new(),
         })
     }
 }

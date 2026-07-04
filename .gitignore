@@ -6,3 +6,7 @@
 .agents
 .codex
 .venv
+
+.webui*
+api-keys.toml
+.api-keys.toml

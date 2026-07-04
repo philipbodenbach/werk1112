@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -44,6 +44,7 @@ pub struct ApiState {
     default_model: Option<String>,
     prompt_options_resolver: Option<PromptOptionsResolver>,
     chat_sessions: Arc<Mutex<HashMap<String, Arc<dyn ChatGenerationSession>>>>,
+    api_keys: Arc<Vec<String>>,
     verbose: bool,
 }
 
@@ -88,7 +89,49 @@ impl ApiState {
             default_model,
             prompt_options_resolver,
             chat_sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_keys: Arc::new(Vec::new()),
             verbose,
+        }
+    }
+
+    pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Self {
+        self.api_keys = Arc::new(api_keys);
+        self
+    }
+
+    pub fn api_key_auth_enabled(&self) -> bool {
+        !self.api_keys.is_empty()
+    }
+
+    fn authorize(&self, headers: &HeaderMap) -> Result<(), Response> {
+        if self.api_keys.is_empty() {
+            return Ok(());
+        }
+
+        let Some(header_value) = headers.get(header::AUTHORIZATION) else {
+            return Err(auth_error("missing bearer token"));
+        };
+        let Ok(header_value) = header_value.to_str() else {
+            return Err(auth_error("invalid authorization header"));
+        };
+        let Some((scheme, token)) = header_value.split_once(' ') else {
+            return Err(auth_error("expected Authorization: Bearer <token>"));
+        };
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return Err(auth_error("expected Authorization: Bearer <token>"));
+        }
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(auth_error("empty bearer token"));
+        }
+        if self
+            .api_keys
+            .iter()
+            .any(|key| constant_time_eq(key.as_bytes(), token.as_bytes()))
+        {
+            Ok(())
+        } else {
+            Err(auth_error("invalid bearer token"))
         }
     }
 
@@ -147,11 +190,17 @@ pub fn router(state: ApiState) -> Router {
 pub async fn serve(addr: SocketAddr, state: ApiState) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("Server running at http://{addr}");
+    if state.api_key_auth_enabled() {
+        println!("API key auth enabled; clients must send Authorization: Bearer <key>");
+    }
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
 
-async fn models_handler(State(state): State<ApiState>) -> Response {
+async fn models_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(response) = state.authorize(&headers) {
+        return response;
+    }
     match state.store.list() {
         Ok(manifests) => {
             state.log_verbose(format!(
@@ -179,8 +228,12 @@ async fn models_handler(State(state): State<ApiState>) -> Response {
 
 async fn chat_completions_handler(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
+    if let Err(response) = state.authorize(&headers) {
+        return response;
+    }
     let model_id = match request.model.as_deref().or(state.default_model.as_deref()) {
         Some(model) => model,
         None => {
@@ -482,6 +535,25 @@ fn api_error(status: StatusCode, message: String, param: Option<String>) -> Resp
         .into_response()
 }
 
+fn auth_error(message: &'static str) -> Response {
+    let mut response = api_error(StatusCode::UNAUTHORIZED, message.to_string(), None);
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+    for index in 0..max_len {
+        let left = a.get(index).copied().unwrap_or(0);
+        let right = b.get(index).copied().unwrap_or(0);
+        diff |= (left ^ right) as usize;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +754,79 @@ mod tests {
         assert!(stream.contains("\"object\":\"chat.completion.chunk\""));
         assert!(stream.contains("\"content\":\"hello\""));
         assert!(stream.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn server_api_keys_require_matching_bearer_token() {
+        let store = test_store();
+        let manifest = ModelManifest {
+            id: "mock".to_string(),
+            source: ModelSource::LocalPath {
+                path: "test".to_string(),
+            },
+            format: ModelFormat::Unknown,
+            architecture: None,
+            tokenizer_path: None,
+            config_path: None,
+            model_path: None,
+            backend: "mock".to_string(),
+            created_unix: 1,
+            files: Vec::new(),
+            artifacts: Vec::new(),
+        };
+        fs::create_dir_all(store.model_dir("mock")).unwrap();
+        fs::write(
+            store
+                .model_dir("mock")
+                .join(crate::model_store::MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let app = router(
+            ApiState::new(store, Arc::new(MockBackend)).with_api_keys(vec!["sk-test".to_string()]),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header(header::AUTHORIZATION, "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header(header::AUTHORIZATION, "Bearer sk-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

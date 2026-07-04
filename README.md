@@ -78,10 +78,10 @@ Current capabilities include:
 
 The project focuses on stability, predictable runtime behaviour and long-term compatibility rather than rapidly expanding feature scope.
 
-- Release artifacts are universal runtime-router binaries, one binary per supported OS/architecture.
-- Prebuilt artifacts can start without CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, or Cargo installed.
-- Backend acceleration is discovered at runtime from the host system and installed companion runtimes.
-- CUDA, CUDNN, Metal, MKL, Vulkan, Burn, and legacy llama.cpp are opt-in Cargo features for source/developer builds.
+- Release artifacts are universal runtime-router binaries, one binary per supported OS/architecture, with platform accelerator support compiled in.
+- Installers install only Werk1112; they do not install models, CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, Cargo, or other runtime dependencies.
+- Backend acceleration is selected at runtime from compiled support, host system capabilities, and installed companion runtimes.
+- CPU-only, CUDNN, MKL, Burn, and legacy llama.cpp remain explicit source/developer build choices.
 - `/v1/models` returns installed model manifests in an OpenAI-style model list.
 - `/v1/chat/completions` accepts OpenAI-style chat requests.
 - Streaming uses `text/event-stream` with `chat.completion.chunk` payloads and a final `data: [DONE]`.
@@ -136,7 +136,7 @@ Source builds remain available for developers in the Build section.
 
 ## Uninstall
 
-The uninstaller removes the Werk1112 CLI and can optionally remove the model store. It does not remove model data automatically without confirmation.
+The uninstaller removes the Werk1112 CLI and can optionally remove the model store and API key file. It does not remove model data or API keys automatically without confirmation.
 
 ### Linux / macOS
 
@@ -220,10 +220,10 @@ Planner policy:
 
 ## Build
 
-Release builds use one target-specific Cargo alias per deployed end-user artifact. Those aliases build with `--no-default-features` and the target `release-*` feature bundle, producing universal runtime-router binaries. Prebuilt artifacts can start without CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, or Cargo installed. Backend-specific acceleration is discovered at runtime from the host system and installed companion runtimes, and users can choose the active backend with `--backend`.
+Release builds use one target-specific Cargo alias per deployed end-user artifact. Those aliases build with `--no-default-features` and the target `release-*` feature bundle, producing universal runtime-router binaries with the platform accelerator path compiled in. Linux and Windows artifacts compile CUDA support; macOS Apple Silicon artifacts compile Metal support. External/server backends such as llama.cpp server, vLLM, ONNX Runtime, MLX, and Transformers compatibility are discovered at runtime from the host system and installed companion runtimes. Users can choose the active backend with `--backend`.
 
 ```bash
-cargo install --path . --locked --force --no-default-features
+cargo install --path . --locked --force
 ```
 
 Use `--locked` for source installs. Without it, Cargo may resolve newer crates than the checked-in lockfile and require a different binding surface than the one this repo was verified with.
@@ -271,11 +271,13 @@ If a target build fails with `E0463` / `can't find crate for core` or many depen
 
 Release feature bundles:
 
-| Bundle | Release binary model | Runtime-discovered acceleration |
+| Bundle | Compiled into the Werk binary | Runtime-discovered companion routes |
 | --- | --- | --- |
-| `release-windows` | Universal router, no backend-specific Cargo features | CUDA, ROCm, vLLM, ONNX Runtime, and llama.cpp server when available on the host |
-| `release-linux` | Universal router, no backend-specific Cargo features | CUDA, ROCm, vLLM, ONNX Runtime, and llama.cpp server when available on the host |
-| `release-macos-apple-silicon` | Universal router, no backend-specific Cargo features | MLX, ONNX Runtime, and llama.cpp server when available on the host |
+| `release-windows` | Universal router, Candle CPU, Candle CUDA | llama.cpp server CUDA/ROCm/Vulkan/CPU, vLLM CUDA/ROCm, ONNX Runtime CUDA/ROCm/CPU, Transformers compatibility when available on the host |
+| `release-linux` | Universal router, Candle CPU, Candle CUDA | llama.cpp server CUDA/ROCm/Vulkan/CPU, vLLM CUDA/ROCm, ONNX Runtime CUDA/ROCm/CPU, Transformers compatibility when available on the host |
+| `release-macos-apple-silicon` | Universal router, Candle CPU, Candle Metal | llama.cpp server Metal/CPU, MLX, ONNX Runtime CPU, Transformers compatibility when available on the host |
+
+The companion routes are not packaged inside the release archives. The Werk binary contains the router support for them; actual use depends on host-installed runtimes, configured paths, managed backend installs, or remote endpoints.
 
 Raw Cargo equivalents:
 
@@ -285,7 +287,7 @@ cargo build --release --locked --no-default-features --target x86_64-unknown-lin
 cargo build --release --locked --no-default-features --target aarch64-apple-darwin --features release-macos-apple-silicon
 ```
 
-Universal release builds do not compile CUDA, ROCm, Metal, or other backend-specific Cargo features, so they do not require NVIDIA drivers, CUDA toolkits, `nvcc`, Python, or companion runtimes just to start. Those requirements apply only to explicit custom source builds. For a CUDA-enabled source build, point Cargo at the intended installed toolkit:
+Target release builds compile the platform accelerator Cargo feature into the artifact. That means Linux and Windows release builders need a working CUDA build environment, and Apple Silicon release builders need the macOS Metal-capable toolchain. The installers still install only the Werk1112 CLI; they do not install CUDA, ROCm, Python, models, or companion runtimes. At runtime, Werk uses compiled Candle support plus available host companion backends and follows the planner fallback policy when a backend is unavailable. For a CUDA-enabled source build, point Cargo at the intended installed toolkit:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-13.0
@@ -412,7 +414,7 @@ target/x86_64-unknown-linux-gnu/release/werk
 target/aarch64-apple-darwin/release/werk
 ```
 
-Runtime backend setup should be a black box for end users. GGUF execution uses a persistent llama.cpp server backend so the decode loop, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. For vLLM-supported HF safetensors architectures on CUDA, vLLM is tried before Candle. Candle is the compatibility fallback instead of the primary target. In `--backend auto`, Werk skips unavailable runtimes quietly and uses the best working fallback; `--debug` and `werk backend doctor --debug` print detailed probe rejection reasons. Source builds may need managed or PATH-provided companion runtimes for llama.cpp/ONNX/vLLM; use `werk backend list`, `werk backend doctor --debug`, `werk backend install llama-cuda`, and `werk artifacts build <model>` for local development. `WERK_LLAMA_CTX`, `WERK_LLAMA_BATCH`, `WERK_LLAMA_UBATCH`, and `WERK_LLAMA_MAIN_GPU` are advanced GGUF tuning overrides. `WERK_LLAMA_SERVER_ROCM` can point to a ROCm/HIP llama.cpp server. `WERK_ONNX_RUNTIME_CUDA`, `WERK_ONNX_RUNTIME_ROCM`, `WERK_ONNX_RUNTIME_CPU`, `WERK_ONNX_RUNTIME`, `WERK_ONNX_RUNTIME_BUNDLE_CUDA`, `WERK_ONNX_RUNTIME_BUNDLE_ROCM`, `WERK_ONNX_RUNTIME_BUNDLE_CPU`, and `WERK_ONNX_EXPORTER` are advanced ONNX artifact/runtime overrides. `WERK_VLLM_PYTHON`, `WERK_VLLM_HOST`, `WERK_VLLM_PORT`, `WERK_VLLM_ACCELERATOR=rocm`, `WERK_VLLM_ROCM=1`, and `WERK_VLLM_ARGS` are available for managed and explicit vLLM routes. The MLX backend uses `python3 -m mlx_lm.generate` or `WERK_MLX_PYTHON`. VLM request/image support is compiled into every build; actual multimodal generation depends on the chosen model and backend.
+Runtime backend setup should be a black box for end users. GGUF execution uses a persistent llama.cpp server backend so the decode loop, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. For vLLM-supported HF safetensors architectures on CUDA, vLLM is tried before Candle. Candle is the compatibility fallback instead of the primary target. In `--backend auto`, Werk skips unavailable runtimes quietly, may provision managed llama.cpp server backends for the platform GGUF hot path, and uses the best working fallback; `--debug` and `werk backend doctor --debug` print detailed probe rejection reasons. Source builds may also use PATH-provided companion runtimes for llama.cpp/ONNX/vLLM; use `werk backend list`, `werk backend doctor --debug`, `werk backend install llama-cuda`, and `werk artifacts build <model>` for local development. `WERK_LLAMA_CTX`, `WERK_LLAMA_BATCH`, `WERK_LLAMA_UBATCH`, and `WERK_LLAMA_MAIN_GPU` are advanced GGUF tuning overrides. `WERK_LLAMA_SERVER_ROCM` can point to a ROCm/HIP llama.cpp server. `WERK_ONNX_RUNTIME_CUDA`, `WERK_ONNX_RUNTIME_ROCM`, `WERK_ONNX_RUNTIME_CPU`, `WERK_ONNX_RUNTIME`, `WERK_ONNX_RUNTIME_BUNDLE_CUDA`, `WERK_ONNX_RUNTIME_BUNDLE_ROCM`, `WERK_ONNX_RUNTIME_BUNDLE_CPU`, and `WERK_ONNX_EXPORTER` are advanced ONNX artifact/runtime overrides. `WERK_VLLM_PYTHON`, `WERK_VLLM_HOST`, `WERK_VLLM_PORT`, `WERK_VLLM_ACCELERATOR=rocm`, `WERK_VLLM_ROCM=1`, and `WERK_VLLM_ARGS` are available for managed and explicit vLLM routes. The MLX backend uses `python3 -m mlx_lm.generate` or `WERK_MLX_PYTHON`. VLM request/image support is compiled into every build; actual multimodal generation depends on the chosen model and backend.
 
 Additional low-level acceleration features are available for custom builds:
 
@@ -494,7 +496,7 @@ releases/werk1112-v<VERSION>-windows-x86_64.zip
 releases/werk1112-v<VERSION>-macos-aarch64.tar.gz
 ```
 
-Each artifact has a `.sha256` checksum file. Release artifacts are universal runtime-router binaries, one per supported OS/architecture. Build them on the matching target OS/toolchain when cross-compilation is unavailable.
+Each artifact has a `.sha256` checksum file. Release artifacts are universal runtime-router binaries, one per supported OS/architecture, with the platform accelerator path compiled in. Build them on the matching target OS/toolchain when cross-compilation is unavailable.
 
 ## Model Store
 
@@ -578,6 +580,25 @@ Override address:
 
 ```bash
 werk serve --host 0.0.0.0 --port 11434
+```
+
+Generate a persistent API key file for clients such as Open WebUI:
+
+```bash
+werk auth api-key generate
+```
+
+By default this creates `~/.config/werk1112/api-keys.toml`. `werk serve` loads that file automatically when it exists. To create or use a different file:
+
+```bash
+werk auth api-key generate --path /path/to/api-keys.toml
+werk serve --api-keys /path/to/api-keys.toml
+```
+
+Clients should send the generated value as an OpenAI-compatible bearer token:
+
+```text
+Authorization: Bearer <key>
 ```
 
 Import a local model file or directory. Files are copied into the managed model store:
@@ -779,9 +800,9 @@ Text deltas are intentionally chunked. They are not one event per token.
 
 ## End-User Releases
 
-Release artifacts should be produced with the target Cargo alias on the target platform. Each release contains the Cargo-built `werk` binary and documentation, not backend-specific companion runtime packages. End users should not need CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc` for the binary to start.
+Release artifacts should be produced with the target Cargo alias on the target platform. Each release contains the Cargo-built `werk` binary and documentation, not backend-specific companion runtime packages. Installers install only the Werk1112 CLI; they do not install CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc`.
 
-Do not ship one artifact per backend. Release artifacts are universal runtime-router binaries; backend-specific acceleration is discovered from the host system and installed companion runtimes. Legacy in-process llama.cpp FFI CUDA/Vulkan builds are debug/developer features, not the normal release route.
+Do not ship one artifact per backend. Release artifacts are universal runtime-router binaries with the platform accelerator path compiled in; external/server acceleration is discovered from the host system and installed companion runtimes. Legacy in-process llama.cpp FFI CUDA/Vulkan builds are debug/developer features, not the normal release route.
 
 Each target artifact keeps the same artifact name regardless of available host acceleration:
 
@@ -806,7 +827,7 @@ werk --backend onnx chat model-id
 werk --backend vllm chat model-id
 ```
 
-`auto` is format-aware: GGUF uses llama.cpp server acceleration when discoverable, then CPU and legacy fallbacks according to the planner; safetensors can use vLLM or Candle according to host capabilities and compiled source-build features; MLX-format models use MLX when available. Explicit `onnx`, `vllm`, and GPU requests do not fallback to CPU. `--backend rocm` is strict ROCm/HIP for compatible formats.
+`auto` is format-aware: GGUF uses llama.cpp server acceleration when discoverable, then CPU and legacy fallbacks according to the planner; safetensors can use vLLM or Candle according to host capabilities and compiled artifact features; MLX-format models use MLX when available. Explicit `onnx`, `vllm`, and GPU requests do not fallback to CPU. `--backend rocm` is strict ROCm/HIP for compatible formats.
 
 MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. CUDA, Vulkan, and CPU GGUF hot paths are implemented through persistent llama.cpp server backends. `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
 

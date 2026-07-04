@@ -16,7 +16,8 @@ usage() {
 Usage: ./scripts/package-release.sh <linux|windows|macos|all>
 
 Builds release artifacts into releases/.
-Artifacts are universal runtime-router binaries, one per supported OS/architecture.
+Artifacts are universal runtime-router binaries, one per supported OS/architecture,
+with the platform accelerator path compiled in.
 USAGE
 }
 
@@ -84,7 +85,7 @@ package_target() {
     artifact="$REPO_ROOT/releases/$artifact_name"
 
     printf '\n==> Building %s release artifact\n' "$platform"
-    printf '    Note: release artifacts are universal runtime-router binaries.\n'
+    printf '    Note: release artifacts are universal runtime-router binaries with platform accelerator support compiled in.\n'
     printf '    If cross-compilation is unavailable for your environment, build this artifact on the matching target OS.\n'
     printf '    Running: cargo %s\n' "$cargo_alias"
 

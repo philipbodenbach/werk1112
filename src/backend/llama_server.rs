@@ -82,6 +82,7 @@ struct ServerCompletion {
     first_token_seconds: f64,
     finish_reason: String,
     backend_diagnostics: Vec<String>,
+    saw_reasoning_content: bool,
 }
 
 impl LlamaServerBackend {
@@ -167,6 +168,7 @@ impl LlamaServerBackend {
         let server = Arc::new(LlamaServerProcess::start(
             &self.store,
             self.mode,
+            manifest,
             &absolute_model_path,
             &self.runtime_options,
         )?);
@@ -303,6 +305,7 @@ impl LlamaServerProcess {
     fn start(
         store: &ModelStore,
         mode: LlamaCppMode,
+        manifest: &ModelManifest,
         model_path: &PathBuf,
         runtime_options: &LlamaRuntimeOptions,
     ) -> Result<Self> {
@@ -314,7 +317,14 @@ impl LlamaServerProcess {
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         let supported = supported_args(&executable);
-        let args = llama_server_args(mode, model_path, port, runtime_options, &supported);
+        let args = llama_server_args(
+            mode,
+            model_path,
+            port,
+            runtime_options,
+            &supported,
+            llama_server_non_thinking(manifest),
+        );
 
         eprintln!("Using llama.cpp server {} backend", display_name(mode));
         let mut command = Command::new(&executable);
@@ -389,6 +399,9 @@ impl LlamaServerProcess {
                     .with_context(|| format!("invalid llama-server SSE event: {event}"))?;
                 let chunk = if use_chat_endpoint {
                     update_chat_completion_from_event(&mut completion, &value);
+                    if chat_delta_has_reasoning_content(&value) {
+                        completion.saw_reasoning_content = true;
+                    }
                     chat_delta_content(&value)
                 } else {
                     update_completion_from_event(&mut completion, &value);
@@ -411,6 +424,15 @@ impl LlamaServerProcess {
         })?;
 
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
+        if use_chat_endpoint
+            && completion.text.trim().is_empty()
+            && completion.completion_tokens > 0
+            && completion.saw_reasoning_content
+        {
+            bail!(
+                "llama.cpp generated hidden reasoning without assistant text; retry with a larger --max-tokens value or disable reasoning for this model"
+            );
+        }
         Ok(completion)
     }
 
@@ -535,6 +557,7 @@ fn llama_server_args(
     port: u16,
     runtime_options: &LlamaRuntimeOptions,
     supported: &SupportedArgs,
+    non_thinking: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "--model".to_string(),
@@ -605,10 +628,24 @@ fn llama_server_args(
     if supported.log_disable && !env_true("WERK_LLAMA_LOG") {
         args.push("--log-disable".to_string());
     }
+    if non_thinking {
+        if supported.reasoning {
+            args.push("--reasoning".to_string());
+            args.push("off".to_string());
+        }
+        if supported.chat_template_kwargs {
+            args.push("--chat-template-kwargs".to_string());
+            args.push(r#"{"enable_thinking":false}"#.to_string());
+        }
+    }
     if let Ok(extra) = env::var("WERK_LLAMA_ARGS") {
         args.extend(split_args(&extra));
     }
     args
+}
+
+fn llama_server_non_thinking(manifest: &ModelManifest) -> bool {
+    manifest_text_matches(manifest, "qwen3")
 }
 
 fn completion_body(request: &GenerateRequest) -> Value {
@@ -761,6 +798,33 @@ fn chat_delta_content(value: &Value) -> Option<String> {
         .get("content")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn chat_delta_has_reasoning_content(value: &Value) -> bool {
+    let Some(delta) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+    else {
+        return false;
+    };
+    ["reasoning_content", "reasoning"].into_iter().any(|key| {
+        delta
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    })
+}
+
+fn manifest_text_matches(manifest: &ModelManifest, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    manifest.id.to_ascii_lowercase().contains(&needle)
+        || manifest
+            .architecture
+            .as_deref()
+            .map(|architecture| architecture.to_ascii_lowercase().contains(&needle))
+            .unwrap_or(false)
 }
 
 fn finalize_completion_stats(
@@ -934,6 +998,8 @@ struct SupportedArgs {
     kv_offload: bool,
     perf: bool,
     log_disable: bool,
+    reasoning: bool,
+    chat_template_kwargs: bool,
 }
 
 fn supported_args(executable: &PathBuf) -> SupportedArgs {
@@ -950,10 +1016,29 @@ fn supported_args(executable: &PathBuf) -> SupportedArgs {
         kv_offload: text.contains("--kv-offload") || text.contains("-kvo,"),
         perf: text.contains("--perf"),
         log_disable: text.contains("--log-disable"),
+        reasoning: text.contains("--reasoning ") || text.contains("-rea,"),
+        chat_template_kwargs: text.contains("--chat-template-kwargs"),
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LlamaServerInstallOptions {
+    pub verbose: bool,
+}
+
 pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<PathBuf> {
+    install_managed_llama_server_with_options(
+        store,
+        mode,
+        LlamaServerInstallOptions { verbose: true },
+    )
+}
+
+pub fn install_managed_llama_server_with_options(
+    store: &ModelStore,
+    mode: LlamaCppMode,
+    options: LlamaServerInstallOptions,
+) -> Result<PathBuf> {
     if mode == LlamaCppMode::Metal && !cfg!(target_os = "macos") {
         bail!("llama.cpp Metal backend can only be built on macOS");
     }
@@ -971,7 +1056,9 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
                 source_dir.display()
             );
         }
-        eprintln!("Cloning llama.cpp into {}", source_dir.display());
+        if options.verbose {
+            eprintln!("Cloning llama.cpp into {}", source_dir.display());
+        }
         run_command(
             Command::new("git")
                 .arg("clone")
@@ -980,8 +1067,9 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
                 .arg("https://github.com/ggml-org/llama.cpp")
                 .arg(&source_dir),
             "failed to clone llama.cpp; install git and check network access",
+            options.verbose,
         )?;
-    } else {
+    } else if options.verbose {
         eprintln!(
             "Using existing llama.cpp checkout at {}",
             source_dir.display()
@@ -989,10 +1077,12 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
     }
 
     if build_dir.join("CMakeCache.txt").is_file() {
-        eprintln!(
-            "Resetting previous llama.cpp build cache at {}",
-            build_dir.display()
-        );
+        if options.verbose {
+            eprintln!(
+                "Resetting previous llama.cpp build cache at {}",
+                build_dir.display()
+            );
+        }
         fs::remove_dir_all(&build_dir).with_context(|| {
             format!(
                 "failed to reset previous llama.cpp build cache {}",
@@ -1001,7 +1091,9 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
         })?;
     }
 
-    eprintln!("Configuring llama.cpp {} build", display_name(mode));
+    if options.verbose {
+        eprintln!("Configuring llama.cpp {} build", display_name(mode));
+    }
     let mut configure = Command::new("cmake");
     configure
         .arg("-B")
@@ -1018,12 +1110,22 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
     match mode {
         LlamaCppMode::Cuda => {
             configure.arg("-DGGML_CUDA=ON");
+            if let Some(nvcc) = cuda_compiler() {
+                if options.verbose {
+                    eprintln!("Using CUDA compiler {}", nvcc.display());
+                }
+                configure.arg(format!("-DCMAKE_CUDA_COMPILER={}", nvcc.display()));
+            }
             if let Some(arch) = cuda_architecture() {
-                eprintln!("Using CUDA architecture {arch}");
+                if options.verbose {
+                    eprintln!("Using CUDA architecture {arch}");
+                }
                 configure.arg(format!("-DCMAKE_CUDA_ARCHITECTURES={arch}"));
             }
             if let Some(host_compiler) = cuda_host_compiler() {
-                eprintln!("Using CUDA host compiler {}", host_compiler.display());
+                if options.verbose {
+                    eprintln!("Using CUDA host compiler {}", host_compiler.display());
+                }
                 configure.arg(format!(
                     "-DCMAKE_CUDA_HOST_COMPILER={}",
                     host_compiler.display()
@@ -1048,9 +1150,12 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
     run_command(
         &mut configure,
         "failed to configure llama.cpp with CMake; install cmake and the required native toolchain",
+        options.verbose,
     )?;
 
-    eprintln!("Building llama-server");
+    if options.verbose {
+        eprintln!("Building llama-server");
+    }
     run_command(
         Command::new("cmake")
             .arg("--build")
@@ -1061,6 +1166,7 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
             .arg("llama-server")
             .arg("-j"),
         "failed to build llama-server with CMake",
+        options.verbose,
     )?;
 
     let executable = find_managed_server(store, mode).ok_or_else(|| {
@@ -1310,12 +1416,57 @@ fn managed_path_file(store: &ModelStore, mode: LlamaCppMode) -> PathBuf {
     managed_backend_dir(store, mode).join("llama-server.path")
 }
 
-fn run_command(command: &mut Command, context: &str) -> Result<()> {
-    let status = command.status().with_context(|| context.to_string())?;
+fn run_command(command: &mut Command, context: &str, verbose: bool) -> Result<()> {
+    if verbose {
+        let status = command.status().with_context(|| context.to_string())?;
+        if !status.success() {
+            bail!("{context}; command exited with {status}");
+        }
+        return Ok(());
+    }
+
+    let status = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| context.to_string())?;
     if !status.success() {
-        bail!("{context}; command exited with {status}");
+        bail!(
+            "{context}; command exited with {}. Build output suppressed; re-run with --verbose/--debug or use `werk backend install ...` for full build output.",
+            status
+        );
     }
     Ok(())
+}
+
+fn cuda_compiler() -> Option<PathBuf> {
+    for var in [
+        "WERK_LLAMA_CUDA_COMPILER",
+        "CMAKE_CUDA_COMPILER",
+        "CUDA_NVCC",
+    ] {
+        if let Some(path) = env::var_os(var).map(PathBuf::from)
+            && path.is_file()
+        {
+            return Some(path);
+        }
+    }
+    for var in [
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "CUDA_ROOT",
+        "CUDA_TOOLKIT_ROOT_DIR",
+    ] {
+        if let Some(root) = env::var_os(var).map(PathBuf::from) {
+            let candidate = root
+                .join("bin")
+                .join(if cfg!(windows) { "nvcc.exe" } else { "nvcc" });
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    find_in_path("nvcc")
 }
 
 fn cuda_host_compiler() -> Option<PathBuf> {
@@ -1347,7 +1498,8 @@ fn matching_c_compiler(cxx_compiler: &Path) -> Option<PathBuf> {
 }
 
 fn cuda_major_version() -> Option<u32> {
-    let output = Command::new("nvcc").arg("--version").output().ok()?;
+    let compiler = cuda_compiler().unwrap_or_else(|| PathBuf::from("nvcc"));
+    let output = Command::new(compiler).arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2028,7 +2180,9 @@ mod tests {
                 kv_offload: true,
                 perf: true,
                 log_disable: true,
+                ..SupportedArgs::default()
             },
+            false,
         );
         let flash_attn = args.iter().position(|arg| arg == "-fa").unwrap();
         assert_eq!(args.get(flash_attn + 1).map(String::as_str), Some("auto"));
@@ -2049,10 +2203,50 @@ mod tests {
                 kv_offload: true,
                 perf: false,
                 log_disable: false,
+                ..SupportedArgs::default()
             },
+            false,
         );
         let flash_attn = args.iter().position(|arg| arg == "-fa").unwrap();
         assert_eq!(args.get(flash_attn + 1).map(String::as_str), Some("off"));
+    }
+
+    #[test]
+    fn server_args_disable_qwen3_thinking_when_supported() {
+        let args = llama_server_args(
+            LlamaCppMode::Cuda,
+            &PathBuf::from("/tmp/model.gguf"),
+            12345,
+            &LlamaRuntimeOptions::default(),
+            &SupportedArgs {
+                reasoning: true,
+                chat_template_kwargs: true,
+                ..SupportedArgs::default()
+            },
+            true,
+        );
+
+        let reasoning = args.iter().position(|arg| arg == "--reasoning").unwrap();
+        assert_eq!(args.get(reasoning + 1).map(String::as_str), Some("off"));
+        let kwargs = args
+            .iter()
+            .position(|arg| arg == "--chat-template-kwargs")
+            .unwrap();
+        assert_eq!(
+            args.get(kwargs + 1).map(String::as_str),
+            Some(r#"{"enable_thinking":false}"#)
+        );
+    }
+
+    #[test]
+    fn chat_completion_event_detects_reasoning_only_delta() {
+        let value = json!({
+            "choices": [{"delta": {"reasoning_content": "thinking"}}],
+            "usage": {"completion_tokens": 1}
+        });
+
+        assert_eq!(chat_delta_content(&value), None);
+        assert!(chat_delta_has_reasoning_content(&value));
     }
 
     fn temp_root(name: &str) -> PathBuf {

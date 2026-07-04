@@ -6695,6 +6695,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "cudarc 0.19.8",
+ "getrandom 0.2.17",
  "indicatif",
  "libc",
  "llama_cpp",

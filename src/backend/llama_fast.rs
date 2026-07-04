@@ -627,6 +627,7 @@ mod imp {
                 completion_tokens,
                 finish_reason,
                 timings,
+                backend_diagnostics: Vec::new(),
             })
         }
 
@@ -956,6 +957,7 @@ mod imp {
                     prompt_tokens: response.prompt_tokens,
                     completion_tokens: response.completion_tokens,
                     timings: response.timings,
+                    backend_diagnostics: response.backend_diagnostics,
                 }));
             }
             Err(err) => {

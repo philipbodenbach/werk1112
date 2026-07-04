@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow = "1.0.98"
 axum = "0.8.4"
 crc32fast = "1.5.0"
+getrandom = "0.2.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.142"
 tokio = { version = "1.47.1", features = ["full"] }
@@ -36,9 +37,9 @@ llama_cpp = { version = "0.3.2", optional = true }
 llama_cpp_sys = { version = "0.3.2", default-features = false, optional = true }
 
 [features]
-# Default builds are backend-neutral so source installs do not require CUDA,
-# ROCm, Metal, MLX, vLLM, llama.cpp, or ONNX Runtime tooling to compile.
-default = []
+# Default source installs include the recommended accelerator support.
+# Runtime routing still falls back when host backends are unavailable.
+default = ["recommended"]
 recommended = ["cuda"]
 llama-cpp = ["dep:llama_cpp"]
 llama-fast = ["dep:llama_cpp_sys"]
@@ -80,11 +81,12 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 vulkan = ["llama-legacy-vulkan"]
 
-# Release bundles intentionally remain backend-neutral.
-# Backend acceleration is opt-in for source/developer builds.
-release-linux = []
-release-windows = []
-release-macos-apple-silicon = []
+# Release bundles stay one artifact per OS/architecture and compile the
+# platform accelerator path into that artifact. External/server backends
+# remain runtime-discovered and are not gated by these feature bundles.
+release-linux = ["cuda"]
+release-windows = ["cuda"]
+release-macos-apple-silicon = ["metal"]
 
 [profile.release]
 lto = "thin"

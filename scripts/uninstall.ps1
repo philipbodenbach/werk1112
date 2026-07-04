@@ -12,6 +12,7 @@ $installDir = if ($env:WERK_INSTALL_DIR) {
 
 $binaryPath = Join-Path $installDir "werk.exe"
 $modelStoreKept = $false
+$apiKeysKept = $false
 
 if (Test-Path $binaryPath) {
     Remove-Item -Path $binaryPath -Force
@@ -49,9 +50,47 @@ if ($modelStore) {
     }
 }
 
+$apiKeysFile = $null
+
+if ($env:WERK_API_KEYS -and (Test-Path $env:WERK_API_KEYS -PathType Leaf)) {
+    $apiKeysFile = $env:WERK_API_KEYS
+} elseif ($env:APPDATA) {
+    $appDataApiKeys = Join-Path $env:APPDATA "Werk1112\api-keys.toml"
+    if (Test-Path $appDataApiKeys -PathType Leaf) {
+        $apiKeysFile = $appDataApiKeys
+    }
+} elseif ($env:USERPROFILE) {
+    $profileApiKeys = Join-Path $env:USERPROFILE ".config\werk1112\api-keys.toml"
+    if (Test-Path $profileApiKeys -PathType Leaf) {
+        $apiKeysFile = $profileApiKeys
+    }
+}
+
+if ($apiKeysFile) {
+    Write-Host ""
+    Write-Host "Werk1112 API key file detected:"
+    Write-Host ""
+    Write-Host $apiKeysFile
+    Write-Host ""
+    Write-Host "This file can grant access to werk serve."
+    Write-Host ""
+
+    $answer = Read-Host "Remove the API key file? [y/N]"
+
+    if ($answer -eq "y" -or $answer -eq "yes") {
+        Remove-Item -Path $apiKeysFile -Force
+    } else {
+        $apiKeysKept = $true
+    }
+}
+
 Write-Host ""
 Write-Host "Werk1112 successfully removed."
 
 if ($modelStoreKept) {
     Write-Host "Model store kept."
+}
+
+if ($apiKeysKept) {
+    Write-Host "API keys kept."
 }

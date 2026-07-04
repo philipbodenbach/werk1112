@@ -25,6 +25,25 @@ find_model_store() {
     return 1
 }
 
+find_api_keys_file() {
+    if [ -n "${WERK_API_KEYS:-}" ] && [ -f "$WERK_API_KEYS" ]; then
+        printf '%s\n' "$WERK_API_KEYS"
+        return 0
+    fi
+
+    if [ -n "${XDG_CONFIG_HOME:-}" ] && [ -f "$XDG_CONFIG_HOME/werk1112/api-keys.toml" ]; then
+        printf '%s\n' "$XDG_CONFIG_HOME/werk1112/api-keys.toml"
+        return 0
+    fi
+
+    if [ -n "${HOME:-}" ] && [ -f "$HOME/.config/werk1112/api-keys.toml" ]; then
+        printf '%s\n' "$HOME/.config/werk1112/api-keys.toml"
+        return 0
+    fi
+
+    return 1
+}
+
 if [ "${WERK_INSTALL_DIR+x}" = "x" ]; then
     install_dir=$WERK_INSTALL_DIR
 else
@@ -34,6 +53,7 @@ fi
 
 binary_path="$install_dir/werk"
 model_store_kept=0
+api_keys_kept=0
 
 if [ -e "$binary_path" ]; then
     rm -f "$binary_path"
@@ -64,8 +84,34 @@ if model_store=$(find_model_store); then
     fi
 fi
 
+if api_keys_file=$(find_api_keys_file); then
+    printf '\nWerk1112 API key file detected:\n\n'
+    printf '%s\n\n' "$api_keys_file"
+    printf 'This file can grant access to werk serve.\n\n'
+    printf 'Remove it?\n\n'
+    printf '[y/N] '
+
+    if read answer; then
+        case "$answer" in
+            y|Y|yes|YES)
+                rm -f "$api_keys_file"
+                ;;
+            *)
+                api_keys_kept=1
+                ;;
+        esac
+    else
+        api_keys_kept=1
+        printf '\n'
+    fi
+fi
+
 printf '\nWerk1112 successfully removed.\n'
 
 if [ "$model_store_kept" -eq 1 ]; then
     printf 'Model store kept.\n'
+fi
+
+if [ "$api_keys_kept" -eq 1 ]; then
+    printf 'API keys kept.\n'
 fi

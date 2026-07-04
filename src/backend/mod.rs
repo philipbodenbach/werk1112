@@ -11,15 +11,16 @@ use std::pin::Pin;
 use tokio_stream::Stream;
 
 pub use burn::{BurnBackend, BurnMode, BurnProbeReport, BurnRuntimeStatus, burn_doctor_checks};
-pub use candle::{CandleBackend, CandleDeviceMode, probe_device};
+pub use candle::{CandleBackend, CandleDeviceMode, candle_gguf_tokenizer_rejection, probe_device};
 pub use external::{
     LlamaCppBackend, LlamaCppMode, MlxBackend, MlxVlmBackend, TransformersCompatBackend,
     is_transformers_compat_model,
 };
 pub use llama_fast::{LlamaFastBackend, LlamaFastRuntimeReport};
 pub use llama_server::{
-    BackendDoctorCheck, LlamaServerBackend, LlamaServerDiscovery, backend_doctor_checks,
-    install_managed_llama_server, llama_server_help_ok, managed_backend_dir,
+    BackendDoctorCheck, LlamaServerBackend, LlamaServerDiscovery, LlamaServerInstallOptions,
+    backend_doctor_checks, install_managed_llama_server, install_managed_llama_server_with_options,
+    llama_server_help_ok, managed_backend_dir,
 };
 pub use onnxruntime::{
     OnnxProvisionOptions, OnnxRuntimeAvailability, OnnxRuntimeBackend, OnnxRuntimeMode,

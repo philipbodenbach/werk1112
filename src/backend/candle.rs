@@ -262,6 +262,50 @@ fn load_tokenizer(store: &ModelStore, manifest: &ModelManifest) -> Result<Tokeni
     bail!("manifest has no tokenizer_path; add tokenizer.json beside the model")
 }
 
+pub fn candle_gguf_tokenizer_rejection(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+) -> Option<String> {
+    if manifest.format != ModelFormat::Gguf || manifest.tokenizer_path.is_some() {
+        return None;
+    }
+
+    if manifest
+        .architecture
+        .as_deref()
+        .is_some_and(is_gguf_bpe_tokenizer_architecture)
+    {
+        return Some(
+            "Candle GGUF fallback requires tokenizer.json for this architecture; use llama.cpp server for GGUF acceleration or add tokenizer.json beside the model"
+                .to_string(),
+        );
+    }
+
+    let model_path = manifest.model_path.as_deref()?;
+    let path = store.absolute_model_file(manifest, model_path);
+    let tokenizer_model = read_gguf_tokenizer_model(&path).ok()?;
+    if tokenizer_model == "llama" {
+        None
+    } else {
+        Some(format!(
+            "Candle GGUF fallback requires tokenizer.json for tokenizer.ggml.model='{tokenizer_model}'; use llama.cpp server for this GGUF or add tokenizer.json beside the model"
+        ))
+    }
+}
+
+fn is_gguf_bpe_tokenizer_architecture(architecture: &str) -> bool {
+    matches!(
+        architecture.to_ascii_lowercase().as_str(),
+        "qwen" | "qwen2" | "qwen3"
+    )
+}
+
+fn read_gguf_tokenizer_model(path: &PathBuf) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let content = gguf_file::Content::read(&mut file)?;
+    gguf_string(&content, "tokenizer.ggml.model")
+}
+
 fn generate_with_loaded_model(
     model: &mut CandleModel,
     tokenizer: &Tokenizer,
