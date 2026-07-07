@@ -1,6 +1,6 @@
 [alias]
 build-cpu = "build --release --locked --no-default-features"
-build-windows = "build --release --locked --no-default-features --target x86_64-pc-windows-msvc --features release-windows"
+build-windows = "--config env.CL='/Zc:preprocessor' --config env.NVCC_PREPEND_FLAGS='-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING' build --release --locked --no-default-features --target x86_64-pc-windows-msvc --features release-windows"
 build-linux = "build --release --locked --no-default-features --target x86_64-unknown-linux-gnu --features release-linux"
 build-macos-apple-silicon = "build --release --locked --no-default-features --target aarch64-apple-darwin --features release-macos-apple-silicon"
 
