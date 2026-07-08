@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://philipbodenbach.github.io/werk1112/sitemap.xml

@@ -16,6 +16,10 @@ Modern AI applications should not need to care whether a model executes through 
 
 Werk1112 abstracts runtime selection while remaining predictable, transparent, and local-first.
 
+## Project Website
+
+The GitHub Pages landing page lives in `docs/`. To publish it, enable GitHub Pages for this repository with Source `Deploy from a branch`, Branch `main`, and Folder `/docs`.
+
 ## Why Werk1112?
 
 Applications should depend on a stable AI runtime, not on individual inference engines.

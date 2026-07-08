@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Werk1112 &ndash; Local-first AI inference router in Rust</title>
+    <meta name="description" content="Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM, ONNX Runtime, Candle and MLX with an OpenAI-compatible API.">
+    <meta name="keywords" content="Rust, AI, LLM, local AI, inference router, OpenAI-compatible API, llama.cpp, vLLM, ONNX Runtime, Candle, MLX, local-first AI runtime">
+    <meta name="robots" content="index, follow">
+    <link rel="canonical" href="https://philipbodenbach.github.io/werk1112/">
+
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Werk1112 &ndash; Local-first AI inference router in Rust">
+    <meta property="og:description" content="Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM, ONNX Runtime, Candle and MLX with an OpenAI-compatible API.">
+    <meta property="og:url" content="https://philipbodenbach.github.io/werk1112/">
+    <meta property="og:site_name" content="Werk1112">
+    <meta property="og:image" content="https://philipbodenbach.github.io/werk1112/assets/banner_werk.png">
+    <meta property="og:image:width" content="546">
+    <meta property="og:image:height" content="145">
+    <meta property="og:image:alt" content="Werk1112 inference router banner">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Werk1112 &ndash; Local-first AI inference router in Rust">
+    <meta name="twitter:description" content="Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM, ONNX Runtime, Candle and MLX with an OpenAI-compatible API.">
+    <meta name="twitter:image" content="https://philipbodenbach.github.io/werk1112/assets/banner_werk.png">
+    <meta name="twitter:image:alt" content="Werk1112 inference router banner">
+
+    <meta name="theme-color" content="#111827">
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareSourceCode",
+        "name": "Werk1112",
+        "headline": "Werk1112 - Local-first AI inference router in Rust",
+        "description": "Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM, ONNX Runtime, Candle and MLX with an OpenAI-compatible API.",
+        "url": "https://philipbodenbach.github.io/werk1112/",
+        "codeRepository": "https://github.com/philipbodenbach/werk1112",
+        "license": "https://www.apache.org/licenses/LICENSE-2.0",
+        "programmingLanguage": {
+          "@type": "ComputerLanguage",
+          "name": "Rust"
+        },
+        "runtimePlatform": [
+          "Linux",
+          "macOS",
+          "Windows"
+        ],
+        "operatingSystem": [
+          "Linux",
+          "macOS",
+          "Windows"
+        ],
+        "applicationCategory": "DeveloperApplication",
+        "isAccessibleForFree": true,
+        "author": {
+          "@type": "Person",
+          "name": "Philip Bodenbach",
+          "url": "https://github.com/philipbodenbach"
+        },
+        "sameAs": [
+          "https://github.com/philipbodenbach/werk1112",
+          "https://github.com/philipbodenbach"
+        ],
+        "keywords": [
+          "Rust",
+          "AI",
+          "LLM",
+          "local AI",
+          "inference router",
+          "OpenAI-compatible API",
+          "llama.cpp",
+          "vLLM",
+          "ONNX Runtime",
+          "Candle",
+          "MLX",
+          "local-first AI runtime"
+        ]
+      }
+    </script>
+
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f8fafc;
+        --panel: #ffffff;
+        --text: #111827;
+        --muted: #4b5563;
+        --line: #d1d5db;
+        --accent: #0f766e;
+        --accent-strong: #0f4f49;
+        --code: #1f2937;
+        --shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.6;
+        color: var(--text);
+        background: var(--bg);
+      }
+
+      a {
+        color: var(--accent-strong);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        color: var(--accent);
+      }
+
+      .site-header,
+      main,
+      .site-footer {
+        width: min(1120px, calc(100% - 32px));
+        margin: 0 auto;
+      }
+
+      .site-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 22px 0;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        font-weight: 800;
+        color: var(--text);
+        text-decoration: none;
+      }
+
+      .brand-mark {
+        display: inline-grid;
+        width: 36px;
+        height: 36px;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--accent-strong);
+        font-size: 0.82rem;
+        letter-spacing: 0;
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        font-size: 0.95rem;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.18fr) minmax(280px, 0.82fr);
+        align-items: center;
+        gap: 48px;
+        min-height: 68vh;
+        padding: 44px 0 48px;
+      }
+
+      .eyebrow {
+        margin: 0 0 14px;
+        color: var(--accent-strong);
+        font-size: 0.8rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 780px;
+        margin-bottom: 18px;
+        font-size: clamp(2.4rem, 6vw, 5.8rem);
+        line-height: 0.95;
+        letter-spacing: 0;
+      }
+
+      .lead {
+        max-width: 700px;
+        margin-bottom: 28px;
+        color: var(--muted);
+        font-size: clamp(1.05rem, 2.2vw, 1.35rem);
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+      }
+
+      .button {
+        display: inline-flex;
+        min-height: 44px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 8px;
+        padding: 10px 16px;
+        font-weight: 800;
+        text-decoration: none;
+      }
+
+      .button.primary {
+        background: var(--text);
+        color: #ffffff;
+      }
+
+      .button.secondary {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--text);
+      }
+
+      .hero-visual {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+
+      .hero-visual img {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .terminal {
+        margin: 0;
+        padding: 22px;
+        overflow-x: auto;
+        background: var(--code);
+        color: #e5e7eb;
+        font-size: 0.95rem;
+        line-height: 1.55;
+      }
+
+      .terminal code {
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      }
+
+      .section {
+        padding: 46px 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .section h2 {
+        margin-bottom: 14px;
+        font-size: clamp(1.6rem, 3vw, 2.4rem);
+        line-height: 1.1;
+        letter-spacing: 0;
+      }
+
+      .section-copy {
+        max-width: 760px;
+        color: var(--muted);
+        font-size: 1.08rem;
+      }
+
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+        margin-top: 24px;
+      }
+
+      .feature-card {
+        min-height: 170px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 22px;
+        background: var(--panel);
+      }
+
+      .feature-card h3 {
+        margin-bottom: 10px;
+        font-size: 1.08rem;
+        letter-spacing: 0;
+      }
+
+      .feature-card p {
+        margin-bottom: 0;
+        color: var(--muted);
+      }
+
+      .topics {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin: 24px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .topics li {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 7px 12px;
+        background: var(--panel);
+        color: var(--muted);
+        font-size: 0.93rem;
+      }
+
+      .repo-panel {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 24px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 24px;
+        background: var(--panel);
+      }
+
+      .repo-panel p {
+        margin-bottom: 0;
+        color: var(--muted);
+      }
+
+      .site-footer {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 34px 0;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      .footer-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+      }
+
+      @media (max-width: 820px) {
+        .site-header {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .nav-links {
+          flex-wrap: wrap;
+        }
+
+        .hero {
+          grid-template-columns: 1fr;
+          gap: 28px;
+          min-height: auto;
+          padding-top: 24px;
+        }
+
+        .feature-grid,
+        .repo-panel {
+          grid-template-columns: 1fr;
+        }
+
+        .repo-panel .button {
+          width: 100%;
+        }
+      }
+
+      @media (max-width: 520px) {
+        .site-header,
+        main,
+        .site-footer {
+          width: min(100% - 24px, 1120px);
+        }
+
+        h1 {
+          font-size: clamp(2.15rem, 14vw, 3.2rem);
+        }
+
+        .actions,
+        .nav-links {
+          width: 100%;
+        }
+
+        .button {
+          width: 100%;
+        }
+
+        .terminal {
+          padding: 18px;
+          font-size: 0.86rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="https://github.com/philipbodenbach/werk1112" aria-label="Werk1112 GitHub repository">
+        <span class="brand-mark" aria-hidden="true">W</span>
+        <span>Werk1112</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary navigation">
+        <a href="#features">Features</a>
+        <a href="#topics">Topics</a>
+        <a href="https://github.com/philipbodenbach/werk1112">Repository</a>
+        <a href="https://github.com/philipbodenbach">Author</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div>
+          <p class="eyebrow">Rust AI runtime</p>
+          <h1 id="hero-title">Werk1112 &ndash; Local-first AI inference router in Rust</h1>
+          <p class="lead">
+            Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM,
+            ONNX Runtime, Candle and MLX with an OpenAI-compatible API.
+          </p>
+          <div class="actions" aria-label="Project links">
+            <a class="button primary" href="https://github.com/philipbodenbach/werk1112">View the GitHub repository</a>
+            <a class="button secondary" href="https://github.com/philipbodenbach">View Philip Bodenbach on GitHub</a>
+          </div>
+        </div>
+
+        <aside class="hero-visual" aria-label="Werk1112 terminal preview">
+          <img src="assets/banner_werk.png" width="546" height="145" alt="Werk1112 startup banner: WERK1112 - Inference Router.">
+          <pre class="terminal"><code>werk serve --model local-model
+curl http://127.0.0.1:11434/v1/models</code></pre>
+        </aside>
+      </section>
+
+      <section class="section" id="features" aria-labelledby="features-title">
+        <h2 id="features-title">Local model routing with one API surface</h2>
+        <p class="section-copy">
+          Applications target Werk1112 while Werk1112 chooses the local or companion runtime
+          for the model format, requested backend, and host capabilities.
+        </p>
+
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>OpenAI-compatible API</h3>
+            <p>Expose local model chat completions through a familiar HTTP API for existing clients and tools.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Runtime planner</h3>
+            <p>Route GGUF, safetensors, ONNX, and MLX-style model directories to the appropriate backend.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Local-first workflow</h3>
+            <p>Manage imports, pulls, estimates, CLI chat, and serving without making the app depend on one engine.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="topics" aria-labelledby="topics-title">
+        <h2 id="topics-title">Project topics</h2>
+        <p class="section-copy">
+          Werk1112 focuses on Rust-based local AI infrastructure and inference routing for common LLM runtimes.
+        </p>
+        <ul class="topics" aria-label="Werk1112 keywords and topics">
+          <li>Rust</li>
+          <li>AI</li>
+          <li>LLM</li>
+          <li>local AI</li>
+          <li>inference router</li>
+          <li>OpenAI-compatible API</li>
+          <li>llama.cpp</li>
+          <li>vLLM</li>
+          <li>ONNX Runtime</li>
+          <li>Candle</li>
+          <li>MLX</li>
+          <li>local-first AI runtime</li>
+        </ul>
+      </section>
+
+      <section class="section" aria-labelledby="source-title">
+        <div class="repo-panel">
+          <div>
+            <h2 id="source-title">Source code</h2>
+            <p>
+              Werk1112 is developed in the
+              <a href="https://github.com/philipbodenbach/werk1112">philipbodenbach/werk1112 GitHub repository</a>
+              by <a href="https://github.com/philipbodenbach">Philip Bodenbach</a>.
+            </p>
+          </div>
+          <a class="button primary" href="https://github.com/philipbodenbach/werk1112">Open repository</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>Werk1112 local-first AI inference router.</span>
+      <span class="footer-links">
+        <a href="https://github.com/philipbodenbach/werk1112">GitHub repository</a>
+        <a href="https://github.com/philipbodenbach">GitHub profile</a>
+      </span>
+    </footer>
+  </body>
+</html>
