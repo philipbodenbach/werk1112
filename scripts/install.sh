@@ -72,7 +72,7 @@ detect_platform() {
 detect_downloader
 detect_platform
 
-WERK_REPO=${WERK_REPO:-phildenbo/werk1112}
+WERK_REPO=${WERK_REPO:-philipbodenbach/werk1112}
 WERK_VERSION_INPUT=${WERK_VERSION:-latest}
 
 if [ "${WERK_INSTALL_DIR+x}" = "x" ]; then

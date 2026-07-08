@@ -52,7 +52,7 @@ function Test-PathContainsEntry {
     return $false
 }
 
-$script:WerkRepo = if ($env:WERK_REPO) { $env:WERK_REPO } else { "phildenbo/werk1112" }
+$script:WerkRepo = if ($env:WERK_REPO) { $env:WERK_REPO } else { "philipbodenbach/werk1112" }
 $versionInput = if ($env:WERK_VERSION) { $env:WERK_VERSION } else { "latest" }
 $installDir = if ($env:WERK_INSTALL_DIR) {
     $env:WERK_INSTALL_DIR
