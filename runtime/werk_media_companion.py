@@ -518,6 +518,106 @@ def require_module(module_name, distribution=None, purpose=None):
         )
 
 
+def accelerator_snapshot():
+    snapshot = {
+        "cpu": {
+            "available": True,
+            "version": None,
+            "detail": "CPU execution is available",
+        }
+    }
+    unavailable = {
+        "available": False,
+        "version": None,
+        "detail": "PyTorch is not available",
+    }
+    snapshot["cuda"] = dict(unavailable)
+    snapshot["rocm"] = dict(unavailable)
+    snapshot["mps"] = dict(unavailable)
+    try:
+        torch = importlib.import_module("torch")
+    except Exception as error:
+        detail = f"PyTorch could not be imported: {error}"
+        for name in ("cuda", "rocm", "mps"):
+            snapshot[name]["detail"] = detail
+        return snapshot
+
+    torch_version = str(getattr(torch, "__version__", "unknown"))
+    cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+    hip_version = getattr(getattr(torch, "version", None), "hip", None)
+    try:
+        torch_gpu_available = bool(torch.cuda.is_available())
+    except Exception as error:
+        torch_gpu_available = False
+        gpu_error = str(error)
+    else:
+        gpu_error = None
+
+    if torch_gpu_available:
+        try:
+            device_count = int(torch.cuda.device_count())
+            names = [
+                str(torch.cuda.get_device_name(index))
+                for index in range(device_count)
+            ]
+            device_detail = ", ".join(names) if names else "GPU available"
+        except Exception as error:
+            device_count = 0
+            device_detail = f"GPU available; device detail unavailable: {error}"
+        kind = "rocm" if hip_version else "cuda"
+        version = hip_version if hip_version else cuda_version
+        snapshot[kind] = {
+            "available": True,
+            "version": str(version) if version else None,
+            "detail": (
+                f"torch {torch_version}; {device_count} device(s): {device_detail}"
+            ),
+        }
+        other = "cuda" if kind == "rocm" else "rocm"
+        snapshot[other]["detail"] = (
+            f"torch {torch_version} uses {kind.upper()}, not {other.upper()}"
+        )
+    else:
+        detail = (
+            f"torch {torch_version} reports no GPU"
+            if gpu_error is None
+            else f"torch {torch_version} GPU check failed: {gpu_error}"
+        )
+        if cuda_version:
+            detail += f"; CUDA build {cuda_version}"
+        if hip_version:
+            detail += f"; ROCm build {hip_version}"
+        snapshot["cuda"]["version"] = (
+            str(cuda_version) if cuda_version else None
+        )
+        snapshot["rocm"]["version"] = (
+            str(hip_version) if hip_version else None
+        )
+        snapshot["cuda"]["detail"] = detail
+        snapshot["rocm"]["detail"] = detail
+
+    mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+    try:
+        mps_available = (
+            mps_backend is not None and bool(mps_backend.is_available())
+        )
+    except Exception as error:
+        mps_available = False
+        mps_detail = f"torch {torch_version} MPS check failed: {error}"
+    else:
+        mps_detail = (
+            f"torch {torch_version} reports MPS available"
+            if mps_available
+            else f"torch {torch_version} reports MPS unavailable"
+        )
+    snapshot["mps"] = {
+        "available": mps_available,
+        "version": None,
+        "detail": mps_detail,
+    }
+    return snapshot
+
+
 def command_health(_payload):
     return {
         "status": "ok",
@@ -526,6 +626,7 @@ def command_health(_payload):
         "python_version": sys.version.split()[0],
         "offline": True,
         "dependencies": dependency_snapshot(),
+        "accelerators": accelerator_snapshot(),
     }
 
 

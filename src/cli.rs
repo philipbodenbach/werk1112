@@ -1,3 +1,5 @@
+mod terminal_activity;
+
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -6,7 +8,7 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::{self, IsTerminal, Read, Write},
     net::{IpAddr, SocketAddr},
@@ -17,6 +19,9 @@ use std::{
 };
 use tokio_stream::StreamExt;
 
+use self::terminal_activity::{
+    ActivityKind, ActivitySpec, generation_activity_enabled, with_activity,
+};
 #[cfg(feature = "burn-experimental")]
 use crate::backend::burn_doctor_checks;
 use crate::{
@@ -45,7 +50,7 @@ use crate::{
         ParameterValue, RoutingOverrides, WorkloadEstimate, parameter_schema,
         parameter_schema_for_manifest,
     },
-    inference_service::{InferenceResult, InferenceService},
+    inference_service::{InferenceResult, InferenceService, OutputStore},
     media_cli::{
         AudioCommands, ImageCommands, RoutingArgs, VideoCommands, collect_raw_overrides,
         parse_set_overrides,
@@ -1080,9 +1085,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 verbose,
                 debug,
             };
-            let response = with_terminal_spinner(
-                terminal_spinner_enabled(debug),
-                format!("Running model '{}'...", manifest.id),
+            let activity = ActivitySpec::chat();
+            let response = with_activity(
+                generation_activity_enabled(debug),
+                activity.kind(),
+                activity.message(&manifest.id),
                 || backend.generate(&manifest, request),
             )?;
             println!("{}", response.text.trim());
@@ -1954,19 +1961,265 @@ fn execute_media_args<T: Serialize>(
     request.parameters = media_parameters(args, routing_args, task)?;
     request.routing = media_routing(routing_args, backend, device)?;
 
-    let result = InferenceService::new(store.clone()).execute(request)?;
-    print_inference_result(&result);
+    let service = InferenceService::new(store.clone());
+    let activity = ActivitySpec::for_task(task);
+    let mut result = with_activity(
+        generation_activity_enabled(false),
+        activity.kind(),
+        activity.message(model),
+        || service.execute(request),
+    )?;
     if let Some(destination) = requested_output {
-        for published in publish_cli_outputs(&result, &destination)? {
-            println!("saved> {}", published.display());
-        }
+        publish_and_release_cli_outputs(
+            service.output_store(),
+            &mut result,
+            destination.as_path(),
+        )?;
+    } else {
+        publish_default_cli_outputs(service.output_store(), &mut result)?;
     }
+    print_inference_result(&result, false);
     Ok(())
 }
 
 fn requested_media_output<T: Serialize>(args: &T) -> Result<Option<PathBuf>> {
     let raw = collect_raw_overrides(args)?;
     Ok(raw.get("output").and_then(Value::as_str).map(PathBuf::from))
+}
+
+fn publish_and_release_cli_outputs(
+    output_store: &OutputStore,
+    result: &mut InferenceResult,
+    destination: &Path,
+) -> Result<()> {
+    ensure_cli_publication_paths(output_store, result, destination)?;
+    let published = publish_cli_outputs(result, destination)?;
+    for (output, path) in result.outputs.iter_mut().zip(published) {
+        output.path = path.display().to_string();
+    }
+    if let Err(error) = output_store.remove_result(&result.id) {
+        result.warnings.push(format!(
+            "outputs were published, but the redundant managed copy could not be removed: {error:#}"
+        ));
+    }
+    Ok(())
+}
+
+fn publish_default_cli_outputs(
+    output_store: &OutputStore,
+    result: &mut InferenceResult,
+) -> Result<()> {
+    ensure_managed_cli_sources(output_store, result)?;
+    output_store.ensure()?;
+    let targets = result
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            let source = PathBuf::from(&output.path);
+            let file_name = default_cli_output_file_name(result, index, &source);
+            (source, output_store.root().join(file_name))
+        })
+        .collect::<Vec<_>>();
+    let published = move_managed_cli_outputs(&targets)?;
+    for (output, path) in result.outputs.iter_mut().zip(published) {
+        output.path = path.display().to_string();
+    }
+    if let Err(error) = output_store.remove_result(&result.id) {
+        result.warnings.push(format!(
+            "outputs were saved, but temporary result metadata could not be removed: {error:#}"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_cli_publication_paths(
+    output_store: &OutputStore,
+    result: &InferenceResult,
+    destination: &Path,
+) -> Result<()> {
+    let output_root = output_store
+        .root()
+        .canonicalize()
+        .context("failed to resolve the managed output store")?;
+    ensure_managed_cli_sources(output_store, result)?;
+
+    let destination = resolve_existing_ancestor(destination)?;
+    if destination.starts_with(&output_root) {
+        bail!(
+            "--output must be outside the managed output store: {}",
+            output_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_managed_cli_sources(output_store: &OutputStore, result: &InferenceResult) -> Result<()> {
+    let result_root = output_store
+        .root()
+        .join(&result.id)
+        .canonicalize()
+        .with_context(|| format!("managed result '{}' was not found", result.id))?;
+    for output in &result.outputs {
+        let source = Path::new(&output.path)
+            .canonicalize()
+            .with_context(|| format!("managed output does not exist: {}", output.path))?;
+        if !source.starts_with(&result_root) {
+            bail!(
+                "managed output escaped result '{}': {}",
+                result.id,
+                source.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn default_cli_output_file_name(result: &InferenceResult, index: usize, source: &Path) -> String {
+    let model = cli_output_slug(&result.model, 48);
+    let identifier = result.id.strip_prefix("out-").unwrap_or(&result.id);
+    let identifier = cli_output_slug(identifier, 48);
+    let ordinal = (result.outputs.len() > 1).then(|| format!("-{:02}", index + 1));
+    let extension = cli_output_extension(source, &result.outputs[index].mime_type);
+    format!(
+        "{model}-{}-{identifier}{}.{}",
+        result.task,
+        ordinal.as_deref().unwrap_or_default(),
+        extension
+    )
+}
+
+fn cli_output_slug(value: &str, max_len: usize) -> String {
+    let mut slug = String::with_capacity(value.len().min(max_len));
+    let mut separator = false;
+    for character in value.chars() {
+        if slug.len() >= max_len {
+            break;
+        }
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            separator = false;
+        } else if !slug.is_empty() && !separator {
+            slug.push('-');
+            separator = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "model".to_string()
+    } else {
+        slug
+    }
+}
+
+fn cli_output_extension(source: &Path, mime_type: &str) -> String {
+    if let Some(extension) = source.extension().and_then(|value| value.to_str())
+        && !extension.is_empty()
+        && extension.len() <= 16
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return extension.to_ascii_lowercase();
+    }
+    match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "audio/wav" => "wav",
+        "audio/flac" => "flac",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "application/json" => "json",
+        "text/plain" => "txt",
+        _ => "bin",
+    }
+    .to_string()
+}
+
+fn move_managed_cli_outputs(targets: &[(PathBuf, PathBuf)]) -> Result<Vec<PathBuf>> {
+    if targets.is_empty() {
+        bail!("inference completed without producing an output file");
+    }
+    let mut unique_targets = HashSet::with_capacity(targets.len());
+    for (source, target) in targets {
+        let metadata = fs::symlink_metadata(source)
+            .with_context(|| format!("managed output does not exist: {}", source.display()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("managed output is not a regular file: {}", source.display());
+        }
+        if !unique_targets.insert(target.clone()) {
+            bail!(
+                "multiple outputs resolve to the same destination {}",
+                target.display()
+            );
+        }
+        if target.exists() {
+            bail!(
+                "refusing to overwrite existing default output {}; remove it or use --output",
+                target.display()
+            );
+        }
+    }
+
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(targets.len());
+    for (source, target) in targets {
+        if let Err(error) = fs::rename(source, target) {
+            let mut rollback_errors = Vec::new();
+            for (original, published) in moved.iter().rev() {
+                if let Err(rollback_error) = fs::rename(published, original) {
+                    rollback_errors.push(format!(
+                        "{} -> {}: {rollback_error}",
+                        published.display(),
+                        original.display()
+                    ));
+                }
+            }
+            let rollback = if rollback_errors.is_empty() {
+                "previous outputs were restored to the managed result".to_string()
+            } else {
+                format!("rollback also failed: {}", rollback_errors.join("; "))
+            };
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to move managed output {} to {}; {rollback}",
+                    source.display(),
+                    target.display()
+                )
+            });
+        }
+        moved.push((source.clone(), target.clone()));
+    }
+    Ok(moved.into_iter().map(|(_, target)| target).collect())
+}
+
+fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut cursor = absolute.as_path();
+    let mut suffix = Vec::new();
+    while !cursor.exists() {
+        let name = cursor
+            .file_name()
+            .ok_or_else(|| anyhow!("cannot resolve output path {}", path.display()))?;
+        suffix.push(name.to_os_string());
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| anyhow!("cannot resolve output path {}", path.display()))?;
+    }
+    let mut resolved = cursor.canonicalize()?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 fn publish_cli_outputs(result: &InferenceResult, destination: &Path) -> Result<Vec<PathBuf>> {
@@ -1983,6 +2236,36 @@ fn publish_cli_outputs(result: &InferenceResult, destination: &Path) -> Result<V
             destination.display()
         );
     }
+    let mut targets = Vec::with_capacity(outputs.len());
+    let mut unique_targets = HashSet::with_capacity(outputs.len());
+    for output in outputs {
+        let source = Path::new(&output.path);
+        let target = if destination_is_directory {
+            let filename = source
+                .file_name()
+                .ok_or_else(|| anyhow!("output has no filename: {}", source.display()))?;
+            destination.join(filename)
+        } else {
+            destination.to_path_buf()
+        };
+        if !source.is_file() {
+            bail!("managed output does not exist: {}", source.display());
+        }
+        if !unique_targets.insert(target.clone()) {
+            bail!(
+                "multiple outputs resolve to the same destination {}",
+                target.display()
+            );
+        }
+        if target.exists() {
+            bail!(
+                "refusing to overwrite existing output {}; choose another --output path",
+                target.display()
+            );
+        }
+        targets.push((source.to_path_buf(), target));
+    }
+
     if destination_is_directory {
         fs::create_dir_all(destination).with_context(|| {
             format!(
@@ -1997,30 +2280,21 @@ fn publish_cli_outputs(result: &InferenceResult, destination: &Path) -> Result<V
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
     }
 
-    let mut published = Vec::with_capacity(outputs.len());
-    for output in outputs {
-        let source = Path::new(&output.path);
-        let target = if destination_is_directory {
-            let filename = source
-                .file_name()
-                .ok_or_else(|| anyhow!("output has no filename: {}", source.display()))?;
-            destination.join(filename)
-        } else {
-            destination.to_path_buf()
-        };
-        if target.exists() {
-            bail!(
-                "refusing to overwrite existing output {}; choose another --output path",
-                target.display()
-            );
+    let mut published = Vec::with_capacity(targets.len());
+    for (source, target) in targets {
+        if let Err(error) = fs::copy(&source, &target) {
+            let _ = fs::remove_file(&target);
+            for path in &published {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to copy managed output {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            });
         }
-        fs::copy(source, &target).with_context(|| {
-            format!(
-                "failed to copy managed output {} to {}",
-                source.display(),
-                target.display()
-            )
-        })?;
         published.push(target);
     }
     Ok(published)
@@ -2518,16 +2792,19 @@ fn normalize_media_parameter_path(task: InferenceTask, path: &str) -> String {
     format!("{}.{}", task.parameter_namespace(), normalized)
 }
 
-fn print_inference_result(result: &InferenceResult) {
-    println!(
-        "{} {} via {} ({})",
-        result.task, result.model, result.runtime, result.id
-    );
+fn print_inference_result(result: &InferenceResult, managed: bool) {
+    if managed {
+        println!(
+            "{} {} via {} ({})",
+            result.task, result.model, result.runtime, result.id
+        );
+    } else {
+        println!("{} {} via {}", result.task, result.model, result.runtime);
+    }
     for output in &result.outputs {
         println!("output> {}", output.path);
-        println!(
-            "  id={} mime={} size={}{}{}{}",
-            output.id,
+        let details = format!(
+            "mime={} size={}{}{}{}",
             output.mime_type,
             format_bytes(output.size_bytes),
             output
@@ -2543,6 +2820,11 @@ fn print_inference_result(result: &InferenceResult) {
                 .map(|duration| format!(" duration={duration:.2}s"))
                 .unwrap_or_default(),
         );
+        if managed {
+            println!("  id={} {details}", output.id);
+        } else {
+            println!("  {details}");
+        }
     }
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
@@ -3004,14 +3286,15 @@ fn should_print_startup_banner_for(
     }
 
     match command {
-        Commands::Serve { .. } | Commands::Run { .. } => true,
+        Commands::Serve { .. }
+        | Commands::Run { .. }
+        | Commands::Image { .. }
+        | Commands::Video { .. }
+        | Commands::Audio { .. } => true,
         Commands::Chat { .. } => stdin_is_terminal,
         Commands::Import { .. }
         | Commands::Pull { .. }
         | Commands::Remove { .. }
-        | Commands::Image { .. }
-        | Commands::Video { .. }
-        | Commands::Audio { .. }
         | Commands::Estimate { .. }
         | Commands::Bench { .. }
         | Commands::Doctor { .. }
@@ -4637,19 +4920,7 @@ fn with_terminal_spinner<T>(
     message: impl Into<String>,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let spinner = enabled.then(|| {
-        let progress = ProgressBar::new_spinner();
-        progress.enable_steady_tick(Duration::from_millis(120));
-        progress.set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
-        progress.set_message(message.into());
-        progress
-    });
-
-    let result = operation();
-    if let Some(progress) = spinner {
-        progress.finish_and_clear();
-    }
-    result
+    with_activity(enabled, ActivityKind::Spinner, message, operation)
 }
 
 enum ChatInputReader {
@@ -5198,13 +5469,12 @@ impl AssistantPendingSpinner {
             return Ok(());
         }
 
-        const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
-        let frame = FRAMES[self.frame_index % FRAMES.len()];
+        let frame = ActivityKind::Chat.frame(self.frame_index);
         self.frame_index += 1;
         self.visible = true;
 
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\r\x1b[2Kassistant> {frame}")?;
+        write!(stdout, "\r\x1b[2Kassistant> {frame} Werk is thinking...")?;
         stdout.flush()?;
         Ok(())
     }
@@ -8047,6 +8317,11 @@ fn format_bytes_f64(bytes: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::{
+        EffectiveInferenceRequest, EstimateConfidence as WorkloadEstimateConfidence, ExecutionPlan,
+        FitAssessment,
+    };
+    use crate::inference_service::OutputMetadata;
     use crate::model_store::{ModelFile, ModelSource};
     use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
@@ -9703,6 +9978,38 @@ mod tests {
         assert!(should_print_startup_banner_for(&chat, true, true));
         assert!(!should_print_startup_banner_for(&chat, true, false));
 
+        for args in [
+            vec![
+                "werk",
+                "image",
+                "generate",
+                "tiny-image",
+                "--prompt",
+                "hello",
+            ],
+            vec![
+                "werk",
+                "video",
+                "generate",
+                "tiny-video",
+                "--prompt",
+                "hello",
+            ],
+            vec![
+                "werk",
+                "audio",
+                "generate",
+                "tiny-audio",
+                "--prompt",
+                "hello",
+            ],
+        ] {
+            let media = Cli::try_parse_from(args).unwrap().command.unwrap();
+            assert!(should_print_startup_banner_for(&media, true, true));
+            assert!(should_print_startup_banner_for(&media, true, false));
+            assert!(!should_print_startup_banner_for(&media, false, true));
+        }
+
         let bench = Commands::Bench {
             model: "tiny".to_string(),
             prompt: "hello".to_string(),
@@ -9738,6 +10045,213 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn explicit_cli_output_replaces_managed_artifact_without_leaving_a_duplicate() {
+        let store = test_store("published-output");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store.create_output_dir("out-cli-publish").unwrap();
+        let source = output_dir.join("generated.png");
+        fs::write(&source, b"generated image").unwrap();
+        let destination = store.home().join("published.png");
+        let mut result = test_inference_result("out-cli-publish", &source);
+
+        publish_and_release_cli_outputs(&output_store, &mut result, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"generated image");
+        assert!(!output_dir.exists());
+        assert_eq!(result.outputs[0].path, destination.display().to_string());
+    }
+
+    #[test]
+    fn missing_cli_output_uses_a_friendly_file_in_the_managed_output_root() {
+        let store = test_store("default-output");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-1784968751-807fe1a83ad7fb22")
+            .unwrap();
+        let source = output_dir.join("image_generation-opaque-1.png");
+        fs::write(&source, b"generated image").unwrap();
+        let mut result = test_inference_result("out-1784968751-807fe1a83ad7fb22", &source);
+        result.model = "Segmind/Tiny SD".to_string();
+        result.effective_request.prompt = Some("private robot prompt".to_string());
+
+        publish_default_cli_outputs(&output_store, &mut result).unwrap();
+
+        let expected = output_store
+            .root()
+            .join("segmind-tiny-sd-image-generation-1784968751-807fe1a83ad7fb22.png");
+        assert_eq!(fs::read(&expected).unwrap(), b"generated image");
+        assert!(!output_dir.exists());
+        assert_eq!(result.outputs[0].path, expected.display().to_string());
+        assert!(!expected.to_string_lossy().contains("private"));
+    }
+
+    #[test]
+    fn default_cli_output_names_multiple_files_uniquely() {
+        let store = test_store("default-multiple-outputs");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-1784968752-a5a791686518b221")
+            .unwrap();
+        let first = output_dir.join("opaque-a.png");
+        let second = output_dir.join("opaque-b.webp");
+        fs::write(&first, b"first image").unwrap();
+        fs::write(&second, b"second image").unwrap();
+        let mut result = test_inference_result("out-1784968752-a5a791686518b221", &first);
+        result.model = "tiny-sd".to_string();
+        let mut second_output = result.outputs[0].clone();
+        second_output.id = "out-1784968752-a5a791686518b221-1".to_string();
+        second_output.path = second.display().to_string();
+        second_output.mime_type = "image/webp".to_string();
+        result.outputs.push(second_output);
+
+        publish_default_cli_outputs(&output_store, &mut result).unwrap();
+
+        assert_eq!(
+            result.outputs[0].path,
+            output_store
+                .root()
+                .join("tiny-sd-image-generation-1784968752-a5a791686518b221-01.png")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            result.outputs[1].path,
+            output_store
+                .root()
+                .join("tiny-sd-image-generation-1784968752-a5a791686518b221-02.webp")
+                .display()
+                .to_string()
+        );
+        assert!(!output_dir.exists());
+    }
+
+    #[test]
+    fn default_cli_output_collision_preserves_the_managed_result() {
+        let store = test_store("default-output-collision");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-1784968753-a5a791686518b222")
+            .unwrap();
+        let source = output_dir.join("opaque.png");
+        fs::write(&source, b"managed image").unwrap();
+        let mut result = test_inference_result("out-1784968753-a5a791686518b222", &source);
+        result.model = "tiny-sd".to_string();
+        let destination = output_store
+            .root()
+            .join("tiny-sd-image-generation-1784968753-a5a791686518b222.png");
+        fs::write(&destination, b"existing image").unwrap();
+
+        let error = publish_default_cli_outputs(&output_store, &mut result).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(fs::read(&source).unwrap(), b"managed image");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing image");
+        assert!(output_dir.exists());
+    }
+
+    #[test]
+    fn default_cli_output_rejects_an_empty_backend_result() {
+        let store = test_store("default-empty-output");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-1784968754-a5a791686518b223")
+            .unwrap();
+        let source = output_dir.join("placeholder.png");
+        fs::write(&source, b"placeholder").unwrap();
+        let mut result = test_inference_result("out-1784968754-a5a791686518b223", &source);
+        result.outputs.clear();
+
+        let error = publish_default_cli_outputs(&output_store, &mut result).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("without producing an output file")
+        );
+        assert!(output_dir.exists());
+    }
+
+    #[test]
+    fn cli_output_slug_is_portable_bounded_and_has_a_fallback() {
+        assert_eq!(cli_output_slug("../CON: Tiny SD 🤖", 48), "con-tiny-sd");
+        assert_eq!(cli_output_slug("🤖", 48), "model");
+        assert_eq!(cli_output_slug(&"A".repeat(100), 48).len(), 48);
+    }
+
+    #[test]
+    fn failed_cli_publish_preserves_the_managed_result() {
+        let store = test_store("failed-publish");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store.create_output_dir("out-cli-failure").unwrap();
+        let source = output_dir.join("generated.png");
+        fs::write(&source, b"managed image").unwrap();
+        let destination = store.home().join("existing.png");
+        fs::write(&destination, b"existing image").unwrap();
+        let mut result = test_inference_result("out-cli-failure", &source);
+
+        let error =
+            publish_and_release_cli_outputs(&output_store, &mut result, &destination).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert!(output_dir.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"managed image");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing image");
+        assert_eq!(result.outputs[0].path, source.display().to_string());
+    }
+
+    #[test]
+    fn cli_output_rejects_destinations_inside_the_managed_store() {
+        let store = test_store("managed-destination");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-cli-managed-destination")
+            .unwrap();
+        let source = output_dir.join("generated.png");
+        fs::write(&source, b"managed image").unwrap();
+        let destination = output_store.root().join("loose.png");
+        let mut result = test_inference_result("out-cli-managed-destination", &source);
+
+        let error =
+            publish_and_release_cli_outputs(&output_store, &mut result, &destination).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--output must be outside the managed output store")
+        );
+        assert!(output_dir.exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn duplicate_cli_output_names_fail_before_any_file_is_copied() {
+        let store = test_store("duplicate-output-names");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-cli-duplicate-names")
+            .unwrap();
+        let first = output_dir.join("first").join("generated.png");
+        let second = output_dir.join("second").join("generated.png");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, b"first image").unwrap();
+        fs::write(&second, b"second image").unwrap();
+        let destination = store.home().join("published");
+        let mut result = test_inference_result("out-cli-duplicate-names", &first);
+        let mut second_output = result.outputs[0].clone();
+        second_output.id = "out-cli-duplicate-names-1".to_string();
+        second_output.path = second.display().to_string();
+        result.outputs.push(second_output);
+
+        let error =
+            publish_and_release_cli_outputs(&output_store, &mut result, &destination).unwrap_err();
+
+        assert!(error.to_string().contains("same destination"));
+        assert!(output_dir.exists());
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -10455,6 +10969,69 @@ mod tests {
             std::process::id()
         ));
         ModelStore::resolve(Some(root)).unwrap()
+    }
+
+    fn test_inference_result(id: &str, output: &Path) -> InferenceResult {
+        let task = InferenceTask::ImageGeneration;
+        InferenceResult {
+            id: id.to_string(),
+            task,
+            model: "test-model".to_string(),
+            runtime: "test-runtime".to_string(),
+            outputs: vec![OutputMetadata {
+                id: format!("{id}-0"),
+                task,
+                model: "test-model".to_string(),
+                runtime: "test-runtime".to_string(),
+                path: output.display().to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: fs::metadata(output).unwrap().len(),
+                width: Some(16),
+                height: Some(16),
+                duration: None,
+                seed: Some(1),
+                effective_parameters: Default::default(),
+                created_unix: 1,
+                backend_metadata: Value::Null,
+            }],
+            effective_request: EffectiveInferenceRequest {
+                model: "test-model".to_string(),
+                task,
+                prompt: Some("test".to_string()),
+                negative_prompt: None,
+                inputs: Vec::new(),
+                output_modality: OutputModality::Image,
+                parameters: Default::default(),
+                explicit_parameters: Default::default(),
+                parameter_policy: ParameterPolicy::Strict,
+                warnings: Vec::new(),
+            },
+            estimate: WorkloadEstimate {
+                task,
+                download_size_bytes: None,
+                weight_payload_bytes: None,
+                accelerator_peak_bytes: None,
+                host_peak_bytes: None,
+                output_size_bytes: Some(fs::metadata(output).unwrap().len()),
+                fit: FitAssessment::Fits,
+                confidence: WorkloadEstimateConfidence::Exact,
+                assumptions: Vec::new(),
+                warnings: Vec::new(),
+                recommendations: Vec::new(),
+            },
+            plan: ExecutionPlan {
+                task,
+                selected_runtime: Some("test-runtime".to_string()),
+                selected_backend: Some("test-backend".to_string()),
+                score: Some(1),
+                candidates: Vec::new(),
+                backend_fallback: false,
+                degradations: Vec::new(),
+                model_or_quality_downgrades: Vec::new(),
+            },
+            warnings: Vec::new(),
+            created_unix: 1,
+        }
     }
 
     fn test_manifest(format: ModelFormat, architecture: Option<&str>) -> ModelManifest {

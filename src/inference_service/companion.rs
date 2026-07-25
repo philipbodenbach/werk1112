@@ -4,13 +4,14 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use super::{
     backend::{BackendExecution, BackendOutput, BackendProbe, MediaInferenceBackend},
     output::ensure_output_path,
-    resources::detected_accelerator,
+    resources::{configured_media_accelerator, detected_accelerator},
 };
 use crate::{
     backend::{BackendAccelerator, BackendRuntime, RuntimeId, runtime_registry},
@@ -19,24 +20,35 @@ use crate::{
         EffectiveInferenceRequest, InferenceRuntimeCandidate, ParameterSource,
         ParameterSupportStatus, ParameterValue, RuntimeAccelerator, WorkloadEstimate,
     },
-    media_companion::{CompanionClient, CompanionExecution, CompanionOutput},
+    media_companion::{CompanionClient, CompanionExecution, CompanionHealth, CompanionOutput},
     model_store::{ModelManifest, ModelStore},
 };
 
 #[derive(Debug, Clone)]
 pub struct CompanionMediaBackend {
     client: std::result::Result<CompanionClient, String>,
+    health_cache: Arc<OnceLock<std::result::Result<CompanionHealth, String>>>,
 }
 
 impl CompanionMediaBackend {
     pub fn discover() -> Self {
         Self {
             client: CompanionClient::discover().map_err(|error| error.to_string()),
+            health_cache: Arc::new(OnceLock::new()),
         }
     }
 
     pub fn with_client(client: CompanionClient) -> Self {
-        Self { client: Ok(client) }
+        Self {
+            client: Ok(client),
+            health_cache: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn health(&self, client: &CompanionClient) -> std::result::Result<CompanionHealth, String> {
+        self.health_cache
+            .get_or_init(|| client.health().map_err(|error| error.to_string()))
+            .clone()
     }
 }
 
@@ -69,18 +81,17 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                 };
             }
         };
-        if let Err(error) = client.health() {
-            return BackendProbe {
-                available: false,
-                detail: error.to_string(),
-                candidates: default_companion_candidates(
-                    false,
-                    Some(error.to_string()),
-                    schema_paths,
-                ),
-                parameter_support: default_companion_parameter_support(schema_paths),
-            };
-        }
+        let health = match self.health(client) {
+            Ok(health) => health,
+            Err(error) => {
+                return BackendProbe {
+                    available: false,
+                    detail: error.clone(),
+                    candidates: default_companion_candidates(false, Some(error), schema_paths),
+                    parameter_support: default_companion_parameter_support(schema_paths),
+                };
+            }
+        };
         let probe_request = json!({
             "model_path": companion_model_path(store, manifest),
             "task": task.to_string(),
@@ -103,14 +114,15 @@ impl MediaInferenceBackend for CompanionMediaBackend {
             ),
             Err(error) => (false, error.to_string()),
         };
-        let parameter_support = default_companion_parameter_support(schema_paths);
+        let parameter_support = companion_parameter_support(schema_paths, Some(&health));
         BackendProbe {
             available,
             detail: detail.clone(),
-            candidates: default_companion_candidates(
+            candidates: companion_candidates(
                 available,
                 (!available).then_some(detail),
                 schema_paths,
+                Some(&health),
             ),
             parameter_support,
         }
@@ -374,7 +386,32 @@ pub(super) fn default_companion_candidates(
     reason: Option<String>,
     schema_paths: &[String],
 ) -> Vec<InferenceRuntimeCandidate> {
-    let detected = detected_accelerator();
+    companion_candidates(available, reason, schema_paths, None)
+}
+
+fn companion_candidates(
+    available: bool,
+    reason: Option<String>,
+    schema_paths: &[String],
+    health: Option<&CompanionHealth>,
+) -> Vec<InferenceRuntimeCandidate> {
+    companion_candidates_with_override(
+        available,
+        reason,
+        schema_paths,
+        health,
+        configured_media_accelerator(),
+    )
+}
+
+fn companion_candidates_with_override(
+    available: bool,
+    reason: Option<String>,
+    schema_paths: &[String],
+    health: Option<&CompanionHealth>,
+    configured: Option<RuntimeAccelerator>,
+) -> Vec<InferenceRuntimeCandidate> {
+    let detected = available_companion_accelerators_with_override(health, configured);
     runtime_registry()
         .iter()
         .filter(|descriptor| descriptor.runtime == BackendRuntime::MediaCompanion)
@@ -387,15 +424,24 @@ pub(super) fn default_companion_candidates(
                 .map(runtime_accelerator)
                 .unwrap_or(RuntimeAccelerator::Other);
             let hardware_available =
-                accelerator == RuntimeAccelerator::Cpu || accelerator == detected;
+                accelerator == RuntimeAccelerator::Cpu || detected.contains(&accelerator);
             let candidate_available = available && hardware_available;
             let availability_reason = if !available {
                 reason.clone()
             } else if !hardware_available {
-                Some(format!(
-                    "{} accelerator is not detected on this host",
-                    format!("{accelerator:?}").to_ascii_lowercase()
-                ))
+                Some(
+                    companion_accelerator_unavailable_reason_with_override(
+                        health,
+                        accelerator,
+                        configured,
+                    )
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{} accelerator is not detected on this host",
+                            format!("{accelerator:?}").to_ascii_lowercase()
+                        )
+                    }),
+                )
             } else {
                 None
             };
@@ -439,7 +485,14 @@ pub(super) fn default_companion_candidates(
 fn default_companion_parameter_support(
     schema_paths: &[String],
 ) -> BTreeMap<String, ParameterSupportStatus> {
-    let detected = detected_accelerator();
+    companion_parameter_support(schema_paths, None)
+}
+
+fn companion_parameter_support(
+    schema_paths: &[String],
+    health: Option<&CompanionHealth>,
+) -> BTreeMap<String, ParameterSupportStatus> {
+    let detected = available_companion_accelerators(health);
     let descriptor = runtime_registry()
         .iter()
         .filter(|descriptor| descriptor.runtime == BackendRuntime::MediaCompanion)
@@ -449,7 +502,7 @@ fn default_companion_parameter_support(
                 .first()
                 .copied()
                 .map(runtime_accelerator)
-                .is_some_and(|accelerator| accelerator == detected)
+                .is_some_and(|accelerator| detected.contains(&accelerator))
         })
         .or_else(|| {
             runtime_registry().iter().find(|descriptor| {
@@ -468,6 +521,72 @@ fn default_companion_parameter_support(
             )
         })
         .collect()
+}
+
+fn available_companion_accelerators(health: Option<&CompanionHealth>) -> Vec<RuntimeAccelerator> {
+    available_companion_accelerators_with_override(health, configured_media_accelerator())
+}
+
+fn available_companion_accelerators_with_override(
+    health: Option<&CompanionHealth>,
+    configured: Option<RuntimeAccelerator>,
+) -> Vec<RuntimeAccelerator> {
+    if let Some(configured) = configured {
+        return vec![configured];
+    }
+    if let Some(health) = health
+        && !health.accelerators.is_empty()
+    {
+        return health
+            .accelerators
+            .iter()
+            .filter(|(_, status)| status.available)
+            .filter_map(|(name, _)| companion_accelerator_from_name(name))
+            .collect();
+    }
+    vec![detected_accelerator()]
+}
+
+fn companion_accelerator_unavailable_reason_with_override(
+    health: Option<&CompanionHealth>,
+    accelerator: RuntimeAccelerator,
+    configured: Option<RuntimeAccelerator>,
+) -> Option<String> {
+    if configured.is_some() {
+        return None;
+    }
+    let health = health.filter(|health| !health.accelerators.is_empty())?;
+    let name = companion_accelerator_name(accelerator)?;
+    let status = health.accelerators.get(name)?;
+    if status.available {
+        return None;
+    }
+    Some(match status.detail.as_deref() {
+        Some(detail) => format!("{name} is unavailable in media companion Python: {detail}"),
+        None => format!("{name} is unavailable in media companion Python"),
+    })
+}
+
+fn companion_accelerator_from_name(name: &str) -> Option<RuntimeAccelerator> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "cpu" => Some(RuntimeAccelerator::Cpu),
+        "cuda" => Some(RuntimeAccelerator::Cuda),
+        "rocm" | "hip" => Some(RuntimeAccelerator::Rocm),
+        "mps" | "metal" => Some(RuntimeAccelerator::Mps),
+        "mlx" => Some(RuntimeAccelerator::Mlx),
+        _ => None,
+    }
+}
+
+fn companion_accelerator_name(accelerator: RuntimeAccelerator) -> Option<&'static str> {
+    match accelerator {
+        RuntimeAccelerator::Cpu => Some("cpu"),
+        RuntimeAccelerator::Cuda => Some("cuda"),
+        RuntimeAccelerator::Rocm => Some("rocm"),
+        RuntimeAccelerator::Mps => Some("mps"),
+        RuntimeAccelerator::Mlx => Some("mlx"),
+        _ => None,
+    }
 }
 
 fn media_runtime_label(id: RuntimeId) -> Option<&'static str> {
@@ -529,4 +648,93 @@ pub(super) fn companion_execution_parameters(
         parameters.insert(execution_flag.to_string(), selected.into());
     }
     parameters
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media_companion::CompanionAccelerator;
+
+    fn health_with_accelerators(
+        accelerators: impl IntoIterator<Item = (&'static str, bool, &'static str)>,
+    ) -> CompanionHealth {
+        CompanionHealth {
+            ok: true,
+            status: "ok".to_string(),
+            protocol_version: 1,
+            companion_version: Some("test".to_string()),
+            python_version: Some("3.12".to_string()),
+            dependencies: BTreeMap::new(),
+            accelerators: accelerators
+                .into_iter()
+                .map(|(name, available, detail)| {
+                    (
+                        name.to_string(),
+                        CompanionAccelerator {
+                            available,
+                            version: None,
+                            detail: Some(detail.to_string()),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn companion_health_controls_media_accelerator_availability() {
+        let health = health_with_accelerators([
+            ("cpu", true, "CPU available"),
+            ("cuda", true, "RTX 3090"),
+            ("rocm", false, "ROCm unavailable"),
+        ]);
+
+        let available = available_companion_accelerators_with_override(Some(&health), None);
+
+        assert!(available.contains(&RuntimeAccelerator::Cpu));
+        assert!(available.contains(&RuntimeAccelerator::Cuda));
+        assert!(!available.contains(&RuntimeAccelerator::Rocm));
+        assert_eq!(
+            companion_accelerator_unavailable_reason_with_override(
+                Some(&health),
+                RuntimeAccelerator::Rocm,
+                None,
+            )
+            .as_deref(),
+            Some("rocm is unavailable in media companion Python: ROCm unavailable")
+        );
+
+        let candidates = companion_candidates_with_override(true, None, &[], Some(&health), None);
+        let cuda = candidates
+            .iter()
+            .find(|candidate| candidate.id == "media-companion-cuda")
+            .unwrap();
+        let rocm = candidates
+            .iter()
+            .find(|candidate| candidate.id == "media-companion-rocm")
+            .unwrap();
+        assert!(cuda.available);
+        assert!(!rocm.available);
+        assert!(
+            rocm.availability_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ROCm unavailable"))
+        );
+    }
+
+    #[test]
+    fn configured_media_accelerator_overrides_health_detection() {
+        let health = health_with_accelerators([
+            ("cpu", true, "CPU available"),
+            ("cuda", false, "CUDA unavailable"),
+        ]);
+
+        assert_eq!(
+            available_companion_accelerators_with_override(
+                Some(&health),
+                Some(RuntimeAccelerator::Cuda),
+            ),
+            vec![RuntimeAccelerator::Cuda]
+        );
+    }
 }

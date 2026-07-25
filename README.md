@@ -209,7 +209,7 @@ For a loopback-only development server without authentication, use
 Werk provides first-class typed inference for generated media. A request names
 one installed model and one canonical task; Werk then resolves effective
 parameters, validates model/runtime support, estimates memory, selects a
-runtime, executes locally, and persists the output with its metadata.
+runtime, executes locally, and manages the resulting output and metadata.
 
 The main CLI workflows are:
 
@@ -229,6 +229,32 @@ werk audio generate musicgen --prompt "cinematic analogue synthwave"
 werk audio speak speech-model --text "Systems nominal."
 werk audio transcribe whisper --input interview.wav
 ```
+
+When interactive stdout and stderr are attached to a terminal, chat and typed
+media commands open with the Werk1112 banner and show a transient,
+task-specific activity animation while inference is running: sparks for chat,
+painting pixels for images, moving frames for video, and a waveform for audio.
+The animation is indeterminate rather than a fabricated percentage, is cleared
+before durable result output, and is disabled for pipes, redirects, debug
+output, and `TERM=dumb`.
+
+For direct CLI inference, omitting `--output` saves generated media directly in
+Werk's managed output directory. Werk creates a portable, collision-resistant
+name from the model, task, Unix timestamp, and random result suffix, for
+example:
+
+```text
+~/.local/share/werk1112/outputs/tiny-sd-image-generation-1784968751-807fe1a83ad7fb22.png
+```
+
+Prompt text is deliberately excluded from filenames so private or unwieldy
+input does not leak into filesystem paths. Supplying `--output` instead
+transfers ownership to that file or directory. In both cases, Werk publishes
+every generated file, removes its temporary result directory after the
+complete publication succeeds, and prints only durable destination paths. A
+publication failure preserves the temporary managed result so generated data
+is not lost. HTTP responses and persisted jobs continue to use managed result
+directories with metadata.
 
 Before execution, inspect and estimate the same typed contract:
 
@@ -284,7 +310,11 @@ capabilities, compiled features, and discovered companion runtimes.
 `--backend auto` may fall back to CPU. Text/chat GPU routes are strict about
 their requested accelerator. For typed media, `cpu`, `cuda`, `rocm`, and
 `metal` map to companion accelerator requirements; the included companion has
-no Vulkan adapter.
+no Vulkan adapter. Media accelerator discovery uses the selected companion
+Python's own PyTorch report (`torch.cuda.is_available()` or MPS/ROCm
+equivalents), so WSL and virtual environments are evaluated where inference
+actually runs. Host-device probing, including WSL's `/dev/dxg`, is retained as
+a compatibility fallback for older external companions.
 
 | Runtime | Formats | Accelerators | VLM | Status |
 | --- | --- | --- | --- | --- |
@@ -339,6 +369,10 @@ Planner policy:
   companion accelerator. Other backend labels such as `vulkan` or `candle` do
   not name media adapters and may be bypassed by the default `backend` fallback
   policy; `--fallback-policy none` rejects mismatched candidates.
+- Candle is considered only for tasks and model families implemented by its
+  registry entry. It does not currently provide a Diffusers/Stable Diffusion
+  image pipeline, so compatible media models fall back from the GPU companion
+  to the CPU companion rather than pretending to use Candle.
 - Image requests filter to VLM-capable runtimes before loading; Candle text routes reject image input.
 - `--debug` exposes candidate decisions for chat/run and
   `werk backend doctor --debug`. For media, use
@@ -650,15 +684,20 @@ Models, optimized artifacts, generated outputs, and jobs are separate:
 │   ├── manifest.json
 │   └── files/...
 ├── artifacts/<model-id>/...
-├── outputs/<result-id>/
-│   ├── metadata.json
-│   └── generated files...
+├── outputs/
+│   ├── <model>-<task>-<timestamp>-<suffix>.<ext>
+│   └── <api-or-job-result-id>/
+│       ├── metadata.json
+│       └── generated files...
 └── jobs/<job-id>.json
 ```
 
-Each inference result owns one directory. Individual output IDs use
-`<result-id>-<index>` and are resolved through that directory's
-`metadata.json`.
+Direct CLI commands publish generated media either to their explicit
+`--output` destination or, by default, as friendly files directly under
+`outputs/`; their temporary result directory is removed after publication.
+HTTP inference and persisted jobs retain one directory per result. Their
+individual output IDs use `<result-id>-<index>` and are resolved through that
+directory's `metadata.json`.
 
 On native Windows, the same model is saved here by default:
 
@@ -672,9 +711,10 @@ precision/quantization, detected defaults and constraints, checksums, runtime
 hints, and optimized-artifact metadata. Schema-v1 manifests remain readable and
 are enriched in memory from their repository contents.
 
-Output retention defaults to 30 days and 20 GiB and only ever removes children
-of `outputs/`; model data is never part of retention. Override the limits with
-`WERK_OUTPUT_RETENTION_SECONDS` and `WERK_OUTPUT_MAX_BYTES`.
+Output retention defaults to 30 days and 20 GiB and covers both direct CLI
+files and result directories immediately below `outputs/`; model data is never
+part of retention. Override the limits with `WERK_OUTPUT_RETENTION_SECONDS` and
+`WERK_OUTPUT_MAX_BYTES`.
 
 For GGUF repositories that contain many quantizations, new imports prefer a balanced `Q4_K_M` file when it is present instead of taking the first filename alphabetically. The selected file is stored in `manifest.json` as `model_path`, and both `chat` and `serve` use that selected file.
 
@@ -987,15 +1027,19 @@ werk doctor --model flux-dev
 werk doctor perf text-model
 ```
 
-The unfiltered report checks the companion launcher/protocol and optional
-dependencies. `--task` narrows the installed-manifest summary; it does not load
-a concrete pipeline. `--model` adds a model/task routing probe. Python and
+The unfiltered report checks the companion launcher/protocol, optional
+dependencies, and the accelerators reported by the selected companion Python.
+For CUDA it includes the PyTorch build, availability, and detected device
+names. `--task` narrows the installed-manifest summary; it does not load a
+concrete pipeline. `--model` adds a model/task routing probe. Python and
 optional media packages are never installed silently, and a missing optional
 package limits matching tasks without making the global doctor result fail.
 
 `--max-tokens` is a hard cap on generated completion tokens. If you set `--max-tokens 32`, the model may stop mid-sentence because the decoder reached the limit, not because the answer is complete. Use a larger value such as `--max-tokens 64` or `--max-tokens 128` for normal chat.
 
-Terminal chat prints decoded token-pieces as soon as the backend produces them, so text appears progressively after `assistant>`. To reduce terminal flushes, switch back to chunked output:
+Terminal chat shows a small thinking animation until the first decoded
+token-piece arrives, then prints token-pieces progressively after `assistant>`.
+To reduce terminal flushes, switch back to chunked output:
 
 ```bash
 werk chat gemma-2b-it --stream-granularity chunk

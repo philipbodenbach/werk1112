@@ -282,7 +282,7 @@ pub struct OutputArgs {
         long = "output",
         alias = "output-path",
         value_name = "PATH",
-        help = "Output file or directory"
+        help = "Output file or directory; defaults to WERK_HOME/outputs with a generated name"
     )]
     pub output: Option<PathBuf>,
 }
@@ -1172,7 +1172,12 @@ pub struct VideoEncodingArgs {
     #[arg(long = "output-format")]
     pub output_format: Option<String>,
 
-    #[arg(long = "output", alias = "output-path", value_name = "PATH")]
+    #[arg(
+        long = "output",
+        alias = "output-path",
+        value_name = "PATH",
+        help = "Output file or directory; defaults to WERK_HOME/outputs with a generated name"
+    )]
     pub output: Option<PathBuf>,
 }
 
@@ -1737,7 +1742,12 @@ pub struct AudioExportArgs {
     #[arg(long = "stems-file", value_name = "PATH")]
     pub stems_file: Option<PathBuf>,
 
-    #[arg(long = "output", alias = "output-path", value_name = "PATH")]
+    #[arg(
+        long = "output",
+        alias = "output-path",
+        value_name = "PATH",
+        help = "Output file or directory; defaults to WERK_HOME/outputs with a generated name"
+    )]
     pub output: Option<PathBuf>,
 }
 
@@ -1882,7 +1892,12 @@ pub struct TextToSpeechArgs {
     #[arg(long)]
     pub chunk_size: Option<u32>,
 
-    #[arg(long = "output", alias = "output-path", value_name = "PATH")]
+    #[arg(
+        long = "output",
+        alias = "output-path",
+        value_name = "PATH",
+        help = "Output file or directory; defaults to WERK_HOME/outputs with a generated name"
+    )]
     pub output: Option<PathBuf>,
 }
 
@@ -2026,7 +2041,12 @@ pub struct SpeechToTextArgs {
     #[arg(long = "output-format")]
     pub output_format: Option<String>,
 
-    #[arg(long = "output", alias = "output-path", value_name = "PATH")]
+    #[arg(
+        long = "output",
+        alias = "output-path",
+        value_name = "PATH",
+        help = "Output file or directory; defaults to WERK_HOME/outputs with a generated name"
+    )]
     pub output: Option<PathBuf>,
 }
 
@@ -2090,7 +2110,12 @@ pub struct AudioSeparationArgs {
     )]
     pub no_normalization: bool,
 
-    #[arg(long = "output", alias = "output-path", value_name = "PATH")]
+    #[arg(
+        long = "output",
+        alias = "output-path",
+        value_name = "PATH",
+        help = "Output file or directory; defaults to WERK_HOME/outputs with a generated name"
+    )]
     pub output: Option<PathBuf>,
 }
 

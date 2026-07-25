@@ -4,7 +4,7 @@ Werk1112 is an inference router, not a workflow engine. A request names one
 model and one concrete task. Werk normalizes its inputs, resolves defaults,
 validates parameters, estimates the workload, scores runtime candidates,
 executes the best accepted runtime (with policy-controlled runtime retry), and
-persists outputs and metadata.
+manages outputs and metadata.
 
 ## Public commands
 
@@ -18,6 +18,22 @@ werk serve
 
 The old `werk run` parser remains hidden for compatibility. New applications
 should use `chat` for text and the typed media commands for generated files.
+
+Interactive chat and media commands print the Werk1112 startup banner. During
+local inference, the CLI renders a transient modality-specific activity line
+on terminal stderr (including an audio waveform). This is an indeterminate
+liveness indicator, not backend progress or a percentage. It is cleared before
+the result is printed and omitted when terminal output is redirected.
+
+For a direct CLI request without `--output`, Werk publishes completed media
+directly under `WERK_HOME/outputs` with a generated name such as
+`tiny-sd-image-generation-1784968751-807fe1a83ad7fb22.png`. The name combines a
+sanitized model ID, task, Unix timestamp, and random suffix; it never includes
+prompt text. `--output PATH` selects another file or directory instead. Werk
+publishes all outputs first and then removes the request's temporary managed
+result directory, avoiding a persistent duplicate. If publication fails, the
+temporary result remains intact. HTTP requests and persisted jobs retain their
+managed result metadata and output IDs.
 
 Generative prompt priority is:
 
@@ -136,7 +152,12 @@ remain catalogable but have no executable adapter in this release.
 
 `werk doctor` reports the protocol and optional dependencies. Missing
 Diffusers, Transformers, Pillow, audio/video codecs, or accelerator packages
-only disables affected tasks.
+only disables affected tasks. Accelerator availability comes from the exact
+Python/PyTorch process selected for the media companion; the report includes
+CUDA/ROCm/MPS availability and device details. Host probing, including WSL's
+`/dev/dxg`, is used only when an older external companion does not report
+accelerators. Candle is not currently a Diffusers image fallback; unsupported
+media GPU routes fall back to the compatible CPU companion.
 
 ### Execution support
 
@@ -206,11 +227,12 @@ WERK_HOME/
 └── jobs/
 ```
 
-Each output metadata record includes ID, task, model, runtime, path, MIME type,
-size, dimensions/duration where applicable, seed, effective parameters, and
-creation time. Retention only targets `outputs/`, never models. Defaults are 30
-days and 20 GiB; use `WERK_OUTPUT_RETENTION_SECONDS` and
-`WERK_OUTPUT_MAX_BYTES` to override them.
+HTTP and job output metadata records include ID, task, model, runtime, path,
+MIME type, size, dimensions/duration where applicable, seed, effective
+parameters, and creation time. Direct CLI output files and retained result
+directories are both subject to output retention. Retention only targets direct
+children of `outputs/`, never models. Defaults are 30 days and 20 GiB; use
+`WERK_OUTPUT_RETENTION_SECONDS` and `WERK_OUTPUT_MAX_BYTES` to override them.
 
 ## Current limitations
 
@@ -223,8 +245,9 @@ days and 20 GiB; use `WERK_OUTPUT_RETENTION_SECONDS` and
 - Persisted job cancellation is cooperative. A native third-party call that
   lacks cancellation may release resources only when it returns.
 - The companion currently returns one terminal response rather than granular
-  progress events. Persisted phases are available, but `encoding` can be too
-  brief to observe for fast jobs.
+  progress events. The CLI animation therefore indicates liveness only.
+  Persisted phases are available, but `encoding` can be too brief to observe
+  for fast jobs.
 - Werk serves authenticated whole-file outputs. HTTP byte ranges and
   object-storage export are future work.
 - Generic adapters for voice conversion, stems, and enhancement are described

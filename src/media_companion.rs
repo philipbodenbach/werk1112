@@ -39,6 +39,15 @@ pub struct CompanionDependency {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompanionAccelerator {
+    pub available: bool,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompanionHealth {
     pub ok: bool,
     pub status: String,
@@ -49,6 +58,8 @@ pub struct CompanionHealth {
     pub python_version: Option<String>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, CompanionDependency>,
+    #[serde(default)]
+    pub accelerators: BTreeMap<String, CompanionAccelerator>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -281,6 +292,21 @@ impl CompanionClient {
                         health.python_version.as_deref().unwrap_or("unknown")
                     ),
                 });
+                for (name, accelerator) in health.accelerators {
+                    let detail = match (accelerator.version, accelerator.detail) {
+                        (Some(version), Some(detail)) => format!("{detail}; runtime {version}"),
+                        (Some(version), None) => format!("runtime {version}"),
+                        (None, Some(detail)) => detail,
+                        (None, None) if accelerator.available => "available".to_string(),
+                        (None, None) => "unavailable".to_string(),
+                    };
+                    checks.push(CompanionDoctorCheck {
+                        name: format!("media accelerator {name}"),
+                        available: accelerator.available,
+                        required: false,
+                        detail,
+                    });
+                }
                 for (name, dependency) in health.dependencies {
                     checks.push(CompanionDoctorCheck {
                         name,
@@ -738,6 +764,18 @@ if operation == "health":
         "protocol_version": 1,
         "companion_version": "mock",
         "python_version": sys.version.split()[0],
+        "accelerators": {
+            "cpu": {
+                "available": True,
+                "version": None,
+                "detail": "mock CPU",
+            },
+            "cuda": {
+                "available": False,
+                "version": "12.4",
+                "detail": "mock CUDA unavailable",
+            },
+        },
         "dependencies": {
             "torch": {
                 "available": False,
@@ -834,6 +872,8 @@ print(json.dumps(response))
         assert_eq!(health.status, "ok");
         assert_eq!(health.protocol_version, PROTOCOL_VERSION);
         assert!(!health.dependencies["torch"].available);
+        assert!(health.accelerators["cpu"].available);
+        assert!(!health.accelerators["cuda"].available);
 
         let probe = client
             .probe_model(&json!({"model_path": "/tmp/model"}))
@@ -932,7 +972,7 @@ print(json.dumps(response))
                 kind: LauncherKind::Python,
                 embedded_script: true,
             },
-            request_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(15),
             execute_timeout: Duration::from_secs(5),
         };
         let health = client.health().unwrap();

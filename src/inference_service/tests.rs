@@ -460,11 +460,16 @@ fn output_retention_only_removes_output_children() {
     let outputs = OutputStore::with_limits(&root, 1, u64::MAX);
     let first = outputs.create_output_dir("out-old").unwrap();
     fs::write(first.join("data.bin"), vec![0_u8; 32]).unwrap();
+    let direct_cli_output = outputs
+        .root()
+        .join("tiny-sd-image-generation-1784968751-807fe1a8.png");
+    fs::write(&direct_cli_output, vec![0_u8; 32]).unwrap();
     let models = root.join("models");
     fs::create_dir_all(&models).unwrap();
     fs::write(models.join("keep"), b"model").unwrap();
     outputs.enforce_retention().unwrap();
     assert!(!first.exists());
+    assert!(!direct_cli_output.exists());
     assert!(models.join("keep").is_file());
     let _ = fs::remove_dir_all(root);
 }

@@ -108,10 +108,11 @@ impl OutputStore {
         let mut entries = fs::read_dir(&self.root)?
             .filter_map(std::result::Result::ok)
             .filter_map(|entry| {
-                let metadata = entry.metadata().ok()?;
-                if !metadata.is_dir() {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_dir() && !file_type.is_file() {
                     return None;
                 }
+                let metadata = entry.metadata().ok()?;
                 let modified = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
                 let size = directory_size(&entry.path()).ok()?;
                 Some((entry.path(), modified, size))
@@ -128,7 +129,7 @@ impl OutputStore {
                 .ok()
                 .is_some_and(|age| age.as_secs() > self.max_age_seconds)
             {
-                remove_output_dir(&self.root, path)?;
+                remove_output_entry(&self.root, path)?;
             }
         }
         entries.retain(|(path, _, _)| path.exists());
@@ -143,7 +144,7 @@ impl OutputStore {
             if preserve.is_some_and(|preserve| preserve == path) {
                 continue;
             }
-            remove_output_dir(&self.root, &path)?;
+            remove_output_entry(&self.root, &path)?;
             total = total.saturating_sub(size);
         }
         Ok(total > self.max_bytes)
@@ -223,13 +224,33 @@ pub(super) fn ensure_output_path(root: &Path, path: &Path) -> Result<()> {
 }
 
 pub(super) fn remove_output_dir(root: &Path, path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        bail!("refusing to remove non-directory output {}", path.display());
+    }
+    remove_output_entry(root, path)
+}
+
+fn remove_output_entry(root: &Path, path: &Path) -> Result<()> {
     let root = root.canonicalize()?;
-    let path = path.canonicalize()?;
-    if path.parent() != Some(root.as_path()) {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("output path has no parent"))?
+        .canonicalize()?;
+    if parent != root {
         bail!("refusing to remove non-output path {}", path.display());
     }
-    fs::remove_dir_all(&path)
-        .with_context(|| format!("failed to remove expired output {}", path.display()))
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        bail!("refusing to remove symlinked output {}", path.display());
+    }
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else if metadata.is_file() {
+        fs::remove_file(path)
+    } else {
+        bail!("refusing to remove unsupported output {}", path.display());
+    }
+    .with_context(|| format!("failed to remove managed output {}", path.display()))
 }
 
 fn directory_size(path: &Path) -> Result<u64> {
