@@ -359,8 +359,91 @@ fn companion_execution(
         runtime: runtime.to_string(),
         outputs,
         warnings: response.warnings,
-        metadata: response.metadata,
+        metadata: sanitized_companion_metadata(response.metadata),
     })
+}
+
+fn sanitized_companion_metadata(metadata: Value) -> Value {
+    let Some(source) = metadata.as_object() else {
+        return Value::Null;
+    };
+    let mut sanitized = serde_json::Map::new();
+    copy_metadata_fields(
+        source,
+        &mut sanitized,
+        &["runtime", "created_unix", "elapsed_seconds", "offline"],
+    );
+
+    if let Some(backend) = source.get("backend").and_then(Value::as_object) {
+        let mut safe_backend = serde_json::Map::new();
+        copy_metadata_fields(
+            backend,
+            &mut safe_backend,
+            &[
+                "runtime",
+                "pipeline_task",
+                "pipeline_class",
+                "device",
+                "dtype",
+                "seed",
+                "model_load_seconds",
+                "inference_seconds",
+                "encoding_seconds",
+            ],
+        );
+        if let Some(parameters) = backend.get("translated_parameters").and_then(string_array) {
+            safe_backend.insert("translated_parameters".to_string(), parameters);
+        }
+        if let Some(support) = backend
+            .get("parameter_support")
+            .and_then(sanitized_parameter_support)
+        {
+            safe_backend.insert("parameter_support".to_string(), support);
+        }
+        sanitized.insert("backend".to_string(), Value::Object(safe_backend));
+    }
+    Value::Object(sanitized)
+}
+
+fn copy_metadata_fields(
+    source: &serde_json::Map<String, Value>,
+    destination: &mut serde_json::Map<String, Value>,
+    fields: &[&str],
+) {
+    for field in fields {
+        if let Some(value) = source.get(*field)
+            && matches!(
+                value,
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+            )
+        {
+            destination.insert((*field).to_string(), value.clone());
+        }
+    }
+}
+
+fn string_array(value: &Value) -> Option<Value> {
+    let values = value
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|value| Value::String(value.to_string()))
+        .collect::<Vec<_>>();
+    Some(Value::Array(values))
+}
+
+fn sanitized_parameter_support(value: &Value) -> Option<Value> {
+    let source = value.as_object()?;
+    let mut sanitized = serde_json::Map::new();
+    if let Some(policy) = source.get("policy").and_then(Value::as_str) {
+        sanitized.insert("policy".to_string(), Value::String(policy.to_string()));
+    }
+    for field in ["explicit_parameters", "unsupported_explicit_parameters"] {
+        if let Some(values) = source.get(field).and_then(string_array) {
+            sanitized.insert(field.to_string(), values);
+        }
+    }
+    Some(Value::Object(sanitized))
 }
 
 fn companion_output(output: CompanionOutput, output_dir: &Path) -> Result<BackendOutput> {
@@ -736,5 +819,60 @@ mod tests {
             ),
             vec![RuntimeAccelerator::Cuda]
         );
+    }
+
+    #[test]
+    fn persisted_companion_metadata_keeps_diagnostics_but_drops_private_duplicates() {
+        let metadata = json!({
+            "runtime": "werk-media-companion",
+            "model_path": "/private/models/secret",
+            "effective_parameters": {
+                "prompt": "private prompt",
+                "lyrics": "private lyrics"
+            },
+            "outputs": [{"path": "/private/output.png"}],
+            "elapsed_seconds": 12.5,
+            "offline": true,
+            "backend": {
+                "runtime": "diffusers",
+                "device": "cuda",
+                "dtype": "float16",
+                "seed": 17,
+                "model_load_seconds": 8.0,
+                "inference_seconds": 4.0,
+                "encoding_seconds": 0.5,
+                "text": "private transcript",
+                "translated_parameters": ["prompt", "width", 42],
+                "parameter_support": {
+                    "policy": "strict",
+                    "explicit_parameters": ["image.width"],
+                    "unsupported_explicit_parameters": [],
+                    "unsupported_reasons": {
+                        "image.path": "/private/reason"
+                    }
+                }
+            }
+        });
+
+        let sanitized = sanitized_companion_metadata(metadata);
+
+        assert_eq!(sanitized["elapsed_seconds"], 12.5);
+        assert_eq!(sanitized["backend"]["device"], "cuda");
+        assert_eq!(sanitized["backend"]["inference_seconds"], 4.0);
+        assert_eq!(
+            sanitized["backend"]["translated_parameters"],
+            json!(["prompt", "width"])
+        );
+        assert!(sanitized.get("model_path").is_none());
+        assert!(sanitized.get("effective_parameters").is_none());
+        assert!(sanitized.get("outputs").is_none());
+        assert!(sanitized["backend"].get("text").is_none());
+        assert!(
+            sanitized["backend"]["parameter_support"]
+                .get("unsupported_reasons")
+                .is_none()
+        );
+        let encoded = serde_json::to_string(&sanitized).unwrap();
+        assert!(!encoded.contains("private"));
     }
 }

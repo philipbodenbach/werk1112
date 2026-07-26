@@ -238,6 +238,38 @@ The animation is indeterminate rather than a fabricated percentage, is cleared
 before durable result output, and is disabled for pipes, redirects, debug
 output, and `TERM=dumb`.
 
+Typed media commands also provide task-aware diagnostics:
+
+```bash
+# Measured image timings, output properties, and workload estimate
+werk image generate tiny-sd --prompt "a small service robot" --verbose
+
+# Resolved video request, runtime candidates, and routing decision
+werk video generate wan-t2v --prompt "clouds above a mountain" --debug
+
+# Runtime statistics and routing details together
+werk audio transcribe whisper --input interview.wav --verbose --debug
+```
+
+`--verbose` prints measured execution timings, actual output properties, and
+clearly labelled workload estimates. The useful values depend on the task:
+images report resolution/count, effective steps and seed, plus image/pixel
+throughput when measured; video distinguishes playback FPS from generation
+throughput; and generated audio or speech can report output duration, sample
+rate, channels, and real-time performance.
+Available backend phases such as model loading, inference, and encoding are
+shown separately. A phase that the selected backend did not measure is omitted
+rather than reported as zero or inferred from unrelated wall-clock time.
+
+`--debug` explains the resolved request and routing decision: candidate
+runtimes and rejection reasons, the selected runtime, fallback/degradation
+state, parameter sources, and safe backend details such as adapter, device, and
+dtype. The flags are independent and may be combined. Both write diagnostics
+to stderr so normal result/output lines remain on stdout; `--debug` also
+disables the transient animation so it cannot overwrite diagnostic lines.
+Prompt text, negative prompts, lyrics, transcription text, inline media, URL
+queries, and raw private input/model paths are never dumped by these reports.
+
 For direct CLI inference, omitting `--output` saves generated media directly in
 Werk's managed output directory. Werk creates a portable, collision-resistant
 name from the model, task, Unix timestamp, and random result suffix, for
@@ -374,10 +406,12 @@ Planner policy:
   image pipeline, so compatible media models fall back from the GPU companion
   to the CPU companion rather than pretending to use Candle.
 - Image requests filter to VLM-capable runtimes before loading; Candle text routes reject image input.
-- `--debug` exposes candidate decisions for chat/run and
-  `werk backend doctor --debug`. For media, use
-  `werk doctor --model MODEL --task TASK` for plan/rejection details and
-  `werk parameters MODEL --json` for parameter support.
+- `--debug` exposes candidate decisions for chat/run and typed media commands;
+  `werk backend doctor --debug` remains the backend-wide diagnostic view.
+  Media debug output also includes the resolved parameters and their sources.
+  Use `werk doctor --model MODEL --task TASK` for a non-executing preflight
+  report and `werk parameters MODEL --json` for the full parameter schema and
+  support matrix.
 - Media plans evaluate model task, runtime task, layout, family/architecture probe, availability, accelerator, explicitly set parameters, and workload fit. Backend fallback and execution degradation are separate. Smaller models, stronger quantization, lower resolution, fewer frames, and shorter duration are recommendations only and are never applied silently.
 
 ## Build
@@ -1046,7 +1080,7 @@ werk chat gemma-2b-it --stream-granularity chunk
 ```
 
 Timing and throughput stats are quiet by default. Add `--verbose` to `chat`
-for runtime timing stats:
+for token-oriented runtime timing stats:
 
 ```bash
 werk chat TinyLlama-1B-GGUF --max-tokens 128 --verbose
@@ -1066,6 +1100,11 @@ eval rate:            86.81 tokens/s
 ```
 
 `prompt eval` is prompt/prefill time. `eval` is assistant-token decode time. `total` also includes model load and tokenizer overhead for that turn. For TinyLlama GGUF on a CUDA build, use `Q4_K_M` as the default balance of speed and quality; `Q2_K` is smaller but noticeably worse, and larger quants can be slower.
+
+Image, video, and audio commands accept the same `--verbose` spelling, but
+their reports use media-specific values instead of token counts and token
+rates. Combine it with `--debug` when both performance measurements and the
+routing explanation are needed.
 
 CLI chat is a first-class workflow. OpenAI-compatible chat clients can use
 Werk1112 without a chat-specific adapter.

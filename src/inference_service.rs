@@ -18,7 +18,9 @@ pub use jobs::{JobManager, JobRecord, JobStatus, JobStore};
 pub use output::OutputStore;
 pub use resources::detect_host_resources;
 pub use service::InferenceService;
-pub use types::{InferenceResult, OutputMetadata};
+pub use types::{
+    InferenceResult, InferenceTimings, OutputMetadata, RuntimeAttemptOutcome, RuntimeAttemptTiming,
+};
 
 #[cfg(test)]
 mod tests;

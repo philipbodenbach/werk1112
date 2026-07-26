@@ -42,6 +42,81 @@ Generative prompt priority is:
 3. piped standard input;
 4. interactive terminal input.
 
+## CLI diagnostics
+
+Every typed image, video, and audio command accepts two independent,
+combinable diagnostic flags:
+
+```bash
+# Performance and output statistics
+werk image generate tiny-sd --prompt "a small service robot" --verbose
+
+# Request resolution and inference routing
+werk video animate wan-i2v --image first-frame.png \
+  --prompt "slow camera movement" --debug
+
+# Both views for one request
+werk audio generate musicgen --prompt "quiet analogue ambience" \
+  --verbose --debug
+```
+
+`--verbose` is the performance/result view. It is printed after execution and
+uses values that make sense for the concrete task rather than copying chat's
+token counters:
+
+- common values include measured total/service/publication time, the selected
+  runtime, actual output count and bytes, and the workload fit/confidence with
+  accelerator and host peak estimates clearly marked as estimates;
+- image values include actual dimensions/count, effective steps and seed, plus
+  seconds per image and generated megapixels per second when inference timing
+  is available;
+- video values keep playback FPS separate from generated-frames-per-second and
+  include actual dimensions, frame count, and duration when the encoder
+  reports them;
+- generated audio and TTS values include actual output duration, sample rate,
+  channels, and real-time performance when those measurements are available;
+- transcription and other audio-input tasks report only safe structural and
+  timing information, never the transcript itself.
+
+Audio real-time factor is measured inference wall time divided by produced
+audio duration; values below `1.0` are faster than real-time. When one request
+produces multiple variations, Werk labels the throughput-oriented value
+`aggregate RTF` because it divides by their combined duration. Stem outputs do
+not use this metric because summing parallel stem durations would be
+misleading.
+
+Backends may additionally measure model loading, inference, and encoding as
+separate phases. Werk prints a phase only when that phase was actually
+measured. It does not relabel an entire backend call as inference time, derive
+fake percentages, or turn a missing measurement into zero.
+
+If routing succeeds but every accepted runtime later fails while loading or
+executing the model, either diagnostic flag prints the attempted runtime,
+outcome, and elapsed attempt time before the normal error. Backend error text
+is not copied into that timing block.
+
+`--debug` is the request/routing view. It reports the canonical task, resolved
+routing policy, workload fit, candidate runtimes with scores and rejection
+reasons, selected backend, fallback and permitted degradation state, explicit
+and effective parameter sources, and safe backend details such as adapter,
+device, dtype, and translated parameter names. The command
+`werk doctor --model MODEL --task TASK` remains useful as a non-executing
+preflight, while `werk parameters MODEL --json` provides the complete
+parameter support matrix.
+
+Both reports are written to stderr; normal result and durable output-path lines
+stay on stdout. `--verbose` and `--debug` do not imply one another, and using
+both emits both reports. Debug mode disables the transient activity animation
+so diagnostic lines remain stable.
+
+Werk-authored diagnostic sections are safe to paste into an issue by default.
+They never print raw prompts, negative prompts, lyrics, TTS input, initial ASR
+prompts, hotwords, transcription text, inline base64 media, URL query strings,
+or raw private input/model paths. Output paths continue to follow the normal
+CLI output contract. A separate error or warning originating in a third-party
+runtime can contain runtime-specific detail and should still be reviewed
+before sharing.
+
 ## Canonical tasks
 
 The manifest and API use typed tasks rather than a matrix of booleans:
@@ -245,7 +320,8 @@ children of `outputs/`, never models. Defaults are 30 days and 20 GiB; use
 - Persisted job cancellation is cooperative. A native third-party call that
   lacks cancellation may release resources only when it returns.
 - The companion currently returns one terminal response rather than granular
-  progress events. The CLI animation therefore indicates liveness only.
+  progress events. The CLI animation therefore indicates liveness only, while
+  measured phase timings are printed after completion by `--verbose`.
   Persisted phases are available, but `encoding` can be too brief to observe
   for fast jobs.
 - Werk serves authenticated whole-file outputs. HTTP byte ranges and

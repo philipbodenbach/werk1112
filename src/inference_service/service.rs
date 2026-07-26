@@ -1,14 +1,14 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, sync::Arc};
+use std::{collections::BTreeMap, fs, sync::Arc, time::Instant};
 
 use super::{
-    backend::{BackendProbe, MediaInferenceBackend},
+    backend::{BackendExecution, BackendProbe, MediaInferenceBackend},
     companion::CompanionMediaBackend,
     helpers::{new_id, validate_safe_name, write_json_atomic},
     output::{OutputStore, output_metadata, remove_output_dir},
     resources::detect_host_resources,
-    types::InferenceResult,
+    types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome, RuntimeAttemptTiming},
 };
 use crate::{
     inference::{
@@ -159,9 +159,42 @@ impl InferenceService {
     }
 
     pub fn execute(&self, request: InferenceRequest) -> Result<InferenceResult> {
+        self.execute_with_observers(request, |_, _, _| {}, |_| {})
+    }
+
+    pub fn execute_with_plan_observer<F>(
+        &self,
+        request: InferenceRequest,
+        observer: F,
+    ) -> Result<InferenceResult>
+    where
+        F: FnOnce(&EffectiveInferenceRequest, &WorkloadEstimate, &ExecutionPlan),
+    {
+        self.execute_with_observers(request, observer, |_| {})
+    }
+
+    pub(crate) fn execute_with_observers<P, A>(
+        &self,
+        request: InferenceRequest,
+        plan_observer: P,
+        mut attempt_observer: A,
+    ) -> Result<InferenceResult>
+    where
+        P: FnOnce(&EffectiveInferenceRequest, &WorkloadEstimate, &ExecutionPlan),
+        A: FnMut(&RuntimeAttemptTiming),
+    {
+        let mut timings = InferenceTimings::default();
+
+        let resolve_started = Instant::now();
         let manifest = self.store.get(&request.model)?;
         let mut effective = self.resolve(request)?;
+        timings.resolve_seconds = resolve_started.elapsed().as_secs_f64();
+
+        let estimate_started = Instant::now();
         let estimate = self.estimate_effective(&manifest, &effective)?;
+        timings.estimate_seconds = estimate_started.elapsed().as_secs_f64();
+
+        let planning_started = Instant::now();
         let schema_paths = parameter_schema_for_manifest(effective.task, &manifest)?
             .into_iter()
             .map(|descriptor| descriptor.path)
@@ -170,6 +203,10 @@ impl InferenceService {
             .backend
             .probe(&self.store, &manifest, effective.task, &schema_paths);
         let mut plan = plan_execution(&manifest, &effective, &estimate, &probe.candidates);
+        timings.planning_seconds = planning_started.elapsed().as_secs_f64();
+
+        plan_observer(&effective, &estimate, &plan);
+
         let selected_runtime = plan.selected_runtime.clone().ok_or_else(|| {
             anyhow!(
                 "no executable runtime for {}: {}",
@@ -177,6 +214,8 @@ impl InferenceService {
                 format_plan_rejections(&plan)
             )
         })?;
+
+        let output_setup_started = Instant::now();
         self.outputs.enforce_retention()?;
         let result_id = new_id("out")?;
         let output_dir = self.outputs.create_output_dir(&result_id)?;
@@ -192,6 +231,9 @@ impl InferenceService {
             })
             .cloned()
             .collect::<Vec<_>>();
+        timings.output_setup_seconds = output_setup_started.elapsed().as_secs_f64();
+
+        let execution_started = Instant::now();
         let mut execution_errors = Vec::new();
         let mut execution = None;
         for (index, candidate) in runtime_attempts.iter().enumerate() {
@@ -206,14 +248,25 @@ impl InferenceService {
                 &candidate.backend,
                 &candidate.degradations,
             );
-            match self.backend.execute(
+            let attempt_started = Instant::now();
+            let attempt = self.backend.execute(
                 &self.store,
                 &manifest,
                 &attempt_effective,
                 &output_dir,
                 &candidate.runtime_id,
-            ) {
+            );
+            let attempt_seconds = attempt_started.elapsed().as_secs_f64();
+            match attempt {
                 Ok(value) => {
+                    let attempt_timing = RuntimeAttemptTiming {
+                        runtime: candidate.runtime_id.clone(),
+                        duration_seconds: attempt_seconds,
+                        outcome: RuntimeAttemptOutcome::Succeeded,
+                        error: None,
+                    };
+                    attempt_observer(&attempt_timing);
+                    timings.runtime_attempts.push(attempt_timing);
                     if candidate.runtime_id != selected_runtime {
                         plan.selected_runtime = Some(candidate.runtime_id.clone());
                         plan.selected_backend = Some(candidate.backend.clone());
@@ -225,9 +278,21 @@ impl InferenceService {
                     execution = Some(value);
                     break;
                 }
-                Err(error) => execution_errors.push(format!("{}: {error:#}", candidate.runtime_id)),
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    let attempt_timing = RuntimeAttemptTiming {
+                        runtime: candidate.runtime_id.clone(),
+                        duration_seconds: attempt_seconds,
+                        outcome: RuntimeAttemptOutcome::Failed,
+                        error: Some(error.clone()),
+                    };
+                    attempt_observer(&attempt_timing);
+                    timings.runtime_attempts.push(attempt_timing);
+                    execution_errors.push(format!("{}: {error}", candidate.runtime_id));
+                }
             }
         }
+        timings.execution_seconds = execution_started.elapsed().as_secs_f64();
         let Some(execution) = execution else {
             let _ = remove_output_dir(&self.outputs.root, &output_dir);
             bail!(
@@ -236,11 +301,18 @@ impl InferenceService {
                 execution_errors.join("; ")
             );
         };
+
+        let finalization_started = Instant::now();
+        let BackendExecution {
+            runtime,
+            outputs: backend_outputs,
+            warnings: execution_warnings,
+            metadata: backend_metadata,
+        } = execution;
         let created_unix = unix_ts();
         let seed =
             effective.u64_parameter(&format!("{}.seed", effective.task.parameter_namespace()));
-        let outputs = match execution
-            .outputs
+        let outputs = match backend_outputs
             .into_iter()
             .enumerate()
             .map(|(index, output)| {
@@ -249,7 +321,7 @@ impl InferenceService {
                     index,
                     &manifest,
                     &effective,
-                    &execution.runtime,
+                    &runtime,
                     output,
                     seed,
                     created_unix,
@@ -266,22 +338,26 @@ impl InferenceService {
         };
         let mut warnings = effective.warnings.clone();
         warnings.extend(estimate.warnings.clone());
-        warnings.extend(execution.warnings);
+        warnings.extend(execution_warnings);
         if !execution_errors.is_empty() {
             warnings.push(format!(
                 "runtime fallback was used after: {}",
                 execution_errors.join("; ")
             ));
         }
+        timings.finalization_seconds = finalization_started.elapsed().as_secs_f64();
+        timings.update_total();
         let mut result = InferenceResult {
             id: result_id,
             task: effective.task,
             model: manifest.id,
-            runtime: execution.runtime,
+            runtime,
             outputs,
             effective_request: effective,
             estimate,
             plan,
+            backend_metadata,
+            timings,
             warnings,
             created_unix,
         };

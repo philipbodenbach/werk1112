@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::{
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
@@ -16,6 +17,7 @@ use super::{
     jobs::{JobStatus, JobStore},
     output::OutputStore,
     service::{InferenceService, complete_backend_fit},
+    types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome},
 };
 use crate::{
     capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
@@ -92,7 +94,10 @@ impl MediaInferenceBackend for MockMediaBackend {
                 metadata: json!({"mock": true}),
             }],
             warnings: Vec::new(),
-            metadata: Value::Null,
+            metadata: json!({
+                "adapter": "mock",
+                "device": "cpu",
+            }),
         })
     }
 }
@@ -166,7 +171,10 @@ impl MediaInferenceBackend for FallbackMediaBackend {
                 metadata: Value::Null,
             }],
             warnings: Vec::new(),
-            metadata: Value::Null,
+            metadata: json!({
+                "adapter": "mock",
+                "device": "cpu",
+            }),
         })
     }
 }
@@ -227,15 +235,29 @@ fn service_resolves_plans_executes_and_persists_output_metadata() {
     let result = service.execute(request).unwrap();
     assert_eq!(result.outputs.len(), 1);
     assert_eq!(result.runtime, "mock-cpu");
+    assert_eq!(result.backend_metadata["adapter"], "mock");
+    assert_eq!(result.backend_metadata["device"], "cpu");
+    assert!(result.timings.total_seconds.is_finite());
+    assert_eq!(result.timings.runtime_attempts.len(), 1);
+    assert_eq!(
+        result.timings.runtime_attempts[0].outcome,
+        RuntimeAttemptOutcome::Succeeded
+    );
+    assert!(result.timings.runtime_attempts[0].error.is_none());
+    assert!(result.timings.total_seconds >= result.timings.runtime_attempts[0].duration_seconds);
     assert_eq!(result.outputs[0].mime_type, "image/png");
     assert!(Path::new(&result.outputs[0].path).is_file());
-    assert!(
-        service
-            .output_store()
-            .root()
-            .join(&result.id)
-            .join("metadata.json")
-            .is_file()
+    let metadata_path = service
+        .output_store()
+        .root()
+        .join(&result.id)
+        .join("metadata.json");
+    let persisted: InferenceResult =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(persisted.backend_metadata, result.backend_metadata);
+    assert_eq!(
+        persisted.timings.runtime_attempts,
+        result.timings.runtime_attempts
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -251,6 +273,25 @@ fn execution_retries_accepted_runtime_and_records_backend_adjustment() {
     assert_eq!(result.runtime, "mock-cpu");
     assert_eq!(result.plan.selected_runtime.as_deref(), Some("mock-cpu"));
     assert!(result.plan.backend_fallback);
+    assert_eq!(result.timings.runtime_attempts.len(), 2);
+    assert_eq!(
+        result.timings.runtime_attempts[0].outcome,
+        RuntimeAttemptOutcome::Failed
+    );
+    assert_eq!(result.timings.runtime_attempts[0].runtime, "mock-cuda");
+    assert!(
+        result.timings.runtime_attempts[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("simulated accelerator load failure"))
+    );
+    assert_eq!(
+        result.timings.runtime_attempts[1].outcome,
+        RuntimeAttemptOutcome::Succeeded
+    );
+    assert_eq!(result.timings.runtime_attempts[1].runtime, "mock-cpu");
+    assert!(result.timings.runtime_attempts[1].error.is_none());
+    assert_eq!(result.backend_metadata["device"], "cpu");
     assert!(
         result
             .warnings
@@ -276,6 +317,74 @@ fn execution_retries_accepted_runtime_and_records_backend_adjustment() {
             .exists()
     );
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plan_and_attempt_observers_report_a_later_backend_failure() {
+    let (root, store) = image_store("plan-observer");
+    let service = InferenceService::with_backend(store, Arc::new(FallbackMediaBackend));
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("observe failed execution".to_string());
+    request.routing.fallback_policy = Some("none".to_string());
+    let calls = Cell::new(0);
+    let attempts = RefCell::new(Vec::new());
+
+    let result = service.execute_with_observers(
+        request,
+        |effective, estimate, plan| {
+            calls.set(calls.get() + 1);
+            assert_eq!(effective.model, "flux");
+            assert_eq!(estimate.task, InferenceTask::ImageGeneration);
+            assert_eq!(plan.selected_runtime.as_deref(), Some("mock-cuda"));
+        },
+        |attempt| attempts.borrow_mut().push(attempt.clone()),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(calls.get(), 1);
+    let attempts = attempts.borrow();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].runtime, "mock-cuda");
+    assert_eq!(attempts[0].outcome, RuntimeAttemptOutcome::Failed);
+    assert!(attempts[0].duration_seconds.is_finite());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn inference_result_diagnostics_are_backward_compatible_with_legacy_metadata() {
+    let (root, store) = image_store("legacy-result");
+    let service = InferenceService::with_backend(store, Arc::new(MockMediaBackend));
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("legacy metadata".to_string());
+    let result = service.execute(request).unwrap();
+    let mut value = serde_json::to_value(result).unwrap();
+    let fields = value.as_object_mut().unwrap();
+    fields.remove("backend_metadata");
+    fields.remove("timings");
+
+    let legacy: InferenceResult = serde_json::from_value(value).unwrap();
+    assert_eq!(legacy.backend_metadata, Value::Null);
+    assert_eq!(legacy.timings, Default::default());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn inference_timing_types_accept_partial_serialized_records() {
+    let timings: InferenceTimings = serde_json::from_value(json!({
+        "runtime_attempts": [{
+            "runtime": "legacy-runtime"
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(timings.total_seconds, 0.0);
+    assert_eq!(timings.runtime_attempts.len(), 1);
+    assert_eq!(timings.runtime_attempts[0].duration_seconds, 0.0);
+    assert_eq!(
+        timings.runtime_attempts[0].outcome,
+        RuntimeAttemptOutcome::Unknown
+    );
+    assert!(timings.runtime_attempts[0].error.is_none());
 }
 
 #[test]

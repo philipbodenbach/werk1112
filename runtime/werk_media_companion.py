@@ -1232,6 +1232,18 @@ def torch_runtime(parameters):
     return torch, device, dtype
 
 
+def synchronize_torch_device(torch, device):
+    """Wait for queued accelerator work before reading a wall-clock timer."""
+    if device == "cuda":
+        # PyTorch exposes both CUDA and ROCm/HIP synchronization here.
+        torch.cuda.synchronize()
+        return
+    if device == "mps":
+        synchronize = getattr(getattr(torch, "mps", None), "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
+
 def seeded_generator(torch, device, parameters):
     seed = parameters.get("seed")
     if seed is None:
@@ -1786,6 +1798,7 @@ def execute_diffusers(
     identifier,
     parameter_guard,
 ):
+    model_load_started = time.perf_counter()
     torch, device, dtype = torch_runtime(parameters)
     has_image = any(
         key in inputs for key in ("image", "input_image", "initial_image")
@@ -1801,6 +1814,8 @@ def execute_diffusers(
         parameter_guard,
     )
     apply_loras(pipeline, parameters, warnings, parameter_guard)
+    synchronize_torch_device(torch, device)
+    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
     values, required, seed, parameter_paths = diffusers_call_values(
         task,
         parameters,
@@ -1844,11 +1859,16 @@ def execute_diffusers(
         parameter_paths=parameter_paths,
     )
     try:
+        synchronize_torch_device(torch, device)
+        inference_started = time.perf_counter()
         with torch.inference_mode():
             result = pipeline(**kwargs)
+        synchronize_torch_device(torch, device)
+        inference_seconds = max(0.0, time.perf_counter() - inference_started)
     except Exception as error:
         fail("execution_failed", f"Diffusers pipeline failed for task '{task}'", str(error))
 
+    encoding_started = time.perf_counter()
     if task in IMAGE_TASKS:
         images = getattr(result, "images", None)
         if images is None and isinstance(result, dict):
@@ -1887,12 +1907,16 @@ def execute_diffusers(
                     metadata={"frames": len(batch), "fps": fps},
                 )
             )
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
     return outputs, warnings, {
         "runtime": "diffusers",
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "seed": seed,
         "translated_parameters": sorted(kwargs),
+        "model_load_seconds": model_load_seconds,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
     }
 
 
@@ -1904,6 +1928,7 @@ def execute_diffusers_audio(
     identifier,
     parameter_guard,
 ):
+    model_load_started = time.perf_counter()
     torch, device, dtype = torch_runtime(parameters)
     pipeline = load_diffusers_pipeline(
         model_path,
@@ -1921,6 +1946,8 @@ def execute_diffusers_audio(
         warnings,
         parameter_guard,
     )
+    synchronize_torch_device(torch, device)
+    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
     prompt = prompt_with_lyrics(
         parameters.get("prompt") or parameters.get("description"),
         parameters.get("lyrics"),
@@ -1954,10 +1981,16 @@ def execute_diffusers_audio(
         },
     )
     try:
+        synchronize_torch_device(torch, device)
+        inference_started = time.perf_counter()
         with torch.inference_mode():
             result = pipeline(**kwargs)
+        synchronize_torch_device(torch, device)
+        inference_seconds = max(0.0, time.perf_counter() - inference_started)
     except Exception as error:
         fail("execution_failed", f"Diffusers audio pipeline failed for '{task}'", str(error))
+
+    encoding_started = time.perf_counter()
     audios = getattr(result, "audios", None)
     if audios is None and isinstance(result, dict):
         audios = result.get("audios")
@@ -2006,12 +2039,16 @@ def execute_diffusers_audio(
                 metadata={"sample_rate": sample_rate, "channels": channels},
             )
         )
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
     return outputs, warnings, {
         "runtime": "diffusers",
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "seed": seed,
         "translated_parameters": sorted(kwargs),
+        "model_load_seconds": model_load_seconds,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
     }
 
 
@@ -2122,11 +2159,14 @@ def execute_audio_generation(
     identifier,
     parameter_guard,
 ):
+    model_load_started = time.perf_counter()
     pipeline, torch, device, dtype = load_transformers_pipeline(
         model_path,
         "text-to-audio",
         parameters,
     )
+    synchronize_torch_device(torch, device)
+    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
     prompt = prompt_with_lyrics(
         parameters.get("prompt") or parameters.get("description"),
         parameters.get("lyrics"),
@@ -2150,6 +2190,8 @@ def execute_audio_generation(
     }
     if not call_values["forward_params"]:
         call_values = {}
+    synchronize_torch_device(torch, device)
+    inference_started = time.perf_counter()
     try:
         result = pipeline(prompt, **call_values)
     except TypeError:
@@ -2165,12 +2207,17 @@ def execute_audio_generation(
             fail("execution_failed", f"Transformers audio pipeline failed for '{task}'", str(error))
     except Exception as error:
         fail("execution_failed", f"Transformers audio pipeline failed for '{task}'", str(error))
+    synchronize_torch_device(torch, device)
+    inference_seconds = max(0.0, time.perf_counter() - inference_started)
+
+    encoding_started = time.perf_counter()
     audio, sample_rate = audio_array_and_rate(result, parameters)
     format_name = normalized_name(parameters.get("output_format") or parameters.get("format") or "wav")
     if format_name not in {"wav", "flac", "ogg"}:
         fail("unsupported_parameter", f"unsupported direct audio output format '{format_name}'")
     path = output_dir / f"{task}-{identifier}.{format_name}"
     channels, duration = write_audio(path, audio, sample_rate, format_name)
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
     return [output_record(
         path,
         mimetypes.guess_type(path.name)[0] or f"audio/{format_name}",
@@ -2182,30 +2229,43 @@ def execute_audio_generation(
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "seed": seed,
+        "model_load_seconds": model_load_seconds,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
     }
 
 
 def execute_tts(model_path, task, parameters, output_dir, identifier):
-    pipeline, _torch, device, dtype = load_transformers_pipeline(
+    model_load_started = time.perf_counter()
+    pipeline, torch, device, dtype = load_transformers_pipeline(
         model_path,
         "text-to-speech",
         parameters,
     )
+    synchronize_torch_device(torch, device)
+    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
     text = required_string(parameters.get("text") or parameters.get("prompt"), "effective_parameters.text")
     kwargs = {}
     for key in ("speaker_embeddings", "vocoder", "generate_kwargs"):
         if key in parameters:
             kwargs[key] = parameters[key]
+    synchronize_torch_device(torch, device)
+    inference_started = time.perf_counter()
     try:
         result = pipeline(text, **kwargs)
     except Exception as error:
         fail("execution_failed", "Transformers text-to-speech pipeline failed", str(error))
+    synchronize_torch_device(torch, device)
+    inference_seconds = max(0.0, time.perf_counter() - inference_started)
+
+    encoding_started = time.perf_counter()
     audio, sample_rate = audio_array_and_rate(result, parameters)
     format_name = normalized_name(parameters.get("output_format") or parameters.get("format") or "wav")
     if format_name not in {"wav", "flac", "ogg"}:
         fail("unsupported_parameter", f"unsupported direct audio output format '{format_name}'")
     path = output_dir / f"{task}-{identifier}.{format_name}"
     channels, duration = write_audio(path, audio, sample_rate, format_name)
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
     return [output_record(
         path,
         mimetypes.guess_type(path.name)[0] or f"audio/{format_name}",
@@ -2216,6 +2276,9 @@ def execute_tts(model_path, task, parameters, output_dir, identifier):
         "pipeline_task": "text-to-speech",
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
+        "model_load_seconds": model_load_seconds,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
     }
 
 
@@ -2310,11 +2373,14 @@ def execute_asr(
     identifier,
     parameter_guard,
 ):
-    pipeline, _torch, device, dtype = load_transformers_pipeline(
+    model_load_started = time.perf_counter()
+    pipeline, torch, device, dtype = load_transformers_pipeline(
         model_path,
         "automatic-speech-recognition",
         parameters,
     )
+    synchronize_torch_device(torch, device)
+    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
     source = (
         inputs.get("input_audio")
         or inputs.get("source_audio")
@@ -2396,10 +2462,16 @@ def execute_asr(
             "generate_kwargs": generate_paths,
         },
     )
+    synchronize_torch_device(torch, device)
+    inference_started = time.perf_counter()
     try:
         result = pipeline(str(source_path), **kwargs)
     except Exception as error:
         fail("execution_failed", "Transformers speech-to-text pipeline failed", str(error))
+    synchronize_torch_device(torch, device)
+    inference_seconds = max(0.0, time.perf_counter() - inference_started)
+
+    encoding_started = time.perf_counter()
     if not isinstance(result, dict):
         result = {"text": str(result)}
     text = str(result.get("text") or "")
@@ -2410,12 +2482,16 @@ def execute_asr(
         identifier,
         parameters,
     )
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
     return outputs, [], {
         "runtime": "transformers",
         "pipeline_task": "automatic-speech-recognition",
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "text": text,
+        "model_load_seconds": model_load_seconds,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
     }
 
 
@@ -2476,7 +2552,8 @@ def command_execute(payload):
     validate_adapter_inputs(task, adapter, inputs)
     output_dir = output_directory(payload)
     identifier = uuid.uuid4().hex
-    started = time.time()
+    created_unix = time.time()
+    started = time.perf_counter()
 
     if adapter == "diffusers":
         outputs, warnings, backend_metadata = execute_diffusers(
@@ -2541,8 +2618,8 @@ def command_execute(payload):
         "effective_parameters": parameters,
         "outputs": outputs,
         "warnings": warnings,
-        "created_unix": int(started),
-        "elapsed_seconds": max(0.0, time.time() - started),
+        "created_unix": int(created_unix),
+        "elapsed_seconds": max(0.0, time.perf_counter() - started),
         "offline": True,
     }
     metadata_path = output_dir / f"{task}-{identifier}.metadata.json"

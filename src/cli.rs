@@ -1,3 +1,4 @@
+mod media_diagnostics;
 mod terminal_activity;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,6 +9,7 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::{self, IsTerminal, Read, Write},
@@ -19,6 +21,10 @@ use std::{
 };
 use tokio_stream::StreamExt;
 
+use self::media_diagnostics::{
+    MediaCliTimings, write_media_backend_debug, write_media_failed_attempts,
+    write_media_routing_debug, write_media_verbose_stats,
+};
 use self::terminal_activity::{
     ActivityKind, ActivitySpec, generation_activity_enabled, with_activity,
 };
@@ -50,7 +56,7 @@ use crate::{
         ParameterValue, RoutingOverrides, WorkloadEstimate, parameter_schema,
         parameter_schema_for_manifest,
     },
-    inference_service::{InferenceResult, InferenceService, OutputStore},
+    inference_service::{InferenceResult, InferenceService, OutputStore, RuntimeAttemptTiming},
     media_cli::{
         AudioCommands, ImageCommands, RoutingArgs, VideoCommands, collect_raw_overrides,
         parse_set_overrides,
@@ -1963,12 +1969,41 @@ fn execute_media_args<T: Serialize>(
 
     let service = InferenceService::new(store.clone());
     let activity = ActivitySpec::for_task(task);
-    let mut result = with_activity(
-        generation_activity_enabled(false),
+    let total_started = Instant::now();
+    let service_started = Instant::now();
+    let attempts = RefCell::new(Vec::<RuntimeAttemptTiming>::new());
+    let execution = with_activity(
+        generation_activity_enabled(routing_args.debug),
         activity.kind(),
         activity.message(model),
-        || service.execute(request),
-    )?;
+        || {
+            service.execute_with_observers(
+                request,
+                |effective, estimate, plan| {
+                    if routing_args.debug {
+                        let mut stderr = io::stderr().lock();
+                        let _ = write_media_routing_debug(&mut stderr, effective, estimate, plan);
+                    }
+                },
+                |attempt| attempts.borrow_mut().push(attempt.clone()),
+            )
+        },
+    );
+    let service_seconds = service_started.elapsed().as_secs_f64();
+    let mut result = match execution {
+        Ok(result) => result,
+        Err(error) => {
+            if routing_args.verbose || routing_args.debug {
+                let attempts = attempts.borrow();
+                if !attempts.is_empty() {
+                    let mut stderr = io::stderr().lock();
+                    let _ = write_media_failed_attempts(&mut stderr, &attempts, service_seconds);
+                }
+            }
+            return Err(error);
+        }
+    };
+    let publication_started = Instant::now();
     if let Some(destination) = requested_output {
         publish_and_release_cli_outputs(
             service.output_store(),
@@ -1978,7 +2013,20 @@ fn execute_media_args<T: Serialize>(
     } else {
         publish_default_cli_outputs(service.output_store(), &mut result)?;
     }
+    let timings = MediaCliTimings {
+        total_seconds: total_started.elapsed().as_secs_f64(),
+        service_seconds,
+        publication_seconds: publication_started.elapsed().as_secs_f64(),
+    };
     print_inference_result(&result, false);
+    if routing_args.verbose {
+        let mut stderr = io::stderr().lock();
+        write_media_verbose_stats(&mut stderr, &result, timings)?;
+    }
+    if routing_args.debug {
+        let mut stderr = io::stderr().lock();
+        write_media_backend_debug(&mut stderr, &result)?;
+    }
     Ok(())
 }
 
@@ -3314,13 +3362,13 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         Commands::Run { verbose, debug, .. } | Commands::Chat { verbose, debug, .. } => {
             *verbose || *debug
         }
+        Commands::Image { command } => command.routing().verbose || command.routing().debug,
+        Commands::Video { command } => command.routing().verbose || command.routing().debug,
+        Commands::Audio { command } => command.routing().verbose || command.routing().debug,
         Commands::Bench { debug, .. } => *debug,
         Commands::Import { .. }
         | Commands::Pull { .. }
         | Commands::Remove { .. }
-        | Commands::Image { .. }
-        | Commands::Video { .. }
-        | Commands::Audio { .. }
         | Commands::Estimate { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
@@ -9067,6 +9115,8 @@ mod tests {
             "--set",
             "image.seed=17",
             "--no-allow-cpu-offload",
+            "--verbose",
+            "--debug",
         ])
         .unwrap();
         let Commands::Image {
@@ -9104,6 +9154,10 @@ mod tests {
         assert_eq!(routing.accelerator.as_deref(), Some("cuda"));
         assert_eq!(routing.device.as_deref(), Some("cuda"));
         assert_eq!(routing.allow_cpu_offload, OverrideBool::Disabled);
+        assert!(args.routing.verbose);
+        assert!(args.routing.debug);
+        assert!(!parameters.contains_key("image.verbose"));
+        assert!(!parameters.contains_key("image.debug"));
 
         let mlx = media_routing(&args.routing, BackendArg::Mlx, None).unwrap();
         assert_eq!(mlx.backend.as_deref(), Some("mlx"));
@@ -10959,6 +11013,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn media_debug_and_verbose_enable_backend_install_details() {
+        let image_debug =
+            Cli::try_parse_from(["werk", "image", "generate", "model", "--debug"]).unwrap();
+        assert!(command_backend_install_verbose(
+            image_debug.command.as_ref().unwrap()
+        ));
+
+        let audio_verbose = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "speak",
+            "model",
+            "--text",
+            "hello",
+            "--verbose",
+        ])
+        .unwrap();
+        assert!(command_backend_install_verbose(
+            audio_verbose.command.as_ref().unwrap()
+        ));
+    }
+
     fn test_store(name: &str) -> ModelStore {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -11029,6 +11106,8 @@ mod tests {
                 degradations: Vec::new(),
                 model_or_quality_downgrades: Vec::new(),
             },
+            backend_metadata: Value::Null,
+            timings: Default::default(),
             warnings: Vec::new(),
             created_unix: 1,
         }

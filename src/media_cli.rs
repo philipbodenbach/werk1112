@@ -93,6 +93,20 @@ pub fn bool_override(enabled: bool, disabled: bool) -> BoolOverride {
 pub struct RoutingArgs {
     #[arg(
         long,
+        help = "Print media-specific timing, runtime, and output statistics"
+    )]
+    #[serde(skip)]
+    pub verbose: bool,
+
+    #[arg(
+        long,
+        help = "Print the resolved media request, routing candidates, and backend details"
+    )]
+    #[serde(skip)]
+    pub debug: bool,
+
+    #[arg(
+        long,
         help = "Requested accelerator, for example cpu, cuda, rocm, metal, or auto"
     )]
     pub accelerator: Option<String>,
@@ -801,6 +815,16 @@ pub enum ImageCommands {
     Upscale(ImageUpscaleArgs),
 }
 
+impl ImageCommands {
+    pub fn routing(&self) -> &RoutingArgs {
+        match self {
+            Self::Generate(args) => &args.routing,
+            Self::Edit(args) => &args.routing,
+            Self::Upscale(args) => &args.routing,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Args, Serialize, Default)]
 pub struct VideoCoreArgs {
     #[arg(long)]
@@ -1331,6 +1355,17 @@ pub enum VideoCommands {
 
     #[command(about = "Upscale an existing video with an installed model")]
     Upscale(VideoUpscaleArgs),
+}
+
+impl VideoCommands {
+    pub fn routing(&self) -> &RoutingArgs {
+        match self {
+            Self::Generate(args) => &args.routing,
+            Self::Animate(args) => &args.routing,
+            Self::Transform(args) => &args.routing,
+            Self::Upscale(args) => &args.routing,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -2153,6 +2188,17 @@ pub enum AudioCommands {
     Separate(AudioSeparateArgs),
 }
 
+impl AudioCommands {
+    pub fn routing(&self) -> &RoutingArgs {
+        match self {
+            Self::Generate(args) => &args.routing,
+            Self::Speak(args) => &args.routing,
+            Self::Transcribe(args) => &args.routing,
+            Self::Separate(args) => &args.routing,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2859,5 +2905,129 @@ mod tests {
             Some(&Value::String("cinematic".to_string()))
         );
         assert!(parse_set_overrides(&["missing-equals".to_string()]).is_err());
+    }
+
+    #[test]
+    fn every_media_leaf_accepts_verbose_and_debug() {
+        let image_commands = [
+            vec!["werk-image", "generate", "model", "--verbose", "--debug"],
+            vec![
+                "werk-image",
+                "edit",
+                "model",
+                "--image",
+                "input.png",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-image",
+                "upscale",
+                "model",
+                "--image",
+                "input.png",
+                "--verbose",
+                "--debug",
+            ],
+        ];
+        for argv in image_commands {
+            let command = ImageCli::try_parse_from(argv).unwrap().command;
+            assert!(command.routing().verbose);
+            assert!(command.routing().debug);
+        }
+
+        let video_commands = [
+            vec!["werk-video", "generate", "model", "--verbose", "--debug"],
+            vec![
+                "werk-video",
+                "animate",
+                "model",
+                "--image",
+                "input.png",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-video",
+                "transform",
+                "model",
+                "--video",
+                "input.mp4",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-video",
+                "upscale",
+                "model",
+                "--video",
+                "input.mp4",
+                "--verbose",
+                "--debug",
+            ],
+        ];
+        for argv in video_commands {
+            let command = VideoCli::try_parse_from(argv).unwrap().command;
+            assert!(command.routing().verbose);
+            assert!(command.routing().debug);
+        }
+
+        let audio_commands = [
+            vec!["werk-audio", "generate", "model", "--verbose", "--debug"],
+            vec![
+                "werk-audio",
+                "speak",
+                "model",
+                "--text",
+                "hello",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-audio",
+                "transcribe",
+                "model",
+                "--input",
+                "input.wav",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-audio",
+                "separate",
+                "model",
+                "--input",
+                "input.wav",
+                "--verbose",
+                "--debug",
+            ],
+        ];
+        for argv in audio_commands {
+            let command = AudioCli::try_parse_from(argv).unwrap().command;
+            assert!(command.routing().verbose);
+            assert!(command.routing().debug);
+        }
+    }
+
+    #[test]
+    fn diagnostics_are_not_serialized_as_inference_overrides() {
+        let cli = ImageCli::try_parse_from([
+            "werk-image",
+            "generate",
+            "model",
+            "--verbose",
+            "--debug",
+            "--width",
+            "512",
+        ])
+        .unwrap();
+        let ImageCommands::Generate(args) = cli.command else {
+            panic!("expected image generate");
+        };
+
+        let raw = collect_raw_overrides(&args).unwrap();
+        assert!(!raw.contains_key("verbose"));
+        assert!(!raw.contains_key("debug"));
+        assert_eq!(raw.get("width"), Some(&Value::from(512)));
     }
 }
