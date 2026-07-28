@@ -39,7 +39,11 @@ pub struct WorkloadEstimate {
     pub download_size_bytes: Option<u64>,
     pub weight_payload_bytes: Option<u64>,
     pub accelerator_peak_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accelerator_memory_limit_bytes: Option<u64>,
     pub host_peak_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_limit_bytes: Option<u64>,
     pub output_size_bytes: Option<u64>,
     pub fit: FitAssessment,
     pub confidence: EstimateConfidence,
@@ -269,6 +273,32 @@ pub fn estimate_workload(
     let mut warnings = Vec::new();
     let mut recommendations = Vec::new();
     let fit = classify_workload_fit(Some(accelerator_peak), Some(host_peak), resources);
+    if let Some(limit) = resources.accelerator_memory_bytes {
+        assumptions.push(format!(
+            "detected accelerator memory limit is {}",
+            format_memory_bytes(limit)
+        ));
+        if accelerator_peak >= limit {
+            warnings.push(format!(
+                "estimated accelerator peak of {} reaches or exceeds detected accelerator memory limit of {}",
+                format_memory_bytes(accelerator_peak),
+                format_memory_bytes(limit)
+            ));
+        }
+    }
+    if let Some(limit) = resources.host_memory_bytes {
+        assumptions.push(format!(
+            "detected host memory limit is {}",
+            format_memory_bytes(limit)
+        ));
+        if host_peak >= limit {
+            warnings.push(format!(
+                "estimated host peak of {} reaches or exceeds detected host memory limit of {}",
+                format_memory_bytes(host_peak),
+                format_memory_bytes(limit)
+            ));
+        }
+    }
     match fit {
         FitAssessment::Tight => {
             warnings.push("estimated peak is close to available memory".to_string());
@@ -293,13 +323,52 @@ pub fn estimate_workload(
         download_size_bytes: Some(download_size),
         weight_payload_bytes: Some(weights),
         accelerator_peak_bytes: Some(accelerator_peak),
+        accelerator_memory_limit_bytes: resources.accelerator_memory_bytes,
         host_peak_bytes: Some(host_peak),
+        host_memory_limit_bytes: resources.host_memory_bytes,
         output_size_bytes: Some(output_size),
         fit,
         confidence: EstimateConfidence::Heuristic,
         assumptions,
         warnings,
         recommendations,
+    }
+}
+
+/// Conservatively projects host memory after moving accelerator state to the
+/// CPU. The current host working set remains resident, all model weights may
+/// need a host copy, and a third of the remaining accelerator working set is
+/// reserved for staging and activations.
+pub(crate) fn projected_host_peak_with_offload(estimate: &WorkloadEstimate) -> Option<u64> {
+    let current_host_peak = estimate.host_peak_bytes?;
+    let weights = estimate
+        .weight_payload_bytes
+        .or(estimate.download_size_bytes)?;
+    let accelerator_working_set = estimate
+        .accelerator_peak_bytes
+        .unwrap_or(weights)
+        .saturating_sub(weights);
+
+    Some(
+        current_host_peak
+            .saturating_add(weights)
+            .saturating_add(accelerator_working_set / 3),
+    )
+}
+
+pub(crate) fn format_memory_bytes(bytes: u64) -> String {
+    const GIBIBYTE: u64 = 1024 * 1024 * 1024;
+    const MEBIBYTE: u64 = 1024 * 1024;
+    const KIBIBYTE: u64 = 1024;
+
+    if bytes >= GIBIBYTE {
+        format!("{:.2} GiB", bytes as f64 / GIBIBYTE as f64)
+    } else if bytes >= MEBIBYTE {
+        format!("{:.2} MiB", bytes as f64 / MEBIBYTE as f64)
+    } else if bytes >= KIBIBYTE {
+        format!("{:.2} KiB", bytes as f64 / KIBIBYTE as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -335,20 +404,40 @@ pub(crate) fn classify_workload_fit(
     host_peak: Option<u64>,
     resources: &HostResources,
 ) -> FitAssessment {
-    let ratios = [
-        accelerator_peak
-            .zip(resources.accelerator_memory_bytes)
-            .map(|(peak, limit)| peak as f64 / limit.max(1) as f64),
-        host_peak
-            .zip(resources.host_memory_bytes)
-            .map(|(peak, limit)| peak as f64 / limit.max(1) as f64),
-    ];
-    let Some(max_ratio) = ratios.into_iter().flatten().reduce(f64::max) else {
+    let accelerator_oom = accelerator_peak
+        .zip(resources.accelerator_memory_bytes)
+        .is_some_and(|(peak, limit)| peak >= limit);
+    let host_oom = host_peak
+        .zip(resources.host_memory_bytes)
+        .is_some_and(|(peak, limit)| peak >= limit);
+    if accelerator_oom || host_oom {
+        return FitAssessment::LikelyOom;
+    }
+    let accelerator_ratio = accelerator_peak
+        .zip(resources.accelerator_memory_bytes)
+        .map(|(peak, limit)| peak as f64 / limit.max(1) as f64);
+    let host_ratio = host_peak
+        .zip(resources.host_memory_bytes)
+        .map(|(peak, limit)| peak as f64 / limit.max(1) as f64);
+    let accelerator_capacity_unknown = accelerator_peak.is_some()
+        && resources.accelerator_memory_bytes.is_none()
+        && resources.accelerator.as_deref().is_some_and(|accelerator| {
+            matches!(
+                accelerator.to_ascii_lowercase().as_str(),
+                "cuda" | "rocm" | "hip" | "mps" | "metal" | "mlx"
+            )
+        });
+    if accelerator_capacity_unknown {
+        return FitAssessment::Unknown;
+    }
+    let Some(max_ratio) = [accelerator_ratio, host_ratio]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max)
+    else {
         return FitAssessment::Unknown;
     };
-    if max_ratio > 1.0 {
-        FitAssessment::LikelyOom
-    } else if max_ratio >= 0.85 {
+    if max_ratio >= 0.85 {
         FitAssessment::Tight
     } else {
         FitAssessment::Fits

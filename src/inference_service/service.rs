@@ -27,6 +27,7 @@ pub struct InferenceService {
     store: ModelStore,
     backend: Arc<dyn MediaInferenceBackend>,
     outputs: OutputStore,
+    resource_detector: Arc<dyn Fn() -> HostResources + Send + Sync>,
 }
 
 impl InferenceService {
@@ -36,6 +37,7 @@ impl InferenceService {
             store,
             backend: Arc::new(CompanionMediaBackend::discover()),
             outputs,
+            resource_detector: Arc::new(detect_host_resources),
         }
     }
 
@@ -45,6 +47,22 @@ impl InferenceService {
             store,
             backend,
             outputs,
+            resource_detector: Arc::new(detect_host_resources),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_backend_and_resources(
+        store: ModelStore,
+        backend: Arc<dyn MediaInferenceBackend>,
+        resources: HostResources,
+    ) -> Self {
+        let outputs = OutputStore::new(store.home());
+        Self {
+            store,
+            backend,
+            outputs,
+            resource_detector: Arc::new(move || resources.clone()),
         }
     }
 
@@ -119,7 +137,7 @@ impl InferenceService {
         manifest: &ModelManifest,
         effective: &EffectiveInferenceRequest,
     ) -> Result<WorkloadEstimate> {
-        let resources = detect_host_resources();
+        let resources = resources_for_request((self.resource_detector)(), effective);
         let fallback = estimate_workload(manifest, effective, &resources);
         match self.backend.estimate(&self.store, manifest, effective) {
             Ok(Some(mut estimate)) => {
@@ -448,6 +466,45 @@ impl InferenceService {
     }
 }
 
+pub(super) fn resources_for_request(
+    mut resources: HostResources,
+    request: &EffectiveInferenceRequest,
+) -> HostResources {
+    let Some(requested) = request
+        .string_parameter("routing.device")
+        .map(str::trim)
+        .filter(|device| !device.is_empty() && !device.eq_ignore_ascii_case("auto"))
+        .or_else(|| {
+            request
+                .string_parameter("routing.accelerator")
+                .map(str::trim)
+                .filter(|accelerator| {
+                    !accelerator.is_empty() && !accelerator.eq_ignore_ascii_case("auto")
+                })
+        })
+        .map(normalized_accelerator_label)
+    else {
+        return resources;
+    };
+    let detected = resources
+        .accelerator
+        .as_deref()
+        .map(normalized_accelerator_label);
+    if requested == "cpu" || detected.as_deref() != Some(requested.as_str()) {
+        resources.accelerator_memory_bytes = None;
+    }
+    resources.accelerator = Some(requested);
+    resources
+}
+
+fn normalized_accelerator_label(accelerator: &str) -> String {
+    match accelerator.trim().to_ascii_lowercase().as_str() {
+        "hip" => "rocm".to_string(),
+        "mps" => "metal".to_string(),
+        value => value.to_string(),
+    }
+}
+
 fn dynamic_tools(models: &[Value]) -> Vec<Value> {
     let mut tasks = models
         .iter()
@@ -481,12 +538,28 @@ fn append_unique(target: &mut Vec<String>, values: Vec<String>) {
 }
 
 pub(super) fn complete_backend_fit(estimate: &mut WorkloadEstimate, resources: &HostResources) {
-    if estimate.fit == crate::inference::FitAssessment::Unknown {
-        estimate.fit = classify_workload_fit(
-            estimate.accelerator_peak_bytes,
-            estimate.host_peak_bytes,
-            resources,
-        );
+    if resources.accelerator_memory_bytes.is_some() {
+        estimate.accelerator_memory_limit_bytes = resources.accelerator_memory_bytes;
+    }
+    if resources.host_memory_bytes.is_some() {
+        estimate.host_memory_limit_bytes = resources.host_memory_bytes;
+    }
+    let detected_fit = classify_workload_fit(
+        estimate.accelerator_peak_bytes,
+        estimate.host_peak_bytes,
+        resources,
+    );
+    if fit_severity(detected_fit) > fit_severity(estimate.fit) {
+        estimate.fit = detected_fit;
+    }
+}
+
+fn fit_severity(fit: crate::inference::FitAssessment) -> u8 {
+    match fit {
+        crate::inference::FitAssessment::Unknown => 0,
+        crate::inference::FitAssessment::Fits => 1,
+        crate::inference::FitAssessment::Tight => 2,
+        crate::inference::FitAssessment::LikelyOom => 3,
     }
 }
 

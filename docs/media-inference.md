@@ -90,6 +90,17 @@ separate phases. Werk prints a phase only when that phase was actually
 measured. It does not relabel an entire backend call as inference time, derive
 fake percentages, or turn a missing measurement into zero.
 
+Offload diagnostics deliberately distinguish intent from reality. `planned
+offload` comes from the Rust execution plan and is printed before model
+loading. `active offload` is emitted only after successful runtime
+configuration; its values are `none`, `model-cpu`, or `sequential-cpu`, and a
+non-`none` value confirms a concrete Diffusers hook. A permission such as
+`--allow-cpu-offload` alone is never reported as an active hook. When a plan
+uses offload, post-execution verbose
+output labels the original fit and peak estimates as `before offload`; they are
+the values that caused routing to select the strategy, not fabricated
+measurements of memory retained by the running pipeline.
+
 If routing succeeds but every accepted runtime later fails while loading or
 executing the model, either diagnostic flag prints the attempted runtime,
 outcome, and elapsed attempt time before the normal error. Backend error text
@@ -99,7 +110,10 @@ is not copied into that timing block.
 routing policy, workload fit, candidate runtimes with scores and rejection
 reasons, selected backend, fallback and permitted degradation state, explicit
 and effective parameter sources, and safe backend details such as adapter,
-device, dtype, and translated parameter names. The command
+device, dtype, and translated parameter names. When accelerator capacity is
+known it shows that value beside the estimated peak. If no permitted strategy
+can satisfy the limit, the plan has no selected runtime and debug reports
+`preflight outcome: blocked before runtime execution`. The command
 `werk doctor --model MODEL --task TASK` remains useful as a non-executing
 preflight, while `werk parameters MODEL --json` provides the complete
 parameter support matrix.
@@ -207,6 +221,26 @@ parameters, and workload fit. It distinguishes:
 - backend fallback: the same model through another runtime;
 - execution degradation: offload, tiling/windowing, or a slower attention path;
 - model/quality downgrade: a recommendation that is never silently executed.
+
+For CUDA, Werk obtains the accelerator-memory limit from `nvidia-smi`, with
+`WERK_ACCELERATOR_MEMORY_BYTES` as an explicit override. Heterogeneous
+multi-GPU configurations without a stable GPU UUID intentionally report the
+limit as unknown rather than assigning another card's capacity. If an
+estimated peak reaches or exceeds a known limit, exactly one explicitly
+permitted offload strategy may keep the GPU candidate eligible. The projected
+post-offload host working set must also remain below known available host RAM;
+offload cannot mask an existing host-memory OOM. Without a viable strategy,
+Werk rejects the plan before creating an output request directory or invoking
+the backend. `--fallback-policy degrade` allows inherited degradation
+permissions; an explicit `--allow-cpu-offload` permits that strategy even under
+the default backend-fallback policy. If either required capacity cannot be
+detected or projected, Werk reports it as unknown and cannot promise the
+corresponding preflight guarantee.
+
+The companion advertises offload only for CUDA/ROCm Diffusers adapters:
+image/video pipelines and Diffusers-layout audio. Transformers audio, TTS, and
+ASR adapters are routed without a fictional offload capability; the companion
+also validates this again before execution.
 
 ## Media companion
 

@@ -981,6 +981,27 @@ print(json.dumps(response))
     }
 
     #[test]
+    fn real_companion_offload_contract_tests_pass() {
+        let Some(python) = python_program_names()
+            .iter()
+            .find_map(|name| find_in_path(name))
+        else {
+            return;
+        };
+        let tests = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("runtime")
+            .join("test_werk_media_companion.py");
+        let output = Command::new(python).arg(tests).output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "media companion offload tests failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn real_companion_strict_policy_rejects_unsupported_explicit_parameter() {
         let Some(python) = python_program_names()
             .iter()

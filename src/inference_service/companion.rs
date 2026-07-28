@@ -72,10 +72,13 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                 return BackendProbe {
                     available: false,
                     detail: error.clone(),
-                    candidates: default_companion_candidates(
+                    candidates: companion_candidates_for_model(
                         false,
                         Some(error.clone()),
                         schema_paths,
+                        task,
+                        manifest.metadata.repository_layout,
+                        None,
                     ),
                     parameter_support: default_companion_parameter_support(schema_paths),
                 };
@@ -87,7 +90,14 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                 return BackendProbe {
                     available: false,
                     detail: error.clone(),
-                    candidates: default_companion_candidates(false, Some(error), schema_paths),
+                    candidates: companion_candidates_for_model(
+                        false,
+                        Some(error),
+                        schema_paths,
+                        task,
+                        manifest.metadata.repository_layout,
+                        None,
+                    ),
                     parameter_support: default_companion_parameter_support(schema_paths),
                 };
             }
@@ -118,10 +128,12 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         BackendProbe {
             available,
             detail: detail.clone(),
-            candidates: companion_candidates(
+            candidates: companion_candidates_for_model(
                 available,
                 (!available).then_some(detail),
                 schema_paths,
+                task,
+                manifest.metadata.repository_layout,
                 Some(&health),
             ),
             parameter_support,
@@ -391,6 +403,18 @@ fn sanitized_companion_metadata(metadata: Value) -> Value {
                 "encoding_seconds",
             ],
         );
+        copy_metadata_enum_field(
+            backend,
+            &mut safe_backend,
+            "offload_mode",
+            &["none", "model_cpu", "sequential_cpu"],
+        );
+        copy_metadata_enum_field(
+            backend,
+            &mut safe_backend,
+            "offload_request",
+            &["none", "model_cpu", "sequential_cpu", "component"],
+        );
         if let Some(parameters) = backend.get("translated_parameters").and_then(string_array) {
             safe_backend.insert("translated_parameters".to_string(), parameters);
         }
@@ -403,6 +427,19 @@ fn sanitized_companion_metadata(metadata: Value) -> Value {
         sanitized.insert("backend".to_string(), Value::Object(safe_backend));
     }
     Value::Object(sanitized)
+}
+
+fn copy_metadata_enum_field(
+    source: &serde_json::Map<String, Value>,
+    destination: &mut serde_json::Map<String, Value>,
+    field: &str,
+    allowed: &[&str],
+) {
+    if let Some(value) = source.get(field).and_then(Value::as_str)
+        && allowed.contains(&value)
+    {
+        destination.insert(field.to_string(), Value::String(value.to_string()));
+    }
 }
 
 fn copy_metadata_fields(
@@ -464,18 +501,28 @@ fn companion_output(output: CompanionOutput, output_dir: &Path) -> Result<Backen
     })
 }
 
+#[cfg(test)]
 pub(super) fn default_companion_candidates(
     available: bool,
     reason: Option<String>,
     schema_paths: &[String],
 ) -> Vec<InferenceRuntimeCandidate> {
-    companion_candidates(available, reason, schema_paths, None)
+    companion_candidates_with_override(
+        available,
+        reason,
+        schema_paths,
+        None,
+        configured_media_accelerator(),
+        None,
+    )
 }
 
-fn companion_candidates(
+fn companion_candidates_for_model(
     available: bool,
     reason: Option<String>,
     schema_paths: &[String],
+    task: InferenceTask,
+    layout: RepositoryLayout,
     health: Option<&CompanionHealth>,
 ) -> Vec<InferenceRuntimeCandidate> {
     companion_candidates_with_override(
@@ -484,6 +531,7 @@ fn companion_candidates(
         schema_paths,
         health,
         configured_media_accelerator(),
+        Some((task, layout)),
     )
 }
 
@@ -493,8 +541,11 @@ fn companion_candidates_with_override(
     schema_paths: &[String],
     health: Option<&CompanionHealth>,
     configured: Option<RuntimeAccelerator>,
+    model_context: Option<(InferenceTask, RepositoryLayout)>,
 ) -> Vec<InferenceRuntimeCandidate> {
     let detected = available_companion_accelerators_with_override(health, configured);
+    let adapter_supports_offloading = model_context
+        .is_some_and(|(task, layout)| companion_adapter_supports_offloading(task, layout));
     runtime_registry()
         .iter()
         .filter(|descriptor| descriptor.runtime == BackendRuntime::MediaCompanion)
@@ -552,7 +603,8 @@ fn companion_candidates_with_override(
                         )
                     })
                     .collect(),
-                supports_offloading: descriptor.supports_offloading
+                supports_offloading: adapter_supports_offloading
+                    && descriptor.supports_offloading
                     && matches!(
                         accelerator,
                         RuntimeAccelerator::Cuda | RuntimeAccelerator::Rocm
@@ -563,6 +615,34 @@ fn companion_candidates_with_override(
             })
         })
         .collect()
+}
+
+/// Mirrors the adapter choice in `runtime/werk_media_companion.py` without
+/// advertising an offload path for model/task combinations whose execution is
+/// handled by Transformers.
+fn companion_adapter_supports_offloading(task: InferenceTask, layout: RepositoryLayout) -> bool {
+    match task {
+        InferenceTask::ImageGeneration
+        | InferenceTask::ImageEditing
+        | InferenceTask::ImageVariation
+        | InferenceTask::ImageInpainting
+        | InferenceTask::ImageOutpainting
+        | InferenceTask::ImageUpscaling
+        | InferenceTask::VideoGeneration
+        | InferenceTask::ImageToVideo
+        | InferenceTask::VideoToVideo
+        | InferenceTask::VideoInpainting
+        | InferenceTask::VideoExtension
+        | InferenceTask::VideoUpscaling
+        | InferenceTask::FrameInterpolation => matches!(
+            layout,
+            RepositoryLayout::Diffusers | RepositoryLayout::SingleFile
+        ),
+        InferenceTask::AudioGeneration | InferenceTask::MusicGeneration => {
+            layout == RepositoryLayout::Diffusers
+        }
+        _ => false,
+    }
 }
 
 fn default_companion_parameter_support(
@@ -787,7 +867,8 @@ mod tests {
             Some("rocm is unavailable in media companion Python: ROCm unavailable")
         );
 
-        let candidates = companion_candidates_with_override(true, None, &[], Some(&health), None);
+        let candidates =
+            companion_candidates_with_override(true, None, &[], Some(&health), None, None);
         let cuda = candidates
             .iter()
             .find(|candidate| candidate.id == "media-companion-cuda")
@@ -822,6 +903,87 @@ mod tests {
     }
 
     #[test]
+    fn companion_candidates_only_offer_offloading_for_diffusers_adapters() {
+        let cases = [
+            (
+                InferenceTask::ImageGeneration,
+                RepositoryLayout::Diffusers,
+                true,
+            ),
+            (
+                InferenceTask::ImageGeneration,
+                RepositoryLayout::SingleFile,
+                true,
+            ),
+            (
+                InferenceTask::VideoGeneration,
+                RepositoryLayout::Diffusers,
+                true,
+            ),
+            (
+                InferenceTask::AudioGeneration,
+                RepositoryLayout::Diffusers,
+                true,
+            ),
+            (
+                InferenceTask::AudioGeneration,
+                RepositoryLayout::Transformers,
+                false,
+            ),
+            (
+                InferenceTask::MusicGeneration,
+                RepositoryLayout::Transformers,
+                false,
+            ),
+            (
+                InferenceTask::TextToSpeech,
+                RepositoryLayout::Diffusers,
+                false,
+            ),
+            (
+                InferenceTask::SpeechToText,
+                RepositoryLayout::Transformers,
+                false,
+            ),
+        ];
+
+        for (task, layout, adapter_supports_offloading) in cases {
+            let candidates = companion_candidates_with_override(
+                true,
+                None,
+                &[],
+                None,
+                Some(RuntimeAccelerator::Cuda),
+                Some((task, layout)),
+            );
+
+            for candidate in candidates {
+                let accelerator_supports_offloading = matches!(
+                    candidate.accelerator,
+                    RuntimeAccelerator::Cuda | RuntimeAccelerator::Rocm
+                );
+                assert_eq!(
+                    candidate.supports_offloading,
+                    adapter_supports_offloading && accelerator_supports_offloading,
+                    "unexpected offload support for task {task}, layout {layout}, runtime {}",
+                    candidate.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_companion_candidates_do_not_guess_offload_support() {
+        let candidates = default_companion_candidates(true, None, &[]);
+
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !candidate.supports_offloading)
+        );
+    }
+
+    #[test]
     fn persisted_companion_metadata_keeps_diagnostics_but_drops_private_duplicates() {
         let metadata = json!({
             "runtime": "werk-media-companion",
@@ -841,6 +1003,8 @@ mod tests {
                 "model_load_seconds": 8.0,
                 "inference_seconds": 4.0,
                 "encoding_seconds": 0.5,
+                "offload_mode": "model_cpu",
+                "offload_request": "component",
                 "text": "private transcript",
                 "translated_parameters": ["prompt", "width", 42],
                 "parameter_support": {
@@ -859,6 +1023,8 @@ mod tests {
         assert_eq!(sanitized["elapsed_seconds"], 12.5);
         assert_eq!(sanitized["backend"]["device"], "cuda");
         assert_eq!(sanitized["backend"]["inference_seconds"], 4.0);
+        assert_eq!(sanitized["backend"]["offload_mode"], "model_cpu");
+        assert_eq!(sanitized["backend"]["offload_request"], "component");
         assert_eq!(
             sanitized["backend"]["translated_parameters"],
             json!(["prompt", "width"])
@@ -874,5 +1040,18 @@ mod tests {
         );
         let encoded = serde_json::to_string(&sanitized).unwrap();
         assert!(!encoded.contains("private"));
+    }
+
+    #[test]
+    fn persisted_companion_metadata_rejects_unknown_offload_values() {
+        let sanitized = sanitized_companion_metadata(json!({
+            "backend": {
+                "offload_mode": "component",
+                "offload_request": "invented"
+            }
+        }));
+
+        assert!(sanitized["backend"].get("offload_mode").is_none());
+        assert!(sanitized["backend"].get("offload_request").is_none());
     }
 }

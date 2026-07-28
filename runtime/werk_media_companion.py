@@ -317,6 +317,30 @@ def execution_adapter(model_path, task):
     return None
 
 
+def selected_offload_request(parameters):
+    if bool(parameters.get("_werk_enable_sequential_offload")):
+        return "sequential_cpu"
+    if bool(parameters.get("_werk_enable_component_offload")):
+        return "component"
+    if bool(parameters.get("_werk_enable_cpu_offload")):
+        return "model_cpu"
+    return "none"
+
+
+def validate_adapter_offload(adapter, parameters):
+    offload_request = selected_offload_request(parameters)
+    if offload_request != "none" and adapter not in {"diffusers", "diffusers_audio"}:
+        fail(
+            "backend_configuration_failed",
+            "selected CPU offload is unsupported by the chosen media adapter",
+            {
+                "adapter": adapter,
+                "offload_request": offload_request,
+            },
+        )
+    return offload_request
+
+
 def supported_explicit_parameters(task, adapter):
     supported = set(ORCHESTRATOR_PARAMETERS)
     supported.update(TORCH_RUNTIME_PARAMETERS)
@@ -1386,38 +1410,46 @@ def configure_diffusers_pipeline(
     if hasattr(pipeline, "set_progress_bar_config"):
         pipeline.set_progress_bar_config(disable=True)
     sequential = bool(parameters.get("_werk_enable_sequential_offload"))
-    cpu_offload = bool(
-        parameters.get("_werk_enable_cpu_offload")
-        or parameters.get("_werk_enable_component_offload")
-    )
+    component = bool(parameters.get("_werk_enable_component_offload"))
+    model_cpu = bool(parameters.get("_werk_enable_cpu_offload"))
+    offload_request = selected_offload_request(parameters)
+
     # Diffusers/Accelerate CPU-offload hooks target a CUDA-style accelerator.
     # Never invoke them for a CPU (or MPS) execution attempt.
-    if device != "cuda":
-        sequential = False
-        cpu_offload = False
+    can_cpu_offload = device == "cuda"
+    offload_mode = "none"
     try:
-        configured = False
-        if sequential and hasattr(pipeline, "enable_sequential_cpu_offload"):
-            pipeline.enable_sequential_cpu_offload()
-            configured = True
-        elif sequential:
-            parameter_guard.reject(
-                "routing.allow_sequential_offload",
-                "the selected pipeline has no sequential CPU offload hook",
+        if offload_request != "none" and not can_cpu_offload:
+            fail(
+                "backend_configuration_failed",
+                "selected CPU offload requires a CUDA-style accelerator",
+                {
+                    "device": device,
+                    "offload_request": offload_request,
+                },
             )
-        if not configured and cpu_offload and hasattr(pipeline, "enable_model_cpu_offload"):
-            pipeline.enable_model_cpu_offload()
-            configured = True
-        elif not configured and cpu_offload:
-            for path in (
-                "routing.allow_cpu_offload",
-                "routing.allow_component_offload",
-            ):
-                parameter_guard.reject(
-                    path,
-                    "the selected pipeline has no model CPU offload hook",
+
+        if sequential:
+            if not callable(getattr(pipeline, "enable_sequential_cpu_offload", None)):
+                fail(
+                    "backend_configuration_failed",
+                    "selected pipeline has no sequential CPU offload hook",
+                    {"offload_request": offload_request},
                 )
-        if not configured and hasattr(pipeline, "to"):
+            pipeline.enable_sequential_cpu_offload()
+            offload_mode = "sequential_cpu"
+
+        model_cpu_requested = component or model_cpu
+        if offload_mode == "none" and model_cpu_requested:
+            if not callable(getattr(pipeline, "enable_model_cpu_offload", None)):
+                fail(
+                    "backend_configuration_failed",
+                    "selected pipeline has no model CPU offload hook",
+                    {"offload_request": offload_request},
+                )
+            pipeline.enable_model_cpu_offload()
+            offload_mode = "model_cpu"
+        if offload_mode == "none" and hasattr(pipeline, "to"):
             pipeline.to(device)
     except CompanionFailure:
         raise
@@ -1465,6 +1497,10 @@ def configure_diffusers_pipeline(
                 )
     if bool(parameters.get("attention_slicing")) and hasattr(pipeline, "enable_attention_slicing"):
         pipeline.enable_attention_slicing()
+    return {
+        "offload_mode": offload_mode,
+        "offload_request": offload_request,
+    }
 
 
 def apply_loras(pipeline, parameters, warnings, parameter_guard):
@@ -1805,7 +1841,7 @@ def execute_diffusers(
     )
     pipeline = load_diffusers_pipeline(model_path, task, has_image, torch, dtype)
     warnings = []
-    configure_diffusers_pipeline(
+    offload_metadata = configure_diffusers_pipeline(
         pipeline,
         device,
         task,
@@ -1917,6 +1953,7 @@ def execute_diffusers(
         "model_load_seconds": model_load_seconds,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
+        **offload_metadata,
     }
 
 
@@ -1938,7 +1975,7 @@ def execute_diffusers_audio(
         dtype,
     )
     warnings = []
-    configure_diffusers_pipeline(
+    offload_metadata = configure_diffusers_pipeline(
         pipeline,
         device,
         task,
@@ -2049,6 +2086,7 @@ def execute_diffusers_audio(
         "model_load_seconds": model_load_seconds,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
+        **offload_metadata,
     }
 
 
@@ -2232,6 +2270,8 @@ def execute_audio_generation(
         "model_load_seconds": model_load_seconds,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
+        "offload_mode": "none",
+        "offload_request": "none",
     }
 
 
@@ -2279,6 +2319,8 @@ def execute_tts(model_path, task, parameters, output_dir, identifier):
         "model_load_seconds": model_load_seconds,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
+        "offload_mode": "none",
+        "offload_request": "none",
     }
 
 
@@ -2492,6 +2534,8 @@ def execute_asr(
         "model_load_seconds": model_load_seconds,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
+        "offload_mode": "none",
+        "offload_request": "none",
     }
 
 
@@ -2538,6 +2582,7 @@ def command_execute(payload):
     adapter = execution_adapter(model_path, task)
     if adapter is None:
         fail("unsupported_task", f"no executable companion adapter for task '{task}'")
+    validate_adapter_offload(adapter, parameters)
     parameter_guard = ExplicitParameterGuard(
         payload,
         task,

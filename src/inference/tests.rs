@@ -572,6 +572,67 @@ fn image_estimate_scales_with_resolution_and_tiling() {
 }
 
 #[test]
+fn fit_rejects_zero_accelerator_headroom() {
+    let resources = HostResources {
+        host_memory_bytes: Some(1_000),
+        accelerator_memory_bytes: Some(100),
+        accelerator: Some("cuda".to_string()),
+    };
+
+    assert_eq!(
+        classify_workload_fit(Some(100), Some(20), &resources),
+        FitAssessment::LikelyOom
+    );
+}
+
+#[test]
+fn cuda_fit_stays_unknown_without_detected_vram_unless_host_is_already_oom() {
+    let resources = HostResources {
+        host_memory_bytes: Some(1_000),
+        accelerator_memory_bytes: None,
+        accelerator: Some("cuda".to_string()),
+    };
+
+    assert_eq!(
+        classify_workload_fit(Some(100), Some(20), &resources),
+        FitAssessment::Unknown
+    );
+    assert_eq!(
+        classify_workload_fit(Some(100), Some(1_000), &resources),
+        FitAssessment::LikelyOom
+    );
+}
+
+#[test]
+fn workload_estimate_deserializes_without_memory_limits() {
+    let manifest = image_manifest();
+    let effective = resolve_request(&manifest, request(), &ResolutionContext::default()).unwrap();
+    let estimate = estimate_workload(
+        &manifest,
+        &effective,
+        &HostResources {
+            host_memory_bytes: Some(64 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: Some(24 * 1024 * 1024 * 1024),
+            accelerator: Some("cuda".to_string()),
+        },
+    );
+    let mut legacy = serde_json::to_value(estimate).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("accelerator_memory_limit_bytes");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("host_memory_limit_bytes");
+
+    let decoded: WorkloadEstimate = serde_json::from_value(legacy).unwrap();
+
+    assert_eq!(decoded.accelerator_memory_limit_bytes, None);
+    assert_eq!(decoded.host_memory_limit_bytes, None);
+}
+
+#[test]
 fn offload_permission_does_not_change_estimate_until_planner_selects_it() {
     let manifest = image_manifest();
     let baseline = resolve_request(&manifest, request(), &ResolutionContext::default()).unwrap();
@@ -605,17 +666,18 @@ fn offload_permission_does_not_change_estimate_until_planner_selects_it() {
 }
 
 #[test]
-fn planner_only_selects_gpu_offload_under_degrade_policy() {
+fn planner_honors_explicit_gpu_offload_under_default_fallback_policy() {
     let manifest = image_manifest();
     let mut permitted_request = request();
     permitted_request.routing.allow_cpu_offload = OverrideBool::Enabled;
     permitted_request.routing.allow_sequential_offload = OverrideBool::Disabled;
     permitted_request.routing.allow_component_offload = OverrideBool::Disabled;
-    permitted_request.routing.fallback_policy = Some("degrade".to_string());
     let effective =
         resolve_request(&manifest, permitted_request, &ResolutionContext::default()).unwrap();
     let mut estimate = estimate_workload(&manifest, &effective, &HostResources::default());
     estimate.fit = FitAssessment::LikelyOom;
+    estimate.accelerator_peak_bytes = Some(20 * 1024 * 1024 * 1024);
+    estimate.accelerator_memory_limit_bytes = Some(12 * 1024 * 1024 * 1024);
     let candidate = |id: &str, accelerator: RuntimeAccelerator| InferenceRuntimeCandidate {
         id: id.to_string(),
         backend: "media-companion".to_string(),
@@ -656,21 +718,273 @@ fn planner_only_selects_gpu_offload_under_degrade_policy() {
         .unwrap();
     assert_eq!(cuda.status, PlanCandidateStatus::Accepted);
     assert_eq!(cuda.degradations, vec![ExecutionDegradation::CpuOffload]);
+}
 
-    let mut no_degrade = effective;
-    no_degrade
-        .parameters
-        .get_mut("routing.fallback_policy")
-        .unwrap()
-        .value = "backend".into();
-    let plan = plan_execution(
-        &manifest,
-        &no_degrade,
-        &estimate,
-        &[candidate("media-companion-cuda", RuntimeAccelerator::Cuda)],
-    );
+#[test]
+fn planner_rejects_before_loading_when_vram_is_exceeded_and_cpu_offload_is_disabled() {
+    let manifest = image_manifest();
+    let mut denied_request = request();
+    denied_request.routing.allow_cpu_offload = OverrideBool::Disabled;
+    let effective =
+        resolve_request(&manifest, denied_request, &ResolutionContext::default()).unwrap();
+    let mut estimate = estimate_workload(&manifest, &effective, &HostResources::default());
+    estimate.fit = FitAssessment::Fits;
+    estimate.accelerator_peak_bytes = Some(20 * 1024 * 1024 * 1024);
+    estimate.accelerator_memory_limit_bytes = Some(12 * 1024 * 1024 * 1024);
+    let candidate = InferenceRuntimeCandidate {
+        id: "media-companion-cuda".to_string(),
+        backend: "media-companion".to_string(),
+        accelerator: RuntimeAccelerator::Cuda,
+        available: true,
+        availability_reason: None,
+        supported_tasks: vec![InferenceTask::ImageGeneration],
+        supported_layouts: vec![RepositoryLayout::Diffusers],
+        supported_formats: vec![ModelFormat::SafeTensors],
+        supported_families: Vec::new(),
+        supported_architectures: Vec::new(),
+        parameter_support: BTreeMap::new(),
+        supports_offloading: true,
+        supports_compile: false,
+        supports_batching: true,
+        priority: 100,
+    };
+    let plan = plan_execution(&manifest, &effective, &estimate, &[candidate]);
+
+    assert_eq!(plan.selected_runtime, None);
     assert_eq!(plan.candidates[0].status, PlanCandidateStatus::Rejected);
     assert!(plan.candidates[0].degradations.is_empty());
+    assert!(plan.candidates[0].reasons.iter().any(|reason| {
+        reason.contains("20.00 GiB")
+            && reason.contains("12.00 GiB")
+            && reason.contains("no permitted offload")
+    }));
+}
+
+#[test]
+fn planner_rejects_every_offload_mode_when_projected_host_memory_does_not_fit() {
+    let manifest = image_manifest();
+    let candidate = InferenceRuntimeCandidate {
+        id: "media-companion-cuda".to_string(),
+        backend: "media-companion".to_string(),
+        accelerator: RuntimeAccelerator::Cuda,
+        available: true,
+        availability_reason: None,
+        supported_tasks: vec![InferenceTask::ImageGeneration],
+        supported_layouts: vec![RepositoryLayout::Diffusers],
+        supported_formats: vec![ModelFormat::SafeTensors],
+        supported_families: Vec::new(),
+        supported_architectures: Vec::new(),
+        parameter_support: BTreeMap::new(),
+        supports_offloading: true,
+        supports_compile: false,
+        supports_batching: true,
+        priority: 100,
+    };
+
+    for offload in [
+        ExecutionDegradation::CpuOffload,
+        ExecutionDegradation::SequentialOffload,
+        ExecutionDegradation::ComponentOffload,
+    ] {
+        let mut offload_request = request();
+        offload_request.routing.allow_cpu_offload = OverrideBool::Disabled;
+        offload_request.routing.allow_sequential_offload = OverrideBool::Disabled;
+        offload_request.routing.allow_component_offload = OverrideBool::Disabled;
+        match offload {
+            ExecutionDegradation::CpuOffload => {
+                offload_request.routing.allow_cpu_offload = OverrideBool::Enabled;
+            }
+            ExecutionDegradation::SequentialOffload => {
+                offload_request.routing.allow_sequential_offload = OverrideBool::Enabled;
+            }
+            ExecutionDegradation::ComponentOffload => {
+                offload_request.routing.allow_component_offload = OverrideBool::Enabled;
+            }
+            _ => unreachable!(),
+        }
+        let effective =
+            resolve_request(&manifest, offload_request, &ResolutionContext::default()).unwrap();
+        let mut estimate = estimate_workload(&manifest, &effective, &HostResources::default());
+        estimate.fit = FitAssessment::LikelyOom;
+        estimate.weight_payload_bytes = Some(10 * 1024 * 1024 * 1024);
+        estimate.accelerator_peak_bytes = Some(20 * 1024 * 1024 * 1024);
+        estimate.accelerator_memory_limit_bytes = Some(12 * 1024 * 1024 * 1024);
+        estimate.host_peak_bytes = Some(4 * 1024 * 1024 * 1024);
+        estimate.host_memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
+
+        let plan = plan_execution(
+            &manifest,
+            &effective,
+            &estimate,
+            std::slice::from_ref(&candidate),
+        );
+
+        assert_eq!(plan.selected_runtime, None, "offload mode {offload:?}");
+        assert!(plan.candidates[0].degradations.is_empty());
+        assert!(plan.candidates[0].reasons.iter().any(|reason| {
+            reason.contains("17.33 GiB")
+                && reason.contains("16.00 GiB")
+                && reason.contains("offload was not selected")
+        }));
+    }
+}
+
+#[test]
+fn planner_never_uses_accelerator_offload_to_mask_known_host_oom() {
+    let manifest = image_manifest();
+    let mut offload_request = request();
+    offload_request.routing.allow_cpu_offload = OverrideBool::Enabled;
+    let effective =
+        resolve_request(&manifest, offload_request, &ResolutionContext::default()).unwrap();
+    let mut estimate = estimate_workload(&manifest, &effective, &HostResources::default());
+    estimate.fit = FitAssessment::LikelyOom;
+    estimate.accelerator_peak_bytes = Some(20 * 1024 * 1024 * 1024);
+    estimate.accelerator_memory_limit_bytes = Some(12 * 1024 * 1024 * 1024);
+    estimate.host_peak_bytes = Some(16 * 1024 * 1024 * 1024);
+    estimate.host_memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
+    let candidate = InferenceRuntimeCandidate {
+        id: "media-companion-cuda".to_string(),
+        backend: "media-companion".to_string(),
+        accelerator: RuntimeAccelerator::Cuda,
+        available: true,
+        availability_reason: None,
+        supported_tasks: vec![InferenceTask::ImageGeneration],
+        supported_layouts: vec![RepositoryLayout::Diffusers],
+        supported_formats: vec![ModelFormat::SafeTensors],
+        supported_families: Vec::new(),
+        supported_architectures: Vec::new(),
+        parameter_support: BTreeMap::new(),
+        supports_offloading: true,
+        supports_compile: false,
+        supports_batching: true,
+        priority: 100,
+    };
+
+    let plan = plan_execution(&manifest, &effective, &estimate, &[candidate]);
+
+    assert_eq!(plan.selected_runtime, None);
+    assert!(plan.candidates[0].degradations.is_empty());
+    assert!(plan.candidates[0].reasons.iter().any(|reason| {
+        reason.contains("16.00 GiB")
+            && reason.contains("accelerator offload cannot resolve host-memory pressure")
+    }));
+}
+
+#[test]
+fn planner_gives_device_precedence_over_conflicting_accelerator() {
+    let manifest = image_manifest();
+    let mut routed_request = request();
+    routed_request.routing.accelerator = Some("cuda".to_string());
+    routed_request.routing.device = Some(" cpu ".to_string());
+    let effective =
+        resolve_request(&manifest, routed_request, &ResolutionContext::default()).unwrap();
+    let estimate = estimate_workload(&manifest, &effective, &HostResources::default());
+    let candidate = |id: &str, accelerator: RuntimeAccelerator| InferenceRuntimeCandidate {
+        id: id.to_string(),
+        backend: "media-companion".to_string(),
+        accelerator,
+        available: true,
+        availability_reason: None,
+        supported_tasks: vec![InferenceTask::ImageGeneration],
+        supported_layouts: vec![RepositoryLayout::Diffusers],
+        supported_formats: vec![ModelFormat::SafeTensors],
+        supported_families: Vec::new(),
+        supported_architectures: Vec::new(),
+        parameter_support: BTreeMap::new(),
+        supports_offloading: true,
+        supports_compile: false,
+        supports_batching: true,
+        priority: 100,
+    };
+
+    let plan = plan_execution(
+        &manifest,
+        &effective,
+        &estimate,
+        &[
+            candidate("media-companion-cuda", RuntimeAccelerator::Cuda),
+            candidate("media-companion-cpu", RuntimeAccelerator::Cpu),
+        ],
+    );
+
+    assert_eq!(
+        plan.selected_runtime.as_deref(),
+        Some("media-companion-cpu")
+    );
+    let cuda = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.runtime_id == "media-companion-cuda")
+        .unwrap();
+    assert!(
+        cuda.reasons
+            .iter()
+            .any(|reason| reason == "accelerator 'cpu' was requested")
+    );
+}
+
+#[test]
+fn degrade_policy_selects_one_offload_and_respects_explicit_cpu_denial() {
+    let manifest = image_manifest();
+    let candidate = InferenceRuntimeCandidate {
+        id: "media-companion-cuda".to_string(),
+        backend: "media-companion".to_string(),
+        accelerator: RuntimeAccelerator::Cuda,
+        available: true,
+        availability_reason: None,
+        supported_tasks: vec![InferenceTask::ImageGeneration],
+        supported_layouts: vec![RepositoryLayout::Diffusers],
+        supported_formats: vec![ModelFormat::SafeTensors],
+        supported_families: Vec::new(),
+        supported_architectures: Vec::new(),
+        parameter_support: BTreeMap::new(),
+        supports_offloading: true,
+        supports_compile: false,
+        supports_batching: true,
+        priority: 100,
+    };
+    let mut degrade_request = request();
+    degrade_request.routing.fallback_policy = Some("degrade".to_string());
+    let effective =
+        resolve_request(&manifest, degrade_request, &ResolutionContext::default()).unwrap();
+    let mut estimate = estimate_workload(&manifest, &effective, &HostResources::default());
+    estimate.fit = FitAssessment::LikelyOom;
+    let plan = plan_execution(
+        &manifest,
+        &effective,
+        &estimate,
+        std::slice::from_ref(&candidate),
+    );
+    assert_eq!(plan.degradations, vec![ExecutionDegradation::CpuOffload]);
+
+    let mut denied_request = request();
+    denied_request.routing.fallback_policy = Some("degrade".to_string());
+    denied_request.routing.allow_cpu_offload = OverrideBool::Disabled;
+    let denied = resolve_request(&manifest, denied_request, &ResolutionContext::default()).unwrap();
+    let denied_plan = plan_execution(
+        &manifest,
+        &denied,
+        &estimate,
+        std::slice::from_ref(&candidate),
+    );
+    assert_eq!(denied_plan.selected_runtime, None);
+    assert!(denied_plan.candidates[0].degradations.is_empty());
+
+    let mut alternative_request = request();
+    alternative_request.routing.fallback_policy = Some("degrade".to_string());
+    alternative_request.routing.allow_cpu_offload = OverrideBool::Disabled;
+    alternative_request.routing.allow_component_offload = OverrideBool::Enabled;
+    let alternative = resolve_request(
+        &manifest,
+        alternative_request,
+        &ResolutionContext::default(),
+    )
+    .unwrap();
+    let alternative_plan = plan_execution(&manifest, &alternative, &estimate, &[candidate]);
+    assert_eq!(
+        alternative_plan.degradations,
+        vec![ExecutionDegradation::ComponentOffload]
+    );
 }
 
 #[test]

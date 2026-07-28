@@ -8,6 +8,7 @@ use crate::{
     inference::{
         EffectiveInferenceRequest, ExecutionDegradation, ExecutionPlan, InferenceInputSource,
         ParameterSource, ParameterValue, PlanCandidateStatus, WorkloadEstimate,
+        projected_host_peak_with_offload,
     },
     inference_service::{InferenceResult, RuntimeAttemptTiming},
 };
@@ -76,6 +77,13 @@ pub(super) fn write_media_verbose_stats<W: Write>(
             write_media_stat(writer, label, value)?;
         }
     }
+    if let Some(mode) = backend
+        .get("offload_mode")
+        .and_then(Value::as_str)
+        .and_then(media_offload_mode_label)
+    {
+        write_media_stat(writer, "active offload:", mode)?;
+    }
     write_media_stat(
         writer,
         "total duration:",
@@ -137,20 +145,44 @@ pub(super) fn write_media_verbose_stats<W: Write>(
         OutputModality::Text | OutputModality::Embedding => {}
     }
 
+    let planned_offload = media_planned_offload(&result.plan);
+    let estimate_scope = (planned_offload != "none").then_some(" before offload");
     write_media_stat(
         writer,
         "workload fit:",
         &format!(
-            "{} ({})",
+            "{}{} ({})",
             serialized_enum_label(&result.estimate.fit),
+            estimate_scope.unwrap_or_default(),
             serialized_enum_label(&result.estimate.confidence)
         ),
     )?;
     if let Some(bytes) = result.estimate.accelerator_peak_bytes {
-        write_media_stat(writer, "estimated accel peak:", &format_bytes(bytes))?;
+        let label = if estimate_scope.is_some() {
+            "pre-offload accel peak:"
+        } else {
+            "estimated accel peak:"
+        };
+        write_media_stat(writer, label, &format_bytes(bytes))?;
+    }
+    if let Some(bytes) = result.estimate.accelerator_memory_limit_bytes {
+        write_media_stat(writer, "detected accel memory:", &format_bytes(bytes))?;
     }
     if let Some(bytes) = result.estimate.host_peak_bytes {
-        write_media_stat(writer, "estimated host peak:", &format_bytes(bytes))?;
+        let label = if estimate_scope.is_some() {
+            "pre-offload host peak:"
+        } else {
+            "estimated host peak:"
+        };
+        write_media_stat(writer, label, &format_bytes(bytes))?;
+    }
+    if estimate_scope.is_some()
+        && let Some(bytes) = projected_host_peak_with_offload(&result.estimate)
+    {
+        write_media_stat(writer, "projected offload host:", &format_bytes(bytes))?;
+    }
+    if let Some(bytes) = result.estimate.host_memory_limit_bytes {
+        write_media_stat(writer, "detected host memory:", &format_bytes(bytes))?;
     }
     write_media_stat(
         writer,
@@ -379,8 +411,23 @@ pub(super) fn write_media_routing_debug<W: Write>(
     if let Some(bytes) = estimate.accelerator_peak_bytes {
         write_media_stat(writer, "estimated accel peak:", &format_bytes(bytes))?;
     }
+    if let Some(bytes) = estimate.accelerator_memory_limit_bytes {
+        write_media_stat(writer, "detected accel memory:", &format_bytes(bytes))?;
+    } else {
+        write_media_stat(writer, "detected accel memory:", "unknown")?;
+    }
     if let Some(bytes) = estimate.host_peak_bytes {
         write_media_stat(writer, "estimated host peak:", &format_bytes(bytes))?;
+    }
+    if media_planned_offload(plan) != "none"
+        && let Some(bytes) = projected_host_peak_with_offload(estimate)
+    {
+        write_media_stat(writer, "projected offload host:", &format_bytes(bytes))?;
+    }
+    if let Some(bytes) = estimate.host_memory_limit_bytes {
+        write_media_stat(writer, "detected host memory:", &format_bytes(bytes))?;
+    } else {
+        write_media_stat(writer, "detected host memory:", "unknown")?;
     }
 
     writeln!(writer, "candidate runtimes:")?;
@@ -420,6 +467,14 @@ pub(super) fn write_media_routing_debug<W: Write>(
         plan.selected_backend.as_deref().unwrap_or("none"),
     )?;
     write_media_stat(writer, "selected score:", &media_optional_i32(plan.score))?;
+    write_media_stat(writer, "planned offload:", &media_planned_offload(plan))?;
+    if plan.selected_runtime.is_none() {
+        write_media_stat(
+            writer,
+            "preflight outcome:",
+            "blocked before runtime execution",
+        )?;
+    }
 
     writeln!(writer, "resolved parameters:")?;
     for (path, parameter) in &request.parameters {
@@ -474,6 +529,13 @@ pub(super) fn write_media_backend_debug<W: Write>(
         if let Some(value) = backend.get(key).and_then(Value::as_str) {
             write_media_stat(writer, label, value)?;
         }
+    }
+    if let Some(mode) = backend
+        .get("offload_mode")
+        .and_then(Value::as_str)
+        .and_then(media_offload_mode_label)
+    {
+        write_media_stat(writer, "active offload:", mode)?;
     }
     if let Some(seed) = backend.get("seed").and_then(json_value_u64) {
         write_media_stat(writer, "backend seed:", &seed.to_string())?;
@@ -858,6 +920,35 @@ fn format_media_degradation(degradation: &ExecutionDegradation) -> String {
     }
 }
 
+fn media_planned_offload(plan: &ExecutionPlan) -> String {
+    let values = plan
+        .degradations
+        .iter()
+        .filter_map(|degradation| match degradation {
+            ExecutionDegradation::CpuOffload => Some("model-cpu"),
+            ExecutionDegradation::SequentialOffload => Some("sequential-cpu"),
+            ExecutionDegradation::ComponentOffload => Some("component"),
+            ExecutionDegradation::VaeTiling
+            | ExecutionDegradation::TemporalWindowing
+            | ExecutionDegradation::SlowerAttention { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn media_offload_mode_label(mode: &str) -> Option<&'static str> {
+    match mode {
+        "none" => Some("none"),
+        "model_cpu" => Some("model-cpu"),
+        "sequential_cpu" => Some("sequential-cpu"),
+        _ => None,
+    }
+}
+
 fn media_optional_i32(value: Option<i32>) -> String {
     value
         .map(|value| value.to_string())
@@ -889,6 +980,8 @@ mod tests {
                 "runtime": "diffusers",
                 "device": "cuda",
                 "dtype": "float16",
+                "offload_mode": "model_cpu",
+                "offload_request": "component",
                 "model_load_seconds": 6.0,
                 "inference_seconds": 2.0,
                 "encoding_seconds": 0.5
@@ -916,6 +1009,7 @@ mod tests {
             error: None,
         }];
         image.timings.update_total();
+        image.plan.degradations = vec![ExecutionDegradation::ComponentOffload];
 
         let mut output = Vec::new();
         write_media_verbose_stats(
@@ -930,6 +1024,8 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("device:                 cuda"));
+        assert!(output.contains("active offload:         model-cpu"));
+        assert!(output.contains("workload fit:           fits before offload (exact)"));
         assert!(output.contains("model load/setup:       6s"));
         assert!(output.contains("resolution:             512x512"));
         assert!(output.contains("steps:                  20"));
@@ -1009,6 +1105,66 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("output duration:        5s each (2 outputs)"));
         assert!(output.contains("aggregate RTF:          0.200"));
+    }
+
+    #[test]
+    fn media_debug_distinguishes_planned_and_actual_offload() {
+        let mut result = test_media_diagnostic_result("debug-offload");
+        result.estimate.fit = FitAssessment::LikelyOom;
+        result.estimate.weight_payload_bytes = Some(10 * 1024 * 1024 * 1024);
+        result.estimate.accelerator_peak_bytes = Some(60 * 1024 * 1024 * 1024);
+        result.estimate.accelerator_memory_limit_bytes = Some(24 * 1024 * 1024 * 1024);
+        result.estimate.host_peak_bytes = Some(4 * 1024 * 1024 * 1024);
+        result.estimate.host_memory_limit_bytes = Some(64 * 1024 * 1024 * 1024);
+        result.plan.degradations = vec![ExecutionDegradation::ComponentOffload];
+        result.backend_metadata = json!({
+            "backend": {
+                "runtime": "diffusers",
+                "device": "cuda",
+                "offload_mode": "model_cpu",
+                "offload_request": "component"
+            }
+        });
+
+        let mut output = Vec::new();
+        write_media_routing_debug(
+            &mut output,
+            &result.effective_request,
+            &result.estimate,
+            &result.plan,
+        )
+        .unwrap();
+        write_media_backend_debug(&mut output, &result).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("planned offload:        component"));
+        assert!(output.contains("estimated accel peak:   60.00 GiB"));
+        assert!(output.contains("detected accel memory:  24.00 GiB"));
+        assert!(output.contains("projected offload host: 30.67 GiB"));
+        assert!(output.contains("detected host memory:   64.00 GiB"));
+        assert!(output.contains("active offload:         model-cpu"));
+
+        result.plan.selected_runtime = None;
+        result.plan.selected_backend = None;
+        result.plan.score = None;
+        result.plan.degradations.clear();
+        result.backend_metadata = json!({
+            "backend": {"offload_mode": "PRIVATE_UNKNOWN_OFFLOAD"}
+        });
+        let mut blocked = Vec::new();
+        write_media_routing_debug(
+            &mut blocked,
+            &result.effective_request,
+            &result.estimate,
+            &result.plan,
+        )
+        .unwrap();
+        write_media_backend_debug(&mut blocked, &result).unwrap();
+        let blocked = String::from_utf8(blocked).unwrap();
+        assert!(blocked.contains("planned offload:        none"));
+        assert!(blocked.contains("preflight outcome:      blocked before runtime execution"));
+        assert!(!blocked.contains("active offload:"));
+        assert!(!blocked.contains("PRIVATE_UNKNOWN_OFFLOAD"));
     }
 
     #[test]
@@ -1316,7 +1472,9 @@ mod tests {
                 download_size_bytes: None,
                 weight_payload_bytes: None,
                 accelerator_peak_bytes: None,
+                accelerator_memory_limit_bytes: None,
                 host_peak_bytes: None,
+                host_memory_limit_bytes: None,
                 output_size_bytes: Some(10),
                 fit: FitAssessment::Fits,
                 confidence: EstimateConfidence::Exact,

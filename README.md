@@ -259,14 +259,21 @@ throughput; and generated audio or speech can report output duration, sample
 rate, channels, and real-time performance.
 Available backend phases such as model loading, inference, and encoding are
 shown separately. A phase that the selected backend did not measure is omitted
-rather than reported as zero or inferred from unrelated wall-clock time.
+rather than reported as zero or inferred from unrelated wall-clock time. When
+the backend reports it, verbose output also shows the active offload state as
+`none`, `model-cpu`, or `sequential-cpu`; a non-`none` value confirms the
+concrete hook installed by the backend.
 
 `--debug` explains the resolved request and routing decision: candidate
 runtimes and rejection reasons, the selected runtime, fallback/degradation
 state, parameter sources, and safe backend details such as adapter, device, and
-dtype. The flags are independent and may be combined. Both write diagnostics
-to stderr so normal result/output lines remain on stdout; `--debug` also
-disables the transient animation so it cannot overwrite diagnostic lines.
+dtype. For memory routing it keeps the estimated accelerator peak, detected
+accelerator capacity, planned offload, and post-execution active offload
+separate. If no runtime can satisfy a known memory limit, debug output says
+that preflight blocked the request before runtime execution. The flags are
+independent and may be combined. Both write diagnostics to stderr so normal
+result/output lines remain on stdout; `--debug` also disables the transient
+animation so it cannot overwrite diagnostic lines.
 Prompt text, negative prompts, lyrics, transcription text, inline media, URL
 queries, and raw private input/model paths are never dumped by these reports.
 
@@ -1043,12 +1050,31 @@ support and the concrete pipeline may still reject the parameter when loaded.
 
 Parameter policy and runtime fallback are independent. The default
 `--fallback-policy backend` may retry the same model through another accepted
-runtime. `none` disables runtime retry. For a workload estimated as
-`likely_oom`, `degrade` can retain a candidate only when that runtime supports
-offloading and the relevant degradation permission/parameter is already
-enabled. Current companion offload candidates are CUDA/ROCm. The planner may
-record permitted CPU/component/sequential offload, enabled VAE tiling, or
-configured temporal windowing; it does not turn tiling/windowing on by itself.
+runtime. `none` disables runtime retry. An explicit permission such as
+`--allow-cpu-offload` may retain an otherwise over-limit GPU candidate using
+that one strategy even under the default policy; it permits selection but does
+not claim that the backend hook is active yet. `--fallback-policy degrade`
+additionally permits inherited memory-saving defaults. An explicit
+`--no-allow-cpu-offload` prevents inherited CPU, component, and sequential
+offload unless a different strategy is explicitly enabled.
+
+On CUDA, Werk detects total accelerator memory with `nvidia-smi`; the
+`WERK_ACCELERATOR_MEMORY_BYTES` override remains available when automatic
+detection is unavailable. On heterogeneous multi-GPU systems without a stable
+GPU UUID, automatic capacity detection stays unknown instead of associating a
+possibly wrong card; use the override when selecting such a device. If the
+estimated peak reaches or exceeds a known limit and no permitted offload can be
+selected, planning stops before output setup or model loading. Offload is also
+rejected when its conservative projected host-RAM requirement reaches or
+exceeds known available host memory. Debug shows both limits and calls the
+strategy `planned offload`; only a successful backend response can confirm
+`active offload`.
+
+Companion offload is advertised only for CUDA/ROCm Diffusers adapters: image
+and video pipelines, plus Diffusers-layout audio. Transformers audio, TTS, and
+ASR adapters do not claim offload support. The planner may also record enabled
+VAE tiling or configured temporal windowing; it does not turn
+tiling/windowing on by itself.
 Model changes, stronger quantization, lower resolution, fewer frames, and
 shorter duration remain recommendations and are never applied silently.
 

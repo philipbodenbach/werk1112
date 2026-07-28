@@ -30,7 +30,7 @@ pub use types::{
     RoutingOverrides, VideoGenerationOverrides,
 };
 
-pub(crate) use estimate::classify_workload_fit;
+pub(crate) use estimate::{classify_workload_fit, projected_host_peak_with_offload};
 
 #[cfg(test)]
 mod tests;

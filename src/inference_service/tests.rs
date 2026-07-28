@@ -5,7 +5,10 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use super::{
@@ -16,7 +19,7 @@ use super::{
     },
     jobs::{JobStatus, JobStore},
     output::OutputStore,
-    service::{InferenceService, complete_backend_fit},
+    service::{InferenceService, complete_backend_fit, resources_for_request},
     types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome},
 };
 use crate::{
@@ -99,6 +102,84 @@ impl MediaInferenceBackend for MockMediaBackend {
                 "device": "cpu",
             }),
         })
+    }
+}
+
+#[derive(Clone)]
+struct PreflightOomBackend {
+    execute_calls: Arc<AtomicUsize>,
+}
+
+impl MediaInferenceBackend for PreflightOomBackend {
+    fn probe(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        task: InferenceTask,
+        schema_paths: &[String],
+    ) -> BackendProbe {
+        let parameter_support = schema_paths
+            .iter()
+            .cloned()
+            .map(|path| (path, ParameterSupportStatus::Native))
+            .collect::<BTreeMap<_, _>>();
+        BackendProbe {
+            available: true,
+            detail: "preflight OOM fixture".to_string(),
+            candidates: vec![InferenceRuntimeCandidate {
+                id: "mock-cuda".to_string(),
+                backend: "mock".to_string(),
+                accelerator: RuntimeAccelerator::Cuda,
+                available: true,
+                availability_reason: None,
+                supported_tasks: vec![task],
+                supported_layouts: vec![RepositoryLayout::Diffusers],
+                supported_formats: Vec::new(),
+                supported_families: Vec::new(),
+                supported_architectures: Vec::new(),
+                parameter_support: parameter_support.clone(),
+                supports_offloading: true,
+                supports_compile: false,
+                supports_batching: true,
+                priority: 100,
+            }],
+            parameter_support,
+        }
+    }
+
+    fn estimate(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        request: &EffectiveInferenceRequest,
+    ) -> Result<Option<WorkloadEstimate>> {
+        Ok(Some(WorkloadEstimate {
+            task: request.task,
+            download_size_bytes: Some(1),
+            weight_payload_bytes: Some(1),
+            accelerator_peak_bytes: Some(20 * 1024 * 1024 * 1024),
+            accelerator_memory_limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            host_peak_bytes: Some(1),
+            host_memory_limit_bytes: None,
+            output_size_bytes: Some(1),
+            fit: FitAssessment::Fits,
+            confidence: EstimateConfidence::BackendMeasured,
+            assumptions: Vec::new(),
+            warnings: Vec::new(),
+            recommendations: Vec::new(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        _request: &EffectiveInferenceRequest,
+        _output_dir: &Path,
+        _runtime: &str,
+    ) -> Result<BackendExecution> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        bail!("backend execute must not run after preflight rejection")
     }
 }
 
@@ -258,6 +339,58 @@ fn service_resolves_plans_executes_and_persists_output_metadata() {
     assert_eq!(
         persisted.timings.runtime_attempts,
         result.timings.runtime_attempts
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn preflight_vram_rejection_never_calls_execute_or_creates_an_attempt() {
+    let (root, store) = image_store("preflight-vram");
+    let execute_calls = Arc::new(AtomicUsize::new(0));
+    let service = InferenceService::with_backend_and_resources(
+        store,
+        Arc::new(PreflightOomBackend {
+            execute_calls: Arc::clone(&execute_calls),
+        }),
+        HostResources {
+            host_memory_bytes: Some(64 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+            accelerator: Some("cuda".to_string()),
+        },
+    );
+    let output_entries_before = fs::read_dir(service.output_store().root())
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("preflight rejection".to_string());
+    request.routing.allow_cpu_offload = crate::inference::OverrideBool::Disabled;
+    let plan_observed = Cell::new(false);
+    let attempts = RefCell::new(Vec::new());
+
+    let error = service
+        .execute_with_observers(
+            request,
+            |_, estimate, plan| {
+                plan_observed.set(true);
+                assert_eq!(
+                    estimate.accelerator_memory_limit_bytes,
+                    Some(12 * 1024 * 1024 * 1024)
+                );
+                assert_eq!(plan.selected_runtime, None);
+            },
+            |attempt| attempts.borrow_mut().push(attempt.clone()),
+        )
+        .unwrap_err();
+
+    assert!(plan_observed.get());
+    assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+    assert!(attempts.borrow().is_empty());
+    assert!(format!("{error:#}").contains("20.00 GiB"));
+    assert_eq!(
+        fs::read_dir(service.output_store().root())
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        output_entries_before
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -456,7 +589,9 @@ fn backend_fit_is_derived_from_its_own_peaks() {
         download_size_bytes: Some(10),
         weight_payload_bytes: Some(10),
         accelerator_peak_bytes: Some(150),
+        accelerator_memory_limit_bytes: None,
         host_peak_bytes: Some(20),
+        host_memory_limit_bytes: None,
         output_size_bytes: Some(1),
         fit: FitAssessment::Unknown,
         confidence: EstimateConfidence::Heuristic,
@@ -469,6 +604,83 @@ fn backend_fit_is_derived_from_its_own_peaks() {
 
     complete_backend_fit(&mut backend, &resources);
     assert_eq!(backend.fit, FitAssessment::LikelyOom);
+    assert_eq!(backend.accelerator_memory_limit_bytes, Some(100));
+    assert_eq!(backend.host_memory_limit_bytes, Some(100));
+}
+
+#[test]
+fn detected_accelerator_limit_overrides_optimistic_backend_fit() {
+    let resources = HostResources {
+        host_memory_bytes: Some(1_000),
+        accelerator_memory_bytes: Some(100),
+        accelerator: Some("cuda".to_string()),
+    };
+    let mut backend = WorkloadEstimate {
+        task: InferenceTask::ImageGeneration,
+        download_size_bytes: Some(10),
+        weight_payload_bytes: Some(10),
+        accelerator_peak_bytes: Some(101),
+        accelerator_memory_limit_bytes: None,
+        host_peak_bytes: Some(20),
+        host_memory_limit_bytes: None,
+        output_size_bytes: Some(1),
+        fit: FitAssessment::Fits,
+        confidence: EstimateConfidence::BackendMeasured,
+        assumptions: Vec::new(),
+        warnings: Vec::new(),
+        recommendations: Vec::new(),
+    };
+
+    complete_backend_fit(&mut backend, &resources);
+
+    assert_eq!(backend.fit, FitAssessment::LikelyOom);
+    assert_eq!(backend.accelerator_memory_limit_bytes, Some(100));
+    assert_eq!(backend.host_memory_limit_bytes, Some(1_000));
+}
+
+#[test]
+fn explicit_cpu_route_does_not_inherit_cuda_memory_limit() {
+    let (root, store) = image_store("cpu-resource-scope");
+    let manifest = store.get("flux").unwrap();
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("CPU route".to_string());
+    request.routing.accelerator = Some("cpu".to_string());
+    let effective = resolve_request(&manifest, request, &ResolutionContext::default()).unwrap();
+    let resources = resources_for_request(
+        HostResources {
+            host_memory_bytes: Some(64 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: Some(24 * 1024 * 1024 * 1024),
+            accelerator: Some("cuda".to_string()),
+        },
+        &effective,
+    );
+
+    assert_eq!(resources.accelerator.as_deref(), Some("cpu"));
+    assert_eq!(resources.accelerator_memory_bytes, None);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_cpu_device_takes_precedence_over_cuda_accelerator_for_resources() {
+    let (root, store) = image_store("cpu-device-resource-scope");
+    let manifest = store.get("flux").unwrap();
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("CPU device route".to_string());
+    request.routing.accelerator = Some("cuda".to_string());
+    request.routing.device = Some("cpu".to_string());
+    let effective = resolve_request(&manifest, request, &ResolutionContext::default()).unwrap();
+    let resources = resources_for_request(
+        HostResources {
+            host_memory_bytes: Some(64 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: Some(24 * 1024 * 1024 * 1024),
+            accelerator: Some("cuda".to_string()),
+        },
+        &effective,
+    );
+
+    assert_eq!(resources.accelerator.as_deref(), Some("cpu"));
+    assert_eq!(resources.accelerator_memory_bytes, None);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

@@ -7,7 +7,9 @@ use crate::{
 };
 
 use super::{
-    estimate::{FitAssessment, WorkloadEstimate},
+    estimate::{
+        FitAssessment, WorkloadEstimate, format_memory_bytes, projected_host_peak_with_offload,
+    },
     types::{EffectiveInferenceRequest, ParameterPolicy, ParameterSupportStatus},
 };
 
@@ -94,13 +96,32 @@ pub fn plan_execution(
     let requested_backend = request
         .string_parameter("routing.backend")
         .filter(|value| *value != "auto");
+    // The media companion treats a concrete device as the authoritative
+    // execution target, so the planner must resolve the same way when both
+    // values are present.
     let requested_accelerator = request
-        .string_parameter("routing.accelerator")
-        .filter(|value| *value != "auto");
+        .string_parameter("routing.device")
+        .and_then(concrete_routing_target)
+        .or_else(|| {
+            request
+                .string_parameter("routing.accelerator")
+                .and_then(concrete_routing_target)
+        });
     let fallback_policy = request
         .string_parameter("routing.fallback_policy")
         .unwrap_or("backend");
     let allow_degradation = fallback_policy == "degrade";
+    let accelerator_memory_exceeded = estimate
+        .accelerator_peak_bytes
+        .zip(estimate.accelerator_memory_limit_bytes)
+        .is_some_and(|(peak, limit)| peak >= limit);
+    let host_memory_exceeded = estimate
+        .host_peak_bytes
+        .zip(estimate.host_memory_limit_bytes)
+        .is_some_and(|(peak, limit)| peak >= limit);
+    let memory_pressure = estimate.fit == FitAssessment::LikelyOom
+        || accelerator_memory_exceeded
+        || host_memory_exceeded;
     let mut decisions = Vec::new();
 
     for candidate in candidates {
@@ -179,46 +200,42 @@ pub fn plan_execution(
                 reasons.push(format!("explicit parameter '{path}' is unsupported"));
             }
         }
-        if estimate.fit == FitAssessment::LikelyOom {
-            if allow_degradation && candidate.supports_offloading {
+        if memory_pressure {
+            if host_memory_exceeded {
+                reasons.push(host_memory_rejection_reason(estimate));
+            } else {
                 let accelerator_can_offload = matches!(
                     candidate.accelerator,
                     RuntimeAccelerator::Cuda | RuntimeAccelerator::Rocm
                 );
-                if accelerator_can_offload
-                    && request.bool_parameter("routing.allow_cpu_offload") == Some(true)
-                {
-                    degradations.push(ExecutionDegradation::CpuOffload);
+                let selected_offload = (candidate.supports_offloading && accelerator_can_offload)
+                    .then(|| selected_offload(request, allow_degradation))
+                    .flatten();
+                if let Some(offload) = selected_offload {
+                    if let Some(reason) = offload_host_memory_rejection_reason(estimate) {
+                        reasons.push(reason);
+                    } else {
+                        degradations.push(offload);
+                        // Task-level memory reductions accompany an offload plan but
+                        // cannot rescue an estimate that is still over capacity on
+                        // their own: their effect is already included in `estimate`.
+                        if allow_degradation
+                            && request.task.output_modality() == OutputModality::Image
+                            && request.bool_parameter("image.vae_tiling") == Some(true)
+                        {
+                            degradations.push(ExecutionDegradation::VaeTiling);
+                        }
+                        if allow_degradation
+                            && request.task.output_modality() == OutputModality::Video
+                            && (request.bool_parameter("video.temporal_vae_tiling") == Some(true)
+                                || request.u64_parameter("video.window_size").is_some())
+                        {
+                            degradations.push(ExecutionDegradation::TemporalWindowing);
+                        }
+                    }
+                } else {
+                    reasons.push(memory_rejection_reason(estimate, candidate.accelerator));
                 }
-                if accelerator_can_offload
-                    && request.bool_parameter("routing.allow_sequential_offload") == Some(true)
-                {
-                    degradations.push(ExecutionDegradation::SequentialOffload);
-                }
-                if accelerator_can_offload
-                    && request.bool_parameter("routing.allow_component_offload") == Some(true)
-                {
-                    degradations.push(ExecutionDegradation::ComponentOffload);
-                }
-                if request.task.output_modality() == OutputModality::Image
-                    && request.bool_parameter("image.vae_tiling") == Some(true)
-                {
-                    degradations.push(ExecutionDegradation::VaeTiling);
-                }
-                if request.task.output_modality() == OutputModality::Video
-                    && (request.bool_parameter("video.temporal_vae_tiling") == Some(true)
-                        || request.u64_parameter("video.window_size").is_some())
-                {
-                    degradations.push(ExecutionDegradation::TemporalWindowing);
-                }
-                if degradations.is_empty() {
-                    reasons.push(
-                        "workload is likely out of memory and no permitted degradation is enabled"
-                            .to_string(),
-                    );
-                }
-            } else {
-                reasons.push("workload is likely out of memory".to_string());
             }
         }
 
@@ -261,7 +278,7 @@ pub fn plan_execution(
         (Some(requested), Some(selected)) => !requested.eq_ignore_ascii_case(selected),
         _ => false,
     };
-    let model_or_quality_downgrades = if estimate.fit == FitAssessment::LikelyOom {
+    let model_or_quality_downgrades = if memory_pressure {
         vec![
             "consider a smaller model or stronger quantization".to_string(),
             match request.task.output_modality() {
@@ -295,6 +312,97 @@ pub fn plan_execution(
     }
 }
 
+fn selected_offload(
+    request: &EffectiveInferenceRequest,
+    allow_degradation: bool,
+) -> Option<ExecutionDegradation> {
+    let options = [
+        (
+            "routing.allow_cpu_offload",
+            ExecutionDegradation::CpuOffload,
+        ),
+        (
+            "routing.allow_sequential_offload",
+            ExecutionDegradation::SequentialOffload,
+        ),
+        (
+            "routing.allow_component_offload",
+            ExecutionDegradation::ComponentOffload,
+        ),
+    ];
+
+    // An explicit permission is an instruction, not a general fallback. It
+    // therefore applies even under the default `backend` fallback policy.
+    if let Some((_, degradation)) = options.iter().find(|(path, _)| {
+        request.explicit_parameters.contains(*path) && request.bool_parameter(path) == Some(true)
+    }) {
+        return Some(degradation.clone());
+    }
+
+    if !allow_degradation {
+        return None;
+    }
+
+    // Component and sequential offload use CPU-offload hooks too. An explicit
+    // CPU-offload denial suppresses inherited alternatives; a separately
+    // explicit alternative was handled above and remains authoritative.
+    if request
+        .explicit_parameters
+        .contains("routing.allow_cpu_offload")
+        && request.bool_parameter("routing.allow_cpu_offload") == Some(false)
+    {
+        return None;
+    }
+
+    options
+        .into_iter()
+        .find(|(path, _)| request.bool_parameter(path) == Some(true))
+        .map(|(_, degradation)| degradation)
+}
+
+fn memory_rejection_reason(estimate: &WorkloadEstimate, accelerator: RuntimeAccelerator) -> String {
+    if accelerator == RuntimeAccelerator::Cuda
+        && let Some((peak, limit)) = estimate
+            .accelerator_peak_bytes
+            .zip(estimate.accelerator_memory_limit_bytes)
+        && peak >= limit
+    {
+        format!(
+            "estimated accelerator peak of {} reaches or exceeds detected accelerator memory limit of {} and no permitted offload could be selected",
+            format_memory_bytes(peak),
+            format_memory_bytes(limit)
+        )
+    } else {
+        "workload is likely out of memory and no permitted offload could be selected".to_string()
+    }
+}
+
+fn host_memory_rejection_reason(estimate: &WorkloadEstimate) -> String {
+    match estimate
+        .host_peak_bytes
+        .zip(estimate.host_memory_limit_bytes)
+    {
+        Some((peak, limit)) => format!(
+            "estimated host peak of {} reaches or exceeds detected host memory limit of {}; accelerator offload cannot resolve host-memory pressure",
+            format_memory_bytes(peak),
+            format_memory_bytes(limit)
+        ),
+        None => "workload is likely out of host memory; accelerator offload cannot resolve host-memory pressure".to_string(),
+    }
+}
+
+fn offload_host_memory_rejection_reason(estimate: &WorkloadEstimate) -> Option<String> {
+    let limit = estimate.host_memory_limit_bytes?;
+    let required = projected_host_peak_with_offload(estimate)?;
+    (required >= limit).then(|| {
+        format!(
+            "projected host memory required with offload is {}, which reaches or exceeds detected host memory limit of {}; offload was not selected",
+            format_memory_bytes(required),
+            format_memory_bytes(limit)
+        )
+    })
+}
+
 fn runtime_accelerator_matches(accelerator: RuntimeAccelerator, requested: &str) -> bool {
     matches!(
         (accelerator, requested.to_ascii_lowercase().as_str()),
@@ -304,4 +412,9 @@ fn runtime_accelerator_matches(accelerator: RuntimeAccelerator, requested: &str)
             | (RuntimeAccelerator::Mps, "mps" | "metal")
             | (RuntimeAccelerator::Mlx, "mlx" | "metal")
     )
+}
+
+fn concrete_routing_target(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("auto")).then_some(value)
 }

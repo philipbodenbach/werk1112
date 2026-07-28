@@ -129,7 +129,10 @@ pub struct RoutingArgs {
     )]
     pub performance_preference: Option<String>,
 
-    #[arg(long, help = "Backend fallback policy")]
+    #[arg(
+        long,
+        help = "Fallback policy: none, backend, or degrade; degrade permits inherited memory-saving strategies"
+    )]
     pub fallback_policy: Option<String>,
 
     #[arg(long, help = "Parameter support policy: strict, warn, or permissive")]
@@ -138,42 +141,48 @@ pub struct RoutingArgs {
     #[arg(
         long = "allow-cpu-offload",
         action = ArgAction::SetTrue,
-        conflicts_with = "no_allow_cpu_offload"
+        conflicts_with = "no_allow_cpu_offload",
+        help = "Permit model CPU offload when GPU memory is insufficient and the projected host-RAM requirement fits"
     )]
     pub allow_cpu_offload: bool,
 
     #[arg(
         long = "no-allow-cpu-offload",
         action = ArgAction::SetTrue,
-        conflicts_with = "allow_cpu_offload"
+        conflicts_with = "allow_cpu_offload",
+        help = "Forbid model CPU offload; an over-limit GPU plan fails unless another strategy is explicitly permitted"
     )]
     pub no_allow_cpu_offload: bool,
 
     #[arg(
         long = "allow-sequential-offload",
         action = ArgAction::SetTrue,
-        conflicts_with = "no_allow_sequential_offload"
+        conflicts_with = "no_allow_sequential_offload",
+        help = "Permit slower sequential CPU offload when GPU memory is insufficient and projected host RAM fits"
     )]
     pub allow_sequential_offload: bool,
 
     #[arg(
         long = "no-allow-sequential-offload",
         action = ArgAction::SetTrue,
-        conflicts_with = "allow_sequential_offload"
+        conflicts_with = "allow_sequential_offload",
+        help = "Forbid sequential CPU offload"
     )]
     pub no_allow_sequential_offload: bool,
 
     #[arg(
         long = "allow-component-offload",
         action = ArgAction::SetTrue,
-        conflicts_with = "no_allow_component_offload"
+        conflicts_with = "no_allow_component_offload",
+        help = "Permit component offload when GPU memory is insufficient and projected host RAM fits"
     )]
     pub allow_component_offload: bool,
 
     #[arg(
         long = "no-allow-component-offload",
         action = ArgAction::SetTrue,
-        conflicts_with = "allow_component_offload"
+        conflicts_with = "allow_component_offload",
+        help = "Forbid component offload"
     )]
     pub no_allow_component_offload: bool,
 
