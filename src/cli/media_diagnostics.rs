@@ -588,40 +588,36 @@ fn media_debug_parameter_value(path: &str, value: &ParameterValue) -> String {
 
 fn media_parameter_is_sensitive(path: &str) -> bool {
     let leaf = path.rsplit('.').next().unwrap_or(path).to_ascii_lowercase();
-    [
-        "prompt",
-        "lyrics",
-        "text",
-        "hotword",
-        "path",
-        "file",
-        "url",
-        "token",
-        "api_key",
-        "reference",
-        "model",
-        "model_path",
-        "checkpoint",
-        "vae",
-        "refiner",
-        "control_model",
-        "_image",
-        "_video",
-        "_audio",
-        "lora",
-        "adapter",
-        "source_audio",
-        "reference_audio",
-        "input_audio",
-        "initial_image",
-        "reference_image",
-        "input_image",
-        "mask_image",
-        "source_video",
-        "input_video",
-    ]
-    .iter()
-    .any(|part| leaf.contains(part))
+    let sensitive_token = leaf
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| {
+            matches!(
+                token,
+                "prompt"
+                    | "lyrics"
+                    | "text"
+                    | "hotword"
+                    | "path"
+                    | "file"
+                    | "url"
+                    | "token"
+                    | "reference"
+                    | "model"
+                    | "checkpoint"
+                    | "vae"
+                    | "refiner"
+                    | "image"
+                    | "video"
+                    | "audio"
+                    | "lora"
+                    | "adapter"
+            )
+        });
+    sensitive_token
+        || matches!(
+            leaf.as_str(),
+            "api_key" | "apikey" | "filename" | "filepath" | "uri" | "base64"
+        )
 }
 
 fn media_sanitize_debug_text(text: &str) -> String {
@@ -1211,6 +1207,20 @@ mod tests {
         assert_eq!(
             media_debug_parameter_value("image.vae_tiling", &ParameterValue::Boolean(true)),
             "true"
+        );
+        assert_eq!(
+            media_debug_parameter_value(
+                "routing.performance_preference",
+                &ParameterValue::String("balanced".to_string())
+            ),
+            "\"balanced\""
+        );
+        assert_eq!(
+            media_debug_parameter_value(
+                "routing.profile",
+                &ParameterValue::String("quality".to_string())
+            ),
+            "\"quality\""
         );
     }
 
