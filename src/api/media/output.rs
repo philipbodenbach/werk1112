@@ -13,7 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     capabilities::InferenceTask,
     inference::InferenceRequest,
-    inference_service::{InferenceResult, OutputMetadata},
+    inference_service::{InferenceResult, OutputMetadata, OutputStore},
 };
 
 use super::requests::DirectResponseFormat;
@@ -67,18 +67,78 @@ struct DirectMediaOutput {
     duration: Option<f64>,
 }
 
+enum DirectExecutionError {
+    Inference(String),
+    Response(String),
+}
+
+struct ManagedResultCleanup {
+    output_store: OutputStore,
+    result_id: Option<String>,
+}
+
+impl ManagedResultCleanup {
+    fn new(output_store: OutputStore, result_id: String) -> Self {
+        Self {
+            output_store,
+            result_id: Some(result_id),
+        }
+    }
+}
+
+impl Drop for ManagedResultCleanup {
+    fn drop(&mut self) {
+        let Some(result_id) = self.result_id.take() else {
+            return;
+        };
+        if let Err(error) = self.output_store.remove_result(&result_id) {
+            eprintln!("warning: failed to clean up streamed media result '{result_id}': {error:#}");
+        }
+    }
+}
+
 pub(super) async fn execute_direct(
     state: ApiState,
     request: InferenceRequest,
     response_format: DirectResponseFormat,
 ) -> Response {
     let service = state.inference_service.clone();
-    match tokio::task::spawn_blocking(move || service.execute(request)).await {
-        Ok(Ok(result)) => match direct_media_response(result, response_format) {
-            Ok(response) => Json(response).into_response(),
-            Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, error, None),
-        },
-        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, error.to_string(), None),
+    match tokio::task::spawn_blocking(move || {
+        let result = service
+            .execute(request)
+            .map_err(|error| DirectExecutionError::Inference(error.to_string()))?;
+        let release_result = matches!(response_format, DirectResponseFormat::Base64)
+            || result.task == InferenceTask::SpeechToText;
+        let result_id = result.id.clone();
+        let response = direct_media_response(result, response_format);
+        match response {
+            Ok(mut response) => {
+                if release_result
+                    && let Err(error) = service.output_store().remove_result(&result_id)
+                {
+                    response.werk.warnings.push(format!(
+                        "embedded response was returned, but temporary output cleanup failed: {error:#}"
+                    ));
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                if release_result {
+                    let _ = service.output_store().remove_result(&result_id);
+                }
+                Err(DirectExecutionError::Response(error))
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(DirectExecutionError::Inference(error))) => {
+            api_error(StatusCode::BAD_REQUEST, error, None)
+        }
+        Ok(Err(DirectExecutionError::Response(error))) => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, error, None)
+        }
         Err(error) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("inference task failed: {error}"),
@@ -89,8 +149,17 @@ pub(super) async fn execute_direct(
 
 pub(super) async fn execute_audio_bytes(state: ApiState, request: InferenceRequest) -> Response {
     let service = state.inference_service.clone();
-    match tokio::task::spawn_blocking(move || service.execute(request)).await {
-        Ok(Ok(result)) => {
+    let output_store = service.output_store().clone();
+    match tokio::task::spawn_blocking(move || {
+        service.execute(request).map(|result| {
+            let result_id = result.id.clone();
+            let cleanup = ManagedResultCleanup::new(output_store, result_id);
+            (result, cleanup)
+        })
+    })
+    .await
+    {
+        Ok(Ok((result, cleanup))) => {
             let Some(output) = result
                 .outputs
                 .iter()
@@ -102,7 +171,7 @@ pub(super) async fn execute_audio_bytes(state: ApiState, request: InferenceReque
                     None,
                 );
             };
-            let body = match streaming_file_body(&output.path).await {
+            let body = match ephemeral_streaming_file_body(&output.path, cleanup).await {
                 Ok(body) => body,
                 Err(error) => {
                     return api_error(
@@ -139,7 +208,19 @@ pub(super) async fn execute_audio_bytes(state: ApiState, request: InferenceReque
 }
 
 pub(super) async fn streaming_file_body(path: &str) -> std::io::Result<Body> {
-    let mut file = tokio::fs::File::open(path).await?;
+    let file = tokio::fs::File::open(path).await?;
+    Ok(streaming_body(file, None))
+}
+
+async fn ephemeral_streaming_file_body(
+    path: &str,
+    cleanup: ManagedResultCleanup,
+) -> std::io::Result<Body> {
+    let file = tokio::fs::File::open(path).await?;
+    Ok(streaming_body(file, Some(cleanup)))
+}
+
+fn streaming_body(mut file: tokio::fs::File, cleanup: Option<ManagedResultCleanup>) -> Body {
     let (sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(8);
     tokio::spawn(async move {
         loop {
@@ -158,8 +239,10 @@ pub(super) async fn streaming_file_body(path: &str) -> std::io::Result<Body> {
                 }
             }
         }
+        drop(file);
+        drop(cleanup);
     });
-    Ok(Body::from_stream(ReceiverStream::new(receiver)))
+    Body::from_stream(ReceiverStream::new(receiver))
 }
 
 fn direct_media_response(

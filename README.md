@@ -192,7 +192,7 @@ prints the value that clients must use:
 ```bash
 werk auth api-key generate
 export WERK_API_KEY='<paste the generated key>'
-werk serve --model local-model
+werk serve --model local-model --image-model tiny-sd
 ```
 
 Then point OpenAI-compatible chat clients at:
@@ -292,8 +292,9 @@ transfers ownership to that file or directory. In both cases, Werk publishes
 every generated file, removes its temporary result directory after the
 complete publication succeeds, and prints only durable destination paths. A
 publication failure preserves the temporary managed result so generated data
-is not lost. HTTP responses and persisted jobs continue to use managed result
-directories with metadata.
+is not lost. Persisted jobs and explicitly requested HTTP `url` responses keep
+managed result directories with metadata; self-contained HTTP responses are
+removed after they have been encoded or streamed.
 
 Before execution, inspect and estimate the same typed contract:
 
@@ -795,14 +796,30 @@ werk serve
 
 `serve` exposes OpenAI-compatible model/chat routes and Werk media, discovery,
 output, and job routes. `/v1/models` returns summaries of all installed models;
-use `werk inspect MODEL` for a full manifest. Media requests require their JSON
-`model` field.
+`/v1/models/{id}` retrieves one summary, and `werk inspect MODEL` prints a full
+manifest. Video and audio requests require their JSON `model` field. Image
+generation can instead use a configured default or the only installed image
+model.
 
 Set a default model for chat requests that omit `model`:
 
 ```bash
 werk serve --model gemma-2b-it
 ```
+
+Set a separate image default for OpenAI-compatible image clients. Unlike the
+chat model, it is selected by the inference router when a request arrives and
+is not loaded eagerly at server startup:
+
+```bash
+werk serve --model gemma-2b-it --image-model tiny-sd
+```
+
+Clients that omit the image `model`, or are hard-coded to an OpenAI image alias
+such as `gpt-image-1` or `dall-e-3`, are routed to `--image-model`. An explicit
+installed Werk model ID always wins. Without `--image-model`, omission and
+aliases work only when exactly one installed model declares
+`image-generation`.
 
 The default address is:
 
@@ -839,6 +856,15 @@ For a local development server with no authentication:
 
 ```bash
 werk serve --allow-unauthenticated
+```
+
+Browser CORS is disabled by default. Allow only the exact frontend origins you
+control; repeat the option when needed. Wildcard and opaque `null` origins are
+rejected, and browser requests still require the configured API key:
+
+```bash
+werk serve --cors-origin http://127.0.0.1:3000 \
+  --cors-origin tauri://localhost
 ```
 
 Import a local model file or directory. Files are copied into the managed model store:
@@ -1137,16 +1163,17 @@ Werk1112 without a chat-specific adapter.
 
 ## HTTP API
 
-`/v1/models` and `/v1/chat/completions` use OpenAI-compatible shapes. Media,
+`/v1/models`, `/v1/models/{id}`, `/v1/chat/completions`, and the synchronous
+image-generation response use OpenAI-compatible shapes. The remaining media,
 capability, parameter, output, and job routes are OpenAI-inspired or
-Werk-native JSON APIs. They are not a claim of full OpenAI media API
-compatibility.
+Werk-native JSON APIs. Image edits currently use Werk JSON input rather than
+OpenAI multipart uploads.
 
 Authentication is required by default. In the first terminal:
 
 ```bash
 werk auth api-key generate
-werk serve --model local-model
+werk serve --model local-model --image-model tiny-sd
 ```
 
 Copy the printed key into the client shell:
@@ -1157,8 +1184,159 @@ export WERK_API_KEY='sk-werk-replace-with-the-generated-value'
 ```
 
 Use `--allow-unauthenticated` only for a deliberately unauthenticated local
-development server. The server's default model applies to chat; every media
-request must include `model`.
+development server. `--model` applies to chat and `--image-model` applies to
+image generation. Video and audio requests still include `model`.
+
+### Third-party OpenAI clients
+
+Use `http://127.0.0.1:11434/v1` as the OpenAI base URL and a generated Werk key
+as the API key. The trailing `/v1` is required. For example, the OpenAI Python
+client can save a locally generated image without using a temporary download
+URL:
+
+```python
+import base64
+from pathlib import Path
+
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:11434/v1",
+    api_key="sk-werk-replace-with-the-generated-value",
+)
+result = client.images.generate(
+    model="gpt-image-1",  # maps to werk serve --image-model
+    prompt="A tiny friendly red workshop robot repairing a wooden chair",
+    size="1024x1024",
+    n=1,
+)
+Path("robot-chair.png").write_bytes(base64.b64decode(result.data[0].b64_json))
+```
+
+Werk defaults image responses to `b64_json`, which works with server-side SDKs
+and does not retain a duplicate hidden output directory. Explicit
+`response_format: "url"` remains available for Werk-aware clients; it returns
+an authenticated relative `/v1/outputs/...` URL and intentionally retains that
+managed result. Browser applications must additionally opt in their exact
+origin on the server, for example `--cors-origin http://127.0.0.1:3000`.
+Wildcard, `null`, and `file://` origins are rejected.
+
+Image generation consumes the common OpenAI fields `model`, `prompt`, `n`,
+`size`, `quality`, `style`, `response_format`, `output_format`, `background`,
+`moderation`, `output_compression`, `partial_images`, `stream`, and `user` so
+they are not mistaken for native backend parameters. `size: "auto"`,
+`quality: "auto"`, `stream: false`, `background: "auto"`,
+`moderation: "auto"`, and `partial_images: 0` are accepted. Quality is mapped
+to Werk routing profiles and `style` becomes a local prompt hint. Streaming or
+partial images and transparent-background enforcement are rejected with a
+clear error because the current local adapter cannot guarantee those
+semantics. The `auto` and `low` moderation values are accepted as transport
+compatibility fields, but Werk does not claim provider-side moderation.
+`output_compression` is range-validated for client compatibility but is not yet
+applied by the local encoder.
+
+### Open WebUI image generation
+
+The preferred Open WebUI integration is its OpenAI-compatible image engine.
+The variable names below follow the
+[Open WebUI image-generation configuration](https://docs.openwebui.com/troubleshooting/image-generation/).
+Start Werk with a concrete local image model; use `0.0.0.0` when Open WebUI is
+running in a container:
+
+```bash
+werk serve --host 0.0.0.0 --image-model tiny-sd
+```
+
+Configure Open WebUI with:
+
+```text
+ENABLE_IMAGE_GENERATION=true
+IMAGE_GENERATION_ENGINE=openai
+IMAGES_OPENAI_API_BASE_URL=http://host.docker.internal:11434/v1
+IMAGES_OPENAI_API_KEY=<Werk API key>
+IMAGE_GENERATION_MODEL=gpt-image-1
+IMAGE_SIZE=1024x1024
+```
+
+Use `http://127.0.0.1:11434/v1` when both processes run directly on the host.
+The base URL includes `/v1` and has no trailing slash. OpenAI model aliases such
+as `gpt-image-1` resolve to `werk serve --image-model`. Werk's default embedded
+Base64 response avoids a retained temporary output directory. Open WebUI's
+multipart image-edit request is not compatible yet; text-to-image generation
+is supported.
+
+### AUTOMATIC1111-compatible clients
+
+Werk implements the small AUTOMATIC1111 API subset required by Open WebUI and
+basic txt2img clients, using the upstream
+[AUTOMATIC1111 API contract](https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/API):
+
+```text
+POST /sdapi/v1/txt2img
+GET  /sdapi/v1/sd-models
+GET  /sdapi/v1/options
+POST /sdapi/v1/options
+GET  /sdapi/v1/progress
+```
+
+Use the server root `http://127.0.0.1:11434` without `/v1`. Bearer and
+`X-API-Key` authentication work as usual. Clients that expose only A1111 Basic
+authentication can use username `werk` and the Werk API key as password; for
+Open WebUI:
+
+```text
+ENABLE_IMAGE_GENERATION=true
+IMAGE_GENERATION_ENGINE=automatic1111
+AUTOMATIC1111_BASE_URL=http://host.docker.internal:11434
+AUTOMATIC1111_API_AUTH=werk:<Werk API key>
+```
+
+Generate one image and decode the standard A1111 Base64 response:
+
+```bash
+curl -fsS "$WERK_BASE_URL/sdapi/v1/txt2img" \
+  -u "werk:$WERK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "A tiny red workshop robot repairing a wooden chair",
+    "negative_prompt": "broken geometry",
+    "width": 512,
+    "height": 512,
+    "steps": 8,
+    "cfg_scale": 1,
+    "seed": 0
+  }' | jq -r '.images[0]' | base64 --decode > a1111-robot.png
+```
+
+`batch_size * n_iter` maps to Werk's image count, `cfg_scale` maps to guidance,
+and `override_settings.sd_model_checkpoint` selects one installed image model
+for that request. The options endpoint can select a process-wide image model.
+This is a compatibility subset, not an emulation of A1111 extensions, scripts,
+samplers, high-resolution passes, face restoration, or img2img.
+
+### ComfyUI hosted OpenAI node
+
+ComfyUI's built-in hosted OpenAI image node can use Werk through its proxy
+contract. This follows the request path and response handling in ComfyUI's
+[official OpenAI node](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_api_nodes/nodes_openai.py).
+Start Werk, then start ComfyUI with Werk as its hosted API base:
+
+```bash
+werk serve --image-model tiny-sd
+python main.py --comfy-api-base http://127.0.0.1:11434
+```
+
+Set ComfyUI's `api_key_comfy_org` API key to the generated Werk key. Werk accepts
+the node's `X-API-Key` header and exposes
+`POST /proxy/openai/images/generations`; the response contains the expected
+`data[].b64_json`. The corresponding multipart edit proxy returns a clear
+`501 Not Implemented` response until multipart editing exists.
+
+Werk does not emulate ComfyUI's native `/prompt`, workflow graph, custom-node,
+WebSocket, history, or `/view` protocols. Those APIs execute an arbitrary node
+graph and are materially different from routing one installed model. Native
+Comfy workflows should keep using a real ComfyUI server; use its hosted OpenAI
+node when Werk should perform the image generation.
 
 ### Models and Chat
 
@@ -1166,6 +1344,13 @@ List installed model summaries:
 
 ```bash
 curl -fsS "$WERK_BASE_URL/v1/models" \
+  -H "Authorization: Bearer $WERK_API_KEY"
+```
+
+Retrieve one model summary (URL-encode `/` when the ID contains one):
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/models/tiny-sd" \
   -H "Authorization: Bearer $WERK_API_KEY"
 ```
 
@@ -1220,6 +1405,12 @@ per generated token.
 | --- | --- | --- |
 | `POST` | `/v1/images/generations` | `200` synchronous image generation |
 | `POST` | `/v1/images/edits` | `200` synchronous JSON local-path/base64 image editing |
+| `POST` | `/proxy/openai/images/generations` | ComfyUI hosted OpenAI text-to-image alias |
+| `POST` | `/proxy/openai/images/edits` | Authenticated `501` until multipart image edits are supported |
+| `POST` | `/sdapi/v1/txt2img` | AUTOMATIC1111-compatible synchronous text-to-image subset |
+| `GET` | `/sdapi/v1/sd-models` | AUTOMATIC1111-compatible installed image models |
+| `GET`, `POST` | `/sdapi/v1/options` | Read or select the A1111 compatibility model |
+| `GET` | `/sdapi/v1/progress` | Coarse idle/active state without fabricated progress |
 | `POST` | `/v1/videos/generations` | `202` persisted job |
 | `POST` | `/v1/audio/generations` | `202` persisted job |
 | `POST` | `/v1/audio/speech` | `200` raw audio, or `202` job when `async` is true |
@@ -1255,7 +1446,9 @@ one function descriptor per distinct available task. This is an eligibility
 result, not an execution guarantee: media probes do not load the concrete model
 pipeline.
 
-Image generation returns `data` entries plus a complete Werk inference result:
+Image generation returns OpenAI-compatible `data` entries plus a complete Werk
+inference result. This example extracts the default Base64 response directly
+to a file:
 
 ```bash
 curl -fsS "$WERK_BASE_URL/v1/images/generations" \
@@ -1266,15 +1459,21 @@ curl -fsS "$WERK_BASE_URL/v1/images/generations" \
     "prompt": "an abandoned orbital station",
     "size": "1024x1024",
     "n": 1,
-    "response_format": "url",
     "output_format": "png",
     "steps": 28
-  }'
+  }' | jq -r '.data[0].b64_json' | base64 --decode > station.png
 ```
 
-For images, `response_format` selects `url` or `b64_json` delivery. A URL is
-relative to the Werk server. For video, generated audio, TTS, and transcription,
-`response_format` instead selects the requested output codec/format.
+For images, omitted `response_format` defaults to `b64_json`; the field can
+explicitly select `url` or `b64_json` delivery. A URL is
+relative to the Werk server and keeps the managed result until output retention
+removes it. A `b64_json` response is self-contained, so Werk removes its
+temporary managed result after encoding it. Embedded transcription results are
+cleaned up in the same way, and synchronous TTS output is removed after its raw
+response stream finishes. Persisted jobs and URL responses remain available
+through their output records. For video, generated audio, TTS, and
+transcription, `response_format` instead selects the requested output
+codec/format.
 
 Video and audio generation return `202 Accepted` with a persisted `JobRecord`:
 

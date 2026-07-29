@@ -31,7 +31,7 @@ use self::terminal_activity::{
 #[cfg(feature = "burn-experimental")]
 use crate::backend::burn_doctor_checks;
 use crate::{
-    api::{ApiState, serve},
+    api::{ApiState, CorsOrigin, serve},
     api_keys,
     backend::{
         BackendAccelerator, BackendRuntime, BurnBackend, BurnMode, CandleBackend, CandleDeviceMode,
@@ -421,8 +421,14 @@ pub enum Commands {
         #[arg(long, default_value_t = 11434, help = "Port to bind")]
         port: u16,
 
-        #[arg(long, help = "Default model for API requests that omit model")]
+        #[arg(long, help = "Default chat model for API requests that omit model")]
         model: Option<String>,
+
+        #[arg(
+            long,
+            help = "Default image model for compatible clients that omit model or use an OpenAI image alias"
+        )]
+        image_model: Option<String>,
 
         #[arg(
             long,
@@ -448,6 +454,14 @@ pub enum Commands {
             help = "Disable API key auth for local development"
         )]
         allow_unauthenticated: bool,
+
+        #[arg(
+            long = "cors-origin",
+            value_name = "ORIGIN",
+            action = ArgAction::Append,
+            help = "Allow an exact browser origin; repeat for multiple origins (wildcard and null are rejected)"
+        )]
+        cors_origins: Vec<CorsOrigin>,
 
         #[arg(long, help = "Print HTTP request and generation logs")]
         verbose: bool,
@@ -944,9 +958,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         host: "127.0.0.1".to_string(),
         port: 11434,
         model: None,
+        image_model: None,
         api_key: None,
         api_keys: None,
         allow_unauthenticated: false,
+        cors_origins: Vec::new(),
         verbose: false,
     });
     let selection_options =
@@ -961,9 +977,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             host,
             port,
             model,
+            image_model,
             api_key,
             api_keys,
             allow_unauthenticated,
+            cors_origins,
             verbose,
         } => {
             let store = ModelStore::resolve(model_home)?;
@@ -1012,6 +1030,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 )?;
                 println!("Default model available: {model}");
             }
+            if let Some(image_model) = image_model.as_deref() {
+                let manifest = store.get(image_model)?;
+                if !manifest.supports_task(InferenceTask::ImageGeneration) {
+                    bail!(
+                        "default image model '{}' does not declare image-generation",
+                        manifest.id
+                    );
+                }
+                println!("Default image model available: {image_model}");
+            }
             let api_state = ApiState::new_with_default_model_prompt_options_and_verbose(
                 store,
                 backend,
@@ -1019,7 +1047,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(prompt_options_resolver),
                 verbose,
             )
-            .with_api_keys(api_keys);
+            .with_default_image_model(image_model)
+            .with_api_keys(api_keys)
+            .with_cors_origins(cors_origins);
             serve(addr, api_state).await
         }
         Commands::Run {
@@ -8437,8 +8467,18 @@ mod tests {
     #[test]
     fn parses_cli_commands() {
         let cli = Cli::try_parse_from([
-            "werk", "--device", "cuda", "serve", "--host", "0.0.0.0", "--port", "8080", "--model",
+            "werk",
+            "--device",
+            "cuda",
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "--model",
             "m",
+            "--image-model",
+            "image-m",
         ])
         .unwrap();
         assert_eq!(cli.device, Some(DeviceArg::Cuda));
@@ -8447,17 +8487,21 @@ mod tests {
                 host,
                 port,
                 model,
+                image_model,
                 api_key,
                 api_keys,
                 allow_unauthenticated,
+                cors_origins,
                 verbose,
             } => {
                 assert_eq!(host, "0.0.0.0");
                 assert_eq!(port, 8080);
                 assert_eq!(model.as_deref(), Some("m"));
+                assert_eq!(image_model.as_deref(), Some("image-m"));
                 assert!(api_key.is_none());
                 assert!(api_keys.is_none());
                 assert!(!allow_unauthenticated);
+                assert!(cors_origins.is_empty());
                 assert!(!verbose);
             }
             command => panic!("unexpected command: {command:?}"),
@@ -8493,6 +8537,33 @@ mod tests {
                 ..
             } => assert!(allow_unauthenticated),
             command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "serve",
+            "--cors-origin",
+            "http://127.0.0.1:3000",
+            "--cors-origin",
+            "tauri://localhost",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Serve { cors_origins, .. } => assert_eq!(
+                cors_origins
+                    .iter()
+                    .map(CorsOrigin::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["http://127.0.0.1:3000", "tauri://localhost"]
+            ),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        for origin in ["*", "null", "file:///tmp/app.html"] {
+            assert!(
+                Cli::try_parse_from(["werk", "serve", "--cors-origin", origin]).is_err(),
+                "unexpectedly accepted CORS origin {origin}"
+            );
         }
 
         assert!(
@@ -9993,9 +10064,11 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 11434,
             model: None,
+            image_model: None,
             api_key: None,
             api_keys: None,
             allow_unauthenticated: false,
+            cors_origins: Vec::new(),
             verbose: false,
         };
         assert!(should_print_startup_banner_for(&serve, true, true));

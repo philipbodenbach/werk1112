@@ -88,6 +88,111 @@ async fn models_and_chat_routes_use_openai_shapes() {
 }
 
 #[tokio::test]
+async fn model_retrieve_route_returns_openai_model_object() {
+    let app = model_retrieve_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/mock")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "id": "mock",
+            "object": "model",
+            "created": 1,
+            "owned_by": "local"
+        })
+    );
+}
+
+#[tokio::test]
+async fn model_retrieve_route_returns_openai_not_found_error() {
+    let app = model_retrieve_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/missing")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let value = response_json(response).await;
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert_eq!(value["error"]["param"], "model");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("model 'missing' is not installed"))
+    );
+}
+
+#[tokio::test]
+async fn model_retrieve_route_requires_bearer_auth() {
+    let app = model_retrieve_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/mock")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+        "Bearer"
+    );
+    assert_eq!(
+        response_json(response).await["error"]["message"],
+        "missing bearer token"
+    );
+}
+
+fn model_retrieve_app() -> Router {
+    let store = test_store();
+    let manifest = ModelManifest {
+        id: "mock".to_string(),
+        source: ModelSource::LocalPath {
+            path: "test".to_string(),
+        },
+        format: ModelFormat::Unknown,
+        architecture: None,
+        tokenizer_path: None,
+        config_path: None,
+        model_path: None,
+        backend: "mock".to_string(),
+        created_unix: 1,
+        files: Vec::new(),
+        artifacts: Vec::new(),
+        metadata: Default::default(),
+    };
+    fs::create_dir_all(store.model_dir("mock")).unwrap();
+    fs::write(
+        store
+            .model_dir("mock")
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    router(ApiState::new(store, Arc::new(MockBackend)).with_api_keys(vec!["sk-test".to_string()]))
+}
+
+#[tokio::test]
 async fn server_api_keys_require_matching_bearer_token() {
     let store = test_store();
     let manifest = ModelManifest {

@@ -70,7 +70,7 @@ impl WerkRequestOptions {
         replace_some(&mut routing.profile, self.profile);
         replace_some(
             &mut routing.quality,
-            self.quality.map(|value| normalize_quality(&value)),
+            self.quality.and_then(|value| normalize_quality(&value)),
         );
         replace_some(
             &mut routing.performance_preference,
@@ -141,11 +141,13 @@ fn replace_override(target: &mut OverrideBool, replacement: Option<bool>) {
     }
 }
 
-fn normalize_quality(value: &str) -> String {
+fn normalize_quality(value: &str) -> Option<String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "standard" => "balanced".to_string(),
-        "hd" => "high".to_string(),
-        _ => value.to_string(),
+        "auto" => None,
+        "low" => Some("draft".to_string()),
+        "medium" | "standard" => Some("balanced".to_string()),
+        "high" | "hd" => Some("high".to_string()),
+        _ => Some(value.to_string()),
     }
 }
 

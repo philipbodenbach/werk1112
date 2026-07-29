@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.98"
 axum = "0.8.4"
+base64 = "0.22.1"
 crc32fast = "1.5.0"
 getrandom = "0.2.17"
 serde = { version = "1.0", features = ["derive"] }
@@ -31,6 +32,7 @@ indicatif = "0.17.11"
 libc = "0.2"
 safetensors = "0.4.5"
 tower = { version = "0.5.2", features = ["util"] }
+tower-http = { version = "0.6.11", features = ["cors"] }
 tokenizers = "0.21.4"
 cudarc = { version = "0.19.8", default-features = false, optional = true }
 llama_cpp = { version = "0.3.2", optional = true }

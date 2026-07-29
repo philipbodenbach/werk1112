@@ -16,7 +16,8 @@ pub(in crate::api) enum DirectResponseFormat {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(in crate::api) struct ImageGenerationApiRequest {
-    model: String,
+    #[serde(default)]
+    model: Option<String>,
     prompt: String,
     #[serde(default)]
     negative_prompt: Option<String>,
@@ -26,19 +27,47 @@ pub(in crate::api) struct ImageGenerationApiRequest {
     size: Option<String>,
     #[serde(default)]
     response_format: Option<String>,
+    #[serde(default)]
+    output_format: Option<String>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    moderation: Option<String>,
+    #[serde(default)]
+    output_compression: Option<u32>,
+    #[serde(default)]
+    partial_images: Option<u32>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    style: Option<String>,
     #[serde(flatten)]
     werk: WerkRequestOptions,
 }
 
 impl ImageGenerationApiRequest {
+    pub(in crate::api) fn requested_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     pub(in crate::api) fn into_inference(
         self,
+        model: String,
     ) -> Result<(InferenceRequest, DirectResponseFormat), String> {
         let response_format = image_response_format(self.response_format.as_deref())?;
+        validate_image_generation_compatibility(
+            self.background.as_deref(),
+            self.moderation.as_deref(),
+            self.output_compression,
+            self.partial_images,
+            self.stream,
+            self.style.as_deref(),
+        )?;
+        let prompt = apply_openai_style_hint(self.prompt, self.style.as_deref());
         let mut request = media_request(
-            self.model,
+            model,
             InferenceTask::ImageGeneration,
-            Some(self.prompt),
+            Some(prompt),
             self.negative_prompt,
             self.werk,
         )?;
@@ -48,6 +77,7 @@ impl ImageGenerationApiRequest {
                 .insert("image.num_images".to_string(), n.into());
         }
         apply_size(&mut request, "image", self.size.as_deref())?;
+        apply_output_format(&mut request, "image", self.output_format.as_deref());
         Ok((request, response_format))
     }
 }
@@ -348,6 +378,9 @@ fn apply_size(
         return Ok(());
     };
     let normalized = size.trim().to_ascii_lowercase();
+    if normalized == "auto" {
+        return Ok(());
+    }
     let (width, height) = normalized
         .split_once('x')
         .ok_or_else(|| "size must use WIDTHxHEIGHT, for example 1024x1024".to_string())?;
@@ -372,13 +405,85 @@ fn apply_size(
 }
 
 fn image_response_format(value: Option<&str>) -> Result<DirectResponseFormat, String> {
-    match value.unwrap_or("url").trim().to_ascii_lowercase().as_str() {
+    match value
+        .unwrap_or("b64_json")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "url" => Ok(DirectResponseFormat::Url),
         "b64_json" | "base64" => Ok(DirectResponseFormat::Base64),
         value => Err(format!(
             "image response_format must be 'url' or 'b64_json', got '{value}'"
         )),
     }
+}
+
+fn validate_image_generation_compatibility(
+    background: Option<&str>,
+    moderation: Option<&str>,
+    output_compression: Option<u32>,
+    partial_images: Option<u32>,
+    stream: Option<bool>,
+    style: Option<&str>,
+) -> Result<(), String> {
+    if stream == Some(true) {
+        return Err(
+            "streaming image generation is not supported; set 'stream' to false or omit it"
+                .to_string(),
+        );
+    }
+    if partial_images.unwrap_or(0) > 0 {
+        return Err(
+            "partial image events require streaming, which this endpoint does not support"
+                .to_string(),
+        );
+    }
+    if let Some(value) = output_compression
+        && value > 100
+    {
+        return Err("output_compression must be between 0 and 100".to_string());
+    }
+    match background.map(normalized_name).as_deref() {
+        None | Some("auto" | "opaque") => {}
+        Some("transparent") => {
+            return Err(
+                "transparent image backgrounds are not supported by the selected local adapter"
+                    .to_string(),
+            );
+        }
+        Some(value) => {
+            return Err(format!(
+                "background must be 'auto', 'opaque', or 'transparent', got '{value}'"
+            ));
+        }
+    }
+    match moderation.map(normalized_name).as_deref() {
+        // Local adapters do not expose provider-side moderation levels. Both
+        // current OpenAI values are consumed as transport compatibility fields
+        // instead of leaking into strict backend parameter resolution.
+        None | Some("auto" | "low") => {}
+        Some(value) => {
+            return Err(format!("moderation must be 'auto' or 'low', got '{value}'"));
+        }
+    }
+    match style.map(normalized_name).as_deref() {
+        None | Some("vivid" | "natural") => Ok(()),
+        Some(value) => Err(format!("style must be 'vivid' or 'natural', got '{value}'")),
+    }
+}
+
+fn apply_openai_style_hint(mut prompt: String, style: Option<&str>) -> String {
+    match style.map(normalized_name).as_deref() {
+        Some("vivid") => prompt.push_str("\n\nVisual style: vivid and dramatic."),
+        Some("natural") => prompt.push_str("\n\nVisual style: natural and realistic."),
+        _ => {}
+    }
+    prompt
+}
+
+fn normalized_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn apply_output_format(

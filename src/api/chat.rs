@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
@@ -33,15 +33,7 @@ pub(super) async fn models_handler(State(state): State<ApiState>, headers: Heade
                 "[werk serve] GET /v1/models -> {} model(s)",
                 manifests.len()
             ));
-            let data = manifests
-                .into_iter()
-                .map(|manifest| ModelObject {
-                    id: manifest.id,
-                    object: "model",
-                    created: manifest.created_unix,
-                    owned_by: "local",
-                })
-                .collect();
+            let data = manifests.into_iter().map(model_object).collect();
             Json(ModelListResponse {
                 object: "list",
                 data,
@@ -49,6 +41,33 @@ pub(super) async fn models_handler(State(state): State<ApiState>, headers: Heade
             .into_response()
         }
         Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), None),
+    }
+}
+
+pub(super) async fn model_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = state.authorize(&headers) {
+        return response;
+    }
+    match state.store.get(&id) {
+        Ok(manifest) => Json(model_object(manifest)).into_response(),
+        Err(error) => api_error(
+            StatusCode::NOT_FOUND,
+            error.to_string(),
+            Some("model".to_string()),
+        ),
+    }
+}
+
+fn model_object(manifest: ModelManifest) -> ModelObject {
+    ModelObject {
+        id: manifest.id,
+        object: "model",
+        created: manifest.created_unix,
+        owned_by: "local",
     }
 }
 

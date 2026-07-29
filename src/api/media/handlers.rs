@@ -31,11 +31,67 @@ pub(in crate::api) async fn image_generations_handler(
     if let Err(response) = state.authorize(&headers) {
         return response;
     }
-    let (request, response_format) = match request.into_inference() {
+    let model = match resolve_image_generation_model(&state, request.requested_model()) {
+        Ok(model) => model,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error, Some("model".to_string())),
+    };
+    let (request, response_format) = match request.into_inference(model) {
         Ok(request) => request,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error, None),
     };
     execute_direct(state, request, response_format).await
+}
+
+fn resolve_image_generation_model(
+    state: &ApiState,
+    requested: Option<&str>,
+) -> Result<String, String> {
+    if let Some(requested) = requested
+        && (state.store.get(requested).is_ok() || !is_openai_image_alias(requested))
+    {
+        return Ok(requested.to_string());
+    }
+
+    if let Some(default_model) = state
+        .default_image_model
+        .as_deref()
+        .or(state.default_model.as_deref())
+        && state
+            .store
+            .get(default_model)
+            .is_ok_and(|manifest| manifest.supports_task(InferenceTask::ImageGeneration))
+    {
+        return Ok(default_model.to_string());
+    }
+
+    let candidates = state
+        .store
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|manifest| manifest.supports_task(InferenceTask::ImageGeneration))
+        .map(|manifest| manifest.id)
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [model] => Ok(model.clone()),
+        [] => Err("no installed model declares image-generation".to_string()),
+        _ if requested.is_some() => Err(format!(
+            "model '{}' is an OpenAI image alias; configure a concrete default image model or send an installed model id",
+            requested.unwrap_or_default()
+        )),
+        _ => Err(
+            "request must include model because multiple image-generation models are installed"
+                .to_string(),
+        ),
+    }
+}
+
+fn is_openai_image_alias(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    matches!(
+        model.as_str(),
+        "dall-e-2" | "dall-e-3" | "chatgpt-image-latest"
+    ) || model.starts_with("gpt-image-")
 }
 
 pub(in crate::api) async fn image_edits_handler(
@@ -51,6 +107,21 @@ pub(in crate::api) async fn image_edits_handler(
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error, None),
     };
     execute_direct(state, request, response_format).await
+}
+
+pub(in crate::api) async fn comfy_image_edits_unsupported_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = state.authorize(&headers) {
+        return response;
+    }
+    api_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "ComfyUI's hosted OpenAI image-edit proxy uses multipart uploads, which Werk does not yet support; use text-to-image generation or Werk's JSON /v1/images/edits endpoint"
+            .to_string(),
+        None,
+    )
 }
 
 pub(in crate::api) async fn video_generations_handler(

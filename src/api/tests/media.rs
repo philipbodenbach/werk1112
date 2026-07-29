@@ -9,14 +9,21 @@ fn media_request_shapes_normalize_openai_and_werk_fields() {
         "n": 2,
         "size": "640x480",
         "response_format": "b64_json",
+        "output_format": "webp",
         "steps": 12,
         "parameters": {"guidance": 4.5},
         "backend": "mock-media",
-        "quality": "hd",
+        "quality": "low",
+        "stream": false,
+        "background": "auto",
+        "moderation": "auto",
+        "output_compression": 80,
+        "partial_images": 0,
+        "style": "natural",
         "allow_cpu_offload": true
     }))
     .unwrap();
-    let (request, response_format) = parsed.into_inference().unwrap();
+    let (request, response_format) = parsed.into_inference("media".to_string()).unwrap();
     assert_eq!(request.task, InferenceTask::ImageGeneration);
     assert!(matches!(response_format, DirectResponseFormat::Base64));
     assert_eq!(
@@ -55,8 +62,21 @@ fn media_request_shapes_normalize_openai_and_werk_fields() {
         Some(4.5)
     );
     assert_eq!(request.routing.backend.as_deref(), Some("mock-media"));
-    assert_eq!(request.routing.quality.as_deref(), Some("high"));
+    assert_eq!(request.routing.quality.as_deref(), Some("draft"));
     assert_eq!(request.routing.allow_cpu_offload, OverrideBool::Enabled);
+    assert_eq!(
+        request
+            .parameters
+            .get("image.output_format")
+            .and_then(ParameterValue::as_str),
+        Some("webp")
+    );
+    assert!(
+        request
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.ends_with("Visual style: natural and realistic."))
+    );
 
     let parsed: ImageEditApiRequest = serde_json::from_value(json!({
         "model": "media",
@@ -84,6 +104,46 @@ fn media_request_shapes_normalize_openai_and_werk_fields() {
     );
 }
 
+#[test]
+fn openai_image_defaults_are_accepted_without_becoming_backend_parameters() {
+    let parsed: ImageGenerationApiRequest = serde_json::from_value(json!({
+        "prompt": "a small station",
+        "size": "auto",
+        "quality": "auto",
+        "stream": false,
+        "background": "auto",
+        "moderation": "auto",
+        "output_compression": 100,
+        "partial_images": 0
+    }))
+    .unwrap();
+    assert_eq!(parsed.requested_model(), None);
+    let (request, response_format) = parsed.into_inference("media".to_string()).unwrap();
+    assert!(matches!(response_format, DirectResponseFormat::Base64));
+    assert_eq!(request.model, "media");
+    assert_eq!(request.routing.quality, None);
+    assert!(!request.parameters.contains_key("image.width"));
+    assert!(!request.parameters.contains_key("image.height"));
+    for compatibility_field in [
+        "image.background",
+        "image.moderation",
+        "image.output_compression",
+        "image.partial_images",
+        "image.stream",
+    ] {
+        assert!(!request.parameters.contains_key(compatibility_field));
+    }
+
+    let parsed: ImageGenerationApiRequest = serde_json::from_value(json!({
+        "model": "media",
+        "prompt": "a small station",
+        "stream": true
+    }))
+    .unwrap();
+    let error = parsed.into_inference("media".to_string()).unwrap_err();
+    assert!(error.contains("streaming image generation is not supported"));
+}
+
 #[tokio::test]
 async fn direct_media_routes_return_openai_data_and_werk_metadata() {
     let app = media_app(Vec::new());
@@ -92,7 +152,6 @@ async fn direct_media_routes_return_openai_data_and_werk_metadata() {
         &app,
         "/v1/images/generations",
         json!({
-            "model": "media",
             "prompt": "an orbital greenhouse",
             "size": "512x512",
             "response_format": "b64_json"
@@ -103,12 +162,40 @@ async fn direct_media_routes_return_openai_data_and_werk_metadata() {
     assert_eq!(response.status(), StatusCode::OK);
     let value = response_json(response).await;
     assert_eq!(value["werk"]["task"], "image_generation");
+    assert_eq!(value["werk"]["model"], "media");
     assert_eq!(value["data"][0]["mime_type"], "image/png");
     assert_eq!(value["data"][0]["b64_json"], encode_base64(b"mock image"));
     assert_eq!(
         value["werk"]["effective_request"]["parameters"]["image.width"]["value"],
         512
     );
+    let embedded_output_id = value["data"][0]["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/outputs/{embedded_output_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = post_json(
+        &app,
+        "/v1/images/generations",
+        json!({
+            "model": "gpt-image-1",
+            "prompt": "an orbital greenhouse"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["werk"]["model"], "media");
+    assert!(value["data"][0]["b64_json"].is_string());
 
     let response = post_json(
         &app,
@@ -116,7 +203,8 @@ async fn direct_media_routes_return_openai_data_and_werk_metadata() {
         json!({
             "model": "media",
             "prompt": "make it blue",
-            "image": {"base64": "AAEC", "mime_type": "image/png"}
+            "image": {"base64": "AAEC", "mime_type": "image/png"},
+            "response_format": "url"
         }),
         None,
     )
@@ -163,16 +251,28 @@ async fn direct_media_routes_return_openai_data_and_werk_metadata() {
         response.headers().get(header::CONTENT_TYPE).unwrap(),
         "audio/wav"
     );
-    assert!(
-        response
-            .headers()
-            .get("x-werk-output-id")
-            .is_some_and(|value| value.to_str().unwrap().starts_with("out-"))
-    );
+    let speech_output_id = response
+        .headers()
+        .get("x-werk-output-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(speech_output_id.starts_with("out-"));
     let bytes = body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     assert_eq!(&bytes[..], b"mock audio");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/outputs/{speech_output_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let response = post_json(
         &app,
@@ -189,6 +289,162 @@ async fn direct_media_routes_return_openai_data_and_werk_metadata() {
     let value = response_json(response).await;
     assert_eq!(value["werk"]["task"], "speech_to_text");
     assert_eq!(value["data"][0]["text"], "mock transcript");
+    let transcript_output_id = value["data"][0]["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/outputs/{transcript_output_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn open_webui_openai_image_request_returns_embedded_image() {
+    let app = media_app(vec!["sk-media".to_string()]);
+    let response = post_json(
+        &app,
+        "/v1/images/generations?api-version=2025-04-01-preview",
+        json!({
+            "model": "gpt-image-1",
+            "prompt": "an orbital greenhouse",
+            "n": 1,
+            "size": "512x512"
+        }),
+        Some("sk-media"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["werk"]["model"], "media");
+    assert_eq!(value["data"][0]["b64_json"], encode_base64(b"mock image"));
+
+    let output_id = value["data"][0]["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/outputs/{output_id}"))
+                .header(header::AUTHORIZATION, "Bearer sk-media")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn comfyui_hosted_openai_proxy_accepts_x_api_key() {
+    let app = media_app(vec!["sk-media".to_string()]);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proxy/openai/images/generations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-key", "sk-media")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-image-1",
+                        "prompt": "an orbital greenhouse",
+                        "quality": "low",
+                        "background": "opaque",
+                        "moderation": "low",
+                        "n": 1,
+                        "seed": 7,
+                        "size": "512x512"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["werk"]["model"], "media");
+    assert_eq!(value["data"][0]["b64_json"], encode_base64(b"mock image"));
+    assert_eq!(
+        value["werk"]["effective_request"]["parameters"]["image.seed"]["value"],
+        7
+    );
+    assert!(value["werk"]["effective_request"]["parameters"]["image.moderation"].is_null());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proxy/openai/images/edits")
+                .header("x-api-key", "sk-media")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        response_json(response).await["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("multipart"))
+    );
+}
+
+#[tokio::test]
+async fn image_default_resolves_omissions_and_openai_aliases_with_multiple_models() {
+    let store = test_store();
+    install_media_model(&store);
+    let mut other = store.get("media").unwrap();
+    other.id = "other-image".to_string();
+    fs::create_dir_all(store.model_dir(&other.id)).unwrap();
+    fs::write(
+        store
+            .model_dir(&other.id)
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&other).unwrap(),
+    )
+    .unwrap();
+
+    let inference_service =
+        InferenceService::with_backend(store.clone(), Arc::new(MockMediaBackend));
+    let app = router(
+        ApiState::new(store, Arc::new(MockBackend))
+            .with_default_image_model(Some("media".to_string()))
+            .with_inference_service(inference_service),
+    );
+
+    for model in [None, Some("gpt-image-1")] {
+        let mut payload = json!({"prompt": "an orbital greenhouse"});
+        if let Some(model) = model {
+            payload["model"] = json!(model);
+        }
+        let response = post_json(&app, "/v1/images/generations", payload, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["werk"]["model"], "media");
+    }
+
+    let response = post_json(
+        &app,
+        "/v1/images/generations",
+        json!({
+            "prompt": "an orbital greenhouse",
+            "stream": true
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response_json(response).await["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("streaming image generation is not supported"))
+    );
 }
 
 #[tokio::test]

@@ -14,7 +14,11 @@ use crate::{
     openai::ChatTemplateOptions,
 };
 
-use super::response::{auth_error, constant_time_eq};
+use super::{
+    automatic1111::Automatic1111State,
+    cors::CorsOrigin,
+    response::{auth_error, constant_time_eq},
+};
 
 pub type PromptOptionsResolver = Arc<
     dyn Fn(&ModelStore, &ModelManifest, bool) -> anyhow::Result<ChatTemplateOptions<'static>>
@@ -27,9 +31,12 @@ pub struct ApiState {
     pub(super) store: Arc<ModelStore>,
     pub(super) backend: Arc<dyn GenerationBackend>,
     pub(super) default_model: Option<String>,
+    pub(super) default_image_model: Option<String>,
     prompt_options_resolver: Option<PromptOptionsResolver>,
     chat_sessions: Arc<Mutex<HashMap<String, Arc<dyn ChatGenerationSession>>>>,
     api_keys: Arc<Vec<String>>,
+    cors_origins: Arc<Vec<CorsOrigin>>,
+    pub(super) automatic1111: Arc<Automatic1111State>,
     pub(super) verbose: bool,
     pub(super) inference_service: Arc<InferenceService>,
     pub(super) job_manager: Arc<JobManager>,
@@ -76,9 +83,12 @@ impl ApiState {
             store: Arc::new(store),
             backend,
             default_model,
+            default_image_model: None,
             prompt_options_resolver,
             chat_sessions: Arc::new(Mutex::new(HashMap::new())),
             api_keys: Arc::new(Vec::new()),
+            cors_origins: Arc::new(Vec::new()),
+            automatic1111: Arc::new(Automatic1111State::default()),
             verbose,
             inference_service,
             job_manager,
@@ -87,6 +97,17 @@ impl ApiState {
 
     pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Self {
         self.api_keys = Arc::new(api_keys);
+        self
+    }
+
+    pub fn with_default_image_model(mut self, model: Option<String>) -> Self {
+        self.automatic1111.set_selected_checkpoint(model.clone());
+        self.default_image_model = model;
+        self
+    }
+
+    pub fn with_cors_origins(mut self, cors_origins: Vec<CorsOrigin>) -> Self {
+        self.cors_origins = Arc::new(cors_origins);
         self
     }
 
@@ -103,10 +124,26 @@ impl ApiState {
         !self.api_keys.is_empty()
     }
 
+    pub(super) fn cors_origins(&self) -> &[CorsOrigin] {
+        &self.cors_origins
+    }
+
     #[allow(clippy::result_large_err)]
     pub(super) fn authorize(&self, headers: &HeaderMap) -> Result<(), Response> {
         if self.api_keys.is_empty() {
             return Ok(());
+        }
+
+        if let Some(token) = headers.get("x-api-key") {
+            let Ok(token) = token.to_str() else {
+                return Err(auth_error("invalid X-API-Key header"));
+            };
+            if self.api_key_matches(token.trim()) {
+                return Ok(());
+            }
+            if headers.get(header::AUTHORIZATION).is_none() {
+                return Err(auth_error("invalid API key"));
+            }
         }
 
         let Some(header_value) = headers.get(header::AUTHORIZATION) else {
@@ -125,15 +162,19 @@ impl ApiState {
         if token.is_empty() {
             return Err(auth_error("empty bearer token"));
         }
-        if self
-            .api_keys
-            .iter()
-            .any(|key| constant_time_eq(key.as_bytes(), token.as_bytes()))
-        {
+        if self.api_key_matches(token) {
             Ok(())
         } else {
             Err(auth_error("invalid bearer token"))
         }
+    }
+
+    pub(super) fn api_key_matches(&self, token: &str) -> bool {
+        !token.is_empty()
+            && self
+                .api_keys
+                .iter()
+                .any(|key| constant_time_eq(key.as_bytes(), token.as_bytes()))
     }
 
     pub(super) fn prompt_options(

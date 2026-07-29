@@ -32,8 +32,10 @@ sanitized model ID, task, Unix timestamp, and random suffix; it never includes
 prompt text. `--output PATH` selects another file or directory instead. Werk
 publishes all outputs first and then removes the request's temporary managed
 result directory, avoiding a persistent duplicate. If publication fails, the
-temporary result remains intact. HTTP requests and persisted jobs retain their
-managed result metadata and output IDs.
+temporary result remains intact. Persisted jobs and explicit HTTP URL responses
+retain their managed result metadata and output IDs. Embedded Base64/text
+responses are removed after encoding, and synchronous raw output is removed
+after its response stream finishes.
 
 Generative prompt priority is:
 
@@ -298,6 +300,8 @@ Direct endpoints:
 POST /v1/chat/completions
 POST /v1/images/generations
 POST /v1/images/edits
+POST /proxy/openai/images/generations
+POST /proxy/openai/images/edits
 POST /v1/videos/generations
 POST /v1/audio/generations
 POST /v1/audio/speech
@@ -306,6 +310,30 @@ GET  /v1/capabilities
 GET  /v1/parameters
 GET  /v1/outputs/{id}
 ```
+
+Third-party image clients can use three deliberately bounded compatibility
+surfaces:
+
+- Open WebUI should use its `openai` image engine with
+  `IMAGES_OPENAI_API_BASE_URL=http://HOST:11434/v1`, a Werk API key, and an
+  OpenAI image alias such as `gpt-image-1`; the alias resolves to
+  `werk serve --image-model MODEL`.
+- Basic AUTOMATIC1111 clients can use `/sdapi/v1/txt2img`, `/sdapi/v1/sd-models`,
+  `/sdapi/v1/options`, and `/sdapi/v1/progress`. The adapter translates core
+  prompt, negative-prompt, size, image-count, step, guidance, seed, and model
+  fields. It rejects meaningful unsupported advanced behavior or reports an
+  explicit compatibility warning instead of silently claiming A1111 scripts,
+  high-resolution passes, face restoration, requested samplers, or img2img.
+- ComfyUI's hosted OpenAI image node can use
+  `--comfy-api-base http://HOST:11434`. Werk accepts its `X-API-Key` header and
+  generation proxy path. Multipart editing is reported as unsupported. Werk
+  does not emulate ComfyUI's native workflow-graph `/prompt`, custom-node,
+  history, view, or WebSocket protocol.
+
+Embedded image responses are returned as Base64 and their managed temporary
+results are removed after encoding. This is the portable choice for server-side
+third-party clients; explicit Werk URL responses remain authenticated and
+retained.
 
 Long-running jobs:
 
@@ -317,7 +345,8 @@ DELETE /v1/jobs/{id}
 
 Persisted states are `queued`, `loading`, `running`, `encoding`, `completed`,
 `failed`, and `cancelled`. `/v1/audio/speech` returns audio bytes directly;
-other synchronous media endpoints return Werk metadata and authenticated
+image endpoints default to self-contained Base64 JSON, transcription embeds its
+text, and an explicit URL response returns Werk metadata plus authenticated
 `/v1/outputs/{id}` URLs.
 
 The shared conversation content model can represent text, image, video, audio,
@@ -350,7 +379,10 @@ children of `outputs/`, never models. Defaults are 30 days and 20 GiB; use
   execution, so model-specific incompatibility can still surface then.
 - JSON local-path and inline-base64 inputs are supported. The offline companion
   does not fetch remote HTTP(S) URLs. OpenAI multipart upload compatibility is
-  not implemented yet.
+  not implemented yet, including the hosted ComfyUI image-edit proxy.
+- OpenAI-compatible image generation defaults to embedded Base64 for portable
+  third-party clients. Explicit URL responses are authenticated relative Werk
+  output URLs, not public object-storage URLs.
 - Persisted job cancellation is cooperative. A native third-party call that
   lacks cancellation may release resources only when it returns.
 - The companion currently returns one terminal response rather than granular
