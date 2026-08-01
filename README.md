@@ -846,6 +846,31 @@ werk auth api-key generate --path /path/to/api-keys.toml
 werk serve --api-keys /path/to/api-keys.toml
 ```
 
+The API keys file can contain multiple named keys, for example one key for
+Open WebUI and another for ComfyUI. `generate --name` assigns the name when it
+creates a new file, but does not currently append to an existing file. Generate
+additional keys in a temporary file and copy its `[[keys]]` block into the file
+used by `werk serve`:
+
+```bash
+werk auth api-key generate --name comfyUI --path /tmp/comfyui-key.toml
+```
+
+The combined file has one table per client:
+
+```toml
+[[keys]]
+name = "openWebUI"
+key = "sk-werk-..."
+
+[[keys]]
+name = "comfyUI"
+key = "sk-werk-..."
+```
+
+Do not use `--force` to add a key: it overwrites the complete API keys file and
+therefore removes the existing keys.
+
 Clients should send the generated value as an OpenAI-compatible bearer token:
 
 ```text

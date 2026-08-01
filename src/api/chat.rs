@@ -13,15 +13,18 @@ use tokio_stream::{StreamExt, once};
 
 use crate::{
     backend::{GenerateRequest, GenerateResponse, GenerateStreamEvent, StreamGranularity},
+    capabilities::InferenceTask,
     model_store::{ModelManifest, unix_ts},
     openai::{
         AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ModelListResponse, ModelObject, Usage, image_urls_from_messages,
-        messages_to_prompt_for_model_with_template,
+        ModelListResponse, ModelObject, Usage, generation_messages_for_prompt,
+        image_urls_from_messages, messages_to_prompt_for_model_with_template,
     },
 };
 
 use super::{response::api_error, state::ApiState};
+
+const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
 
 pub(super) async fn models_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(response) = state.authorize(&headers) {
@@ -74,7 +77,7 @@ fn model_object(manifest: ModelManifest) -> ModelObject {
 pub(super) async fn chat_completions_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    Json(mut request): Json<ChatCompletionRequest>,
 ) -> Response {
     if let Err(response) = state.authorize(&headers) {
         return response;
@@ -102,6 +105,50 @@ pub(super) async fn chat_completions_handler(
         }
     };
 
+    if !manifest.metadata.tasks.is_empty()
+        && !manifest.supports_task(InferenceTask::TextGeneration)
+        && !manifest.supports_task(InferenceTask::ImageUnderstanding)
+    {
+        let message = if manifest.supports_task(InferenceTask::ImageGeneration) {
+            format!(
+                "model '{}' is an image-generation model and cannot be used with /v1/chat/completions; use /v1/images/generations instead",
+                manifest.id
+            )
+        } else {
+            format!(
+                "model '{}' does not declare text-generation or image-understanding and cannot be used with /v1/chat/completions",
+                manifest.id
+            )
+        };
+        return api_error(StatusCode::BAD_REQUEST, message, Some("model".to_string()));
+    }
+
+    let max_tokens = request.max_completion_tokens();
+    let context_size = effective_chat_context_size(state.chat_context_size, &manifest);
+    let removed_messages = if let Some(context_size) = context_size {
+        match trim_messages_to_context(&mut request.messages, context_size, max_tokens) {
+            Ok(removed) => removed,
+            Err(message) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    message,
+                    Some("messages".to_string()),
+                );
+            }
+        }
+    } else {
+        0
+    };
+    if removed_messages > 0 {
+        eprintln!(
+            "[werk serve] chat context model={} removed_messages={} context_size={} max_tokens={}",
+            manifest.id,
+            removed_messages,
+            context_size.unwrap_or_default(),
+            max_tokens
+        );
+    }
+
     let image_urls = image_urls_from_messages(&request.messages);
     let stream = request.stream.unwrap_or(false);
     state.log_verbose(format!(
@@ -124,13 +171,13 @@ pub(super) async fn chat_completions_handler(
     };
     let prompt =
         messages_to_prompt_for_model_with_template(&manifest, &request.messages, prompt_options);
-    let max_tokens = request.max_completion_tokens();
+    let generation_messages = generation_messages_for_prompt(&prompt, request.messages.clone());
     let mut stop = prompt.stop;
     stop.extend(request.stop_strings());
 
     let generate_request = GenerateRequest {
         prompt: prompt.prompt,
-        messages: request.messages,
+        messages: generation_messages,
         image_urls,
         max_tokens,
         temperature: request.temperature,
@@ -147,6 +194,89 @@ pub(super) async fn chat_completions_handler(
     } else {
         complete_chat_response(state, manifest, generate_request).await
     }
+}
+
+fn effective_chat_context_size(configured: usize, manifest: &ModelManifest) -> Option<usize> {
+    if manifest.format != crate::model_store::ModelFormat::Gguf {
+        return None;
+    }
+    if configured != 0 {
+        return Some(configured);
+    }
+    manifest
+        .metadata
+        .parameter_constraints
+        .get("max_position_embeddings")
+        .or_else(|| {
+            manifest
+                .metadata
+                .parameter_constraints
+                .get("model_max_length")
+        })
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .or(Some(DEFAULT_LLAMA_CONTEXT_SIZE))
+}
+
+fn trim_messages_to_context(
+    messages: &mut Vec<crate::openai::ChatMessage>,
+    context_size: usize,
+    max_tokens: usize,
+) -> Result<usize, String> {
+    const SAFETY_TOKENS: usize = 64;
+    let reserved = max_tokens
+        .checked_add(SAFETY_TOKENS)
+        .ok_or_else(|| "chat response token reserve overflowed".to_string())?;
+    if reserved >= context_size {
+        return Err(format!(
+            "response budget ({max_tokens} tokens) leaves no prompt space in the {context_size}-token context; reduce max_tokens or increase the server --ctx-size"
+        ));
+    }
+    let prompt_budget = context_size - reserved;
+    let mut removed = 0;
+
+    while estimate_message_tokens(messages) > prompt_budget {
+        let Some(start) = messages
+            .iter()
+            .position(|message| !message.role.eq_ignore_ascii_case("system"))
+        else {
+            return Err(format!(
+                "system prompt is too large for the {context_size}-token context"
+            ));
+        };
+        if start + 1 >= messages.len() {
+            return Err(format!(
+                "current message is too large for the {context_size}-token context after reserving {max_tokens} response tokens"
+            ));
+        }
+        let remove_count = if messages
+            .get(start + 1)
+            .is_some_and(|message| message.role.eq_ignore_ascii_case("assistant"))
+        {
+            2
+        } else {
+            1
+        };
+        messages.drain(start..start + remove_count);
+        removed += remove_count;
+    }
+    Ok(removed)
+}
+
+fn estimate_message_tokens(messages: &[crate::openai::ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            let content_bytes = message
+                .content
+                .as_ref()
+                .map(crate::openai::MessageContent::as_text)
+                .map(|content| content.len())
+                .unwrap_or_default();
+            content_bytes.div_ceil(3) + 16
+        })
+        .sum::<usize>()
+        + 16
 }
 
 async fn complete_chat_response(

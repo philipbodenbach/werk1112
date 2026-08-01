@@ -322,6 +322,64 @@ async fn server_default_model_is_used_when_request_omits_model() {
 }
 
 #[tokio::test]
+async fn chat_route_rejects_image_generation_only_models_before_backend_loading() {
+    let store = test_store();
+    let manifest = ModelManifest {
+        id: "image-only".to_string(),
+        source: ModelSource::LocalPath {
+            path: "test".to_string(),
+        },
+        format: ModelFormat::SafeTensors,
+        architecture: Some("flux_transformer_2d_model".to_string()),
+        tokenizer_path: None,
+        config_path: None,
+        model_path: None,
+        backend: "onnxruntime".to_string(),
+        created_unix: 1,
+        files: Vec::new(),
+        artifacts: Vec::new(),
+        metadata: ModelMetadata {
+            tasks: vec![InferenceTask::ImageGeneration],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Image],
+            ..Default::default()
+        },
+    };
+    fs::create_dir_all(store.model_dir("image-only")).unwrap();
+    fs::write(
+        store
+            .model_dir("image-only")
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let app = router(ApiState::new(store, Arc::new(MockBackend)));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"image-only","messages":[{"role":"user","content":"draw a cat"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value = response_json(response).await;
+    assert_eq!(value["error"]["param"], "model");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("/v1/images/generations"))
+    );
+}
+
+#[tokio::test]
 async fn chat_route_uses_prompt_options_resolver_before_generation() {
     let store = test_store();
     let manifest = ModelManifest {
@@ -383,4 +441,126 @@ async fn chat_route_uses_prompt_options_resolver_before_generation() {
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["choices"][0]["message"]["content"], "hi");
+}
+
+#[tokio::test]
+async fn chat_route_trims_complete_old_turns_for_gguf_context() {
+    let store = test_store();
+    let manifest = ModelManifest {
+        id: "mock-gguf".to_string(),
+        source: ModelSource::LocalPath {
+            path: "test".to_string(),
+        },
+        format: ModelFormat::Gguf,
+        architecture: Some("llama".to_string()),
+        tokenizer_path: None,
+        config_path: None,
+        model_path: None,
+        backend: "llama-server".to_string(),
+        created_unix: 1,
+        files: Vec::new(),
+        artifacts: Vec::new(),
+        metadata: Default::default(),
+    };
+    fs::create_dir_all(store.model_dir("mock-gguf")).unwrap();
+    fs::write(
+        store
+            .model_dir("mock-gguf")
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let app =
+        router(ApiState::new(store, Arc::new(PromptEchoBackend)).with_chat_context_size(Some(256)));
+    let old = format!("OLD_MARKER {}", "x".repeat(700));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "mock-gguf",
+                        "max_tokens": 32,
+                        "messages": [
+                            {"role": "user", "content": old},
+                            {"role": "assistant", "content": "OLD_REPLY"},
+                            {"role": "user", "content": "LATEST_MESSAGE"}
+                        ]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    let prompt = value["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(prompt.contains("LATEST_MESSAGE"));
+    assert!(!prompt.contains("OLD_MARKER"));
+    assert!(!prompt.contains("OLD_REPLY"));
+}
+
+#[tokio::test]
+async fn chat_route_reports_when_current_message_cannot_fit_gguf_context() {
+    let store = test_store();
+    let manifest = ModelManifest {
+        id: "mock-gguf".to_string(),
+        source: ModelSource::LocalPath {
+            path: "test".to_string(),
+        },
+        format: ModelFormat::Gguf,
+        architecture: Some("llama".to_string()),
+        tokenizer_path: None,
+        config_path: None,
+        model_path: None,
+        backend: "llama-server".to_string(),
+        created_unix: 1,
+        files: Vec::new(),
+        artifacts: Vec::new(),
+        metadata: Default::default(),
+    };
+    fs::create_dir_all(store.model_dir("mock-gguf")).unwrap();
+    fs::write(
+        store
+            .model_dir("mock-gguf")
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let app =
+        router(ApiState::new(store, Arc::new(PromptEchoBackend)).with_chat_context_size(Some(256)));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "mock-gguf",
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": "x".repeat(700)}]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value = response_json(response).await;
+    assert_eq!(value["error"]["param"], "messages");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("current message is too large")
+    );
 }

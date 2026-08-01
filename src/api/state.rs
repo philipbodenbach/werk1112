@@ -32,6 +32,7 @@ pub struct ApiState {
     pub(super) backend: Arc<dyn GenerationBackend>,
     pub(super) default_model: Option<String>,
     pub(super) default_image_model: Option<String>,
+    pub(super) chat_context_size: usize,
     prompt_options_resolver: Option<PromptOptionsResolver>,
     chat_sessions: Arc<Mutex<HashMap<String, Arc<dyn ChatGenerationSession>>>>,
     api_keys: Arc<Vec<String>>,
@@ -84,6 +85,7 @@ impl ApiState {
             backend,
             default_model,
             default_image_model: None,
+            chat_context_size: 4096,
             prompt_options_resolver,
             chat_sessions: Arc::new(Mutex::new(HashMap::new())),
             api_keys: Arc::new(Vec::new()),
@@ -103,6 +105,11 @@ impl ApiState {
     pub fn with_default_image_model(mut self, model: Option<String>) -> Self {
         self.automatic1111.set_selected_checkpoint(model.clone());
         self.default_image_model = model;
+        self
+    }
+
+    pub fn with_chat_context_size(mut self, context_size: Option<usize>) -> Self {
+        self.chat_context_size = context_size.unwrap_or(4096);
         self
     }
 

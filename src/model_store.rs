@@ -3,7 +3,7 @@ use crate::capabilities::{
     RepositoryLayout,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use candle_core::quantized::gguf_file;
+use candle_core::quantized::gguf_file::{self, Value as GgufValue};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -142,6 +142,18 @@ pub struct OptimizedArtifactInfo {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedChatTemplate {
+    pub name: String,
+    pub source: String,
+    pub confidence: String,
+    pub applied_by_werk: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_tokens: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop_tokens: Vec<String>,
+}
+
 /// Extensible manifest fields introduced with schema v2. Flattening this
 /// structure keeps the on-disk JSON easy to inspect while requiring only one
 /// compatibility field on `ModelManifest` constructors.
@@ -173,6 +185,8 @@ pub struct ModelMetadata {
     pub compatible_runtimes: Vec<String>,
     #[serde(default)]
     pub optimized_artifacts: Vec<OptimizedArtifactInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template: Option<ResolvedChatTemplate>,
 }
 
 impl Default for ModelMetadata {
@@ -191,6 +205,7 @@ impl Default for ModelMetadata {
             parameter_constraints: BTreeMap::new(),
             compatible_runtimes: Vec::new(),
             optimized_artifacts: Vec::new(),
+            chat_template: None,
         }
     }
 }
@@ -2288,6 +2303,192 @@ fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
     if manifest.metadata.optimized_artifacts.is_empty() {
         manifest.metadata.optimized_artifacts = optimized_artifact_info(&manifest.artifacts);
     }
+    if manifest.metadata.chat_template.is_none() {
+        manifest.metadata.chat_template = resolve_chat_template(model_dir, manifest);
+    }
+}
+
+const LLAMA3_CHAT_TOKENS: &[&str] = &["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"];
+const QWEN_CHAT_TOKENS: &[&str] = &["<|im_start|>", "<|im_end|>"];
+const PHI3_CHAT_TOKENS: &[&str] = &["<|user|>", "<|assistant|>", "<|end|>"];
+const GEMMA_CHAT_TOKENS: &[&str] = &["<start_of_turn>", "<end_of_turn>"];
+const CHATML_CHAT_TOKENS: &[&str] = &["<|user|>", "<|assistant|>", "</s>"];
+
+fn resolve_chat_template(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+) -> Option<ResolvedChatTemplate> {
+    if manifest.format != ModelFormat::Gguf {
+        return None;
+    }
+
+    let gguf = manifest
+        .model_path
+        .as_deref()
+        .and_then(|path| read_gguf_chat_metadata(&model_dir.join(path)));
+    if gguf.as_ref().is_some_and(|metadata| metadata.has_template) {
+        return Some(ResolvedChatTemplate {
+            name: "model".to_string(),
+            source: "gguf_metadata".to_string(),
+            confidence: "exact".to_string(),
+            applied_by_werk: false,
+            required_tokens: Vec::new(),
+            stop_tokens: Vec::new(),
+        });
+    }
+
+    let mut tokens = gguf
+        .map(|metadata| metadata.special_tokens)
+        .unwrap_or_default();
+    let repository_tokens = repository_special_tokens(model_dir, manifest);
+    for token in repository_tokens {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+
+    let candidates = [
+        ("llama3", LLAMA3_CHAT_TOKENS, llama3_template_stops()),
+        ("qwen-chatml", QWEN_CHAT_TOKENS, qwen_template_stops()),
+        ("phi3", PHI3_CHAT_TOKENS, phi3_template_stops()),
+        ("gemma", GEMMA_CHAT_TOKENS, gemma_template_stops()),
+        ("chatml", CHATML_CHAT_TOKENS, chatml_template_stops()),
+    ]
+    .into_iter()
+    .filter(|(_, required, _)| {
+        required
+            .iter()
+            .all(|token| tokens.iter().any(|item| item == token))
+    })
+    .collect::<Vec<_>>();
+
+    // A token set may intentionally contain overlapping protocol vocabularies.
+    // Do not guess when more than one complete template signature matches.
+    let [(name, required, stops)] = candidates.as_slice() else {
+        return None;
+    };
+    Some(ResolvedChatTemplate {
+        name: (*name).to_string(),
+        source: "tokenizer_special_tokens".to_string(),
+        confidence: "high".to_string(),
+        applied_by_werk: true,
+        required_tokens: required.iter().map(|token| (*token).to_string()).collect(),
+        stop_tokens: stops.clone(),
+    })
+}
+
+#[derive(Default)]
+struct GgufChatMetadata {
+    has_template: bool,
+    special_tokens: Vec<String>,
+}
+
+fn read_gguf_chat_metadata(path: &Path) -> Option<GgufChatMetadata> {
+    let mut file = fs::File::open(path).ok()?;
+    let content = gguf_file::Content::read(&mut file).ok()?;
+    let has_template = content.metadata.iter().any(|(key, value)| {
+        key.starts_with("tokenizer.chat_template")
+            && matches!(value, GgufValue::String(template) if !template.trim().is_empty())
+    });
+    let special_tokens = match content.metadata.get("tokenizer.ggml.tokens") {
+        Some(GgufValue::Array(tokens)) => tokens
+            .iter()
+            .filter_map(|token| match token {
+                GgufValue::String(token) if is_known_chat_token(token) => Some(token.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(GgufChatMetadata {
+        has_template,
+        special_tokens,
+    })
+}
+
+fn repository_special_tokens(model_dir: &Path, manifest: &ModelManifest) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for name in ["tokenizer_config.json", "special_tokens_map.json"] {
+        if let Some(path) = find_repository_file(manifest, name)
+            && let Some(value) = read_repository_json(model_dir, &path)
+        {
+            collect_known_chat_tokens(&value, &mut tokens);
+        }
+    }
+    if let Some(path) = find_repository_file(manifest, "chat_template.jinja")
+        && let Ok(template) = fs::read_to_string(model_dir.join(path))
+    {
+        collect_known_chat_tokens_from_text(&template, &mut tokens);
+    }
+    tokens
+}
+
+fn collect_known_chat_tokens(value: &Value, tokens: &mut Vec<String>) {
+    match value {
+        Value::String(text) => collect_known_chat_tokens_from_text(text, tokens),
+        Value::Array(items) => {
+            for item in items {
+                collect_known_chat_tokens(item, tokens);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values() {
+                collect_known_chat_tokens(value, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_known_chat_tokens_from_text(text: &str, tokens: &mut Vec<String>) {
+    for token in known_chat_tokens() {
+        if text.contains(token) && !tokens.iter().any(|item| item == token) {
+            tokens.push((*token).to_string());
+        }
+    }
+}
+
+fn known_chat_tokens() -> impl Iterator<Item = &'static str> {
+    LLAMA3_CHAT_TOKENS
+        .iter()
+        .chain(QWEN_CHAT_TOKENS)
+        .chain(PHI3_CHAT_TOKENS)
+        .chain(GEMMA_CHAT_TOKENS)
+        .chain(CHATML_CHAT_TOKENS)
+        .copied()
+}
+
+fn is_known_chat_token(token: &str) -> bool {
+    known_chat_tokens().any(|known| known == token)
+}
+
+fn llama3_template_stops() -> Vec<String> {
+    vec!["<|eot_id|>", "<|end_of_text|>"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn qwen_template_stops() -> Vec<String> {
+    vec!["<|im_end|>", "<|endoftext|>"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn phi3_template_stops() -> Vec<String> {
+    vec!["<|end|>", "<|endoftext|>"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn gemma_template_stops() -> Vec<String> {
+    vec!["<end_of_turn>".to_string()]
+}
+
+fn chatml_template_stops() -> Vec<String> {
+    vec!["</s>".to_string()]
 }
 
 fn detect_repository_layout(manifest: &ModelManifest) -> RepositoryLayout {
@@ -3623,6 +3824,96 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gguf_without_embedded_template_resolves_llama3_from_special_tokens() {
+        let tmp = test_dir("gguf-llama3-chat-template");
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(model_dir.join("files")).unwrap();
+        fs::write(
+            model_dir.join("files/tokenizer_config.json"),
+            r#"{
+                "chat_template": null,
+                "added_tokens_decoder": {
+                    "128000": {"content": "<|begin_of_text|>", "special": true},
+                    "128006": {"content": "<|start_header_id|>", "special": true},
+                    "128007": {"content": "<|end_header_id|>", "special": true},
+                    "128009": {"content": "<|eot_id|>", "special": true}
+                }
+            }"#,
+        )
+        .unwrap();
+        let manifest = ModelManifest {
+            id: "renamed-model".to_string(),
+            source: ModelSource::LocalPath {
+                path: "model".to_string(),
+            },
+            format: ModelFormat::Gguf,
+            architecture: Some("llama".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: None,
+            backend: "llama-server".to_string(),
+            created_unix: 1,
+            files: vec![ModelFile {
+                path: "files/tokenizer_config.json".to_string(),
+                size: 1,
+                checksum: "crc32:0".to_string(),
+            }],
+            artifacts: Vec::new(),
+            metadata: ModelMetadata::default(),
+        };
+
+        let resolved = resolve_chat_template(&model_dir, &manifest).unwrap();
+
+        assert_eq!(resolved.name, "llama3");
+        assert_eq!(resolved.source, "tokenizer_special_tokens");
+        assert_eq!(resolved.confidence, "high");
+        assert!(resolved.applied_by_werk);
+        assert!(resolved.required_tokens.contains(&"<|eot_id|>".to_string()));
+        assert_eq!(
+            resolved.stop_tokens,
+            vec!["<|eot_id|>".to_string(), "<|end_of_text|>".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn chat_template_resolution_does_not_guess_from_partial_token_signature() {
+        let tmp = test_dir("gguf-partial-chat-template");
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(model_dir.join("files")).unwrap();
+        fs::write(
+            model_dir.join("files/tokenizer_config.json"),
+            r#"{"additional_special_tokens":["<|start_header_id|>","<|eot_id|>"]}"#,
+        )
+        .unwrap();
+        let manifest = ModelManifest {
+            id: "ambiguous".to_string(),
+            source: ModelSource::LocalPath {
+                path: "model".to_string(),
+            },
+            format: ModelFormat::Gguf,
+            architecture: Some("llama".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: None,
+            backend: "llama-server".to_string(),
+            created_unix: 1,
+            files: vec![ModelFile {
+                path: "files/tokenizer_config.json".to_string(),
+                size: 1,
+                checksum: "crc32:0".to_string(),
+            }],
+            artifacts: Vec::new(),
+            metadata: ModelMetadata::default(),
+        };
+
+        assert!(resolve_chat_template(&model_dir, &manifest).is_none());
+
+        let _ = fs::remove_dir_all(tmp);
+    }
 
     #[test]
     fn import_copies_files_and_writes_manifest() {

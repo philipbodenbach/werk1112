@@ -77,6 +77,8 @@ use crate::{
 };
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
+const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
+const CHAT_CONTEXT_SAFETY_TOKENS: usize = 64;
 const MIB: u64 = 1024 * 1024;
 #[cfg(test)]
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -1048,6 +1050,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 verbose,
             )
             .with_default_image_model(image_model)
+            .with_chat_context_size(llama_options.ctx_size)
             .with_api_keys(api_keys)
             .with_cors_origins(cors_origins);
             serve(addr, api_state).await
@@ -1193,10 +1196,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 llama_options.clone(),
                 selection_options,
             )?;
+            let chat_context_size =
+                chat_context_size(selected_backend, &manifest, llama_options.ctx_size);
             chat_loop(
                 backend,
                 manifest,
                 selected_backend,
+                chat_context_size,
                 max_tokens,
                 temperature,
                 top_p,
@@ -5575,6 +5581,7 @@ async fn chat_loop(
     backend: Arc<dyn GenerationBackend>,
     manifest: ModelManifest,
     selected_backend: BackendChoice,
+    context_size: Option<usize>,
     max_tokens: usize,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -5616,8 +5623,25 @@ async fn chat_loop(
             name: None,
         };
 
-        let request_messages =
+        let mut request_messages =
             request_messages_for_turn(&mut messages, user_message, history_enabled);
+        let removed_messages = trim_chat_history_to_context(
+            &manifest,
+            selected_backend,
+            chat_template,
+            &mut request_messages,
+            context_size,
+            max_tokens,
+        )?;
+        if history_enabled {
+            messages.clone_from(&request_messages);
+        }
+        if removed_messages > 0 {
+            eprintln!(
+                "[werk chat] context window: removed {removed_messages} old message(s) to fit {} tokens",
+                context_size.unwrap_or_default()
+            );
+        }
         let prompt = prompt_for_backend(
             &manifest,
             &request_messages,
@@ -5754,6 +5778,107 @@ fn request_messages_for_turn(
     } else {
         vec![user_message]
     }
+}
+
+fn chat_context_size(
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    configured: Option<usize>,
+) -> Option<usize> {
+    if !matches!(backend, BackendChoice::LlamaServer(_)) {
+        return None;
+    }
+    match configured {
+        Some(0) => manifest
+            .metadata
+            .parameter_constraints
+            .get("max_position_embeddings")
+            .or_else(|| {
+                manifest
+                    .metadata
+                    .parameter_constraints
+                    .get("model_max_length")
+            })
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .or(Some(DEFAULT_LLAMA_CONTEXT_SIZE)),
+        Some(size) => Some(size),
+        None => Some(DEFAULT_LLAMA_CONTEXT_SIZE),
+    }
+}
+
+fn trim_chat_history_to_context(
+    manifest: &ModelManifest,
+    backend: BackendChoice,
+    chat_template: Option<ChatTemplateArg>,
+    messages: &mut Vec<ChatMessage>,
+    context_size: Option<usize>,
+    max_tokens: usize,
+) -> Result<usize> {
+    let Some(context_size) = context_size else {
+        return Ok(0);
+    };
+    let reserved = max_tokens
+        .checked_add(CHAT_CONTEXT_SAFETY_TOKENS)
+        .context("chat response token reserve overflowed")?;
+    if reserved >= context_size {
+        bail!(
+            "chat response budget ({max_tokens} tokens) leaves no prompt space in the {context_size}-token context; reduce --max-tokens or increase --ctx-size"
+        );
+    }
+    let prompt_budget = context_size - reserved;
+    let mut removed = 0;
+
+    loop {
+        let prompt = prompt_for_backend(manifest, messages, backend, chat_template);
+        let estimated_tokens = estimate_chat_prompt_tokens(&prompt, messages);
+        if estimated_tokens <= prompt_budget {
+            return Ok(removed);
+        }
+
+        let Some(start) = messages
+            .iter()
+            .position(|message| !message.role.eq_ignore_ascii_case("system"))
+        else {
+            bail!(
+                "system prompt is too large for the {context_size}-token context; increase --ctx-size"
+            );
+        };
+        if start + 1 >= messages.len() {
+            bail!(
+                "current message is too large for the {context_size}-token context after reserving {max_tokens} response tokens; shorten it, reduce --max-tokens, or increase --ctx-size"
+            );
+        }
+
+        let remove_count = if messages
+            .get(start + 1)
+            .is_some_and(|message| message.role.eq_ignore_ascii_case("assistant"))
+        {
+            2
+        } else {
+            1
+        };
+        messages.drain(start..start + remove_count);
+        removed += remove_count;
+    }
+}
+
+fn estimate_chat_prompt_tokens(prompt: &PromptSpec, messages: &[ChatMessage]) -> usize {
+    let rendered = prompt.prompt.len().div_ceil(3).max(1);
+    let structured = messages
+        .iter()
+        .map(|message| {
+            let content_bytes = message
+                .content
+                .as_ref()
+                .map(MessageContent::as_text)
+                .map(|content| content.len())
+                .unwrap_or_default();
+            content_bytes.div_ceil(3) + 16
+        })
+        .sum::<usize>()
+        + 16;
+    rendered.max(structured)
 }
 
 fn prompt_for_backend(
