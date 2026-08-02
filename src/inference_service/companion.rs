@@ -27,13 +27,15 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct CompanionMediaBackend {
     client: std::result::Result<CompanionClient, String>,
-    health_cache: Arc<OnceLock<std::result::Result<CompanionHealth, String>>>,
+    health_cache: Arc<OnceLock<CompanionHealth>>,
 }
 
 impl CompanionMediaBackend {
     pub fn discover() -> Self {
         Self {
-            client: CompanionClient::discover().map_err(|error| error.to_string()),
+            client: CompanionClient::discover()
+                .map(CompanionClient::with_resident_worker)
+                .map_err(|error| error.to_string()),
             health_cache: Arc::new(OnceLock::new()),
         }
     }
@@ -46,9 +48,19 @@ impl CompanionMediaBackend {
     }
 
     fn health(&self, client: &CompanionClient) -> std::result::Result<CompanionHealth, String> {
-        self.health_cache
-            .get_or_init(|| client.health().map_err(|error| error.to_string()))
+        if let Some(health) = self.health_cache.get() {
+            return Ok(health.clone());
+        }
+        // Preflight operations must not queue behind a long resident media
+        // generation. They are lightweight one-shot calls; only execute owns
+        // the serialized resident worker and its loaded pipeline.
+        let health = client
             .clone()
+            .without_resident_worker()
+            .health()
+            .map_err(|error| error.to_string())?;
+        let _ = self.health_cache.set(health.clone());
+        Ok(health)
     }
 }
 
@@ -109,7 +121,10 @@ impl MediaInferenceBackend for CompanionMediaBackend {
             "family": manifest.metadata.family,
             "architecture": manifest.architecture,
         });
-        let model_probe = client.probe_model(&probe_request);
+        let model_probe = client
+            .clone()
+            .without_resident_worker()
+            .probe_model(&probe_request);
         let (available, detail) = match model_probe {
             Ok(value) => (
                 value
@@ -220,7 +235,10 @@ impl MediaInferenceBackend for CompanionMediaBackend {
             "parameter_policy": request.parameter_policy,
             "local_files_only": true
         });
-        let mut value = client.estimate(&companion_request)?;
+        let mut value = client
+            .clone()
+            .without_resident_worker()
+            .estimate(&companion_request)?;
         let object = value
             .as_object_mut()
             .ok_or_else(|| anyhow!("media companion estimate response must be an object"))?;
@@ -399,6 +417,7 @@ fn sanitized_companion_metadata(metadata: Value) -> Value {
                 "dtype",
                 "seed",
                 "model_load_seconds",
+                "model_cache_hit",
                 "inference_seconds",
                 "encoding_seconds",
             ],
@@ -1001,6 +1020,7 @@ mod tests {
                 "dtype": "float16",
                 "seed": 17,
                 "model_load_seconds": 8.0,
+                "model_cache_hit": true,
                 "inference_seconds": 4.0,
                 "encoding_seconds": 0.5,
                 "offload_mode": "model_cpu",
@@ -1022,6 +1042,7 @@ mod tests {
 
         assert_eq!(sanitized["elapsed_seconds"], 12.5);
         assert_eq!(sanitized["backend"]["device"], "cuda");
+        assert_eq!(sanitized["backend"]["model_cache_hit"], true);
         assert_eq!(sanitized["backend"]["inference_seconds"], 4.0);
         assert_eq!(sanitized["backend"]["offload_mode"], "model_cpu");
         assert_eq!(sanitized["backend"]["offload_request"], "component");

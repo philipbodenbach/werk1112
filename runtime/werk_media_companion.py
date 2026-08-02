@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Offline media companion for Werk.
 
-The process handles exactly one operation. It reads one JSON object from stdin
-and writes exactly one JSON object to stdout. Model loading is deliberately
-local-only: this module never installs packages and never downloads a model.
+The traditional command mode handles exactly one JSON request. ``serve`` uses
+a newline-delimited resident transport so configured Diffusers pipelines can
+remain warm between requests. Model loading is deliberately local-only: this
+module never installs packages and never downloads a model.
 """
 
 import contextlib
+import gc
 import importlib
 import importlib.metadata
 import importlib.util
@@ -21,11 +23,14 @@ import time
 import traceback
 import uuid
 import wave
+from collections import OrderedDict
 from pathlib import Path
 
 
 PROTOCOL_VERSION = 1
 COMPANION_VERSION = "1.0.0"
+TRANSPORT_VERSION = 1
+PIPELINE_CACHE_SIZE_ENV = "WERK_MEDIA_PIPELINE_CACHE_SIZE"
 
 for _name in (
     "HF_HUB_OFFLINE",
@@ -155,6 +160,152 @@ class CompanionFailure(Exception):
 
 def fail(code, message, detail=None):
     raise CompanionFailure(code, message, detail)
+
+
+class DiffusersConfigurationOutcome:
+    """Reusable result of configuring a cached Diffusers pipeline.
+
+    Configuration mutates a pipeline, so it must only run on a cache miss.
+    Parameter-policy handling, however, is request-local and must be replayed
+    on every cache hit.  This object keeps those two concerns separate.
+    """
+
+    def __init__(self):
+        self.unsupported = {}
+        self.implicit_warnings = {}
+        self.fatal_when_implicit = {}
+
+    def reject(
+        self,
+        path,
+        reason,
+        *,
+        implicit_warning=None,
+        fatal_when_implicit=None,
+    ):
+        path = normalized_name(path)
+        self.unsupported[path] = str(reason)
+        if implicit_warning:
+            self.implicit_warnings[path] = str(implicit_warning)
+        if fatal_when_implicit:
+            self.fatal_when_implicit[path] = fatal_when_implicit
+
+
+class DiffusersPipelineEntry:
+    def __init__(
+        self,
+        pipeline,
+        torch,
+        device,
+        dtype,
+        offload_metadata,
+        configuration_outcome,
+        model_load_seconds,
+        configuration_warnings=None,
+    ):
+        self.pipeline = pipeline
+        self.torch = torch
+        self.device = device
+        self.dtype = dtype
+        self.offload_metadata = dict(offload_metadata)
+        self.configuration_outcome = configuration_outcome
+        self.model_load_seconds = float(model_load_seconds)
+        self.configuration_warnings = list(configuration_warnings or [])
+
+
+def cleanup_diffusers_pipeline_entry(entry):
+    """Release a cached pipeline and return allocator caches to the runtime."""
+    if entry is None:
+        return
+    pipeline = entry.pipeline
+    entry.pipeline = None
+    del pipeline
+    gc.collect()
+    torch = entry.torch
+    try:
+        if entry.device == "cuda" and bool(torch.cuda.is_available()):
+            torch.cuda.empty_cache()
+        elif entry.device == "mps":
+            empty_cache = getattr(getattr(torch, "mps", None), "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
+    except Exception:
+        # Eviction is best-effort. A cleanup failure must not poison the
+        # resident protocol or hide the original inference result/error.
+        pass
+
+
+class DiffusersPipelineCache:
+    """Synchronous bounded LRU for fully configured Diffusers pipelines."""
+
+    def __init__(self, max_size=1, cleanup=cleanup_diffusers_pipeline_entry):
+        try:
+            max_size = int(max_size)
+        except (TypeError, ValueError):
+            fail("invalid_configuration", "pipeline cache size must be an integer")
+        if max_size < 0:
+            fail("invalid_configuration", "pipeline cache size must not be negative")
+        self.max_size = max_size
+        self._cleanup = cleanup
+        self._entries = OrderedDict()
+
+    @property
+    def enabled(self):
+        return self.max_size > 0
+
+    def __len__(self):
+        return len(self._entries)
+
+    def get(self, key):
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._entries[key] = entry
+        return entry
+
+    def prepare_for_load(self, key):
+        """Make room before loading, avoiding simultaneous old/new weights."""
+        if not self.enabled or key in self._entries:
+            return
+        while len(self._entries) >= self.max_size:
+            _old_key, entry = self._entries.popitem(last=False)
+            self._cleanup(entry)
+
+    def put(self, key, entry):
+        if not self.enabled:
+            return False
+        previous = self._entries.pop(key, None)
+        if previous is not None and previous is not entry:
+            self._cleanup(previous)
+        self._entries[key] = entry
+        while len(self._entries) > self.max_size:
+            _old_key, evicted = self._entries.popitem(last=False)
+            self._cleanup(evicted)
+        return True
+
+    def evict(self, key):
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._cleanup(entry)
+            return True
+        return False
+
+    def clear(self):
+        entries = list(self._entries.values())
+        self._entries.clear()
+        for entry in entries:
+            self._cleanup(entry)
+
+
+class CompanionRuntime:
+    """State that exists only for the long-lived ``serve`` transport."""
+
+    def __init__(self, pipeline_cache_size=None):
+        if pipeline_cache_size is None:
+            pipeline_cache_size = os.environ.get(PIPELINE_CACHE_SIZE_ENV, "1")
+        self.pipeline_cache = DiffusersPipelineCache(pipeline_cache_size)
+
+    def close(self):
+        self.pipeline_cache.clear()
 
 
 def normalized_name(value):
@@ -1292,6 +1443,102 @@ def local_input_path(value, name):
     return path
 
 
+def path_cache_identity(path):
+    """Return a lightweight identity for immutable/local model assets."""
+    path = Path(path).expanduser().resolve()
+
+    def stat_identity(item):
+        try:
+            stat = item.stat()
+            return (
+                str(item),
+                int(getattr(stat, "st_dev", 0)),
+                int(getattr(stat, "st_ino", 0)),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            )
+        except Exception:
+            return (str(item), None, None, None, None)
+
+    identity = [stat_identity(path)]
+    if path.is_dir():
+        # These files determine the concrete Diffusers pipeline and are cheap
+        # to stat. Werk model-store directories are otherwise immutable.
+        for name in ("model_index.json", "config.json"):
+            candidate = path / name
+            if candidate.exists():
+                identity.append(stat_identity(candidate))
+    return tuple(identity)
+
+
+def normalized_lora_specs(parameters):
+    raw = parameters.get("loras") or parameters.get("lora") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not raw:
+        return ()
+    if not isinstance(raw, list):
+        fail("invalid_parameter", "LoRA adapters must be a list")
+    specs = []
+    for index, item in enumerate(raw):
+        if isinstance(item, str):
+            path = local_input_path(item, f"loras[{index}]")
+            weight = 1.0
+        elif isinstance(item, dict):
+            path = local_input_path(
+                item.get("model") or item.get("path"),
+                f"loras[{index}].model",
+            )
+            try:
+                weight = float(item.get("weight", 1.0))
+            except (TypeError, ValueError):
+                fail("invalid_parameter", f"loras[{index}].weight must be numeric")
+            if not math.isfinite(weight):
+                fail("invalid_parameter", f"loras[{index}].weight must be finite")
+        else:
+            fail("invalid_parameter", "each LoRA entry must be a path or object")
+        specs.append((path, weight, path_cache_identity(path)))
+    return tuple(specs)
+
+
+def diffusers_pipeline_cache_key(
+    payload,
+    model_path,
+    task,
+    has_image,
+    device,
+    dtype,
+    parameters,
+    lora_specs,
+):
+    """Describe only state that affects a loaded/configured pipeline."""
+    cuda_index = None
+    if device == "cuda":
+        try:
+            torch = importlib.import_module("torch")
+            cuda_index = int(torch.cuda.current_device())
+        except Exception:
+            cuda_index = 0
+    return (
+        str(payload.get("model") or ""),
+        path_cache_identity(model_path),
+        str(task),
+        bool(has_image),
+        str(device),
+        cuda_index,
+        str(dtype).replace("torch.", ""),
+        selected_offload_request(parameters),
+        bool(parameters.get("vae_tiling")),
+        bool(parameters.get("temporal_vae_tiling")),
+        bool(parameters.get("vae_slicing")),
+        bool(parameters.get("attention_slicing")),
+        tuple(
+            (identity, float(weight))
+            for _path, weight, identity in lora_specs
+        ),
+    )
+
+
 def load_image(value, name):
     image_module = require_module("PIL.Image", "Pillow", "image input")
     path = local_input_path(value, name)
@@ -1406,6 +1653,7 @@ def configure_diffusers_pipeline(
     parameters,
     warnings,
     parameter_guard,
+    configuration_outcome=None,
 ):
     if hasattr(pipeline, "set_progress_bar_config"):
         pipeline.set_progress_bar_config(disable=True)
@@ -1471,30 +1719,43 @@ def configure_diffusers_pipeline(
         elif getattr(pipeline, "vae", None) is not None and hasattr(pipeline.vae, "enable_tiling"):
             pipeline.vae.enable_tiling()
         else:
-            parameter_guard.reject(
-                tiling_path,
-                "VAE tiling is unavailable on the selected pipeline",
+            reason = "VAE tiling is unavailable on the selected pipeline"
+            implicit_warning = (
+                "VAE tiling requested by resolved defaults but unavailable on "
+                "the selected pipeline"
             )
-            if tiling_path not in parameter_guard.explicit:
-                warnings.append(
-                    "VAE tiling requested by resolved defaults but unavailable on "
-                    "the selected pipeline"
+            if configuration_outcome is not None:
+                configuration_outcome.reject(
+                    tiling_path,
+                    reason,
+                    implicit_warning=implicit_warning,
                 )
+            else:
+                parameter_guard.reject(tiling_path, reason)
+                if tiling_path not in parameter_guard.explicit:
+                    warnings.append(implicit_warning)
     if bool(parameters.get("vae_slicing")):
         if hasattr(pipeline, "enable_vae_slicing"):
             pipeline.enable_vae_slicing()
         elif getattr(pipeline, "vae", None) is not None and hasattr(pipeline.vae, "enable_slicing"):
             pipeline.vae.enable_slicing()
         else:
-            parameter_guard.reject(
-                "image.vae_slicing",
-                "VAE slicing is unavailable on the selected pipeline",
+            path = "image.vae_slicing"
+            reason = "VAE slicing is unavailable on the selected pipeline"
+            implicit_warning = (
+                "VAE slicing requested by resolved defaults but unavailable on "
+                "the selected pipeline"
             )
-            if "image.vae_slicing" not in parameter_guard.explicit:
-                warnings.append(
-                    "VAE slicing requested by resolved defaults but unavailable on "
-                    "the selected pipeline"
+            if configuration_outcome is not None:
+                configuration_outcome.reject(
+                    path,
+                    reason,
+                    implicit_warning=implicit_warning,
                 )
+            else:
+                parameter_guard.reject(path, reason)
+                if path not in parameter_guard.explicit:
+                    warnings.append(implicit_warning)
     if bool(parameters.get("attention_slicing")) and hasattr(pipeline, "enable_attention_slicing"):
         pipeline.enable_attention_slicing()
     return {
@@ -1503,36 +1764,38 @@ def configure_diffusers_pipeline(
     }
 
 
-def apply_loras(pipeline, parameters, warnings, parameter_guard):
-    loras = parameters.get("loras") or parameters.get("lora") or []
-    if isinstance(loras, dict):
-        loras = [loras]
-    if not loras:
+def apply_loras(
+    pipeline,
+    parameters,
+    warnings,
+    parameter_guard,
+    configuration_outcome=None,
+    lora_specs=None,
+):
+    if lora_specs is None:
+        lora_specs = normalized_lora_specs(parameters)
+    if not lora_specs:
         return
-    if not isinstance(loras, list):
-        fail("invalid_parameter", "LoRA adapters must be a list")
     if not hasattr(pipeline, "load_lora_weights"):
-        parameter_guard.reject(
-            "image.loras",
-            "the selected pipeline has no LoRA loading hook",
-        )
-        if "image.loras" in parameter_guard.explicit:
+        path = "image.loras"
+        reason = "the selected pipeline has no LoRA loading hook"
+        if configuration_outcome is not None:
+            configuration_outcome.reject(
+                path,
+                reason,
+                fatal_when_implicit=(
+                    "unsupported_parameter",
+                    "LoRA adapters are not supported by the selected pipeline",
+                ),
+            )
+            return
+        parameter_guard.reject(path, reason)
+        if path in parameter_guard.explicit:
             return
         fail("unsupported_parameter", "LoRA adapters are not supported by the selected pipeline")
     names = []
     weights = []
-    for index, item in enumerate(loras):
-        if isinstance(item, str):
-            path = local_input_path(item, f"loras[{index}]")
-            weight = 1.0
-        elif isinstance(item, dict):
-            path = local_input_path(
-                item.get("model") or item.get("path"),
-                f"loras[{index}].model",
-            )
-            weight = float(item.get("weight", 1.0))
-        else:
-            fail("invalid_parameter", "each LoRA entry must be a path or object")
+    for index, (path, weight, _identity) in enumerate(lora_specs):
         name = f"werk_lora_{index}"
         try:
             pipeline.load_lora_weights(
@@ -1554,15 +1817,72 @@ def apply_loras(pipeline, parameters, warnings, parameter_guard):
     if hasattr(pipeline, "set_adapters"):
         pipeline.set_adapters(names, adapter_weights=weights)
     elif any(weight != 1.0 for weight in weights):
-        parameter_guard.reject(
-            "image.loras",
-            "the pipeline loaded LoRA files but cannot apply their explicit weights",
+        path = "image.loras"
+        reason = (
+            "the pipeline loaded LoRA files but cannot apply their explicit weights"
         )
-        if "image.loras" not in parameter_guard.explicit:
-            warnings.append(
-                "pipeline loaded LoRA adapters but cannot apply adapter weights "
-                "from resolved defaults"
+        implicit_warning = (
+            "pipeline loaded LoRA adapters but cannot apply adapter weights "
+            "from resolved defaults"
+        )
+        if configuration_outcome is not None:
+            configuration_outcome.reject(
+                path,
+                reason,
+                implicit_warning=implicit_warning,
             )
+        else:
+            parameter_guard.reject(path, reason)
+            if path not in parameter_guard.explicit:
+                warnings.append(implicit_warning)
+
+
+def replay_diffusers_configuration(outcome, parameter_guard, warnings):
+    if outcome is None:
+        return
+    for path, reason in outcome.unsupported.items():
+        explicit = path in parameter_guard.explicit
+        fatal = outcome.fatal_when_implicit.get(path)
+        if not explicit and fatal is not None:
+            code, message = fatal
+            fail(code, message)
+        parameter_guard.reject(path, reason)
+        if not explicit and path in outcome.implicit_warnings:
+            warnings.append(outcome.implicit_warnings[path])
+
+
+def diffusers_count_parameter(namespace, parameters, parameter_guard):
+    """Resolve Werk's task count aliases for a Diffusers pipeline call.
+
+    Werk resolves defaults before invoking the companion, so checking only
+    whether ``num_images``/``num_videos`` is present makes that default mask an
+    explicitly requested ``batch_size``. Explicitness determines precedence;
+    the resolved values are only used after that choice has been made.
+    """
+    if namespace == "image":
+        count_name = "num_images"
+        call_name = "num_images_per_prompt"
+    elif namespace == "video":
+        count_name = "num_videos"
+        call_name = "num_videos_per_prompt"
+    else:
+        fail("invalid_request", f"unsupported Diffusers count namespace '{namespace}'")
+
+    count_path = f"{namespace}.{count_name}"
+    batch_path = f"{namespace}.batch_size"
+    count_explicit = count_path in parameter_guard.explicit
+    batch_explicit = batch_path in parameter_guard.explicit
+
+    if count_explicit and batch_explicit:
+        # Preserve the existing conflict semantics: the task-specific count
+        # wins under warn/permissive and strict policy rejects the request.
+        parameter_guard.reject_overridden(batch_path, count_path)
+
+    if batch_explicit and not count_explicit:
+        return call_name, parameters.get("batch_size"), batch_path
+    if parameters.get(count_name) is not None:
+        return call_name, parameters.get(count_name), count_path
+    return call_name, parameters.get("batch_size"), batch_path
 
 
 def diffusers_call_values(
@@ -1578,46 +1898,11 @@ def diffusers_call_values(
         prompt = required_string(prompt, "effective_parameters.prompt")
     generator, seed = seeded_generator(torch, device, parameters)
     namespace = "video" if task in VIDEO_TASKS else "image"
-    if namespace == "video":
-        count_key = "num_videos_per_prompt"
-        count_path = (
-            "video.num_videos"
-            if parameters.get("num_videos") is not None
-            else "video.batch_size"
-        )
-        count_value = (
-            parameters.get("num_videos")
-            if parameters.get("num_videos") is not None
-            else parameters.get("batch_size")
-        )
-        if (
-            parameters.get("num_videos") is not None
-            and parameters.get("batch_size") is not None
-        ):
-            parameter_guard.reject_overridden(
-                "video.batch_size",
-                "video.num_videos",
-            )
-    else:
-        count_key = "num_images_per_prompt"
-        count_path = (
-            "image.num_images"
-            if parameters.get("num_images") is not None
-            else "image.batch_size"
-        )
-        count_value = (
-            parameters.get("num_images")
-            if parameters.get("num_images") is not None
-            else parameters.get("batch_size")
-        )
-        if (
-            parameters.get("num_images") is not None
-            and parameters.get("batch_size") is not None
-        ):
-            parameter_guard.reject_overridden(
-                "image.batch_size",
-                "image.num_images",
-            )
+    count_key, count_value, count_path = diffusers_count_parameter(
+        namespace,
+        parameters,
+        parameter_guard,
+    )
     values = {
         "prompt": prompt or None,
         "negative_prompt": parameters.get("negative_prompt"),
@@ -1824,6 +2109,98 @@ def export_video(frames, path, fps, format_name):
         fail("encoding_failed", f"failed to encode video: {path}", str(error))
 
 
+def prepare_diffusers_pipeline(
+    runtime,
+    payload,
+    model_path,
+    task,
+    has_image,
+    torch,
+    device,
+    dtype,
+    parameters,
+    parameter_guard,
+):
+    """Load or reuse a fully configured image/video Diffusers pipeline."""
+    cache = runtime.pipeline_cache if runtime is not None else None
+    cache_enabled = cache is not None and cache.enabled
+    lora_specs = normalized_lora_specs(parameters)
+    cache_key = diffusers_pipeline_cache_key(
+        payload,
+        model_path,
+        task,
+        has_image,
+        device,
+        dtype,
+        parameters,
+        lora_specs,
+    )
+    if cache_enabled:
+        entry = cache.get(cache_key)
+        if entry is not None:
+            return entry, cache_key, True
+        # Eviction deliberately precedes model loading. Keeping both the old
+        # and new pipeline alive can otherwise turn a normal model switch into
+        # an avoidable accelerator OOM.
+        cache.prepare_for_load(cache_key)
+
+    load_started = time.perf_counter()
+    pipeline = None
+    configuration_outcome = (
+        DiffusersConfigurationOutcome() if cache_enabled else None
+    )
+    warnings = []
+    try:
+        pipeline = load_diffusers_pipeline(model_path, task, has_image, torch, dtype)
+        offload_metadata = configure_diffusers_pipeline(
+            pipeline,
+            device,
+            task,
+            parameters,
+            warnings,
+            parameter_guard,
+            configuration_outcome=configuration_outcome,
+        )
+        apply_loras(
+            pipeline,
+            parameters,
+            warnings,
+            parameter_guard,
+            configuration_outcome=configuration_outcome,
+            lora_specs=lora_specs,
+        )
+        synchronize_torch_device(torch, device)
+        model_load_seconds = max(0.0, time.perf_counter() - load_started)
+        entry = DiffusersPipelineEntry(
+            pipeline,
+            torch,
+            device,
+            dtype,
+            offload_metadata,
+            configuration_outcome,
+            model_load_seconds,
+            warnings,
+        )
+        if cache_enabled:
+            cache.put(cache_key, entry)
+        return entry, cache_key, False
+    except BaseException:
+        if pipeline is not None:
+            cleanup_diffusers_pipeline_entry(
+                DiffusersPipelineEntry(
+                    pipeline,
+                    torch,
+                    device,
+                    dtype,
+                    {},
+                    configuration_outcome,
+                    0.0,
+                    warnings,
+                )
+            )
+        raise
+
+
 def execute_diffusers(
     payload,
     model_path,
@@ -1833,25 +2210,72 @@ def execute_diffusers(
     output_dir,
     identifier,
     parameter_guard,
+    runtime=None,
 ):
-    model_load_started = time.perf_counter()
     torch, device, dtype = torch_runtime(parameters)
     has_image = any(
         key in inputs for key in ("image", "input_image", "initial_image")
     )
-    pipeline = load_diffusers_pipeline(model_path, task, has_image, torch, dtype)
-    warnings = []
-    offload_metadata = configure_diffusers_pipeline(
-        pipeline,
-        device,
+    entry, cache_key, model_cache_hit = prepare_diffusers_pipeline(
+        runtime,
+        payload,
+        model_path,
         task,
+        has_image,
+        torch,
+        device,
+        dtype,
         parameters,
-        warnings,
         parameter_guard,
     )
-    apply_loras(pipeline, parameters, warnings, parameter_guard)
-    synchronize_torch_device(torch, device)
-    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
+    cached = runtime is not None and runtime.pipeline_cache.enabled
+    try:
+        return execute_prepared_diffusers_pipeline(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            torch,
+            device,
+            dtype,
+            task,
+            parameters,
+            inputs,
+            output_dir,
+            identifier,
+            parameter_guard,
+        )
+    finally:
+        # A one-shot process and a resident worker with cache size zero both
+        # own an uncached pipeline for exactly one request. Explicit cleanup is
+        # required even when validation or encoding raises: dropping Python
+        # locals alone does not return PyTorch allocator caches to the device.
+        if not cached:
+            cleanup_diffusers_pipeline_entry(entry)
+
+
+def execute_prepared_diffusers_pipeline(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    torch,
+    device,
+    dtype,
+    task,
+    parameters,
+    inputs,
+    output_dir,
+    identifier,
+    parameter_guard,
+):
+    pipeline = entry.pipeline
+    warnings = list(entry.configuration_warnings)
+    replay_diffusers_configuration(
+        entry.configuration_outcome,
+        parameter_guard,
+        warnings,
+    )
     values, required, seed, parameter_paths = diffusers_call_values(
         task,
         parameters,
@@ -1902,6 +2326,12 @@ def execute_diffusers(
         synchronize_torch_device(torch, device)
         inference_seconds = max(0.0, time.perf_counter() - inference_started)
     except Exception as error:
+        # A call-time failure may leave scheduler/module state inconsistent.
+        # Signature validation happens before this block, so an unsupported
+        # warm parameter does not discard an otherwise healthy resident model.
+        if runtime is not None and runtime.pipeline_cache.enabled:
+            pipeline = None
+            runtime.pipeline_cache.evict(cache_key)
         fail("execution_failed", f"Diffusers pipeline failed for task '{task}'", str(error))
 
     encoding_started = time.perf_counter()
@@ -1950,10 +2380,11 @@ def execute_diffusers(
         "dtype": str(dtype).replace("torch.", ""),
         "seed": seed,
         "translated_parameters": sorted(kwargs),
-        "model_load_seconds": model_load_seconds,
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
-        **offload_metadata,
+        **entry.offload_metadata,
     }
 
 
@@ -2573,7 +3004,7 @@ def atomic_json_write(path, value):
             pass
 
 
-def command_execute(payload):
+def command_execute(payload, runtime=None):
     model_path = local_model_path(payload)
     task = normalized_name(payload.get("task"))
     if not task:
@@ -2610,6 +3041,7 @@ def command_execute(payload):
             output_dir,
             identifier,
             parameter_guard,
+            runtime=runtime,
         )
     elif adapter == "diffusers_audio":
         outputs, warnings, backend_metadata = execute_diffusers_audio(
@@ -2678,7 +3110,7 @@ def command_execute(payload):
     }
 
 
-def dispatch(operation, payload):
+def dispatch(operation, payload, runtime=None):
     commands = {
         "health": command_health,
         "capabilities": command_capabilities,
@@ -2689,6 +3121,8 @@ def dispatch(operation, payload):
     handler = commands.get(operation)
     if handler is None:
         fail("unknown_command", f"unknown companion command '{operation}'")
+    if operation == "execute":
+        return handler(payload, runtime=runtime)
     return handler(payload)
 
 
@@ -2732,8 +3166,160 @@ def response_error(error):
     }
 
 
+def write_json_line(stream, value):
+    encoded = json.dumps(json_safe(value), ensure_ascii=False, separators=(",", ":"))
+    stream.write(encoded)
+    stream.write("\n")
+    stream.flush()
+
+
+def isolate_resident_protocol_output():
+    """Reserve the original stdout pipe for JSONL and redirect fd 1 to stderr.
+
+    ``redirect_stdout`` only replaces Python's ``sys.stdout`` object. Native
+    extensions and child processes can still write directly to file descriptor
+    1 and corrupt a long-lived framed transport. Duplicating the original pipe
+    first gives protocol writes a private descriptor while all later fd-1
+    output is routed to the diagnostic stream.
+    """
+    original_stdout = sys.stdout
+    protocol_fd = None
+    protocol_stream = None
+    try:
+        original_stdout.flush()
+        sys.stderr.flush()
+        protocol_fd = os.dup(original_stdout.fileno())
+        protocol_stream = os.fdopen(
+            protocol_fd,
+            "w",
+            encoding=getattr(original_stdout, "encoding", None) or "utf-8",
+            errors="backslashreplace",
+            buffering=1,
+        )
+        protocol_fd = None
+        os.dup2(sys.stderr.fileno(), original_stdout.fileno())
+        return protocol_stream, True
+    except Exception:
+        if protocol_stream is not None:
+            try:
+                protocol_stream.close()
+            except Exception:
+                pass
+        if protocol_fd is not None:
+            try:
+                os.close(protocol_fd)
+            except Exception:
+                pass
+        return original_stdout, False
+
+
+def resident_response(request, runtime):
+    request_id = request.get("request_id") if isinstance(request, dict) else None
+    try:
+        if not isinstance(request, dict):
+            fail("invalid_request", "resident request must be a JSON object")
+        if request.get("transport_version") != TRANSPORT_VERSION:
+            fail(
+                "transport_version_mismatch",
+                f"resident transport requires version {TRANSPORT_VERSION}",
+                {"expected": TRANSPORT_VERSION, "received": request.get("transport_version")},
+            )
+        if request_id is None or isinstance(request_id, (dict, list)):
+            fail("invalid_request", "request_id must be a JSON scalar")
+        operation = normalized_name(request.get("operation")).replace("_", "-")
+        if not operation:
+            fail("invalid_request", "operation is required")
+        payload = request.get("payload", {})
+        if not isinstance(payload, dict):
+            fail("invalid_request", "payload must be a JSON object")
+        if operation == "shutdown":
+            body = {"status": "shutting_down"}
+            keep_running = False
+        else:
+            body = dispatch(operation, payload, runtime=runtime)
+            keep_running = True
+        response = {"ok": True}
+        if isinstance(body, dict):
+            response.update(body)
+        else:
+            response["result"] = body
+        # Envelope fields are transport-owned and cannot be overwritten by an
+        # operation response.
+        response.update(
+            {
+                "transport_version": TRANSPORT_VERSION,
+                "request_id": request_id,
+                "ok": True,
+            }
+        )
+        return response, keep_running
+    except Exception as error:
+        response = {
+            "transport_version": TRANSPORT_VERSION,
+            "request_id": request_id,
+        }
+        response.update(response_error(error))
+        return response, True
+
+
+def serve_loop(input_stream, output_stream, runtime=None):
+    runtime = runtime or CompanionRuntime()
+    try:
+        for line in input_stream:
+            if not line.strip():
+                continue
+            try:
+                request = json.loads(line)
+            except Exception as error:
+                response = {
+                    "transport_version": TRANSPORT_VERSION,
+                    "request_id": None,
+                }
+                response.update(
+                    response_error(
+                        CompanionFailure(
+                            "invalid_json",
+                            "resident request line must contain one JSON object",
+                            str(error),
+                        )
+                    )
+                )
+                write_json_line(output_stream, response)
+                continue
+            response, keep_running = resident_response(request, runtime)
+            write_json_line(output_stream, response)
+            if not keep_running:
+                break
+    finally:
+        runtime.close()
+
+
 def main():
     original_stdout = sys.stdout
+    if len(sys.argv) == 2 and normalized_name(sys.argv[1]) == "serve":
+        protocol_stdout, owns_protocol_stdout = isolate_resident_protocol_output()
+        try:
+            runtime = CompanionRuntime()
+        except Exception as error:
+            response = {
+                "transport_version": TRANSPORT_VERSION,
+                "request_id": None,
+            }
+            response.update(response_error(error))
+            write_json_line(protocol_stdout, response)
+            if owns_protocol_stdout:
+                protocol_stdout.close()
+            return
+        # Keep the entire lifetime protected: third-party libraries may print
+        # after a call has returned. Python stdout and native fd 1 both point
+        # at stderr; only protocol_stdout retains the framed transport pipe.
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                serve_loop(sys.stdin, protocol_stdout, runtime=runtime)
+        finally:
+            if owns_protocol_stdout:
+                protocol_stdout.close()
+        return
     try:
         if len(sys.argv) != 2:
             fail("invalid_command", "expected exactly one command argument")
@@ -2757,10 +3343,7 @@ def main():
     except BaseException as error:
         response = response_error(error)
 
-    encoded = json.dumps(json_safe(response), ensure_ascii=False, separators=(",", ":"))
-    original_stdout.write(encoded)
-    original_stdout.write("\n")
-    original_stdout.flush()
+    write_json_line(original_stdout, response)
 
 
 if __name__ == "__main__":

@@ -247,17 +247,40 @@ also validates this again before execution.
 ## Media companion
 
 Rust remains the control and routing plane. The included Python companion uses
-a versioned single-request JSON process protocol with:
+a versioned JSON process protocol with:
 
 ```text
 health  capabilities  probe-model  estimate  execute
 ```
 
-It performs lazy, local-only Diffusers/Transformers execution. The companion
-sets Hugging Face offline variables and passes `local_files_only=True`; it
-never installs a package or downloads model weights. `WERK_MEDIA_COMPANION`
-can point to a compatible executable, while `WERK_MEDIA_PYTHON` chooses the
-Python interpreter for the included adapter. `WERK_MEDIA_ACCELERATOR` can
+Under `werk serve`, media execution runs through one persistent, serialized
+worker. Lightweight health, model-probe, and estimate preflights use independent
+one-shot calls so concurrent requests do not fail behind a long generation.
+The worker performs lazy, local-only Diffusers/Transformers execution and
+caches one fully configured Diffusers image/video pipeline by default. The
+first compatible request is cold; subsequent requests with the same model and
+runtime configuration are warm. Prompt, seed, size, steps, and count are
+request-local and do not invalidate the cache. Model, device, dtype,
+offload/tiling configuration, and LoRA changes may select a different entry and
+therefore cause a cold load. At the default cache size, the existing pipeline
+is evicted before a replacement is loaded.
+
+`WERK_MEDIA_PIPELINE_CACHE_SIZE` controls the maximum number of resident
+Diffusers entries and defaults to `1`; `0` disables the pipeline cache while
+the worker can remain persistent. Cached pipelines retain VRAM and/or host RAM
+until eviction or server shutdown. Execution metadata exposes
+`model_cache_hit` and `model_load_seconds` for warm/cold diagnostics. A worker
+crash or request timeout discards the process and cache, and the next request
+starts cold. The resident transport never replays the same `execute` frame;
+Werk's higher-level fallback policy may still try another accepted runtime
+candidate.
+
+The companion sets Hugging Face offline variables and passes
+`local_files_only=True`; it never installs a package or downloads model
+weights. `WERK_MEDIA_COMPANION` can point to a compatible executable, while
+`WERK_MEDIA_PYTHON` chooses the Python interpreter for the included adapter. A
+legacy external companion that does not support the persistent-worker transport
+automatically uses the one-shot protocol. `WERK_MEDIA_ACCELERATOR` can
 explicitly select `cuda`, `rocm`, `mps`/`metal`, or `cpu`. MLX media models
 remain catalogable but have no executable adapter in this release.
 
@@ -375,8 +398,9 @@ children of `outputs/`, never models. Defaults are 30 days and 20 GiB; use
 ## Current limitations
 
 - `probe-model` checks local repository metadata, task hints, and dependencies.
-  The concrete Diffusers/Transformers pipeline is loaded only during
-  execution, so model-specific incompatibility can still surface then.
+  The concrete Diffusers/Transformers pipeline is first loaded during
+  execution and may then remain resident, so model-specific incompatibility
+  can still surface on the first cold request.
 - JSON local-path and inline-base64 inputs are supported. The offline companion
   does not fetch remote HTTP(S) URLs. OpenAI multipart upload compatibility is
   not implemented yet, including the hosted ComfyUI image-edit proxy.

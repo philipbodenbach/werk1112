@@ -316,6 +316,17 @@ continuation/variation, voice conversion, stems, and audio enhancement are
 represented by the request/schema/planner contract but are not yet generically
 executable.
 
+Under `werk serve`, media execution uses a persistent, serialized companion
+worker. It lazily caches one fully configured Diffusers image/video pipeline by default,
+so the first compatible request is a cold load and later requests using the same
+model and runtime configuration are warm. Prompt, seed, size, steps, and image
+count do not invalidate that entry. Changes to the model, device, dtype,
+offload/tiling configuration, or LoRA set may require a cold reload; with the
+default one-entry cache, Werk evicts the old pipeline before loading the new
+one. Set `WERK_MEDIA_PIPELINE_CACHE_SIZE` to another non-negative entry count,
+or to `0` to disable pipeline caching while leaving the worker persistent.
+Resident pipelines retain VRAM and/or RAM until eviction or server shutdown.
+
 The HTTP service exposes the same media pipeline through synchronous image
 routes, persisted video/audio jobs, synchronous or asynchronous TTS, JSON
 transcription, parameter/capability discovery, and authenticated output
@@ -383,15 +394,23 @@ validated, and estimated. Generic companion execution is currently:
 | Stem generation and separation | Yes | Prepared; no generic adapter yet |
 | Audio enhancement | Yes | Prepared; no generic adapter yet |
 
-The bundled adapter is embedded in the Werk binary and uses a one-request
-local-only process protocol; an explicit external companion can replace it.
-Neither variant downloads weights or installs packages. Image execution needs
-Python, Torch, Diffusers, and Pillow. Video additionally needs NumPy and
-`imageio` for video I/O; MP4 encoding normally needs an imageio-compatible
-encoder backend such as `imageio-ffmpeg`. Generative audio needs Torch and
-NumPy plus Diffusers or Transformers; TTS and ASR need Torch, Transformers, and
-NumPy. FLAC/OGG output additionally needs `soundfile`; WAV has a direct writer.
-The exact model pipeline can still reject a request when it is loaded.
+The bundled adapter is embedded in the Werk binary and uses the persistent
+local-only execution protocol under `werk serve`. Lightweight health, model
+probe, and estimate calls remain independent so they do not queue behind a long
+generation. A legacy external companion that
+does not support this protocol automatically falls back to one-shot process
+execution. Neither variant downloads weights or installs packages. A worker
+crash or request timeout resets the worker and its cache. The resident transport
+never replays the same `execute` frame; Werk's higher-level fallback policy may
+still try another accepted runtime candidate. Execution metadata reports
+`model_cache_hit` and `model_load_seconds` for cold/warm diagnostics. Image
+execution needs Python, Torch, Diffusers, and Pillow. Video additionally needs
+NumPy and `imageio` for video I/O; MP4 encoding normally needs an
+imageio-compatible encoder backend such as `imageio-ffmpeg`. Generative audio
+needs Torch and NumPy plus Diffusers
+or Transformers; TTS and ASR need Torch, Transformers, and NumPy. FLAC/OGG
+output additionally needs `soundfile`; WAV has a direct writer. The exact model
+pipeline can still reject a request when it is first loaded.
 
 See [Media inference](docs/media-inference.md) for the canonical tasks,
 parameter contract, output formats, environment variables, and current
@@ -1362,6 +1381,12 @@ WebSocket, history, or `/view` protocols. Those APIs execute an arbitrary node
 graph and are materially different from routing one installed model. Native
 Comfy workflows should keep using a real ComfyUI server; use its hosted OpenAI
 node when Werk should perform the image generation.
+
+For deeper native integration, the self-contained custom-node package in
+[`utils/comfyUI`](utils/comfyUI/README.md) adds Werk model discovery,
+available-task and parameter-schema discovery, synchronous image generation,
+typed image and routing configuration, an explicit model socket, authenticated
+URL outputs, and sanitized inference metadata without changing ComfyUI core.
 
 ### Models and Chat
 
