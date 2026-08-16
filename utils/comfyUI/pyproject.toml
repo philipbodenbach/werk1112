@@ -5,10 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "werk1112"
 version = "0.1.0"
-description = "Native Werk1112 inference nodes for ComfyUI"
+description = "Beta Werk1112 inference nodes for ComfyUI"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
+classifiers = [
+  "Development Status :: 4 - Beta",
+]
 dependencies = [
   "Pillow",
   "numpy",
@@ -21,7 +24,7 @@ Documentation = "https://github.com/philipbodenbach/werk1112/tree/main/utils/com
 
 [tool.comfy]
 PublisherId = "philipbodenbach"
-DisplayName = "WERK1112"
+DisplayName = "WERK1112 (Beta)"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

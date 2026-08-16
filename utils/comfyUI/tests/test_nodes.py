@@ -560,7 +560,8 @@ def test_node_exports_and_display_names_are_complete():
     assert NODE_CLASS_MAPPINGS["WerkRoutingConfig"] is WerkRoutingConfigNode
     assert NODE_CLASS_MAPPINGS["WerkImageConfig"] is WerkImageConfigNode
     assert NODE_CLASS_MAPPINGS["WerkImageGenerate"] is WerkImageGenerateNode
-    assert NODE_DISPLAY_NAME_MAPPINGS["WerkImageGenerate"] == "WERK Image Generate"
+    assert NODE_DISPLAY_NAME_MAPPINGS["WerkImageGenerate"] == "WERK Image Generate (Beta)"
+    assert all(name.endswith(" (Beta)") for name in NODE_DISPLAY_NAME_MAPPINGS.values())
     assert WEB_DIRECTORY == "./web/js"
     assert (Path(__file__).parents[1] / "web" / "js" / "werk_ui.js").is_file()
 

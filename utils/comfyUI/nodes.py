@@ -973,11 +973,11 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "WerkConnection": "WERK Connection",
-    "WerkServerInfo": "WERK Server Info",
-    "WerkImageModels": "WERK Image Models",
-    "WerkImageParameters": "WERK Image Parameters",
-    "WerkRoutingConfig": "WERK Routing Config",
-    "WerkImageConfig": "WERK Image Config",
-    "WerkImageGenerate": "WERK Image Generate",
+    "WerkConnection": "WERK Connection (Beta)",
+    "WerkServerInfo": "WERK Server Info (Beta)",
+    "WerkImageModels": "WERK Image Models (Beta)",
+    "WerkImageParameters": "WERK Image Parameters (Beta)",
+    "WerkRoutingConfig": "WERK Routing Config (Beta)",
+    "WerkImageConfig": "WERK Image Config (Beta)",
+    "WerkImageGenerate": "WERK Image Generate (Beta)",
 }

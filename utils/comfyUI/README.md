@@ -1,4 +1,8 @@
-# ComfyUI Werk1112 nodes
+# ComfyUI Werk1112 nodes (Beta)
+
+> [!WARNING]
+> This integration is currently in beta. Node inputs, outputs, and discovery
+> behavior may still change before the first stable release.
 
 This package connects native ComfyUI nodes to `werk serve` over HTTP. ComfyUI
 still owns its workflow graph, queue, history, previews, and saved images; Werk
@@ -20,7 +24,7 @@ queue, custom-node, or workflow-graph protocols.
 ### ComfyUI Manager (recommended)
 
 The release package uses the immutable Comfy Registry ID `werk1112`. Once its
-first Registry version has been published, search for **WERK1112** in ComfyUI
+first Registry version has been published, search for **WERK1112 (Beta)** in ComfyUI
 Manager and select **Install**. The equivalent Comfy CLI command is:
 
 ```bash
