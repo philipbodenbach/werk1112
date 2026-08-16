@@ -17,8 +17,26 @@ queue, custom-node, or workflow-graph protocols.
 
 ## Installation
 
-Copy the package into ComfyUI and install only its small image dependencies in
-the Python environment used by ComfyUI:
+### ComfyUI Manager (recommended)
+
+The release package uses the immutable Comfy Registry ID `werk1112`. Once its
+first Registry version has been published, search for **WERK1112** in ComfyUI
+Manager and select **Install**. The equivalent Comfy CLI command is:
+
+```bash
+comfy node install werk1112
+```
+
+Manager installs the package dependencies in the correct ComfyUI Python
+environment and handles future updates. Restart ComfyUI after installation.
+
+Until the first Registry release, or for repository development, use the
+manual method below.
+
+### Manual development installation
+
+Copy the package from a Werk1112 checkout into ComfyUI and install only its
+small image dependencies in the Python environment used by ComfyUI:
 
 ```bash
 cp -R utils/comfyUI /path/to/ComfyUI/custom_nodes/comfyui-werk1112
@@ -43,6 +61,11 @@ New-Item -ItemType Junction `
 
 Restart ComfyUI. The nodes appear in the `WERK` categories. The package does
 not pin, replace, or install Torch.
+
+Do not use `pip install .` as the node installation method. ComfyUI must load
+the complete node directory, including its frontend extension, from
+`custom_nodes`; Registry/Manager installation or the directory copy/symlink
+above provides that layout.
 
 ## Starting Werk
 
@@ -333,3 +356,29 @@ python -m pytest -q utils/comfyUI/tests
 ```
 
 Tests require no GPU, ComfyUI installation, model, or live Werk server.
+
+## Publishing to the Comfy Registry
+
+The node is validated and packaged by
+`.github/workflows/comfyui-registry.yml` whenever this directory changes. A
+push or pull request never publishes a release. Publication is an explicit
+manual action and is allowed only from the repository's default branch.
+
+Before the first publication:
+
+1. Create or claim the `philipbodenbach` publisher in the Comfy Registry. If
+   that publisher ID cannot be used, update `PublisherId` in `pyproject.toml`
+   before publishing anything.
+2. Create a Registry publishing API key for that publisher.
+3. Add it to this GitHub repository as the Actions secret
+   `REGISTRY_ACCESS_TOKEN`.
+4. Confirm that the immutable node ID `werk1112` is available. Change
+   `project.name` before the first publication if another ID is required.
+5. Increment the semantic `project.version`, merge the change to the default
+   branch, then run **ComfyUI Registry** from GitHub Actions. Optional release
+   notes can be supplied through the workflow's `changelog` input.
+
+Published Registry versions cannot be overwritten. Fixes require another
+version increment. The workflow deliberately runs the Comfy CLI from this
+directory so the Registry archive contains the node package rather than the
+entire Werk1112 monorepo.

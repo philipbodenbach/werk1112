@@ -1,0 +1,12 @@
+# Development-only files. Runtime code, examples, and frontend assets remain
+# part of the Comfy Registry archive.
+tests/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Local packaging output and Python build artifacts.
+node.zip
+build/
+dist/
+*.egg-info/
