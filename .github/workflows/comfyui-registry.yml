@@ -49,6 +49,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "comfy-cli==${COMFY_CLI_VERSION}" pytest ruff
           python -m pip install -r requirements.txt
+          # ComfyUI provides Torch at runtime. Install the CPU wheel only for
+          # this standalone validation environment so CI does not alter users'
+          # ComfyUI-managed Torch installation.
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Disable Comfy CLI telemetry prompts
         run: comfy --skip-prompt --no-enable-telemetry env
