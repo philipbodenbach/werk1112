@@ -24,6 +24,10 @@ class Server:
                 owner.requests.append((self.path, dict(self.headers), body))
                 responder(self, owner)
 
+            def do_DELETE(self):
+                owner.requests.append((self.path, dict(self.headers)))
+                responder(self, owner)
+
             def log_message(self, *_args):
                 pass
 
@@ -103,6 +107,14 @@ def test_json_post(servers):
     assert json.loads(server.requests[0][2]) == {"n": 2}
 
 
+def test_authenticated_json_delete(servers):
+    server = servers(lambda handler, _owner: send(handler, body=b'{"status":"cancelled"}'))
+    payload = WerkClient(WerkConnection(server.url, "secret")).delete_json("/v1/jobs/job-1")
+    assert payload == {"status": "cancelled"}
+    assert server.requests[0][0] == "/v1/jobs/job-1"
+    assert server.requests[0][1]["Authorization"] == "Bearer secret"
+
+
 def test_api_key_absent_from_401_and_500_errors(servers):
     for status in (401, 500):
         def responder(handler, _owner, status=status):
@@ -149,6 +161,13 @@ def test_relative_output_download_reuses_auth_on_werk_origin(servers):
     assert body == b"png"
     assert mime == "image/png"
     assert server.requests[0][1]["Authorization"] == "Bearer secret"
+
+
+def test_output_download_accepts_a_call_specific_byte_limit(servers):
+    server = servers(lambda handler, _owner: send(handler, body=b"video"))
+    client = WerkClient(WerkConnection(server.url))
+    with pytest.raises(WerkApiError, match="exceeds 4 bytes"):
+        client.download_bytes("/v1/outputs/video", max_bytes=4)
 
 
 def test_cross_origin_download_never_receives_auth(servers):

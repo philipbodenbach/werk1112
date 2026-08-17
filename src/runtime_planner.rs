@@ -1126,6 +1126,62 @@ mod tests {
     }
 
     #[test]
+    fn video_task_auto_prefers_fastest_available_media_accelerator() {
+        let manifest = media_manifest(InferenceTask::VideoGeneration);
+        let available = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::MediaCompanionCpu,
+                available: true,
+                reason: None,
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::MediaCompanionCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+
+        let selected = select_runtime_for_task(
+            &manifest,
+            RequestedBackend::Auto,
+            InferenceTask::VideoGeneration,
+            &available,
+        )
+        .unwrap();
+
+        assert_eq!(selected.runtime_id, RuntimeId::MediaCompanionCuda);
+        assert_eq!(selected.accelerator, BackendAccelerator::Cuda);
+    }
+
+    #[test]
+    fn explicit_video_cpu_route_overrides_available_cuda() {
+        let manifest = media_manifest(InferenceTask::VideoGeneration);
+        let available = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::MediaCompanionCuda,
+                available: true,
+                reason: None,
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::MediaCompanionCpu,
+                available: true,
+                reason: None,
+            },
+        ];
+
+        let selected = select_runtime_for_task(
+            &manifest,
+            RequestedBackend::Cpu,
+            InferenceTask::VideoGeneration,
+            &available,
+        )
+        .unwrap();
+
+        assert_eq!(selected.runtime_id, RuntimeId::MediaCompanionCpu);
+        assert_eq!(selected.accelerator, BackendAccelerator::Cpu);
+    }
+
+    #[test]
     fn typed_task_mismatch_rejects_media_runtime() {
         let manifest = media_manifest(InferenceTask::ImageGeneration);
         let plan = plan_runtime_for_task(

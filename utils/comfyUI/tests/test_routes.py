@@ -16,6 +16,8 @@ class FakeClient:
                 "data": [
                     {"id": "image-ready", "object": "model"},
                     {"id": "image-unavailable", "object": "model"},
+                    {"id": "video-ready", "object": "model"},
+                    {"id": "video-i2v", "object": "model"},
                     {"id": "text", "object": "model"},
                 ],
             }
@@ -38,6 +40,16 @@ class FakeClient:
                         "tasks": ["text_generation"],
                         "available_tasks": ["text_generation"],
                     },
+                    {
+                        "id": "video-ready",
+                        "tasks": ["video_generation"],
+                        "available_tasks": ["video_generation"],
+                    },
+                    {
+                        "id": "video-i2v",
+                        "tasks": ["image_to_video"],
+                        "available_tasks": ["image_to_video"],
+                    },
                 ],
             }
         raise AssertionError(path)
@@ -56,12 +68,32 @@ def test_connection_discovery_returns_safe_status_and_model_lists():
     assert result["ok"] is True
     assert result["server_url"] == "http://127.0.0.1:11434"
     assert result["authentication_configured"] is True
-    assert result["models"] == ["image-ready", "image-unavailable", "text"]
+    assert result["models"] == [
+        "image-ready",
+        "image-unavailable",
+        "video-ready",
+        "video-i2v",
+        "text",
+    ]
     assert result["image_models"] == {
         "declared": ["image-ready", "image-unavailable"],
         "available": ["image-ready"],
     }
-    assert result["status"] == "Connected · 3 models · 1 image"
+    assert result["video_models"] == {
+        "declared": ["video-ready", "video-i2v"],
+        "available": ["video-ready", "video-i2v"],
+        "by_task": {
+            "video-generation": {
+                "declared": ["video-ready"],
+                "available": ["video-ready"],
+            },
+            "image-to-video": {
+                "declared": ["video-i2v"],
+                "available": ["video-i2v"],
+            },
+        },
+    }
+    assert result["status"] == "Connected · 5 models · 1 image · 2 videos"
     assert "never-return-this" not in repr(result)
 
 
@@ -78,6 +110,7 @@ def test_connection_discovery_tolerates_optional_capabilities_failure():
     )
     assert result["ok"] is True
     assert result["image_models"] == {"declared": [], "available": []}
+    assert result["video_models"]["declared"] == []
     assert "not supported" in result["warning"]
 
 

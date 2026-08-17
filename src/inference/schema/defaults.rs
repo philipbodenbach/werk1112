@@ -65,7 +65,14 @@ pub(in crate::inference) fn family_defaults(
         }
     }
     if task.output_modality() == OutputModality::Video {
-        if family.contains("wan") {
+        if family.contains("wan2.2-ti2v") {
+            values.insert("video.width".to_string(), 1280_i64.into());
+            values.insert("video.height".to_string(), 704_i64.into());
+            values.insert("video.frames".to_string(), 121_i64.into());
+            values.insert("video.fps".to_string(), 24.0_f64.into());
+            values.insert("video.steps".to_string(), 50_i64.into());
+            values.insert("video.guidance".to_string(), 5.0_f64.into());
+        } else if family.contains("wan") {
             values.insert("video.frames".to_string(), 81_i64.into());
             values.insert("video.fps".to_string(), 16.0_f64.into());
         } else if family.contains("cogvideo") {

@@ -2784,6 +2784,14 @@ fn infer_model_family(
     root_config: Option<&Value>,
 ) -> Option<String> {
     let mut hints = vec![manifest.id.to_ascii_lowercase()];
+    match &manifest.source {
+        ModelSource::HuggingFace { repo } => hints.push(repo.to_ascii_lowercase()),
+        ModelSource::LocalPath { path } => {
+            if let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) {
+                hints.push(name.to_ascii_lowercase());
+            }
+        }
+    }
     if let Some(architecture) = manifest.architecture.as_deref() {
         hints.push(architecture.to_ascii_lowercase());
     }
@@ -2838,6 +2846,19 @@ fn infer_model_family(
             "stable-diffusion",
         ),
         (&["flux"][..], "flux"),
+        (
+            &[
+                "wan2.2-ti2v",
+                "wan2.2_ti2v",
+                "wan2.2 ti2v",
+                "wan2-2-ti2v",
+                "wan2_2_ti2v",
+                "wan22-ti2v",
+                "wan22_ti2v",
+            ][..],
+            "wan2.2-ti2v",
+        ),
+        (&["wan"][..], "wan"),
         (&["hunyuanvideo", "hunyuan-video"][..], "hunyuan-video"),
         (&["cogvideo"][..], "cogvideo"),
         (&["ltxvideo", "ltx-video"][..], "ltx-video"),
@@ -2893,6 +2914,14 @@ fn infer_inference_tasks(
             .unwrap_or_default()
             .to_ascii_lowercase(),
     ];
+    match &manifest.source {
+        ModelSource::HuggingFace { repo } => hints.push(repo.to_ascii_lowercase()),
+        ModelSource::LocalPath { path } => {
+            if let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) {
+                hints.push(name.to_ascii_lowercase());
+            }
+        }
+    }
     for value in [model_index, root_config].into_iter().flatten() {
         for key in [
             "_class_name",
@@ -2915,19 +2944,45 @@ fn infer_inference_tasks(
     let hint = hints.join(" ");
     let mut tasks = Vec::new();
 
-    let video = contains_any(
+    let text_image_to_video = contains_any(
         &hint,
         &[
-            "video",
-            "image-to-video",
-            "image_to_video",
-            "i2v",
-            "cogvideo",
-            "hunyuanvideo",
-            "ltxvideo",
-            "animatediff",
+            "ti2v",
+            "text-image-to-video",
+            "text_image_to_video",
+            "text image to video",
         ],
     );
+    let wan_image_to_video_pipeline = contains_any(
+        &hint,
+        &["wanimagetovideopipeline", "wan_image_to_video_pipeline"],
+    );
+    let text_to_video = contains_any(
+        &hint,
+        &[
+            "wanpipeline",
+            "text-to-video",
+            "text_to_video",
+            "text to video",
+            "t2v",
+        ],
+    );
+    let video = text_image_to_video
+        || wan_image_to_video_pipeline
+        || text_to_video
+        || contains_any(
+            &hint,
+            &[
+                "video",
+                "image-to-video",
+                "image_to_video",
+                "i2v",
+                "cogvideo",
+                "hunyuanvideo",
+                "ltxvideo",
+                "animatediff",
+            ],
+        );
     let audio = contains_any(
         &hint,
         &[
@@ -3031,15 +3086,20 @@ fn infer_inference_tasks(
             push_unique(&mut tasks, InferenceTask::VideoExtension);
         } else if contains_any(&hint, &["video-to-video", "video_to_video", "vid2vid"]) {
             push_unique(&mut tasks, InferenceTask::VideoToVideo);
-        } else if contains_any(
-            &hint,
-            &[
-                "image-to-video",
-                "image_to_video",
-                "i2v",
-                "stablevideodiffusion",
-            ],
-        ) {
+        } else if text_image_to_video {
+            push_unique(&mut tasks, InferenceTask::VideoGeneration);
+            push_unique(&mut tasks, InferenceTask::ImageToVideo);
+        } else if wan_image_to_video_pipeline
+            || contains_any(
+                &hint,
+                &[
+                    "image-to-video",
+                    "image_to_video",
+                    "i2v",
+                    "stablevideodiffusion",
+                ],
+            )
+        {
             push_unique(&mut tasks, InferenceTask::ImageToVideo);
         } else {
             push_unique(&mut tasks, InferenceTask::VideoGeneration);
@@ -4390,6 +4450,109 @@ mod tests {
     }
 
     #[test]
+    fn wan22_ti2v_repo_resolves_specific_family_and_both_video_tasks() {
+        let tmp = test_dir("pipeline-classification-ti2v");
+        let source = tmp.join("source");
+        write_diffusers_pipeline_fixture(&source, "WanPipeline");
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store
+            .import_path_with_source(
+                &source,
+                "renamed-pipeline",
+                ModelSource::HuggingFace {
+                    repo: "Wan-AI/Wan2.2-TI2V-5B-Diffusers".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(manifest.metadata.family.as_deref(), Some("wan2.2-ti2v"));
+        assert_eq!(
+            manifest.metadata.tasks,
+            vec![InferenceTask::VideoGeneration, InferenceTask::ImageToVideo]
+        );
+        assert_eq!(
+            manifest.metadata.input_modalities,
+            vec![InputModality::Text, InputModality::Image]
+        );
+        assert_eq!(
+            manifest.metadata.output_modalities,
+            vec![OutputModality::Video]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn local_wan22_ti2v_directory_keeps_hybrid_tasks_after_rename() {
+        let tmp = test_dir("pipeline-classification-local-ti2v");
+        let source = tmp.join("Wan2.2-TI2V-5B-Diffusers");
+        write_diffusers_pipeline_fixture(&source, "WanPipeline");
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store
+            .import_path(&source, "renamed-local-pipeline")
+            .unwrap();
+
+        assert_eq!(manifest.metadata.family.as_deref(), Some("wan2.2-ti2v"));
+        assert_eq!(
+            manifest.metadata.tasks,
+            vec![InferenceTask::VideoGeneration, InferenceTask::ImageToVideo]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn wan_pipeline_resolves_generic_family_and_text_to_video_task() {
+        let tmp = test_dir("pipeline-classification-a");
+        let source = tmp.join("source");
+        write_diffusers_pipeline_fixture(&source, "WanPipeline");
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "renamed-pipeline").unwrap();
+
+        assert_eq!(manifest.metadata.family.as_deref(), Some("wan"));
+        assert_eq!(
+            manifest.metadata.tasks,
+            vec![InferenceTask::VideoGeneration]
+        );
+        assert_eq!(
+            manifest.metadata.input_modalities,
+            vec![InputModality::Text]
+        );
+        assert_eq!(
+            manifest.metadata.output_modalities,
+            vec![OutputModality::Video]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn wan_image_to_video_pipeline_resolves_generic_family_and_i2v_task() {
+        let tmp = test_dir("pipeline-classification-b");
+        let source = tmp.join("source");
+        write_diffusers_pipeline_fixture(&source, "WanImageToVideoPipeline");
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "renamed-pipeline").unwrap();
+
+        assert_eq!(manifest.metadata.family.as_deref(), Some("wan"));
+        assert_eq!(manifest.metadata.tasks, vec![InferenceTask::ImageToVideo]);
+        assert_eq!(
+            manifest.metadata.input_modalities,
+            vec![InputModality::Text, InputModality::Image]
+        );
+        assert_eq!(
+            manifest.metadata.output_modalities,
+            vec![OutputModality::Video]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn get_reclassifies_legacy_mlx_safetensors_manifest() {
         let tmp = test_dir("legacy-mlx-safetensors-manifest");
         let source = tmp.join("source");
@@ -5105,6 +5268,20 @@ mod tests {
         }
         let manifest = store.import_path(&source, id).unwrap();
         assert_eq!(manifest.format, format);
+    }
+
+    fn write_diffusers_pipeline_fixture(source: &Path, pipeline_class: &str) {
+        fs::create_dir_all(source.join("transformer")).unwrap();
+        fs::write(
+            source.join("model_index.json"),
+            format!(r#"{{"_class_name":"{pipeline_class}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            source.join("transformer/diffusion_pytorch_model.safetensors"),
+            b"transformer",
+        )
+        .unwrap();
     }
 
     fn test_dir(name: &str) -> PathBuf {

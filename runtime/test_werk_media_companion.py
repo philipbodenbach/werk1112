@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -246,6 +247,427 @@ class DiffusersCountParameterTests(unittest.TestCase):
                     failure.exception.detail["reasons"][batch_path],
                     f"it is overridden by explicit parameter '{count_path}'",
                 )
+
+
+class VideoBackendTests(unittest.TestCase):
+    def test_null_schema_values_do_not_mask_video_estimate_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "model_index.json").write_text(
+                json.dumps({"_class_name": "WanPipeline"}),
+                encoding="utf-8",
+            )
+
+            estimate = COMPANION.command_estimate(
+                {
+                    "model_path": str(model),
+                    "task": "image_to_video",
+                    "effective_parameters": {
+                        "video.width": 1216,
+                        "video.height": 320,
+                        "video.frames": 33,
+                        "video.fps": 16.0,
+                        "video.temporal_vae_tiling": True,
+                        "video.window_size": None,
+                        "video.bitrate": None,
+                    },
+                    "explicit_parameters": [
+                        "video.width",
+                        "video.height",
+                        "video.frames",
+                        "video.fps",
+                        "video.temporal_vae_tiling",
+                    ],
+                }
+            )
+
+        self.assertIn(
+            "1216x320, 33 frames at 16 fps, active window 33",
+            estimate["assumptions"],
+        )
+        self.assertEqual(estimate["output_size_bytes"], 2_062_500)
+
+    def test_adapter_accepts_diffusers_layout_and_rejects_native_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps({"architectures": ["ExampleVideoModel"]}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(
+                COMPANION.execution_adapter(model, "video_generation")
+            )
+
+            (model / "model_index.json").write_text("{}", encoding="utf-8")
+            self.assertIsNone(
+                COMPANION.execution_adapter(model, "video_generation")
+            )
+
+            (model / "model_index.json").write_text(
+                json.dumps({"_class_name": "ExampleVideoPipeline"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                COMPANION.execution_adapter(model, "video_generation"),
+                "diffusers",
+            )
+
+    def test_probe_does_not_claim_image_pipeline_for_video(self):
+        dependencies = {
+            name: {"available": name in {"torch", "diffusers", "PIL", "av"}}
+            for name in (
+                "torch",
+                "diffusers",
+                "PIL",
+                "av",
+                "imageio",
+                "imageio_ffmpeg",
+                "ffmpeg",
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "model_index.json").write_text(
+                json.dumps({"_class_name": "StableDiffusionPipeline"}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=dependencies,
+            ):
+                result = COMPANION.command_probe_model(
+                    {"model_path": str(model), "task": "video_generation"}
+                )
+
+        self.assertFalse(result["supported"])
+        self.assertEqual(result["adapter"], "diffusers")
+        self.assertTrue(
+            any("does not advertise" in reason for reason in result["reasons"])
+        )
+
+    def test_video_dependencies_require_real_encoder_and_input_decoder(self):
+        dependencies = {
+            name: {"available": name in {"torch", "diffusers", "PIL", "imageio"}}
+            for name in (
+                "torch",
+                "diffusers",
+                "PIL",
+                "av",
+                "imageio",
+                "imageio_ffmpeg",
+                "ffmpeg",
+            )
+        }
+        self.assertFalse(
+            COMPANION.task_dependency_ready("video_generation", dependencies)[0]
+        )
+
+        dependencies["imageio_ffmpeg"]["available"] = True
+        self.assertTrue(
+            COMPANION.task_dependency_ready("video_generation", dependencies)[0]
+        )
+        self.assertTrue(
+            COMPANION.task_dependency_ready("video_to_video", dependencies)[0]
+        )
+
+        dependencies["imageio"]["available"] = False
+        self.assertFalse(
+            COMPANION.task_dependency_ready("video_to_video", dependencies)[0]
+        )
+        dependencies["ffmpeg"]["available"] = True
+        self.assertFalse(
+            COMPANION.task_dependency_ready("video_to_video", dependencies)[0]
+        )
+        dependencies["av"]["available"] = True
+        self.assertTrue(
+            COMPANION.task_dependency_ready("video_to_video", dependencies)[0]
+        )
+
+    def test_task_registry_selects_related_image_to_video_pipeline(self):
+        class WanImageToVideoPipeline:
+            pass
+
+        auto_pipeline = types.SimpleNamespace(
+            AUTO_IMAGE2VIDEO_PIPELINES_MAPPING={
+                "unrelated": object,
+                "wan-i2v": WanImageToVideoPipeline,
+            },
+            _get_task_class=lambda *_args, **_kwargs: None,
+            _get_model=lambda class_name: (
+                "wan" if class_name == "WanPipeline" else None
+            ),
+        )
+        diffusers = types.SimpleNamespace()
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "model_index.json").write_text(
+                json.dumps({"_class_name": "WanPipeline"}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                COMPANION.importlib,
+                "import_module",
+                return_value=auto_pipeline,
+            ):
+                selected = COMPANION.resolve_diffusers_video_pipeline_class(
+                    diffusers,
+                    model,
+                    "image_to_video",
+                )
+
+        self.assertIs(selected, WanImageToVideoPipeline)
+
+    def test_video_call_requests_portable_pil_frames(self):
+        guard = COMPANION.ExplicitParameterGuard(
+            {"explicit_parameters": []},
+            "video_generation",
+            "diffusers",
+            {"prompt": "ocean"},
+        )
+
+        values, required, _seed, _paths = COMPANION.diffusers_call_values(
+            "video_generation",
+            {"prompt": "ocean"},
+            {},
+            object(),
+            "cpu",
+            guard,
+        )
+
+        self.assertEqual(values["output_type"], "pil")
+        self.assertIn("prompt", required)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("PIL"),
+        "Pillow is an optional media dependency",
+    )
+    def test_video_execution_reports_pipeline_and_output_metadata(self):
+        from PIL import Image
+
+        class FakeTorch:
+            @staticmethod
+            def inference_mode():
+                return contextlib.nullcontext()
+
+        class FakeVideoPipeline:
+            def __call__(self, prompt, output_type=None):
+                self.prompt = prompt
+                self.output_type = output_type
+                return types.SimpleNamespace(
+                    frames=[
+                        [Image.new("RGB", (10, 8), color) for color in (0, 127, 255)]
+                    ]
+                )
+
+        pipeline = FakeVideoPipeline()
+        entry = COMPANION.DiffusersPipelineEntry(
+            pipeline,
+            FakeTorch(),
+            "cpu",
+            "bf16",
+            {"offload_mode": "none", "offload_request": "none"},
+            COMPANION.DiffusersConfigurationOutcome(),
+            0.25,
+        )
+        guard = COMPANION.ExplicitParameterGuard(
+            {"explicit_parameters": []},
+            "video_generation",
+            "diffusers",
+            {"prompt": "ocean", "frames": 3, "fps": 12.0},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+
+            def fake_export(_frames, path, _fps, _format):
+                path.write_bytes(b"video")
+
+            with mock.patch.object(
+                COMPANION,
+                "export_video",
+                side_effect=fake_export,
+            ):
+                outputs, warnings, metadata = (
+                    COMPANION.execute_prepared_diffusers_pipeline(
+                        entry,
+                        "cache-key",
+                        False,
+                        None,
+                        entry.torch,
+                        "cpu",
+                        "bf16",
+                        "video_generation",
+                        {
+                            "prompt": "ocean",
+                            "frames": 3,
+                            "fps": 12.0,
+                            "output_format": "mp4",
+                        },
+                        {},
+                        output_dir,
+                        "test",
+                        guard,
+                    )
+                )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(outputs[0]["mime_type"], "video/mp4")
+        self.assertEqual(outputs[0]["width"], 10)
+        self.assertEqual(outputs[0]["height"], 8)
+        self.assertEqual(outputs[0]["duration"], 0.25)
+        self.assertEqual(outputs[0]["metadata"], {"frames": 3, "fps": 12.0})
+        self.assertEqual(metadata["pipeline_task"], "video_generation")
+        self.assertEqual(metadata["pipeline_class"], "FakeVideoPipeline")
+        self.assertEqual(metadata["dtype"], "bf16")
+
+    def test_wan_vae_component_uses_fp32_without_changing_other_pipelines(self):
+        torch = types.SimpleNamespace(float32="fp32")
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "model_index.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "WanPipeline",
+                        "vae": ["diffusers", "AutoencoderKLWan"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                COMPANION.diffusers_load_dtype(model, torch, "bf16"),
+                {"default": "bf16", "vae": "fp32"},
+            )
+
+            (model / "model_index.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "ExamplePipeline",
+                        "vae": ["diffusers", "AutoencoderKL"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                COMPANION.diffusers_load_dtype(model, torch, "bf16"),
+                "bf16",
+            )
+
+    def test_loader_passes_component_dtype_policy_to_diffusers(self):
+        calls = []
+
+        class Pipeline:
+            @classmethod
+            def from_pretrained(cls, model_path, **kwargs):
+                calls.append((model_path, kwargs))
+                return cls()
+
+        torch = types.SimpleNamespace(float32="fp32")
+        diffusers = types.SimpleNamespace(DiffusionPipeline=Pipeline)
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "model_index.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "WanPipeline",
+                        "vae": ["diffusers", "AutoencoderKLWan"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(COMPANION, "require_module", return_value=diffusers),
+                mock.patch.object(
+                    COMPANION,
+                    "resolve_diffusers_video_pipeline_class",
+                    return_value=None,
+                ),
+            ):
+                COMPANION.load_diffusers_pipeline(
+                    model,
+                    "video_generation",
+                    False,
+                    torch,
+                    "bf16",
+                )
+
+        self.assertEqual(
+            calls[0][1]["torch_dtype"],
+            {"default": "bf16", "vae": "fp32"},
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy") and importlib.util.find_spec("PIL"),
+        "NumPy and Pillow are optional media dependencies",
+    )
+    def test_frame_batches_normalize_channels_last_and_channels_first(self):
+        import numpy
+
+        channels_last = numpy.zeros((2, 5, 8, 10, 3), dtype="uint8")
+        batches = COMPANION.frame_batches(channels_last)
+        self.assertEqual([len(batch) for batch in batches], [5, 5])
+        self.assertEqual(COMPANION.ensure_pil_image(batches[0][0]).size, (10, 8))
+
+        channels_first = numpy.zeros((2, 3, 5, 8, 10), dtype="float32")
+        batches = COMPANION.frame_batches(channels_first)
+        self.assertEqual([len(batch) for batch in batches], [5, 5])
+        self.assertEqual(COMPANION.ensure_pil_image(batches[0][0]).size, (10, 8))
+
+        short_bcfhw = numpy.zeros((1, 3, 1, 8, 10), dtype="float32")
+        batches = COMPANION.frame_batches(short_bcfhw, expected_frames=1)
+        self.assertEqual([len(batch) for batch in batches], [1])
+        self.assertEqual(COMPANION.ensure_pil_image(batches[0][0]).size, (10, 8))
+
+        short_fchw = numpy.zeros((1, 3, 8, 10), dtype="float32")
+        batches = COMPANION.frame_batches(short_fchw, expected_frames=1)
+        self.assertEqual([len(batch) for batch in batches], [1])
+        self.assertEqual(COMPANION.ensure_pil_image(batches[0][0]).size, (10, 8))
+
+    def test_ffmpeg_resolution_uses_imageio_ffmpeg_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "ffmpeg"
+            executable.write_bytes(b"binary")
+            module = types.SimpleNamespace(
+                get_ffmpeg_exe=lambda: str(executable)
+            )
+            with (
+                mock.patch.object(COMPANION.shutil, "which", return_value=None),
+                mock.patch.object(
+                    COMPANION.importlib,
+                    "import_module",
+                    return_value=module,
+                ),
+            ):
+                self.assertEqual(
+                    COMPANION.ffmpeg_executable(),
+                    str(executable),
+                )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("av")
+        and importlib.util.find_spec("numpy")
+        and importlib.util.find_spec("PIL"),
+        "PyAV, NumPy and Pillow are optional video dependencies",
+    )
+    def test_pyav_encoder_writes_decodable_mp4(self):
+        import av
+        import numpy
+        from PIL import Image
+
+        frames = [
+            Image.fromarray(numpy.full((16, 16, 3), value, dtype="uint8"))
+            for value in (0, 127, 255)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "video.mp4"
+            COMPANION.encode_video_with_pyav(frames, output, 12.0)
+            with av.open(str(output)) as container:
+                decoded = list(container.decode(video=0))
+            loaded = COMPANION.load_video_frames(str(output), "source video")
+
+            self.assertGreater(output.stat().st_size, 0)
+            self.assertEqual(len(decoded), 3)
+            self.assertEqual(len(loaded), 3)
+            self.assertEqual(loaded[0].size, (16, 16))
 
 
 class DiffusersPipelineCacheTests(unittest.TestCase):

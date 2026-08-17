@@ -5,7 +5,7 @@
 > behavior may still change before the first stable release.
 
 This package connects native ComfyUI nodes to `werk serve` over HTTP. ComfyUI
-still owns its workflow graph, queue, history, previews, and saved images; Werk
+still owns its workflow graph, queue, history, previews, and saved media; Werk
 performs model discovery, routing, and inference.
 
 ## Existing ComfyUI compatibility
@@ -40,7 +40,7 @@ manual method below.
 ### Manual development installation
 
 Copy the package from a Werk1112 checkout into ComfyUI and install only its
-small image dependencies in the Python environment used by ComfyUI:
+small media-transfer dependencies in the Python environment used by ComfyUI:
 
 ```bash
 cp -R utils/comfyUI /path/to/ComfyUI/custom_nodes/comfyui-werk1112
@@ -94,10 +94,37 @@ For local unauthenticated development only:
 werk serve --image-model tiny-sd --allow-unauthenticated
 ```
 
+`--image-model` supplies the alias used by image compatibility endpoints; the
+Werk-native image and video model nodes discover installed models and select
+one explicitly in the graph. They do not need a server-wide video-model alias.
+
 The normal address is `http://127.0.0.1:11434`. Put the address and key into a
 **WERK Connection** node, or set `WERK_BASE_URL` and `WERK_API_KEY` before
 starting ComfyUI. Explicit widget values take precedence over environment
 defaults.
+
+### Preparing Wan2.2 for Werk video nodes
+
+The Werk nodes call Werk's local media companion. They do not load checkpoints
+from ComfyUI's `models` directories. Pull the official Diffusers repository
+into Werk before starting the server:
+
+```bash
+werk pull Wan-AI/Wan2.2-TI2V-5B-Diffusers --name wan22-ti2v-5b
+werk doctor --model wan22-ti2v-5b --task video-generation
+werk doctor --model wan22-ti2v-5b --task image-to-video
+werk serve
+```
+
+Use
+[`Wan-AI/Wan2.2-TI2V-5B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers),
+not the native
+[`Wan-AI/Wan2.2-TI2V-5B`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B)
+layout. The latter has no Diffusers `model_index.json`, so Werk can catalog it
+but the bundled local adapter rejects it as non-executable. ComfyUI's
+[official native Wan2.2 workflow](https://docs.comfy.org/tutorials/video/wan/wan2_2)
+is a separate path with model components installed directly under ComfyUI; it
+is not required by these HTTP-backed Werk nodes.
 
 ## Nodes
 
@@ -111,6 +138,11 @@ defaults.
   **WERK Connection**, click **Refresh Models**, and select a model from the
   **available_model** dropdown.
 - **WERK Image Parameters** reads the active model/runtime parameter schema.
+- **WERK Video Models** discovers video models per explicit task. Choose
+  `video-generation` for T2V or `image-to-video` for I2V, refresh discovery,
+  and select `preferred_model` when more than one eligible model exists.
+- **WERK Video Parameters** reads the selected model/runtime schema for that
+  same explicit video task.
 - **WERK Routing Config** represents all current Werk routing overrides without
   turning inherited server, model, or profile defaults into explicit request
   values.
@@ -121,6 +153,15 @@ defaults.
   is a real, required ComfyUI input and should be connected to the `model`
   output of **WERK Image Models**. It returns a ComfyUI `IMAGE` batch plus
   sanitized Werk metadata and IDs.
+- **WERK Video Config** contains common dimensions, frame rate/count, sampling,
+  seed, output-container, and temporal-VAE controls. Remaining schema-discovered
+  video parameters are accepted as JSON, and routing stays a separate typed
+  input.
+- **WERK Video Generate** submits a persisted Werk video job, polls it, fetches
+  each authenticated output, and returns native ComfyUI `VIDEO` values plus
+  sanitized metadata, seed, job/result IDs, and output IDs. Its `model` socket
+  must come from **WERK Video Models**. Connecting one `initial_image` changes
+  the generated request to I2V.
 
 The interactive verification and dropdown discovery run through a local
 ComfyUI route. The browser sends the connection settings only to its own
@@ -152,12 +193,86 @@ embedded Base64 response. The default batch size is treated as inherited and
 is not sent explicitly. For a reproducible and visible workflow, connecting an
 explicit **WERK Image Config** is recommended.
 
+### Recommended video workflows
+
+Text-to-video uses this explicit chain:
+
+```text
+WERK Connection.connection --------+--> WERK Video Models.connection
+                                    +--> WERK Video Generate.connection
+
+WERK Video Models.model ----------------> WERK Video Generate.model
+WERK Routing Config.routing ------------> WERK Video Config.routing
+WERK Video Config.config ---------------> WERK Video Generate.config
+WERK Video Generate.videos -------------> Save Video.video
+```
+
+Set **WERK Video Models.task** to `video-generation`. For image-to-video, set it
+to `image-to-video` and add exactly one image:
+
+```text
+Load Image.IMAGE ------------------------> WERK Video Generate.initial_image
+```
+
+The selector task and presence of `initial_image` must agree. Task discovery
+only filters eligible models; it does not add a hidden image or silently change
+the generated request. **WERK Video Parameters** is an optional diagnostic
+branch: connect the same connection and singular model output, then select the
+same task to inspect its live schema.
+
+As with image generation, connect `model`, not `available_models`. With
+`require_available=true`, discovery filters to tasks accepted by the current
+runtime probe. Multiple candidates require `preferred_model`; the node does
+not choose one arbitrarily. Probe eligibility is still not a promise that the
+first cold pipeline load will fit memory or support every explicit parameter.
+
+For `wan22-ti2v-5b`, configure 1280x704, 121 frames, 24 FPS, 50 steps, and
+guidance 5, and set `precision=bf16` in **WERK Routing Config**. The companion
+keeps Wan's VAE in fp32. The official flow shift 5 is already stored in the
+Diffusers repository's
+[scheduler configuration](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers/blob/main/scheduler/scheduler_config.json),
+so leave `additional_video_parameters_json` empty. These values come from the
+[official Wan2.2 configuration](https://github.com/Wan-Video/Wan2.2/blob/main/wan/configs/wan_ti2v_5B.py)
+and [model card](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B). The generic
+node defaults—832x480, 81 frames, 24 FPS, 30 steps, and guidance 6—are useful
+for filling a portable request but are not a Wan2.2 quality preset.
+
+Wan calls its 1280x704/704x1280 output 720P. Its native reference requires at
+least 24 GB VRAM with offload and reports under nine minutes for a five-second
+720P clip on a consumer GPU; the repository download is about 34.2 GB. The
+official ComfyUI native workflow separately reports that its own native
+offloading can fit the 5B model in 8 GB VRAM. Neither upstream figure guarantees
+the memory or speed of Werk's Diffusers route. In **WERK Routing Config**, set
+`allow_cpu_offload=enabled` only when the chosen accelerator and available host
+RAM can support it, and use metadata to confirm the active pipeline and offload
+state.
+
+For a smaller T2V-only plumbing check, install
+[`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers)
+and use 832x480. The [official Wan2.1 model card](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B)
+reports 8.19 GB VRAM and about four minutes for five seconds of 480P video on an
+RTX 4090 without quantization. This checks transport, job polling, download,
+native `VIDEO` conversion, and saving, but not Wan2.2 I2V or 720P behavior.
+
+Video generation is asynchronous at the Werk API boundary. The generator polls
+states `queued`, `loading`, `running`, and `encoding`, and requests best-effort
+job cancellation when ComfyUI interrupts or the connection timeout expires.
+The **WERK Connection** default is 900 seconds; increase it for a slower local
+run. The routing config's `inference_timeout_seconds` is a distinct Werk request
+override and does not extend a shorter client connection timeout.
+
+Ready API-prompt examples are provided for
+[text-to-video](examples/werk_video_generation_api.json) and
+[image-to-video](examples/werk_image_to_video_api.json). They contain no
+credential; read the [example assumptions](examples/README.md) before
+submitting them to ComfyUI.
+
 When these nodes call `werk serve`, the bundled media execution worker stays
 running and serializes generation requests. Health, discovery, and estimation
-preflights remain independent of that queue. Its Diffusers image/video cache holds one
-fully configured pipeline by default: the first generation is a cold load, and
-later generations with the same model/runtime configuration should be
-substantially faster to start. Changing prompt, seed, dimensions, steps, or
+preflights remain independent of that queue. Its Diffusers image/video cache
+holds one fully configured pipeline by default: the first generation is a cold
+load, and later generations with the same model/runtime configuration should
+be substantially faster to start. Changing prompt, seed, dimensions, steps, or
 count keeps the pipeline warm. Changing model, device, dtype, offload/tiling
 settings, or LoRAs may reload it; the previous entry is evicted before the new
 one is loaded at the default cache size. Set
@@ -301,6 +416,50 @@ The node accepts embedded Base64 or authenticated URL responses. RGBA images
 are composited over white, all images become float32 RGB `[B,H,W,C]` tensors,
 and differently sized outputs fail rather than being resized.
 
+### WERK Video Config
+
+The video config exposes the portable request controls directly:
+
+| Node input | Werk request |
+| --- | --- |
+| `width`, `height` | `size: "WIDTHxHEIGHT"` |
+| `count` | `n` when `batch_size=1` |
+| `batch_size` | `parameters["video.batch_size"]` only when greater than 1 |
+| `frames` | `parameters["video.frames"]` |
+| `fps` | `parameters["video.fps"]` |
+| `steps` | `parameters["video.steps"]` |
+| `guidance` | `parameters["video.guidance"]` |
+| `seed` | `parameters["video.seed"]` |
+| `output_format` | API `response_format`, either MP4 or GIF |
+| `temporal_vae_tiling` | Tri-state `parameters["video.temporal_vae_tiling"]` |
+
+`count` and `batch_size` are alternative video-count controls. The node
+rejects a config when both are greater than 1 instead of relying on
+adapter-specific precedence. The selected adapter may impose narrower bounds
+than the portable node widgets, so inspect the live task schema before tuning:
+
+```bash
+werk parameters MODEL --task video-generation --json
+werk parameters MODEL --task image-to-video --json
+```
+
+Use `additional_video_parameters_json` for schema-discovered controls without a
+dedicated widget. Unqualified, canonical, and grouped spellings normalize into
+the `video.*` namespace. Request, routing, and duplicate dedicated keys are
+rejected. This escape hatch does not make an unsupported parameter executable:
+the planner and concrete pipeline still validate it. In particular, do not
+copy a native runner's sampling knobs into a Diffusers request merely because
+their names look similar; prefer the selected repository's scheduler config
+unless the live adapter schema explicitly accepts an override.
+
+For I2V, the generator accepts exactly one ComfyUI `IMAGE`, converts it to an
+inline RGB PNG, and sends it as `initial_image`. A batch with zero or multiple
+images fails locally. Generated artifacts are fetched through authenticated
+Werk output URLs, bounded by `WERK_MAX_VIDEO_BYTES`, and wrapped with
+`comfy_api.latest.InputImpl.VideoFromFile`. Use a current ComfyUI release with
+native `VIDEO` support and connect the result to its
+[Save Video node](https://docs.comfy.org/built-in-nodes/SaveVideo).
+
 ## Discovery and diagnostics
 
 CLI equivalents:
@@ -308,7 +467,11 @@ CLI equivalents:
 ```bash
 werk inspect MODEL
 werk parameters MODEL --task image-generation --json
+werk parameters MODEL --task video-generation --json
+werk parameters MODEL --task image-to-video --json
 werk doctor --model MODEL --task image-generation
+werk doctor --model MODEL --task video-generation
+werk doctor --model MODEL --task image-to-video
 ```
 
 The nodes call:
@@ -317,7 +480,12 @@ The nodes call:
 GET /v1/models
 GET /v1/capabilities
 GET /v1/parameters?task=image-generation&model=MODEL&backend=auto
+GET /v1/parameters?task=video-generation&model=MODEL&backend=auto
+GET /v1/parameters?task=image-to-video&model=MODEL&backend=auto
 POST /v1/images/generations
+POST /v1/videos/generations
+GET /v1/jobs/{id}
+DELETE /v1/jobs/{id}
 GET /v1/outputs/{id}
 ```
 
@@ -349,7 +517,9 @@ Werk URL outputs remain subject to Werk's output-retention policy.
 
 Image decoding defaults to a 67,108,864-pixel allocation limit. Set
 `WERK_MAX_IMAGE_PIXELS` before starting ComfyUI to choose another positive
-limit.
+limit. Video downloads default to a 536,870,912-byte (512 MiB) limit; set
+`WERK_MAX_VIDEO_BYTES` to another positive byte count when a trusted workflow
+needs larger artifacts.
 
 ## Tests
 

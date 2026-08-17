@@ -177,7 +177,18 @@ class WerkClient:
         request = Request(url, data=data, method="POST", headers=self._headers(include_auth=True, json_body=True))
         return self._json(request, f"POST {urlsplit(url).path}")
 
-    def download_bytes(self, value: str) -> tuple[bytes, str | None]:
+    def delete_json(self, path: str) -> Any:
+        url = self._url(path)
+        request = Request(
+            url,
+            method="DELETE",
+            headers=self._headers(include_auth=True),
+        )
+        return self._json(request, f"DELETE {urlsplit(url).path}")
+
+    def download_bytes(
+        self, value: str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, str | None]:
         url = urljoin(self.connection.server_url + "/", value)
         parts = urlsplit(url)
         if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
@@ -186,5 +197,8 @@ class WerkClient:
             raise WerkApiError("download output", _sanitized_url(url), None, "output URL credentials are not allowed")
         include_auth = same_origin(self.connection.server_url, url)
         request = Request(url, headers=self._headers(include_auth=include_auth))
-        body, headers = self._open(request, "download output", self.max_image_bytes)
+        limit = self.max_image_bytes if max_bytes is None else int(max_bytes)
+        if limit <= 0:
+            raise ValueError("download byte limit must be greater than zero")
+        body, headers = self._open(request, "download output", limit)
         return body, headers.get("Content-Type")

@@ -230,6 +230,90 @@ werk audio speak speech-model --text "Systems nominal."
 werk audio transcribe whisper --input interview.wav
 ```
 
+### Local Wan2.2 video smoke test
+
+For local Werk execution, pull the official Diffusers layout rather than the
+native Wan checkpoint layout:
+
+```bash
+werk pull Wan-AI/Wan2.2-TI2V-5B-Diffusers --name wan22-ti2v-5b
+werk inspect wan22-ti2v-5b
+werk doctor --model wan22-ti2v-5b --task video-generation
+```
+
+`Wan-AI/Wan2.2-TI2V-5B` is the official native Wan repository. It is useful
+with the native Wan runner, but it does not contain the Diffusers
+`model_index.json` component layout required by Werk's local Diffusers adapter.
+Importing or cataloging a model does not make that layout executable; the local
+planner rejects it when no registered adapter can run it. Use
+[`Wan-AI/Wan2.2-TI2V-5B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers)
+for the commands below. The corresponding
+[`Wan-AI/Wan2.2-TI2V-5B`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B)
+model card documents the native layout and reference implementation.
+
+Text-to-video and image-to-video smoke commands use the same explicitly named
+installed model:
+
+```bash
+# Text to video
+werk video generate wan22-ti2v-5b \
+  --prompt "A quiet lunar sunrise beyond an orbital station" \
+  --width 1280 --height 704 --frames 121 --fps 24 \
+  --steps 50 --guidance 5 \
+  --backend auto --precision bf16 --allow-cpu-offload \
+  --output wan22-t2v.mp4 --verbose --debug
+
+# Image to video; use a source image with the intended aspect ratio
+werk video animate wan22-ti2v-5b \
+  --image station.png --prompt "A slow, stable camera orbit" \
+  --width 1280 --height 704 --frames 121 --fps 24 \
+  --steps 50 --guidance 5 \
+  --backend auto --precision bf16 --allow-cpu-offload \
+  --output wan22-i2v.mp4 --verbose --debug
+```
+
+The Wan examples use bf16 for the main pipeline components. Werk detects the
+Wan VAE class from the Diffusers component metadata and keeps that VAE in fp32.
+
+These are the official Wan2.2 TI2V reference values: the project calls the
+1280x704/704x1280 output 720P, with 121 frames at 24 FPS, 50 sampling steps,
+guidance 5, and flow shift 5. The Diffusers repository already stores that
+flow shift in its
+[scheduler configuration](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers/blob/main/scheduler/scheduler_config.json),
+so the portable smoke request does not override it. The repository is about
+34.2 GB. Wan's native single-GPU example requires at least 24 GB VRAM with
+model offload, dtype conversion, and T5 on CPU, and reports under nine minutes
+for a five-second 720P video on a consumer GPU without special optimization.
+Those figures are reference measurements, not a Werk fit guarantee; Diffusers
+version, dtype, encoder, accelerator, offload mode, and available host RAM
+still matter. See the
+[official Wan2.2 configuration](https://github.com/Wan-Video/Wan2.2/blob/main/wan/configs/wan_ti2v_5B.py)
+and [model card](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B).
+
+For a smaller T2V-only plumbing check, use the official
+[`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers)
+layout at 832x480. Wan reports 8.19 GB VRAM and about four minutes for a
+five-second 480P video on an RTX 4090 without quantization. It exercises the
+same typed video path but does not validate Wan2.2's hybrid I2V path, new VAE,
+or 720P behavior:
+
+```bash
+werk pull Wan-AI/Wan2.1-T2V-1.3B-Diffusers --name wan21-t2v-1.3b
+werk video generate wan21-t2v-1.3b \
+  --prompt "Clouds moving above a mountain ridge" \
+  --width 832 --height 480 --frames 81 --fps 15 \
+  --steps 50 --guidance 5 \
+  --backend auto --precision bf16 --allow-cpu-offload \
+  --output wan21-smoke.mp4 --verbose --debug
+```
+
+The [official Wan2.1 Diffusers model card](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers)
+uses these 832x480, 81-frame, guidance-5 values and exports at 15 FPS. Its
+repository is still about 28.9 GB, so it saves more accelerator memory and
+generation time than download time. The native
+[Wan2.1 model card](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B) recommends
+480P for the 1.3B model; its 720P results are less stable.
+
 When interactive stdout and stderr are attached to a terminal, chat and typed
 media commands open with the Werk1112 banner and show a transient,
 task-specific activity animation while inference is running: sparks for chat,
@@ -306,15 +390,27 @@ werk estimate flux-dev --task image-generation \
 werk doctor --model flux-dev --task image-generation
 ```
 
-Werk includes an offline media companion adapter for compatible local Diffusers
-and Transformers models. Launcher discovery honors `WERK_MEDIA_COMPANION`,
-`WERK_MEDIA_PYTHON`, and repository scripts before using the embedded adapter
-fallback. The companion never downloads weights or installs packages; Python,
-Torch, model-framework packages, and required codecs must already be available.
-Image, video, audio/music, TTS, and ASR have generic adapters. Song
-continuation/variation, voice conversion, stems, and audio enhancement are
-represented by the request/schema/planner contract but are not yet generically
-executable.
+Werk includes an offline media companion with registered adapters for
+compatible local Diffusers and Transformers models. The typed CLI stays
+architecture- and backend-neutral: the model argument and canonical task are
+explicit, while the planner checks task metadata, repository layout, the
+installed adapter registry, dependencies, accelerator, and routing policy.
+`--backend auto` means "choose among accepted registered candidates," not
+"execute every architecture." An unknown architecture, a native checkpoint
+layout without an adapter, or a task that the resolved pipeline cannot perform
+is rejected with a routing or load error instead of being silently treated as
+Diffusers. Use `--debug` to see those candidate decisions; use an explicit
+backend plus `--fallback-policy none` when the request must not try another
+accepted runtime.
+
+Launcher discovery honors `WERK_MEDIA_COMPANION`, `WERK_MEDIA_PYTHON`, and
+repository scripts before using the embedded adapter fallback. The companion
+never downloads weights or installs packages; Python, Torch, model-framework
+packages, and required codecs must already be available. Image, video,
+audio/music, TTS, and ASR have task adapters whose concrete model support is
+registry- and pipeline-dependent. Song continuation/variation, voice
+conversion, stems, and audio enhancement are represented by the
+request/schema/planner contract but are not yet generically executable.
 
 Under `werk serve`, media execution uses a persistent, serialized companion
 worker. It lazily caches one fully configured Diffusers image/video pipeline by default,
@@ -405,9 +501,9 @@ never replays the same `execute` frame; Werk's higher-level fallback policy may
 still try another accepted runtime candidate. Execution metadata reports
 `model_cache_hit` and `model_load_seconds` for cold/warm diagnostics. Image
 execution needs Python, Torch, Diffusers, and Pillow. Video additionally needs
-NumPy and `imageio` for video I/O; MP4 encoding normally needs an
-imageio-compatible encoder backend such as `imageio-ffmpeg`. Generative audio
-needs Torch and NumPy plus Diffusers
+NumPy and one concrete MP4 encoder: PyAV, a system `ffmpeg`, or
+`imageio-ffmpeg`. Source-video tasks use PyAV, or `imageio` together with
+`imageio-ffmpeg`, for decoding. Generative audio needs Torch and NumPy plus Diffusers
 or Transformers; TTS and ASR need Torch, Transformers, and NumPy. FLAC/OGG
 output additionally needs `soundfile`; WAV has a direct writer. The exact model
 pipeline can still reject a request when it is first loaded.
@@ -1385,8 +1481,10 @@ node when Werk should perform the image generation.
 For deeper native integration, the self-contained custom-node package in
 [`utils/comfyUI`](utils/comfyUI/README.md) adds Werk model discovery,
 available-task and parameter-schema discovery, synchronous image generation,
-typed image and routing configuration, an explicit model socket, authenticated
-URL outputs, and sanitized inference metadata without changing ComfyUI core.
+persisted video-job submission and polling for T2V/I2V, typed image/video and
+routing configuration, explicit model sockets, native ComfyUI `IMAGE`/`VIDEO`
+outputs, authenticated artifact retrieval, and sanitized inference metadata
+without changing ComfyUI core.
 
 ### Models and Chat
 

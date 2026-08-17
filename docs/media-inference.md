@@ -44,6 +44,118 @@ Generative prompt priority is:
 3. piped standard input;
 4. interactive terminal input.
 
+## Local Wan video example
+
+Werk's video commands express canonical tasks; they do not select a pipeline
+class by matching a model name. The requested model remains explicit, and the
+planner accepts a runtime only when its adapter registry, repository-layout
+probe, task registry, dependencies, accelerator, and parameter support all
+match. `--backend auto` leaves that choice to the accepted candidates. It is
+not a claim that every video architecture or checkpoint layout is executable.
+An explicit backend constrains the candidates, and `--fallback-policy none`
+prevents retry through a different accepted runtime.
+
+This distinction matters for Wan2.2 TI2V 5B:
+
+- [`Wan-AI/Wan2.2-TI2V-5B`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B)
+  contains the native Wan checkpoint layout;
+- [`Wan-AI/Wan2.2-TI2V-5B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers)
+  contains the local Diffusers pipeline layout used by the bundled companion.
+
+The native repository can be cataloged, but it has no Diffusers
+`model_index.json`. The local companion therefore reports that no executable
+adapter accepts the layout instead of passing it to
+`DiffusionPipeline.from_pretrained` and failing ambiguously. Pull the Diffusers
+variant before running either task:
+
+```bash
+werk pull Wan-AI/Wan2.2-TI2V-5B-Diffusers --name wan22-ti2v-5b
+werk inspect wan22-ti2v-5b
+werk doctor --model wan22-ti2v-5b --task video-generation
+werk doctor --model wan22-ti2v-5b --task image-to-video
+```
+
+Text-to-video smoke test:
+
+```bash
+werk video generate wan22-ti2v-5b \
+  --prompt "A quiet lunar sunrise beyond an orbital station" \
+  --negative-prompt "text, watermark, static frame" \
+  --width 1280 --height 704 --frames 121 --fps 24 \
+  --steps 50 --guidance 5 \
+  --backend auto --precision bf16 --allow-cpu-offload \
+  --output wan22-t2v.mp4 --verbose --debug
+```
+
+Image-to-video smoke test:
+
+```bash
+werk video animate wan22-ti2v-5b \
+  --image station.png \
+  --prompt "A slow, stable camera orbit around the station" \
+  --negative-prompt "text, watermark, abrupt camera shake" \
+  --width 1280 --height 704 --frames 121 --fps 24 \
+  --steps 50 --guidance 5 \
+  --backend auto --precision bf16 --allow-cpu-offload \
+  --output wan22-i2v.mp4 --verbose --debug
+```
+
+`video generate` selects the `video-generation` task. `video animate` plus its
+required `--image` selects `image-to-video`. For video tasks, the companion
+asks the installed Diffusers task registry for a compatible pipeline class. If
+that registry has no unambiguous mapping, the repository's own `_class_name`
+is the fallback; the first cold load or call can still reject a task that the
+concrete pipeline does not implement. This keeps the route architecture-neutral
+without pretending unknown families are supported.
+
+The Wan examples request bf16 for the main pipeline components. The companion
+detects `AutoencoderKLWan` from the repository metadata and keeps that VAE in
+fp32, independent of the repository name.
+
+The [official Wan2.2 configuration](https://github.com/Wan-Video/Wan2.2/blob/main/wan/configs/wan_ti2v_5B.py)
+uses 121 frames at 24 FPS, 50 sampling steps, guidance 5, and flow shift 5. The
+Diffusers repository already records `flow_shift: 5.0` in its
+[scheduler configuration](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers/blob/main/scheduler/scheduler_config.json),
+so the portable request above inherits it rather than sending an unsupported
+pipeline-call keyword. The
+[official model card](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B) describes
+1280x704 or 704x1280 as its 720P TI2V sizes and supports both T2V and I2V. The
+repository download is about 34.2 GB. Wan's native single-GPU command requires
+at least 24 GB VRAM with model offload, dtype conversion, and T5 on CPU, and
+the project reports under nine minutes for a five-second 720P clip on a
+consumer GPU without special optimization. These are upstream reference
+figures, not guarantees for another Diffusers version or Werk route. Offload
+also needs sufficient host RAM, and `--allow-cpu-offload` is permission for the
+planner rather than proof that a hook was installed; `--verbose` reports the
+active hook after execution.
+
+For a smaller T2V-only transport and encoder check, the official
+[`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers)
+layout uses the same typed Werk path:
+
+```bash
+werk pull Wan-AI/Wan2.1-T2V-1.3B-Diffusers --name wan21-t2v-1.3b
+werk video generate wan21-t2v-1.3b \
+  --prompt "Clouds moving above a mountain ridge" \
+  --width 832 --height 480 --frames 81 --fps 15 \
+  --steps 50 --guidance 5 \
+  --backend auto --precision bf16 --allow-cpu-offload \
+  --output wan21-smoke.mp4 --verbose --debug
+```
+
+The [official Diffusers model card](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers)
+uses 832x480, 81 frames, guidance 5, and a 15 FPS export; its bundled
+[scheduler configuration](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers/blob/main/scheduler/scheduler_config.json)
+contains `flow_shift: 3.0`. These Diffusers values should not be replaced with
+the native Wan runner's differently parameterized `sample_shift`. Wan's
+[official 1.3B model card](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B)
+reports 8.19 GB VRAM and about four minutes for a five-second 480P clip on an
+RTX 4090 without quantization. It recommends 480P because 720P is less stable.
+The Diffusers repository is still about 28.9 GB, so this option saves more
+accelerator memory and generation time than download time. It does not validate
+Wan2.2's hybrid I2V route, new VAE, or 720P behavior, so the Wan2.2 test remains
+the acceptance test.
+
 ## CLI diagnostics
 
 Every typed image, video, and audio command accepts two independent,
@@ -217,8 +329,10 @@ Video estimates additionally scale with frames and temporal windowing. Audio
 estimates scale with duration, sample rate, channels, variations, and stems.
 
 The scored planner checks model task, runtime task, repository layout,
-family/architecture probe, runtime availability, accelerator, explicitly set
-parameters, and workload fit. It distinguishes:
+family/architecture probe, the adapter/task registry, runtime availability,
+accelerator, explicitly set parameters, and workload fit. A model can be
+listed and inspected even when its layout has no executable local adapter; in
+that case planning rejects it with the recorded reason. It distinguishes:
 
 - backend fallback: the same model through another runtime;
 - execution degradation: offload, tiling/windowing, or a slower attention path;
@@ -281,8 +395,10 @@ weights. `WERK_MEDIA_COMPANION` can point to a compatible executable, while
 `WERK_MEDIA_PYTHON` chooses the Python interpreter for the included adapter. A
 legacy external companion that does not support the persistent-worker transport
 automatically uses the one-shot protocol. `WERK_MEDIA_ACCELERATOR` can
-explicitly select `cuda`, `rocm`, `mps`/`metal`, or `cpu`. MLX media models
-remain catalogable but have no executable adapter in this release.
+explicitly select `cuda`, `rocm`, `mps`/`metal`, or `cpu`. MLX media models and
+native framework checkpoints without a registered execution adapter remain
+catalogable but are not routed to Diffusers merely because they contain
+safetensors or a generic `config.json`.
 
 `werk doctor` reports the protocol and optional dependencies. Missing
 Diffusers, Transformers, Pillow, audio/video codecs, or accelerator packages
@@ -292,6 +408,11 @@ CUDA/ROCm/MPS availability and device details. Host probing, including WSL's
 `/dev/dxg`, is used only when an older external companion does not report
 accelerators. Candle is not currently a Diffusers image fallback; unsupported
 media GPU routes fall back to the compatible CPU companion.
+
+Direct MP4 output needs NumPy plus PyAV, a system `ffmpeg`, or
+`imageio-ffmpeg`. Tasks that consume a source video additionally need PyAV, or
+`imageio` together with `imageio-ffmpeg`, for decoding. The capability probe
+does not treat `imageio` alone as proof that an encoder is installed.
 
 ### Execution support
 
@@ -401,6 +522,10 @@ children of `outputs/`, never models. Defaults are 30 days and 20 GiB; use
   The concrete Diffusers/Transformers pipeline is first loaded during
   execution and may then remain resident, so model-specific incompatibility
   can still surface on the first cold request.
+- A repository that declares a media task can still be non-executable when its
+  native layout has no registered local adapter. Discovery reports declared and
+  currently probe-eligible tasks separately; neither state promises that an
+  arbitrary architecture will load.
 - JSON local-path and inline-base64 inputs are supported. The offline companion
   does not fetch remote HTTP(S) URLs. OpenAI multipart upload compatibility is
   not implemented yet, including the hosted ComfyUI image-edit proxy.

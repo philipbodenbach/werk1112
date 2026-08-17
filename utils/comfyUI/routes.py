@@ -12,11 +12,11 @@ from typing import Any, Callable, Mapping
 try:
     from .client import WerkApiError, WerkClient
     from .config import WerkConnection
-    from .nodes import classify_image_models
+    from .nodes import classify_image_models, classify_video_models
 except ImportError:  # pragma: no cover - direct-module development
     from client import WerkApiError, WerkClient
     from config import WerkConnection
-    from nodes import classify_image_models
+    from nodes import classify_image_models, classify_video_models
 
 
 def _connection_from_payload(payload: Mapping[str, Any]) -> WerkConnection:
@@ -54,11 +54,17 @@ def discover_connection(
     except WerkApiError as error:
         warning = str(error)
     classification = classify_image_models(models, capabilities)
+    video_classification = classify_video_models(models, capabilities)
     model_count = len(classification["installed"])
     available_count = len(classification["available"])
+    available_video_count = len(video_classification["available"])
     model_word = "model" if model_count == 1 else "models"
     image_word = "image" if available_count == 1 else "images"
-    status = f"Connected · {model_count} {model_word} · {available_count} {image_word}"
+    video_word = "video" if available_video_count == 1 else "videos"
+    status = (
+        f"Connected · {model_count} {model_word} · {available_count} {image_word}"
+        f" · {available_video_count} {video_word}"
+    )
     response = {
         "ok": True,
         "status": status,
@@ -69,6 +75,11 @@ def discover_connection(
         "image_models": {
             "declared": classification["declared"],
             "available": classification["available"],
+        },
+        "video_models": {
+            "declared": video_classification["declared"],
+            "available": video_classification["available"],
+            "by_task": video_classification["by_task"],
         },
     }
     if warning:

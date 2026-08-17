@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Mapping
+from urllib.parse import quote
 
 try:
     from .client import WerkApiError, WerkClient
@@ -12,8 +14,10 @@ try:
         WerkConnection,
         WerkImageConfig,
         WerkRoutingConfig,
+        WerkVideoConfig,
         environment_api_key,
         environment_max_image_pixels,
+        environment_max_video_bytes,
         environment_server_url,
     )
     from .image_utils import (
@@ -21,6 +25,7 @@ try:
         decode_base64_image,
         image_bytes_to_tensor,
     )
+    from .video_utils import image_tensor_to_api_input, video_bytes_to_comfy
 except ImportError:  # pragma: no cover - direct-module development
     from client import WerkApiError, WerkClient
     from config import (
@@ -28,8 +33,10 @@ except ImportError:  # pragma: no cover - direct-module development
         WerkConnection,
         WerkImageConfig,
         WerkRoutingConfig,
+        WerkVideoConfig,
         environment_api_key,
         environment_max_image_pixels,
+        environment_max_video_bytes,
         environment_server_url,
     )
     from image_utils import (
@@ -37,9 +44,13 @@ except ImportError:  # pragma: no cover - direct-module development
         decode_base64_image,
         image_bytes_to_tensor,
     )
+    from video_utils import image_tensor_to_api_input, video_bytes_to_comfy
 
 
 IMAGE_TASK = "image-generation"
+VIDEO_GENERATION_TASK = "video-generation"
+IMAGE_TO_VIDEO_TASK = "image-to-video"
+VIDEO_TASKS = (VIDEO_GENERATION_TASK, IMAGE_TO_VIDEO_TASK)
 DEDICATED_PARAMETERS = {
     "image.width",
     "image.height",
@@ -53,6 +64,19 @@ IMAGE_CONFIG_DEDICATED_PARAMETERS = DEDICATED_PARAMETERS | {
     "image.batch_size",
     "image.vae_tiling",
     "image.vae_slicing",
+}
+VIDEO_CONFIG_DEDICATED_PARAMETERS = {
+    "video.width",
+    "video.height",
+    "video.frames",
+    "video.fps",
+    "video.batch_size",
+    "video.num_videos",
+    "video.steps",
+    "video.guidance",
+    "video.seed",
+    "video.temporal_vae_tiling",
+    "video.output_format",
 }
 ROUTING_OPTION_PATHS = {
     "backend": "routing.backend",
@@ -92,6 +116,7 @@ RESERVED_ADDITIONAL_KEYS = {
     "model",
     "prompt",
     "negative_prompt",
+    "initial_image",
     "n",
     "size",
     "response_format",
@@ -129,6 +154,7 @@ ALLOWED_IMAGE_REQUEST_FIELDS = {
     "output_format",
     "style",
 }
+ALLOWED_VIDEO_REQUEST_FIELDS = {"n", "size", "response_format"}
 
 
 def _json_text(value: Any) -> str:
@@ -217,6 +243,69 @@ def classify_image_models(
     }
 
 
+def classify_video_models(
+    models_payload: Any, capabilities_payload: Any
+) -> dict[str, Any]:
+    """Classify text-to-video and image-to-video support independently."""
+
+    installed = _model_entries(models_payload)
+    installed_ids = [entry["id"] for entry in installed]
+    capability_by_id = {
+        entry["id"]: entry for entry in _capability_entries(capabilities_payload)
+    }
+    by_task = {
+        task: {"declared": [], "available": []} for task in VIDEO_TASKS
+    }
+    declared: list[str] = []
+    available: list[str] = []
+    metadata: list[dict[str, Any]] = []
+    for model in installed:
+        model_id = model["id"]
+        capability = capability_by_id.get(model_id, model)
+        tasks = _normalized_tasks(capability.get("tasks", model.get("tasks", [])))
+        available_tasks = _normalized_tasks(
+            capability.get("available_tasks", model.get("available_tasks", []))
+        )
+        for task in VIDEO_TASKS:
+            if task in tasks:
+                by_task[task]["declared"].append(model_id)
+                if model_id not in declared:
+                    declared.append(model_id)
+            if task in available_tasks:
+                by_task[task]["available"].append(model_id)
+                if model_id not in available:
+                    available.append(model_id)
+        metadata.append(
+            {
+                "id": model_id,
+                "declares_video_generation": VIDEO_GENERATION_TASK in tasks,
+                "video_generation_probe_eligible": (
+                    VIDEO_GENERATION_TASK in available_tasks
+                ),
+                "declares_image_to_video": IMAGE_TO_VIDEO_TASK in tasks,
+                "image_to_video_probe_eligible": IMAGE_TO_VIDEO_TASK in available_tasks,
+                "tasks": tasks,
+                "available_tasks": available_tasks,
+            }
+        )
+    return {
+        "installed": installed_ids,
+        "declared": declared,
+        "available": available,
+        "by_task": by_task,
+        "models": metadata,
+    }
+
+
+def _video_task(value: str) -> str:
+    task = str(value or "").strip().lower().replace("_", "-")
+    if task not in VIDEO_TASKS:
+        raise ValueError(
+            "task must be video-generation or image-to-video"
+        )
+    return task
+
+
 def _normalize_parameter_object(
     value: str,
     *,
@@ -287,6 +376,15 @@ def normalize_image_config_parameters(value: str) -> dict[str, Any]:
         namespace="image",
         dedicated_parameters=IMAGE_CONFIG_DEDICATED_PARAMETERS,
         label="additional_image_parameters_json",
+    )
+
+
+def normalize_video_config_parameters(value: str) -> dict[str, Any]:
+    return _normalize_parameter_object(
+        value,
+        namespace="video",
+        dedicated_parameters=VIDEO_CONFIG_DEDICATED_PARAMETERS,
+        label="additional_video_parameters_json",
     )
 
 
@@ -497,6 +595,103 @@ def image_config_payload(config: WerkImageConfig) -> dict[str, Any]:
     }
 
 
+def build_video_config(
+    *,
+    width: int = 832,
+    height: int = 480,
+    count: int = 1,
+    batch_size: int = 1,
+    frames: int = 81,
+    fps: float = 24.0,
+    steps: int = 30,
+    guidance: float = 6.0,
+    seed: int = 0,
+    output_format: str = "mp4",
+    temporal_vae_tiling: str = "inherit",
+    additional_video_parameters_json: str = "{}",
+    routing: WerkRoutingConfig | None = None,
+) -> WerkVideoConfig:
+    """Build common video controls plus arbitrary schema-discovered parameters."""
+
+    width_value = int(width)
+    height_value = int(height)
+    count_value = int(count)
+    batch_value = int(batch_size)
+    frames_value = int(frames)
+    fps_value = float(fps)
+    steps_value = int(steps)
+    guidance_value = float(guidance)
+    seed_value = int(seed)
+    output_value = str(output_format or "").strip().lower()
+    if not 64 <= width_value <= 16384 or not 64 <= height_value <= 16384:
+        raise ValueError("width and height must be between 64 and 16384")
+    if not 1 <= count_value <= 256:
+        raise ValueError("count must be between 1 and 256")
+    if not 1 <= batch_value <= 64:
+        raise ValueError("batch_size must be between 1 and 64")
+    if count_value > 1 and batch_value > 1:
+        raise ValueError(
+            "count and batch_size cannot both be greater than 1; "
+            "the selected media adapter treats them as alternative video-count controls"
+        )
+    if not 1 <= frames_value <= 100_000:
+        raise ValueError("frames must be between 1 and 100000")
+    if not 0.1 <= fps_value <= 1000.0:
+        raise ValueError("fps must be between 0.1 and 1000")
+    if not 1 <= steps_value <= 2000:
+        raise ValueError("steps must be between 1 and 2000")
+    if not 0.0 <= guidance_value <= 100.0:
+        raise ValueError("guidance must be between 0 and 100")
+    if not 0 <= seed_value <= 0x7FFFFFFFFFFFFFFF:
+        raise ValueError("seed must be between 0 and 9223372036854775807")
+    if output_value not in {"mp4", "gif"}:
+        raise ValueError("output_format must be mp4 or gif")
+
+    request_fields: dict[str, Any] = {
+        "size": f"{width_value}x{height_value}",
+        # Werk's video API names its container field response_format.
+        "response_format": output_value,
+    }
+    if batch_value == 1:
+        request_fields["n"] = count_value
+    parameters: dict[str, Any] = {
+        "video.frames": frames_value,
+        "video.fps": fps_value,
+        "video.steps": steps_value,
+        "video.guidance": guidance_value,
+        "video.seed": seed_value,
+    }
+    if batch_value > 1:
+        parameters["video.batch_size"] = batch_value
+    temporal_tiling = _optional_bool(
+        "video.temporal_vae_tiling", temporal_vae_tiling
+    )
+    if temporal_tiling is not None:
+        parameters["video.temporal_vae_tiling"] = temporal_tiling
+    parameters.update(
+        normalize_video_config_parameters(additional_video_parameters_json)
+    )
+
+    routing_config = routing or WerkRoutingConfig()
+    if not isinstance(routing_config, WerkRoutingConfig):
+        raise TypeError("routing must be a WerkRoutingConfig")
+    return WerkVideoConfig(
+        request_fields=request_fields,
+        parameters=parameters,
+        routing=routing_config,
+    )
+
+
+def video_config_payload(config: WerkVideoConfig) -> dict[str, Any]:
+    if not isinstance(config, WerkVideoConfig):
+        raise TypeError("config must be a WerkVideoConfig")
+    return {
+        "request_fields": dict(config.request_fields),
+        "parameters": dict(config.parameters),
+        "routing": routing_config_payload(config.routing),
+    }
+
+
 def build_configured_image_request(
     *,
     model: str,
@@ -549,12 +744,80 @@ def build_configured_image_request(
     return request
 
 
+def build_configured_video_request(
+    *,
+    model: str,
+    prompt: str,
+    negative_prompt: str = "",
+    initial_image: Any | None = None,
+    config: WerkVideoConfig | None = None,
+) -> dict[str, Any]:
+    """Merge a typed video config and optional first frame into a Werk request."""
+
+    model_value = str(model or "").strip()
+    if not model_value:
+        raise ValueError("model must not be empty; connect WERK Video Models")
+    if not str(prompt or "").strip():
+        raise ValueError("prompt must not be empty")
+    video_config = config or build_video_config()
+    if not isinstance(video_config, WerkVideoConfig):
+        raise TypeError("config must be a WerkVideoConfig")
+
+    unknown_request_fields = (
+        set(video_config.request_fields) - ALLOWED_VIDEO_REQUEST_FIELDS
+    )
+    if unknown_request_fields:
+        raise ValueError(
+            "video config contains unsupported request field(s): "
+            + ", ".join(sorted(unknown_request_fields))
+        )
+    unknown_routing_fields = set(video_config.routing.request_options) - set(
+        ROUTING_OPTION_PATHS
+    )
+    if unknown_routing_fields:
+        raise ValueError(
+            "routing config contains unsupported request option(s): "
+            + ", ".join(sorted(unknown_routing_fields))
+        )
+
+    parameters = dict(video_config.routing.parameters)
+    duplicates = set(parameters) & set(video_config.parameters)
+    if duplicates:
+        raise ValueError("config parameter collision: " + ", ".join(sorted(duplicates)))
+    parameters.update(video_config.parameters)
+    request: dict[str, Any] = {
+        "model": model_value,
+        "prompt": str(prompt),
+        **dict(video_config.request_fields),
+        **dict(video_config.routing.request_options),
+        "parameters": parameters,
+    }
+    if str(negative_prompt or "").strip():
+        request["negative_prompt"] = str(negative_prompt)
+    if initial_image is not None:
+        request["initial_image"] = image_tensor_to_api_input(initial_image)
+    return request
+
+
 def _sanitize_metadata(value: Any) -> Any:
     if isinstance(value, dict):
+        if str(value.get("kind", "")).lower() == "base64":
+            return {
+                key: _sanitize_metadata(child)
+                for key, child in value.items()
+                if str(key).lower() != "data"
+            } | {"embedded": True}
         safe = {}
         for key, child in value.items():
             lowered = str(key).lower()
-            if lowered in {"path", "output_path", "local_path", "filesystem_path"}:
+            if lowered in {
+                "path",
+                "output_path",
+                "local_path",
+                "filesystem_path",
+                "base64",
+                "b64_json",
+            }:
                 continue
             safe[key] = _sanitize_metadata(child)
         return safe
@@ -606,6 +869,210 @@ def safe_result_metadata(response: Mapping[str, Any]) -> dict[str, Any]:
         "data": data_metadata,
         "werk": safe_werk,
     }
+
+
+def _safe_inference_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key in (
+        "id",
+        "task",
+        "model",
+        "runtime",
+        "effective_request",
+        "estimate",
+        "plan",
+        "backend_metadata",
+        "timings",
+        "warnings",
+        "created_unix",
+    ):
+        if key in result:
+            safe[key] = _sanitize_metadata(result[key])
+    outputs = result.get("outputs", [])
+    if isinstance(outputs, list):
+        safe["outputs"] = [
+            {
+                key: _sanitize_metadata(item[key])
+                for key in (
+                    "id",
+                    "task",
+                    "model",
+                    "runtime",
+                    "mime_type",
+                    "size_bytes",
+                    "width",
+                    "height",
+                    "duration",
+                    "seed",
+                    "effective_parameters",
+                    "created_unix",
+                    "backend_metadata",
+                )
+                if key in item
+            }
+            for item in outputs
+            if isinstance(item, dict)
+        ]
+    return safe
+
+
+def safe_video_job_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
+    safe = {
+        key: record[key]
+        for key in ("id", "status", "created_unix", "updated_unix")
+        if key in record
+    }
+    result = record.get("result")
+    if isinstance(result, dict):
+        safe["result"] = _safe_inference_result(result)
+    if isinstance(record.get("error"), str):
+        safe["error"] = record["error"]
+    return safe
+
+
+def _check_comfy_interrupted() -> None:
+    try:
+        from comfy.model_management import throw_exception_if_processing_interrupted
+    except ImportError:  # pragma: no cover - only available inside ComfyUI
+        return
+    throw_exception_if_processing_interrupted()
+
+
+def _cancel_job_best_effort(client: WerkClient, job_id: str) -> None:
+    try:
+        client.delete_json(f"/v1/jobs/{quote(job_id, safe='')}")
+    except Exception:
+        pass
+
+
+def wait_for_video_job(
+    client: WerkClient,
+    initial_record: Mapping[str, Any],
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 1.0,
+    sleep_fn=None,
+    monotonic_fn=None,
+    interrupt_check=None,
+) -> dict[str, Any]:
+    """Poll one Werk media job and cancel it best-effort if waiting aborts."""
+
+    record = _object(initial_record, "video job")
+    job_id = record.get("id")
+    if not isinstance(job_id, str) or not job_id.strip():
+        raise ValueError("Werk video job response contains no valid job id")
+    timeout = float(timeout_seconds)
+    interval = float(poll_interval_seconds)
+    if timeout <= 0:
+        raise ValueError("video job timeout must be greater than zero")
+    if interval <= 0:
+        raise ValueError("video job poll interval must be greater than zero")
+    sleep = sleep_fn or time.sleep
+    monotonic = monotonic_fn or time.monotonic
+    check_interrupted = interrupt_check or _check_comfy_interrupted
+    deadline = monotonic() + timeout
+    active = True
+    try:
+        while True:
+            status = str(record.get("status", "")).strip().lower()
+            if status == "completed":
+                active = False
+                if not isinstance(record.get("result"), dict):
+                    raise ValueError(
+                        "Werk completed video job contains no inference result"
+                    )
+                return record
+            if status == "failed":
+                active = False
+                detail = record.get("error")
+                message = detail.strip() if isinstance(detail, str) else "unknown failure"
+                raise ValueError(f"Werk video job failed: {message}")
+            if status == "cancelled":
+                active = False
+                raise ValueError("Werk video job was cancelled")
+            if status not in {"queued", "loading", "running", "encoding"}:
+                raise ValueError(f"Werk video job returned unknown status '{status}'")
+
+            check_interrupted()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Werk video job did not complete within {timeout:g} seconds"
+                )
+            sleep(min(interval, remaining))
+            record = _object(
+                client.get_json(f"/v1/jobs/{quote(job_id, safe='')}"),
+                "video job",
+            )
+            if record.get("id") != job_id:
+                raise ValueError("Werk video job id changed while polling")
+    except BaseException:
+        if active:
+            _cancel_job_best_effort(client, job_id)
+        raise
+
+
+def execute_video_request(
+    connection: WerkConnection,
+    request: Mapping[str, Any],
+    seed: int,
+):
+    client = WerkClient(connection)
+    initial = _object(
+        client.post_json("/v1/videos/generations", dict(request)),
+        "video generation",
+    )
+    record = wait_for_video_job(
+        client,
+        initial,
+        timeout_seconds=connection.timeout_seconds,
+    )
+    result = _object(record.get("result"), "video result")
+    outputs = result.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise ValueError("Werk completed video job contains no outputs")
+
+    videos = []
+    output_ids = []
+    max_bytes = environment_max_video_bytes()
+    for item in outputs:
+        if not isinstance(item, dict):
+            raise ValueError("Werk video result contains an invalid output entry")
+        output_id = item.get("id")
+        if not isinstance(output_id, str) or not output_id.strip():
+            raise ValueError("Werk video output contains no valid output id")
+        mime_type = str(item.get("mime_type", "")).lower().split(";", 1)[0]
+        if not (mime_type.startswith("video/") or mime_type == "image/gif"):
+            raise ValueError(
+                f"Werk video output returned non-video MIME type '{mime_type or 'unknown'}'"
+            )
+        raw, content_type = client.download_bytes(
+            f"/v1/outputs/{quote(output_id, safe='')}",
+            max_bytes=max_bytes,
+        )
+        downloaded_type = (
+            content_type.lower().split(";", 1)[0] if content_type else ""
+        )
+        if downloaded_type and not (
+            downloaded_type.startswith("video/") or downloaded_type == "image/gif"
+        ):
+            raise ValueError(
+                f"Werk output returned non-video content type '{content_type}'"
+            )
+        videos.append(video_bytes_to_comfy(raw))
+        output_ids.append(output_id)
+
+    result_id = result.get("id")
+    if not isinstance(result_id, str):
+        result_id = ""
+    return (
+        videos,
+        _json_text(safe_video_job_metadata(record)),
+        int(seed),
+        str(record["id"]),
+        str(result_id),
+        "\n".join(output_ids),
+    )
 
 
 def execute_image_request(
@@ -709,10 +1176,12 @@ class WerkServerInfoNode:
         except WerkApiError as error:
             optional_error = str(error)
         classified = classify_image_models(models, capabilities)
+        video_classified = classify_video_models(models, capabilities)
         metadata = {
             "models": models,
             "capabilities": capabilities,
             "classification": classified,
+            "video_classification": video_classified,
         }
         if optional_error:
             metadata["capabilities_warning"] = optional_error
@@ -778,6 +1247,74 @@ class WerkImageModelsNode:
         return selected, "\n".join(candidates), _json_text(classified)
 
 
+class WerkVideoModelsNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "task": (
+                    [VIDEO_GENERATION_TASK, IMAGE_TO_VIDEO_TASK],
+                    {"default": VIDEO_GENERATION_TASK},
+                ),
+                "refresh_token": ("INT", {"default": 0}),
+                "preferred_model": ("STRING", {"default": ""}),
+                "require_available": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("model", "available_models", "metadata_json")
+    FUNCTION = "select"
+    CATEGORY = "WERK/Discovery"
+
+    def select(
+        self,
+        connection: WerkConnection,
+        task: str,
+        refresh_token: int,
+        preferred_model: str,
+        require_available: bool,
+    ):
+        del refresh_token
+        selected_task = _video_task(task)
+        client = WerkClient(connection)
+        models = client.get_json("/v1/models")
+        try:
+            capabilities = client.get_json("/v1/capabilities")
+        except WerkApiError:
+            capabilities = {}
+        classified = classify_video_models(models, capabilities)
+        task_models = classified["by_task"][selected_task]
+        candidates = (
+            task_models["available"]
+            if require_available
+            else task_models["declared"]
+        )
+        preferred = preferred_model.strip()
+        if preferred and preferred in candidates:
+            selected = preferred
+        elif len(candidates) == 1:
+            selected = candidates[0]
+        elif len(candidates) > 1:
+            raise ValueError(
+                f"multiple matching Werk {selected_task} models; "
+                "set preferred_model to one of: " + ", ".join(candidates)
+            )
+        elif task_models["declared"] and require_available:
+            raise ValueError(
+                f"Werk models declare {selected_task}, but none is currently "
+                "runtime probe-eligible: " + ", ".join(task_models["declared"])
+            )
+        else:
+            raise ValueError(
+                f"no installed Werk model declares {selected_task}"
+            )
+        metadata = dict(classified)
+        metadata["selected_task"] = selected_task
+        return selected, "\n".join(candidates), _json_text(metadata)
+
+
 class WerkImageParametersNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -810,6 +1347,58 @@ class WerkImageParametersNode:
         descriptors = root.get("parameters", root.get("data", []))
         count = len(descriptors) if isinstance(descriptors, (list, dict)) else 0
         summary = f"{model}: {count} parameter descriptor(s) returned by Werk"
+        return _json_text(payload), summary
+
+
+class WerkVideoParametersNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "model": ("STRING", {"default": ""}),
+                "task": (
+                    [VIDEO_GENERATION_TASK, IMAGE_TO_VIDEO_TASK],
+                    {"default": VIDEO_GENERATION_TASK},
+                ),
+                "backend": ("STRING", {"default": "auto"}),
+                "refresh_token": ("INT", {"default": 0}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("parameters_json", "summary")
+    FUNCTION = "parameters"
+    CATEGORY = "WERK/Discovery"
+
+    def parameters(
+        self,
+        connection: WerkConnection,
+        model: str,
+        task: str,
+        backend: str,
+        refresh_token: int,
+    ):
+        del refresh_token
+        model = model.strip()
+        if not model:
+            raise ValueError("model must not be empty")
+        selected_task = _video_task(task)
+        payload = WerkClient(connection).get_json(
+            "/v1/parameters",
+            {
+                "task": selected_task,
+                "model": model,
+                "backend": backend.strip() or "auto",
+            },
+        )
+        root = _object(payload, "parameters")
+        descriptors = root.get("parameters", root.get("data", []))
+        count = len(descriptors) if isinstance(descriptors, (list, dict)) else 0
+        summary = (
+            f"{model} ({selected_task}): {count} parameter descriptor(s) "
+            "returned by Werk"
+        )
         return _json_text(payload), summary
 
 
@@ -918,6 +1507,56 @@ class WerkImageConfigNode:
         return config, _json_text(image_config_payload(config))
 
 
+class WerkVideoConfigNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        tri_state = (["inherit", "enabled", "disabled"], {"default": "inherit"})
+        return {
+            "required": {
+                "width": (
+                    "INT",
+                    {"default": 832, "min": 64, "max": 16384, "step": 8},
+                ),
+                "height": (
+                    "INT",
+                    {"default": 480, "min": 64, "max": 16384, "step": 8},
+                ),
+                "count": ("INT", {"default": 1, "min": 1, "max": 256}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64}),
+                "frames": ("INT", {"default": 81, "min": 1, "max": 100000}),
+                "fps": (
+                    "FLOAT",
+                    {"default": 24.0, "min": 0.1, "max": 1000.0, "step": 0.1},
+                ),
+                "steps": ("INT", {"default": 30, "min": 1, "max": 2000}),
+                "guidance": (
+                    "FLOAT",
+                    {"default": 6.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                ),
+                "seed": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 0x7FFFFFFFFFFFFFFF},
+                ),
+                "output_format": (["mp4", "gif"], {"default": "mp4"}),
+                "temporal_vae_tiling": tri_state,
+                "additional_video_parameters_json": (
+                    "STRING",
+                    {"default": "{}", "multiline": True},
+                ),
+            },
+            "optional": {"routing": ("WERK_ROUTING_CONFIG",)},
+        }
+
+    RETURN_TYPES = ("WERK_VIDEO_CONFIG", "STRING")
+    RETURN_NAMES = ("config", "config_json")
+    FUNCTION = "configure"
+    CATEGORY = "WERK/Configuration"
+
+    def configure(self, routing: WerkRoutingConfig | None = None, **inputs):
+        config = build_video_config(routing=routing, **inputs)
+        return config, _json_text(video_config_payload(config))
+
+
 class WerkImageGenerateNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -962,6 +1601,66 @@ class WerkImageGenerateNode:
         return execute_image_request(connection, request, seed)
 
 
+class WerkVideoGenerateNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "model": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Connect the model output from WERK Video Models.",
+                    },
+                ),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "negative_prompt": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+            },
+            "optional": {
+                "config": ("WERK_VIDEO_CONFIG",),
+                "initial_image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO", "STRING", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = (
+        "videos",
+        "metadata_json",
+        "seed",
+        "job_id",
+        "result_id",
+        "output_ids",
+    )
+    OUTPUT_IS_LIST = (True, False, False, False, False, False)
+    FUNCTION = "generate"
+    CATEGORY = "WERK/Video"
+    OUTPUT_NODE = True
+
+    def generate(
+        self,
+        connection: WerkConnection,
+        model: str,
+        prompt: str,
+        negative_prompt: str,
+        config: WerkVideoConfig | None = None,
+        initial_image=None,
+    ):
+        request = build_configured_video_request(
+            model=model,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            initial_image=initial_image,
+            config=config,
+        )
+        video_config = config or build_video_config()
+        seed = int(video_config.parameters["video.seed"])
+        return execute_video_request(connection, request, seed)
+
+
 NODE_CLASS_MAPPINGS = {
     "WerkConnection": WerkConnectionNode,
     "WerkServerInfo": WerkServerInfoNode,
@@ -970,6 +1669,10 @@ NODE_CLASS_MAPPINGS = {
     "WerkRoutingConfig": WerkRoutingConfigNode,
     "WerkImageConfig": WerkImageConfigNode,
     "WerkImageGenerate": WerkImageGenerateNode,
+    "WerkVideoModels": WerkVideoModelsNode,
+    "WerkVideoParameters": WerkVideoParametersNode,
+    "WerkVideoConfig": WerkVideoConfigNode,
+    "WerkVideoGenerate": WerkVideoGenerateNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -980,4 +1683,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WerkRoutingConfig": "WERK Routing Config (Beta)",
     "WerkImageConfig": "WERK Image Config (Beta)",
     "WerkImageGenerate": "WERK Image Generate (Beta)",
+    "WerkVideoModels": "WERK Video Models (Beta)",
+    "WerkVideoParameters": "WERK Video Parameters (Beta)",
+    "WerkVideoConfig": "WERK Video Config (Beta)",
+    "WerkVideoGenerate": "WERK Video Generate (Beta)",
 }

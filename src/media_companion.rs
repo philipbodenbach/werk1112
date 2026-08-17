@@ -2119,6 +2119,11 @@ else:
         let client = CompanionClient::from_command(python, vec![script.into_os_string()])
             .with_timeout(Duration::from_secs(5));
         let model = TestDirectory::new("strict-model");
+        fs::write(
+            model.0.join("model_index.json"),
+            br#"{"_class_name":"FixturePipeline"}"#,
+        )
+        .unwrap();
         let output = TestDirectory::new("strict-output");
 
         let err = client
@@ -2158,6 +2163,11 @@ else:
         let client = CompanionClient::from_command(python, vec![script.into_os_string()])
             .with_timeout(Duration::from_secs(5));
         let model = TestDirectory::new("warn-model");
+        fs::write(
+            model.0.join("model_index.json"),
+            br#"{"_class_name":"FixturePipeline"}"#,
+        )
+        .unwrap();
         fs::write(model.0.join("weights.bin"), b"fixture").unwrap();
 
         let estimate = client

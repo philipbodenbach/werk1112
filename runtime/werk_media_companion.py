@@ -18,12 +18,14 @@ import math
 import mimetypes
 import os
 import shutil
+import subprocess
 import sys
 import time
 import traceback
 import uuid
 import wave
 from collections import OrderedDict
+from fractions import Fraction
 from pathlib import Path
 
 
@@ -54,6 +56,13 @@ IMAGE_TASKS = {
 VIDEO_TASKS = {
     "video_generation",
     "image_to_video",
+    "video_to_video",
+    "video_inpainting",
+    "video_extension",
+    "video_upscaling",
+    "frame_interpolation",
+}
+VIDEO_INPUT_TASKS = {
     "video_to_video",
     "video_inpainting",
     "video_extension",
@@ -322,6 +331,12 @@ def normalized_parameters(payload):
     for key, item in value.items():
         if isinstance(item, dict) and "value" in item:
             item = item["value"]
+        # EffectiveInferenceRequest intentionally carries every schema path so
+        # diagnostics can explain where values came from.  Unset paths are
+        # serialized as JSON null, which must retain its "not supplied"
+        # meaning inside adapters instead of masking their local defaults.
+        if item is None:
+            continue
         name = normalized_name(key)
         normalized[name] = item
         # Werk's canonical schema uses dotted paths (for example
@@ -451,9 +466,22 @@ class ExplicitParameterGuard:
                 )
 
 
+def has_diffusers_pipeline_manifest(root):
+    manifest = read_json_file(root / "model_index.json")
+    return bool(str(manifest.get("_class_name") or "").strip())
+
+
 def execution_adapter(model_path, task):
     if task in IMAGE_TASKS | VIDEO_TASKS:
-        return "diffusers"
+        # A Diffusers directory is identified by its component manifest.  A
+        # generic config.json alone may describe a native checkpoint layout
+        # (for example a framework-specific transformer shard) which
+        # DiffusionPipeline.from_pretrained cannot execute.  Single-file
+        # pipelines remain model-dependent and are validated while loading.
+        root = model_path if model_path.is_dir() else model_path.parent
+        if model_path.is_file() or has_diffusers_pipeline_manifest(root):
+            return "diffusers"
+        return None
     if task in AUDIO_GENERATION_TASKS:
         root = model_path if model_path.is_dir() else model_path.parent
         return (
@@ -680,6 +708,26 @@ def dependency_snapshot():
     return dependencies
 
 
+def video_encoder_ready(dependencies):
+    # ImageIO alone does not guarantee that an MP4 writer plugin is present.
+    # PyAV, a system ffmpeg, or imageio-ffmpeg's bundled executable each give
+    # the companion a concrete encoder path.
+    return any(
+        bool(dependencies.get(name, {}).get("available"))
+        for name in ("av", "imageio_ffmpeg", "ffmpeg")
+    )
+
+
+def video_decoder_ready(dependencies):
+    if bool(dependencies.get("av", {}).get("available")):
+        return True
+    return bool(
+        dependencies.get("imageio", {}).get("available")
+    ) and bool(
+        dependencies.get("imageio_ffmpeg", {}).get("available")
+    )
+
+
 def require_module(module_name, distribution=None, purpose=None):
     try:
         return importlib.import_module(module_name)
@@ -822,11 +870,7 @@ def command_capabilities(_payload):
         and deps["diffusers"]["available"]
         and deps["PIL"]["available"]
     )
-    video_ready = image_ready and (
-        deps["imageio"]["available"]
-        or deps["imageio_ffmpeg"]["available"]
-        or deps["ffmpeg"]["available"]
-    )
+    video_ready = image_ready and video_encoder_ready(deps)
     transformers_audio_ready = (
         deps["torch"]["available"]
         and deps["transformers"]["available"]
@@ -857,14 +901,21 @@ def command_capabilities(_payload):
             )
         )
     for task in sorted(VIDEO_TASKS):
+        task_ready = video_ready and (
+            task not in VIDEO_INPUT_TASKS or video_decoder_ready(deps)
+        )
         capabilities.append(
             task_capability(
                 task,
-                video_ready,
+                task_ready,
                 "diffusers",
                 model_dependent_reason
-                if video_ready
-                else "requires torch, diffusers, Pillow and a video encoder",
+                if task_ready
+                else (
+                    "requires torch, diffusers, Pillow, a video encoder and a video decoder"
+                    if task in VIDEO_INPUT_TASKS
+                    else "requires torch, diffusers, Pillow and a video encoder"
+                ),
             )
         )
     for task in sorted(AUDIO_GENERATION_TASKS):
@@ -1066,12 +1117,14 @@ def task_dependency_ready(task, deps):
             and deps["diffusers"]["available"]
             and deps["PIL"]["available"]
         )
-        encoder = (
-            deps["imageio"]["available"]
-            or deps["imageio_ffmpeg"]["available"]
-            or deps["ffmpeg"]["available"]
+        encoder = video_encoder_ready(deps)
+        decoder = task not in VIDEO_INPUT_TASKS or video_decoder_ready(deps)
+        reason = (
+            "requires torch, diffusers, Pillow, a video encoder and a video decoder"
+            if task in VIDEO_INPUT_TASKS
+            else "requires torch, diffusers, Pillow and a video encoder"
         )
-        return base and encoder, "requires torch, diffusers, Pillow and a video encoder"
+        return base and encoder and decoder, reason
     if task in AUDIO_GENERATION_TASKS:
         return (
             deps["torch"]["available"]
@@ -1099,19 +1152,30 @@ def command_probe_model(payload):
     reasons = []
     if requested_task:
         ready, dependency_reason = task_dependency_ready(requested_task, dependencies)
-        recognized = (
-            requested_task in probe["tasks"]
-            or (
-                probe["layout"] == "diffusers"
-                and requested_task in IMAGE_TASKS | VIDEO_TASKS
-            )
+        adapter = execution_adapter(path, requested_task)
+        advertised_tasks = set(probe["tasks"])
+        same_media_family = (
+            requested_task in IMAGE_TASKS
+            and bool(advertised_tasks & IMAGE_TASKS)
+        ) or (
+            requested_task in VIDEO_TASKS
+            and bool(advertised_tasks & VIDEO_TASKS)
         )
-        supported = ready and recognized
+        recognized = requested_task in advertised_tasks or (
+            probe["layout"] == "diffusers" and same_media_family
+        )
+        supported = ready and recognized and adapter is not None
         if not ready:
             reasons.append(dependency_reason)
         if not recognized:
             reasons.append(
                 "model metadata does not advertise this task; support remains model-dependent"
+            )
+        if adapter is None:
+            reasons.append(
+                "the local repository layout has no executable companion adapter; "
+                "use a Diffusers pipeline repository, a supported single-file model, "
+                "or configure another media backend"
             )
     if reasons:
         detail = "; ".join(reasons)
@@ -1127,6 +1191,7 @@ def command_probe_model(payload):
     return {
         "model_path": str(path),
         "supported": supported,
+        "adapter": execution_adapter(path, requested_task) if requested_task else None,
         "reasons": reasons,
         "detail": detail,
         "probe": {
@@ -1551,12 +1616,31 @@ def load_image(value, name):
 
 def load_video_frames(value, name):
     path = local_input_path(value, name)
-    imageio = require_module("imageio.v3", "imageio", "video input")
     image_module = require_module("PIL.Image", "Pillow", "video input")
+    errors = []
     try:
-        return [image_module.fromarray(frame).convert("RGB") for frame in imageio.imiter(path)]
+        av = importlib.import_module("av")
+        with av.open(str(path)) as container:
+            frames = [frame.to_image().convert("RGB") for frame in container.decode(video=0)]
+        if frames:
+            return frames
+        errors.append("pyav: decoder returned no frames")
     except Exception as error:
-        fail("invalid_input", f"failed to decode {name}: {path}", str(error))
+        errors.append(f"pyav: {error}")
+    try:
+        imageio = importlib.import_module("imageio.v3")
+        frames = [
+            image_module.fromarray(frame).convert("RGB")
+            for frame in imageio.imiter(path)
+        ]
+        if frames:
+            return frames
+        errors.append("imageio: decoder returned no frames")
+    except Exception as error:
+        errors.append(f"imageio: {error}")
+    if not errors:
+        errors.append("the decoder returned no frames")
+    fail("invalid_input", f"failed to decode {name}: {path}", errors)
 
 
 def supports_keyword(callable_value, keyword):
@@ -1605,6 +1689,124 @@ def filtered_kwargs(
     return result
 
 
+def diffusers_video_mapping_name(task):
+    """Return Diffusers' task registry for a Werk video task when available."""
+    if task == "video_generation":
+        return "AUTO_TEXT2VIDEO_PIPELINES_MAPPING"
+    if task == "image_to_video":
+        return "AUTO_IMAGE2VIDEO_PIPELINES_MAPPING"
+    if task in {
+        "video_to_video",
+        "video_inpainting",
+        "video_extension",
+        "video_upscaling",
+        "frame_interpolation",
+    }:
+        return "AUTO_VIDEO2VIDEO_PIPELINES_MAPPING"
+    return None
+
+
+def resolve_diffusers_video_pipeline_class(diffusers, model_path, task):
+    """Resolve a video pipeline through the installed Diffusers registry.
+
+    Diffusers does not expose an ``AutoPipelineForImage2Video`` class in all
+    releases.  Its internal auto-pipeline registry is nevertheless the
+    authoritative architecture-to-task mapping.  Looking up that registry
+    keeps Werk architecture-neutral and also permits task variants whose
+    registry key extends the repository's base key (for example ``*-i2v``).
+    Unknown architectures deliberately fall back to ``DiffusionPipeline`` so
+    a repository's own ``_class_name`` remains usable.
+    """
+    public_name = {
+        "video_generation": "AutoPipelineForText2Video",
+        "image_to_video": "AutoPipelineForImage2Video",
+        "video_to_video": "AutoPipelineForVideo2Video",
+    }.get(task)
+    public_class = getattr(diffusers, public_name, None) if public_name else None
+    if public_class is not None:
+        return public_class
+
+    mapping_name = diffusers_video_mapping_name(task)
+    if mapping_name is None or model_path.is_file():
+        return None
+    model_index = read_json_file(model_path / "model_index.json")
+    original_class_name = str(model_index.get("_class_name") or "")
+    if not original_class_name:
+        return None
+    try:
+        auto_pipeline = importlib.import_module("diffusers.pipelines.auto_pipeline")
+        mapping = getattr(auto_pipeline, mapping_name, None)
+        resolver = getattr(auto_pipeline, "_get_task_class", None)
+        if mapping is None or not callable(resolver):
+            return None
+        direct = resolver(mapping, original_class_name, throw_error_if_not_exist=False)
+        if direct is not None:
+            return direct
+
+        model_resolver = getattr(auto_pipeline, "_get_model", None)
+        source_key = model_resolver(original_class_name) if callable(model_resolver) else None
+        if not source_key:
+            return None
+        related = []
+        for candidate_key, candidate_class in mapping.items():
+            if (
+                candidate_key == source_key
+                or candidate_key.startswith(f"{source_key}-")
+                or source_key.startswith(f"{candidate_key}-")
+            ):
+                related.append(candidate_class)
+        if len(related) == 1:
+            return related[0]
+    except Exception:
+        # Registry internals vary between Diffusers releases.  The repository
+        # manifest still provides a sound generic fallback below.
+        return None
+    return None
+
+
+def diffusers_component_class_name(model_path, component):
+    if not model_path.is_dir():
+        return None
+    manifest = read_json_file(model_path / "model_index.json")
+    descriptor = manifest.get(component)
+    if isinstance(descriptor, str):
+        class_name = descriptor
+    elif isinstance(descriptor, (list, tuple)):
+        class_name = next(
+            (
+                item
+                for item in reversed(descriptor)
+                if isinstance(item, str) and item.strip()
+            ),
+            None,
+        )
+    elif isinstance(descriptor, dict):
+        class_name = descriptor.get("_class_name") or descriptor.get("class_name")
+    else:
+        class_name = None
+    if class_name:
+        return str(class_name)
+    component_config = read_json_file(model_path / component / "config.json")
+    class_name = component_config.get("_class_name")
+    return str(class_name) if class_name else None
+
+
+def diffusers_load_dtype(model_path, torch, dtype):
+    """Use component precision requirements declared by the local pipeline.
+
+    AutoencoderKLWan is documented and implemented as an fp32 VAE. Detecting
+    the component class in the Diffusers manifest/config keeps the policy
+    independent of repository names and leaves all other architectures alone.
+    """
+    vae_class = normalized_name(
+        diffusers_component_class_name(model_path, "vae") or ""
+    ).replace("_", "")
+    float32 = getattr(torch, "float32", None)
+    if vae_class == "autoencoderklwan" and float32 is not None and dtype != float32:
+        return {"default": dtype, "vae": float32}
+    return dtype
+
+
 def load_diffusers_pipeline(model_path, task, has_image, torch, dtype):
     diffusers = require_module("diffusers", purpose=task)
     class_name = None
@@ -1616,18 +1818,24 @@ def load_diffusers_pipeline(model_path, task, has_image, torch, dtype):
         "image_upscaling",
     }:
         class_name = "AutoPipelineForImage2Image"
-    elif task in VIDEO_TASKS and has_image:
-        class_name = "AutoPipelineForImage2Video"
+    elif task in VIDEO_TASKS:
+        pipeline_class = resolve_diffusers_video_pipeline_class(
+            diffusers,
+            model_path,
+            task,
+        )
     elif task == "image_generation":
         class_name = "AutoPipelineForText2Image"
 
-    pipeline_class = getattr(diffusers, class_name, None) if class_name else None
+    if task not in VIDEO_TASKS:
+        pipeline_class = getattr(diffusers, class_name, None) if class_name else None
     if pipeline_class is None:
         pipeline_class = getattr(diffusers, "DiffusionPipeline", None)
     if pipeline_class is None:
         fail("missing_dependency", "installed diffusers has no compatible pipeline class")
 
-    load_kwargs = {"local_files_only": True, "torch_dtype": dtype}
+    load_dtype = diffusers_load_dtype(model_path, torch, dtype)
+    load_kwargs = {"local_files_only": True, "torch_dtype": load_dtype}
     try:
         if model_path.is_file() and hasattr(pipeline_class, "from_single_file"):
             return pipeline_class.from_single_file(str(model_path), **load_kwargs)
@@ -1635,7 +1843,7 @@ def load_diffusers_pipeline(model_path, task, has_image, torch, dtype):
     except TypeError:
         # Older Diffusers releases may use the deprecated dtype spelling.
         load_kwargs.pop("torch_dtype", None)
-        load_kwargs["dtype"] = dtype
+        load_kwargs["dtype"] = load_dtype
         try:
             if model_path.is_file() and hasattr(pipeline_class, "from_single_file"):
                 return pipeline_class.from_single_file(str(model_path), **load_kwargs)
@@ -1922,6 +2130,10 @@ def diffusers_call_values(
         "motion_bucket_id": parameters.get("motion_bucket"),
         "noise_aug_strength": parameters.get("noise_augmentation"),
         "generator": generator,
+        # PIL output avoids architecture-specific tensor/NumPy layouts and is
+        # supported by modern Diffusers video pipelines.  Older pipelines
+        # simply have this optional hint filtered from their call signature.
+        "output_type": "pil" if task in VIDEO_TASKS else None,
     }
     values[count_key] = count_value
     parameter_paths = {
@@ -2022,12 +2234,49 @@ def image_mime(format_name):
 def ensure_pil_image(value):
     image_module = require_module("PIL.Image", "Pillow", "image output")
     if hasattr(value, "save"):
-        return value
+        if getattr(value, "mode", None) == "RGB" or not hasattr(value, "convert"):
+            return value
+        return value.convert("RGB")
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
     numpy = require_module("numpy", purpose="image output")
     array = numpy.asarray(value)
+    while array.ndim > 3 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim == 3 and array.shape[0] in {1, 3, 4} and array.shape[-1] not in {1, 3, 4}:
+        array = numpy.moveaxis(array, 0, -1)
+    if array.ndim == 3 and array.shape[-1] == 1:
+        array = array[..., 0]
+    if array.ndim not in {2, 3}:
+        fail(
+            "backend_error",
+            "media pipeline returned an unsupported frame layout",
+            {"shape": list(array.shape)},
+        )
     if array.dtype.kind == "f":
-        array = numpy.clip(array * 255.0, 0, 255).astype("uint8")
-    return image_module.fromarray(array)
+        finite = array[numpy.isfinite(array)]
+        minimum = float(finite.min()) if finite.size else 0.0
+        maximum = float(finite.max()) if finite.size else 0.0
+        if minimum >= -1.0 and maximum <= 1.0 and minimum < 0.0:
+            array = (array + 1.0) * 127.5
+        elif minimum >= 0.0 and maximum <= 1.0:
+            array = array * 255.0
+        array = numpy.nan_to_num(array, nan=0.0, posinf=255.0, neginf=0.0)
+        array = numpy.clip(array, 0, 255).astype("uint8")
+    elif array.dtype != numpy.uint8:
+        array = numpy.clip(array, 0, 255).astype("uint8")
+    try:
+        return image_module.fromarray(array).convert("RGB")
+    except Exception as error:
+        fail(
+            "backend_error",
+            "media pipeline returned a frame that Pillow cannot decode",
+            {"shape": list(array.shape), "dtype": str(array.dtype), "error": str(error)},
+        )
 
 
 def save_images(images, output_dir, task, parameters, identifier):
@@ -2057,17 +2306,189 @@ def save_images(images, output_dir, task, parameters, identifier):
     return outputs
 
 
-def frame_batches(value):
+def frame_batches(value, expected_frames=None):
     if value is None:
         return []
-    if not isinstance(value, (list, tuple)):
+    try:
+        expected_frames = int(expected_frames) if expected_frames is not None else None
+    except (TypeError, ValueError):
+        expected_frames = None
+    if expected_frames is not None and expected_frames < 1:
+        expected_frames = None
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return []
+        first = value[0]
+        if isinstance(first, (list, tuple)):
+            return [list(batch) for batch in value]
+        first_ndim = getattr(first, "ndim", None)
+        if first_ndim is None and hasattr(first, "shape"):
+            first_ndim = len(first.shape)
+        if first_ndim in {4, 5}:
+            batches = []
+            for batch in value:
+                batches.extend(frame_batches(batch, expected_frames))
+            return batches
+        return [list(value)]
+
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    ndim = getattr(value, "ndim", None)
+    if ndim is None:
         return [[value]]
-    if not value:
-        return []
-    first = value[0]
-    if isinstance(first, (list, tuple)):
-        return [list(batch) for batch in value]
-    return [list(value)]
+    if ndim == 5:
+        shape = value.shape
+        layouts = []
+        if shape[-1] in {1, 3, 4}:
+            layouts.append(("bfhwc", shape[1]))
+        if shape[2] in {1, 3, 4}:
+            layouts.append(("bfchw", shape[1]))
+        if shape[1] in {1, 3, 4}:
+            layouts.append(("bcfhw", shape[2]))
+        if expected_frames is not None:
+            matching = [layout for layout in layouts if layout[1] == expected_frames]
+            if matching:
+                layouts = matching
+        if not layouts:
+            fail(
+                "backend_error",
+                "video pipeline returned an unsupported batch layout",
+                {"shape": list(shape)},
+            )
+        layout = layouts[0][0]
+        if layout == "bfhwc":  # batch, frames, height, width, channels
+            return [[value[batch, frame] for frame in range(shape[1])] for batch in range(shape[0])]
+        if layout == "bfchw":  # batch, frames, channels, height, width
+            return [[value[batch, frame] for frame in range(shape[1])] for batch in range(shape[0])]
+        return [[value[batch, :, frame] for frame in range(shape[2])] for batch in range(shape[0])]
+    if ndim == 4:
+        shape = value.shape
+        layouts = []
+        if shape[-1] in {1, 3, 4}:
+            layouts.append(("fhwc", shape[0]))
+        if shape[1] in {1, 3, 4}:
+            layouts.append(("fchw", shape[0]))
+        if shape[0] in {1, 3, 4}:
+            layouts.append(("cfhw", shape[1]))
+        if expected_frames is not None:
+            matching = [layout for layout in layouts if layout[1] == expected_frames]
+            if matching:
+                layouts = matching
+        if not layouts:
+            fail(
+                "backend_error",
+                "video pipeline returned an unsupported frame layout",
+                {"shape": list(shape)},
+            )
+        if layouts[0][0] == "cfhw":  # channels, frames, height, width
+            return [[value[:, frame] for frame in range(shape[1])]]
+        return [[value[frame] for frame in range(shape[0])]]
+    if ndim in {2, 3}:
+        return [[value]]
+    fail(
+        "backend_error",
+        "video pipeline returned an unsupported frame batch layout",
+        {"shape": list(value.shape)},
+    )
+
+
+def ffmpeg_executable():
+    executable = shutil.which("ffmpeg")
+    if executable is not None:
+        return executable
+    try:
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        executable = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+    if not executable or not Path(executable).is_file():
+        return None
+    return str(executable)
+
+
+def encode_video_with_pyav(frames, path, fps):
+    av = importlib.import_module("av")
+    numpy = require_module("numpy", purpose="video export")
+    width, height = frames[0].size
+    container = None
+    try:
+        container = av.open(str(path), mode="w", format="mp4")
+        stream = container.add_stream("h264", rate=Fraction(str(float(fps))).limit_denominator(1000))
+        stream.width = int(width)
+        stream.height = int(height)
+        stream.pix_fmt = "yuv420p"
+        for image in frames:
+            if image.size != (width, height):
+                raise ValueError("all video frames must have the same dimensions")
+            array = numpy.asarray(image, dtype="uint8")
+            frame = av.VideoFrame.from_ndarray(array, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    finally:
+        if container is not None:
+            container.close()
+
+
+def encode_video_with_ffmpeg(frames, path, fps):
+    executable = ffmpeg_executable()
+    if executable is None:
+        raise FileNotFoundError("ffmpeg executable not found on PATH or in imageio-ffmpeg")
+    numpy = require_module("numpy", purpose="video export")
+    width, height = frames[0].size
+    command = [
+        executable,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s:v",
+        f"{width}x{height}",
+        "-r",
+        str(float(fps)),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(path),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        for image in frames:
+            if image.size != (width, height):
+                raise ValueError("all video frames must have the same dimensions")
+            array = numpy.asarray(image, dtype="uint8")
+            process.stdin.write(array.tobytes())
+        process.stdin.close()
+        detail = process.stderr.read().decode("utf-8", errors="replace")
+        status = process.wait()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            process.kill()
+        with contextlib.suppress(Exception):
+            process.wait()
+        raise
+    if status != 0:
+        raise RuntimeError(detail.strip() or f"ffmpeg exited with status {status}")
 
 
 def export_video(frames, path, fps, format_name):
@@ -2087,26 +2508,29 @@ def export_video(frames, path, fps, format_name):
             return
         except Exception as error:
             fail("encoding_failed", f"failed to encode animated GIF: {path}", str(error))
-    try:
-        utils = require_module("diffusers.utils", "diffusers", "video export")
-        exporter = getattr(utils, "export_to_video", None)
-        if exporter is not None:
-            exporter(frames, str(path), fps=float(fps))
+    errors = []
+    for encoder in (encode_video_with_pyav, encode_video_with_ffmpeg):
+        try:
+            encoder(frames, path, fps)
             return
-    except CompanionFailure:
-        raise
-    except Exception:
-        pass
-    imageio = require_module("imageio.v3", "imageio", "video export")
-    numpy = require_module("numpy", purpose="video export")
+        except Exception as error:
+            errors.append(f"{encoder.__name__}: {error}")
+            with contextlib.suppress(Exception):
+                path.unlink()
     try:
+        imageio = importlib.import_module("imageio.v3")
+        numpy = require_module("numpy", purpose="video export")
         imageio.imwrite(
             path,
             numpy.stack([numpy.asarray(frame) for frame in frames]),
             fps=float(fps),
         )
+        return
     except Exception as error:
-        fail("encoding_failed", f"failed to encode video: {path}", str(error))
+        errors.append(f"imageio: {error}")
+        with contextlib.suppress(Exception):
+            path.unlink()
+    fail("encoding_failed", f"failed to encode video: {path}", errors)
 
 
 def prepare_diffusers_pipeline(
@@ -2346,7 +2770,10 @@ def execute_prepared_diffusers_pipeline(
         frames = getattr(result, "frames", None)
         if frames is None and isinstance(result, dict):
             frames = result.get("frames")
-        batches = frame_batches(frames)
+        batches = frame_batches(
+            frames,
+            parameters.get("frames", parameters.get("num_frames")),
+        )
         if not batches:
             fail("backend_error", "Diffusers pipeline returned no video frames")
         fps = positive_float(parameters, "fps", 24.0, 0.1)
@@ -2376,6 +2803,8 @@ def execute_prepared_diffusers_pipeline(
     encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
     return outputs, warnings, {
         "runtime": "diffusers",
+        "pipeline_task": task,
+        "pipeline_class": type(entry.pipeline).__name__,
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "seed": seed,

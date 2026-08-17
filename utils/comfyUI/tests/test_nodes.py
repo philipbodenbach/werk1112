@@ -6,9 +6,15 @@ from pathlib import Path
 
 from PIL import Image
 import pytest
+import torch
 
 from .. import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, WEB_DIRECTORY
-from ..config import WerkConnection, WerkImageConfig, WerkRoutingConfig
+from ..config import (
+    WerkConnection,
+    WerkImageConfig,
+    WerkRoutingConfig,
+    WerkVideoConfig,
+)
 from .. import nodes
 from ..nodes import (
     WerkImageConfigNode,
@@ -17,14 +23,24 @@ from ..nodes import (
     WerkImageParametersNode,
     WerkRoutingConfigNode,
     WerkServerInfoNode,
+    WerkVideoConfigNode,
+    WerkVideoGenerateNode,
+    WerkVideoModelsNode,
+    WerkVideoParametersNode,
     build_configured_image_request,
+    build_configured_video_request,
     build_image_config,
     build_routing_config,
+    build_video_config,
     classify_image_models,
+    classify_video_models,
     image_config_payload,
     normalize_image_config_parameters,
     normalize_routing_config_parameters,
+    normalize_video_config_parameters,
     routing_config_payload,
+    video_config_payload,
+    wait_for_video_job,
 )
 
 
@@ -53,6 +69,8 @@ class FakeClient:
     responses = {}
     posted = None
     downloads = {}
+    deleted = []
+    download_limits = []
 
     def __init__(self, _connection):
         pass
@@ -66,7 +84,12 @@ class FakeClient:
         value = self.responses[path]
         return value(payload) if callable(value) else value
 
-    def download_bytes(self, url):
+    def delete_json(self, path):
+        self.__class__.deleted.append(path)
+        return {"id": path.rsplit("/", 1)[-1], "status": "cancelled"}
+
+    def download_bytes(self, url, *, max_bytes=None):
+        self.__class__.download_limits.append(max_bytes)
         return self.downloads[url]
 
 
@@ -75,6 +98,8 @@ def fake_client(monkeypatch):
     FakeClient.responses = {}
     FakeClient.posted = None
     FakeClient.downloads = {}
+    FakeClient.deleted = []
+    FakeClient.download_limits = []
     monkeypatch.setattr(nodes, "WerkClient", FakeClient)
     return FakeClient
 
@@ -110,6 +135,43 @@ def test_model_task_normalization_accepts_json_and_display_spellings():
     assert result["available"] == ["mixed"]
     assert result["models"][0]["tasks"] == ["image-generation"]
     assert result["models"][0]["available_tasks"] == ["image-generation"]
+
+
+def test_video_models_are_classified_per_generation_task_and_as_a_union():
+    capabilities = {
+        "models": [
+            {
+                "id": "text-video",
+                "tasks": ["video_generation"],
+                "available_tasks": ["video_generation"],
+            },
+            {
+                "id": "wan-ti2v",
+                "tasks": ["image-to-video"],
+                "available_tasks": [],
+            },
+            {
+                "id": "both",
+                "tasks": ["video_generation", "image_to_video"],
+                "available_tasks": ["VIDEO_GENERATION", "IMAGE_TO_VIDEO"],
+            },
+        ]
+    }
+    result = classify_video_models(
+        models_payload("text-video", "wan-ti2v", "both", "text"), capabilities
+    )
+    assert result["declared"] == ["text-video", "wan-ti2v", "both"]
+    assert result["available"] == ["text-video", "both"]
+    assert result["by_task"]["video-generation"] == {
+        "declared": ["text-video", "both"],
+        "available": ["text-video", "both"],
+    }
+    assert result["by_task"]["image-to-video"] == {
+        "declared": ["wan-ti2v", "both"],
+        "available": ["both"],
+    }
+    assert result["models"][1]["declares_image_to_video"] is True
+    assert result["models"][1]["image_to_video_probe_eligible"] is False
 
 
 def test_routing_config_exposes_all_current_werk_request_options():
@@ -249,6 +311,23 @@ def test_image_config_json_rejects_wrong_namespace_and_duplicate_controls(value,
         normalize_image_config_parameters(value)
 
 
+def test_video_config_json_normalizes_and_rejects_dedicated_or_transport_fields():
+    assert normalize_video_config_parameters(
+        '{"scheduler":"flow_match","video":{"motion_strength":0.7}}'
+    ) == {
+        "video.scheduler": "flow_match",
+        "video.motion_strength": 0.7,
+    }
+    for value, message in [
+        ('{"frames":49}', "duplicates a dedicated"),
+        ('{"temporal_vae_tiling":true}', "duplicates a dedicated"),
+        ('{"initial_image":"secret"}', "reserved"),
+        ('{"image.scheduler":"euler"}', "must use the 'video.' namespace"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            normalize_video_config_parameters(value)
+
+
 def test_typed_config_nodes_return_complete_serializable_payloads():
     routing, routing_json = WerkRoutingConfigNode().configure(
         allow_cpu_offload="enabled",
@@ -292,6 +371,38 @@ def test_typed_config_nodes_return_complete_serializable_payloads():
         "image.scheduler": "flow_match",
     }
 
+    video, video_json = WerkVideoConfigNode().configure(
+        routing=routing,
+        width=832,
+        height=480,
+        count=2,
+        batch_size=1,
+        frames=49,
+        fps=16.0,
+        steps=24,
+        guidance=5.5,
+        seed=987,
+        output_format="mp4",
+        temporal_vae_tiling="enabled",
+        additional_video_parameters_json='{"motion_strength":0.6}',
+    )
+    assert isinstance(video, WerkVideoConfig)
+    assert json.loads(video_json) == video_config_payload(video)
+    assert dict(video.request_fields) == {
+        "n": 2,
+        "size": "832x480",
+        "response_format": "mp4",
+    }
+    assert dict(video.parameters) == {
+        "video.frames": 49,
+        "video.fps": 16.0,
+        "video.steps": 24,
+        "video.guidance": 5.5,
+        "video.seed": 987,
+        "video.temporal_vae_tiling": True,
+        "video.motion_strength": 0.6,
+    }
+
 
 def test_image_count_and_batch_size_are_alternative_explicit_controls():
     default = build_image_config(count=1, batch_size=1)
@@ -306,9 +417,22 @@ def test_image_count_and_batch_size_are_alternative_explicit_controls():
         build_image_config(count=2, batch_size=4)
 
 
+def test_video_count_and_batch_size_are_alternative_explicit_controls():
+    default = build_video_config(count=1, batch_size=1)
+    assert default.request_fields["n"] == 1
+    assert "video.batch_size" not in default.parameters
+
+    batched = build_video_config(count=1, batch_size=4)
+    assert "n" not in batched.request_fields
+    assert batched.parameters["video.batch_size"] == 4
+
+    with pytest.raises(ValueError, match="cannot both be greater than 1"):
+        build_video_config(count=2, batch_size=4)
+
+
 def test_flux_request_carries_offload_as_explicit_routing_options():
     routing = build_routing_config(
-        backend="diffusers",
+        backend="media-companion",
         accelerator="cuda",
         allow_cpu_offload="enabled",
         allow_sequential_offload="enabled",
@@ -332,7 +456,7 @@ def test_flux_request_carries_offload_as_explicit_routing_options():
     )
 
     assert request["model"] == "black-forest-labs/FLUX.2-klein-4B"
-    assert request["backend"] == "diffusers"
+    assert request["backend"] == "media-companion"
     assert request["accelerator"] == "cuda"
     assert request["allow_cpu_offload"] is True
     assert request["allow_sequential_offload"] is True
@@ -351,6 +475,69 @@ def test_generator_requires_a_real_linkable_model_input():
     assert model_options["forceInput"] is True
     assert "default" not in model_options
     assert inputs["optional"]["config"] == ("WERK_IMAGE_CONFIG",)
+
+    video_inputs = WerkVideoGenerateNode.INPUT_TYPES()
+    video_model_type, video_model_options = video_inputs["required"]["model"]
+    assert video_model_type == "STRING"
+    assert video_model_options["forceInput"] is True
+    assert video_inputs["optional"] == {
+        "config": ("WERK_VIDEO_CONFIG",),
+        "initial_image": ("IMAGE",),
+    }
+    assert WerkVideoGenerateNode.RETURN_TYPES[0] == "VIDEO"
+    assert WerkVideoGenerateNode.OUTPUT_IS_LIST[0] is True
+
+
+def test_configured_video_request_merges_routing_and_embeds_one_initial_image():
+    routing = build_routing_config(
+        backend="media-companion",
+        allow_cpu_offload="enabled",
+        inference_timeout_seconds=1800,
+    )
+    config = build_video_config(
+        width=832,
+        height=480,
+        count=1,
+        frames=49,
+        fps=16,
+        steps=20,
+        guidance=5,
+        seed=42,
+        temporal_vae_tiling="enabled",
+        additional_video_parameters_json='{"flow_shift":3.0}',
+        routing=routing,
+    )
+    image = torch.tensor([[[[1.0, 0.0, 0.0]]]], dtype=torch.float32)
+    request = build_configured_video_request(
+        model="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        prompt="slow camera orbit",
+        negative_prompt="watermark",
+        initial_image=image,
+        config=config,
+    )
+    assert request["model"] == "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+    assert request["size"] == "832x480"
+    assert request["response_format"] == "mp4"
+    assert request["backend"] == "media-companion"
+    assert request["allow_cpu_offload"] is True
+    assert request["timeout_seconds"] == 1800
+    assert request["parameters"] == {
+        "video.frames": 49,
+        "video.fps": 16.0,
+        "video.steps": 20,
+        "video.guidance": 5.0,
+        "video.seed": 42,
+        "video.temporal_vae_tiling": True,
+        "video.flow_shift": 3.0,
+    }
+    assert request["initial_image"]["mime_type"] == "image/png"
+    with Image.open(BytesIO(base64.b64decode(request["initial_image"]["base64"]))) as encoded:
+        assert encoded.size == (1, 1)
+
+    without_image = build_configured_video_request(
+        model="text-video", prompt="clouds", config=build_video_config()
+    )
+    assert "initial_image" not in without_image
 
 
 def test_server_info_tolerates_optional_capabilities_failure(fake_client):
@@ -391,6 +578,37 @@ def test_multiple_image_models_require_explicit_preference(fake_client):
         WerkImageModelsNode().select(WerkConnection("http://werk"), 0, "", True)
 
 
+def test_video_model_selection_filters_the_requested_task(fake_client):
+    fake_client.responses = {
+        "/v1/models": models_payload("text-video", "wan-ti2v"),
+        "/v1/capabilities": {
+            "models": [
+                {
+                    "id": "text-video",
+                    "tasks": ["video_generation"],
+                    "available_tasks": ["video_generation"],
+                },
+                {
+                    "id": "wan-ti2v",
+                    "tasks": ["image_to_video"],
+                    "available_tasks": ["image_to_video"],
+                },
+            ]
+        },
+    }
+    selected, choices, metadata = WerkVideoModelsNode().select(
+        WerkConnection("http://werk"), "image_to_video", 0, "", True
+    )
+    assert selected == "wan-ti2v"
+    assert choices == "wan-ti2v"
+    assert json.loads(metadata)["selected_task"] == "image-to-video"
+
+    with pytest.raises(ValueError, match="task must be"):
+        WerkVideoModelsNode().select(
+            WerkConnection("http://werk"), "video-upscaling", 0, "", True
+        )
+
+
 def test_parameter_schema_query_is_forwarded_and_returned(fake_client):
     seen = {}
 
@@ -403,6 +621,30 @@ def test_parameter_schema_query_is_forwarded_and_returned(fake_client):
     assert seen == {"task": "image-generation", "model": "tiny-sd", "backend": "auto"}
     assert json.loads(payload)["parameters"][0]["path"] == "image.steps"
     assert "1 parameter descriptor" in summary
+
+
+def test_video_parameter_schema_uses_the_selected_task(fake_client):
+    seen = {}
+
+    def response(query):
+        seen.update(query)
+        return {"parameters": [{"path": "video.frames", "default": 81}]}
+
+    fake_client.responses["/v1/parameters"] = response
+    payload, summary = WerkVideoParametersNode().parameters(
+        WerkConnection("http://werk"),
+        "wan-ti2v",
+        "image-to-video",
+        "diffusers",
+        1,
+    )
+    assert seen == {
+        "task": "image-to-video",
+        "model": "wan-ti2v",
+        "backend": "diffusers",
+    }
+    assert json.loads(payload)["parameters"][0]["path"] == "video.frames"
+    assert "image-to-video" in summary
 
 
 def response_with_images(entries):
@@ -535,6 +777,144 @@ def test_generate_executes_typed_config_and_posts_merged_request(fake_client):
     }
 
 
+def completed_video_job():
+    return {
+        "id": "job-video-1",
+        "status": "completed",
+        "created_unix": 1,
+        "updated_unix": 2,
+        "request": {
+            "inputs": [
+                {"source": {"kind": "base64", "data": "request-secret"}}
+            ]
+        },
+        "result": {
+            "id": "result-video-1",
+            "task": "image_to_video",
+            "model": "wan-ti2v",
+            "runtime": "media-companion-cuda",
+            "effective_request": {
+                "inputs": [
+                    {
+                        "modality": "image",
+                        "role": "initial_image",
+                        "source": {
+                            "kind": "base64",
+                            "data": "effective-secret",
+                        },
+                    }
+                ]
+            },
+            "estimate": {},
+            "plan": {},
+            "backend_metadata": {"path": "/private/model"},
+            "timings": {"total_seconds": 1.2},
+            "warnings": [],
+            "created_unix": 2,
+            "outputs": [
+                {
+                    "id": "video-output-1",
+                    "path": "/private/output.mp4",
+                    "mime_type": "video/mp4",
+                    "size_bytes": 13,
+                    "width": 832,
+                    "height": 480,
+                    "duration": 3.0,
+                    "seed": 42,
+                }
+            ],
+        },
+        "error": None,
+    }
+
+
+def test_video_generate_posts_polls_downloads_and_returns_native_video_list(
+    fake_client, monkeypatch
+):
+    fake_client.responses["/v1/videos/generations"] = {
+        "id": "job-video-1",
+        "status": "queued",
+        "created_unix": 1,
+        "updated_unix": 1,
+    }
+    fake_client.responses["/v1/jobs/job-video-1"] = completed_video_job()
+    fake_client.downloads["/v1/outputs/video-output-1"] = (
+        b"encoded-video",
+        "video/mp4",
+    )
+    monkeypatch.setattr(nodes.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        nodes,
+        "video_bytes_to_comfy",
+        lambda raw: {"native_video": raw},
+    )
+
+    videos, metadata, seed, job_id, result_id, output_ids = (
+        WerkVideoGenerateNode().generate(
+            WerkConnection("http://werk", timeout_seconds=30),
+            model="wan-ti2v",
+            prompt="slow orbit",
+            negative_prompt="watermark",
+            config=build_video_config(seed=42),
+        )
+    )
+    assert videos == [{"native_video": b"encoded-video"}]
+    assert seed == 42
+    assert job_id == "job-video-1"
+    assert result_id == "result-video-1"
+    assert output_ids == "video-output-1"
+    assert fake_client.posted[0] == "/v1/videos/generations"
+    assert fake_client.download_limits == [nodes.environment_max_video_bytes()]
+    assert "/private" not in metadata
+    assert "request-secret" not in metadata
+    assert "effective-secret" not in metadata
+    assert json.loads(metadata)["result"]["effective_request"]["inputs"][0][
+        "source"
+    ] == {"kind": "base64", "embedded": True}
+
+
+def test_video_job_timeout_cancels_best_effort(fake_client):
+    moments = iter([0.0, 2.0])
+    client = fake_client(WerkConnection("http://werk"))
+    with pytest.raises(TimeoutError, match="within 1 seconds"):
+        wait_for_video_job(
+            client,
+            {"id": "job-timeout", "status": "running"},
+            timeout_seconds=1,
+            sleep_fn=lambda _seconds: None,
+            monotonic_fn=lambda: next(moments),
+            interrupt_check=lambda: None,
+        )
+    assert fake_client.deleted == ["/v1/jobs/job-timeout"]
+
+
+def test_video_job_comfy_interrupt_cancels_best_effort(fake_client):
+    client = fake_client(WerkConnection("http://werk"))
+
+    def interrupted():
+        raise RuntimeError("ComfyUI processing interrupted")
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        wait_for_video_job(
+            client,
+            {"id": "job-interrupted", "status": "running"},
+            timeout_seconds=30,
+            interrupt_check=interrupted,
+        )
+    assert fake_client.deleted == ["/v1/jobs/job-interrupted"]
+
+
+def test_video_job_failure_is_terminal_and_actionable(fake_client):
+    client = fake_client(WerkConnection("http://werk"))
+    with pytest.raises(ValueError, match="encoder exploded"):
+        wait_for_video_job(
+            client,
+            {"id": "job-failed", "status": "failed", "error": "encoder exploded"},
+            timeout_seconds=1,
+        )
+    assert fake_client.deleted == []
+
+
 def test_configured_request_rejects_parameter_collisions_instead_of_overwriting():
     routing = WerkRoutingConfig(parameters={"image.scheduler": "routing-value"})
     config = WerkImageConfig(
@@ -543,6 +923,18 @@ def test_configured_request_rejects_parameter_collisions_instead_of_overwriting(
     )
     with pytest.raises(ValueError, match="config parameter collision: image.scheduler"):
         build_configured_image_request(model="tiny-sd", prompt="robot", config=config)
+
+    video_routing = WerkRoutingConfig(
+        parameters={"video.scheduler": "routing-value"}
+    )
+    video_config = WerkVideoConfig(
+        parameters={"video.scheduler": "video-value"},
+        routing=video_routing,
+    )
+    with pytest.raises(ValueError, match="config parameter collision: video.scheduler"):
+        build_configured_video_request(
+            model="wan", prompt="robot", config=video_config
+        )
 
 
 def test_node_exports_and_display_names_are_complete():
@@ -554,22 +946,38 @@ def test_node_exports_and_display_names_are_complete():
         "WerkRoutingConfig",
         "WerkImageConfig",
         "WerkImageGenerate",
+        "WerkVideoModels",
+        "WerkVideoParameters",
+        "WerkVideoConfig",
+        "WerkVideoGenerate",
     }
     assert set(NODE_CLASS_MAPPINGS) == expected
     assert set(NODE_DISPLAY_NAME_MAPPINGS) == expected
     assert NODE_CLASS_MAPPINGS["WerkRoutingConfig"] is WerkRoutingConfigNode
     assert NODE_CLASS_MAPPINGS["WerkImageConfig"] is WerkImageConfigNode
     assert NODE_CLASS_MAPPINGS["WerkImageGenerate"] is WerkImageGenerateNode
+    assert NODE_CLASS_MAPPINGS["WerkVideoModels"] is WerkVideoModelsNode
+    assert NODE_CLASS_MAPPINGS["WerkVideoParameters"] is WerkVideoParametersNode
+    assert NODE_CLASS_MAPPINGS["WerkVideoConfig"] is WerkVideoConfigNode
+    assert NODE_CLASS_MAPPINGS["WerkVideoGenerate"] is WerkVideoGenerateNode
     assert NODE_DISPLAY_NAME_MAPPINGS["WerkImageGenerate"] == "WERK Image Generate (Beta)"
+    assert NODE_DISPLAY_NAME_MAPPINGS["WerkVideoGenerate"] == "WERK Video Generate (Beta)"
     assert all(name.endswith(" (Beta)") for name in NODE_DISPLAY_NAME_MAPPINGS.values())
     assert WEB_DIRECTORY == "./web/js"
     assert (Path(__file__).parents[1] / "web" / "js" / "werk_ui.js").is_file()
+    frontend = (Path(__file__).parents[1] / "web" / "js" / "werk_ui.js").read_text()
+    assert 'const VIDEO_MODELS_CLASS = "WerkVideoModels"' in frontend
+    assert "updateVideoModelsNode" in frontend
 
 
 def test_example_workflows_are_distinct_valid_json_shapes():
     examples = Path(__file__).parents[1] / "examples"
     ui = json.loads((examples / "werk_image_generation_workflow.json").read_text())
     api = json.loads((examples / "werk_image_generation_api.json").read_text())
+    video_api = json.loads((examples / "werk_video_generation_api.json").read_text())
+    image_to_video_api = json.loads(
+        (examples / "werk_image_to_video_api.json").read_text()
+    )
     assert ui["version"] == 0.4
     assert {node["type"] for node in ui["nodes"]} >= {
         "WerkConnection",
@@ -593,6 +1001,21 @@ def test_example_workflows_are_distinct_valid_json_shapes():
     assert api["5"]["inputs"]["config"] == ["4", 0]
     assert api["6"]["inputs"]["images"] == ["5", 0]
     assert api["7"]["inputs"]["images"] == ["5", 0]
+
+    assert video_api["2"]["class_type"] == "WerkVideoModels"
+    assert video_api["2"]["inputs"]["task"] == "video-generation"
+    assert video_api["3"]["inputs"]["precision"] == "bf16"
+    assert video_api["4"]["class_type"] == "WerkVideoConfig"
+    assert video_api["5"]["class_type"] == "WerkVideoGenerate"
+    assert "initial_image" not in video_api["5"]["inputs"]
+    assert video_api["6"]["inputs"]["video"] == ["5", 0]
+
+    assert image_to_video_api["2"]["inputs"]["task"] == "image-to-video"
+    assert image_to_video_api["3"]["inputs"]["precision"] == "bf16"
+    assert image_to_video_api["5"]["class_type"] == "LoadImage"
+    assert image_to_video_api["6"]["class_type"] == "WerkVideoGenerate"
+    assert image_to_video_api["6"]["inputs"]["initial_image"] == ["5", 0]
+    assert image_to_video_api["7"]["inputs"]["video"] == ["6", 0]
 
 
 def test_package_reload_performs_no_network_request(monkeypatch):

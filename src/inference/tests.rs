@@ -94,6 +94,41 @@ fn image_manifest() -> ModelManifest {
     }
 }
 
+fn video_manifest(family: &str) -> ModelManifest {
+    ModelManifest {
+        id: family.to_string(),
+        source: ModelSource::LocalPath {
+            path: "fixture".to_string(),
+        },
+        format: ModelFormat::SafeTensors,
+        architecture: Some("WanTransformer3DModel".to_string()),
+        tokenizer_path: None,
+        config_path: None,
+        model_path: Some("files/transformer/model.safetensors".to_string()),
+        backend: "media-companion".to_string(),
+        created_unix: 1,
+        files: vec![ModelFile {
+            path: "files/transformer/model.safetensors".to_string(),
+            size: 1_000_000_000,
+            checksum: "crc32:0".to_string(),
+        }],
+        artifacts: Vec::new(),
+        metadata: ModelMetadata {
+            schema_version: CURRENT_MANIFEST_SCHEMA_VERSION,
+            family: Some(family.to_string()),
+            repository_layout: RepositoryLayout::Diffusers,
+            tasks: vec![InferenceTask::VideoGeneration],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Video],
+            components: vec![ModelComponent::new(
+                crate::capabilities::ModelComponentKind::Transformer,
+                "files/transformer",
+            )],
+            ..Default::default()
+        },
+    }
+}
+
 fn request() -> InferenceRequest {
     let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
     request.prompt = Some("an orbital station".to_string());
@@ -267,6 +302,46 @@ fn family_default_is_overridden_by_model_default() {
         effective.parameters["image.guidance"].source,
         ParameterSource::ModelFamilyDefault
     );
+}
+
+#[test]
+fn wan22_ti2v_family_uses_official_video_defaults() {
+    let manifest = video_manifest("wan2.2-ti2v");
+    let mut request = InferenceRequest::new(&manifest.id, InferenceTask::VideoGeneration);
+    request.prompt = Some("clouds over a mountain lake".to_string());
+
+    let effective = resolve_request(&manifest, request, &ResolutionContext::default()).unwrap();
+    let expected = [
+        ("video.width", 1280_i64.into()),
+        ("video.height", 704_i64.into()),
+        ("video.frames", 121_i64.into()),
+        ("video.fps", 24.0_f64.into()),
+        ("video.steps", 50_i64.into()),
+        ("video.guidance", 5.0_f64.into()),
+    ];
+    for (path, value) in expected {
+        assert_eq!(effective.parameter(path), Some(&value), "{path}");
+        assert_eq!(
+            effective.parameters[path].source,
+            ParameterSource::ModelFamilyDefault,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn generic_wan_family_keeps_existing_video_defaults() {
+    let manifest = video_manifest("wan");
+    let mut request = InferenceRequest::new(&manifest.id, InferenceTask::VideoGeneration);
+    request.prompt = Some("clouds over a mountain lake".to_string());
+
+    let effective = resolve_request(&manifest, request, &ResolutionContext::default()).unwrap();
+    assert_eq!(effective.u64_parameter("video.frames"), Some(81));
+    assert_eq!(effective.f64_parameter("video.fps"), Some(16.0));
+    assert_eq!(effective.u64_parameter("video.width"), Some(832));
+    assert_eq!(effective.u64_parameter("video.height"), Some(480));
+    assert_eq!(effective.u64_parameter("video.steps"), Some(30));
+    assert_eq!(effective.f64_parameter("video.guidance"), Some(6.0));
 }
 
 #[test]
