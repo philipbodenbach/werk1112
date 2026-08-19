@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -716,6 +716,43 @@ impl CompanionClient {
         })
     }
 
+    /// Builds a client that runs the bundled media companion with a specific
+    /// Python interpreter. This keeps architecture-specific dependency sets in
+    /// isolated virtual environments without changing `WERK_MEDIA_PYTHON` for
+    /// unrelated image, video, or audio models.
+    pub fn from_python(program: impl Into<PathBuf>) -> Result<Self> {
+        let configured = program.into();
+        let program = resolve_program(configured.as_os_str()).ok_or_else(|| {
+            anyhow!(
+                "media companion Python does not resolve to an executable file: {}",
+                configured.display()
+            )
+        })?;
+        let launcher = if let Some((script, source)) = discover_repo_script() {
+            CompanionLauncher {
+                program,
+                args: vec![script.into_os_string()],
+                source: format!("explicit Python; {source}"),
+                kind: LauncherKind::Python,
+                embedded_script: false,
+            }
+        } else {
+            CompanionLauncher {
+                program,
+                args: vec![OsString::from("-c"), OsString::from(EMBEDDED_BOOTSTRAP)],
+                source: "explicit Python; embedded companion script".to_string(),
+                kind: LauncherKind::Python,
+                embedded_script: true,
+            }
+        };
+        Ok(Self {
+            launcher,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            execute_timeout: DEFAULT_EXECUTE_TIMEOUT,
+            resident: None,
+        })
+    }
+
     /// Builds a client for an explicitly resolved process. `program` and
     /// `args` are passed directly to `std::process::Command`; no shell parsing
     /// or interpolation is performed.
@@ -1271,7 +1308,7 @@ fn python_program_names() -> &'static [&'static str] {
     }
 }
 
-fn resolve_program(program: &OsString) -> Option<PathBuf> {
+fn resolve_program(program: &OsStr) -> Option<PathBuf> {
     let path = PathBuf::from(program);
     if path.components().count() > 1 || path.is_absolute() {
         return path.is_file().then_some(path);
@@ -1603,6 +1640,23 @@ else:
         let client = CompanionClient::from_command(python, vec![script.into_os_string()])
             .with_timeout(timeout);
         Some((directory, client))
+    }
+
+    #[test]
+    fn explicit_python_client_keeps_the_requested_interpreter() {
+        let Some(python) = python_program_names()
+            .iter()
+            .find_map(|name| find_in_path(name))
+        else {
+            return;
+        };
+
+        let client = CompanionClient::from_python(&python).unwrap();
+
+        assert_eq!(client.launcher.program, python);
+        assert_eq!(client.launcher.kind, LauncherKind::Python);
+        assert!(client.resident.is_none());
+        assert!(client.launcher_description().contains("explicit Python"));
     }
 
     fn scripted_client(

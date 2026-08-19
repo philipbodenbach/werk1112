@@ -950,6 +950,12 @@ def test_node_exports_and_display_names_are_complete():
         "WerkVideoParameters",
         "WerkVideoConfig",
         "WerkVideoGenerate",
+        "WerkAudioModels",
+        "WerkAudioParameters",
+        "WerkAudioConfig",
+        "WerkAudioGenerate",
+        "WerkAudioProcess",
+        "WerkAudioAnalyze",
     }
     assert set(NODE_CLASS_MAPPINGS) == expected
     assert set(NODE_DISPLAY_NAME_MAPPINGS) == expected
@@ -968,6 +974,8 @@ def test_node_exports_and_display_names_are_complete():
     frontend = (Path(__file__).parents[1] / "web" / "js" / "werk_ui.js").read_text()
     assert 'const VIDEO_MODELS_CLASS = "WerkVideoModels"' in frontend
     assert "updateVideoModelsNode" in frontend
+    assert 'const AUDIO_MODELS_CLASS = "WerkAudioModels"' in frontend
+    assert "updateAudioModelsNode" in frontend
 
 
 def test_example_workflows_are_distinct_valid_json_shapes():

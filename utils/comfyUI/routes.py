@@ -12,11 +12,19 @@ from typing import Any, Callable, Mapping
 try:
     from .client import WerkApiError, WerkClient
     from .config import WerkConnection
-    from .nodes import classify_image_models, classify_video_models
+    from .nodes import (
+        classify_audio_models,
+        classify_image_models,
+        classify_video_models,
+    )
 except ImportError:  # pragma: no cover - direct-module development
     from client import WerkApiError, WerkClient
     from config import WerkConnection
-    from nodes import classify_image_models, classify_video_models
+    from nodes import (
+        classify_audio_models,
+        classify_image_models,
+        classify_video_models,
+    )
 
 
 def _connection_from_payload(payload: Mapping[str, Any]) -> WerkConnection:
@@ -55,15 +63,19 @@ def discover_connection(
         warning = str(error)
     classification = classify_image_models(models, capabilities)
     video_classification = classify_video_models(models, capabilities)
+    audio_classification = classify_audio_models(models, capabilities)
     model_count = len(classification["installed"])
     available_count = len(classification["available"])
     available_video_count = len(video_classification["available"])
+    available_audio_count = len(audio_classification["available"])
     model_word = "model" if model_count == 1 else "models"
     image_word = "image" if available_count == 1 else "images"
     video_word = "video" if available_video_count == 1 else "videos"
+    audio_word = "audio model" if available_audio_count == 1 else "audio models"
     status = (
         f"Connected · {model_count} {model_word} · {available_count} {image_word}"
         f" · {available_video_count} {video_word}"
+        f" · {available_audio_count} {audio_word}"
     )
     response = {
         "ok": True,
@@ -80,6 +92,11 @@ def discover_connection(
             "declared": video_classification["declared"],
             "available": video_classification["available"],
             "by_task": video_classification["by_task"],
+        },
+        "audio_models": {
+            "declared": audio_classification["declared"],
+            "available": audio_classification["available"],
+            "by_task": audio_classification["by_task"],
         },
     }
     if warning:

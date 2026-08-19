@@ -12,6 +12,8 @@ DEFAULT_SERVER_URL = "http://127.0.0.1:11434"
 DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_MAX_IMAGE_PIXELS = 64 * 1024 * 1024
 DEFAULT_MAX_VIDEO_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_AUDIO_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_AUDIO_INPUT_BYTES = 64 * 1024 * 1024
 
 
 def normalize_server_url(value: str) -> str:
@@ -58,6 +60,31 @@ def environment_max_video_bytes() -> int:
         raise ValueError("WERK_MAX_VIDEO_BYTES must be an integer") from error
     if value <= 0:
         raise ValueError("WERK_MAX_VIDEO_BYTES must be greater than zero")
+    return value
+
+
+def environment_max_audio_bytes() -> int:
+    raw = os.environ.get("WERK_MAX_AUDIO_BYTES", str(DEFAULT_MAX_AUDIO_BYTES))
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("WERK_MAX_AUDIO_BYTES must be an integer") from error
+    if value <= 0:
+        raise ValueError("WERK_MAX_AUDIO_BYTES must be greater than zero")
+    return value
+
+
+def environment_max_audio_input_bytes() -> int:
+    raw = os.environ.get(
+        "WERK_MAX_AUDIO_INPUT_BYTES",
+        str(DEFAULT_MAX_AUDIO_INPUT_BYTES),
+    )
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("WERK_MAX_AUDIO_INPUT_BYTES must be an integer") from error
+    if value <= 0:
+        raise ValueError("WERK_MAX_AUDIO_INPUT_BYTES must be greater than zero")
     return value
 
 
@@ -162,6 +189,40 @@ class WerkVideoConfig:
     def __repr__(self) -> str:
         return (
             "WerkVideoConfig("
+            f"request_fields={dict(self.request_fields)!r}, "
+            f"parameters={dict(self.parameters)!r}, "
+            f"routing={self.routing!r})"
+        )
+
+
+@dataclass(frozen=True, repr=False, eq=False)
+class WerkAudioConfig:
+    """Validated task-specific audio request fields and Werk parameters."""
+
+    task: str
+    request_fields: Mapping[str, Any] = field(default_factory=dict)
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+    routing: WerkRoutingConfig = field(default_factory=WerkRoutingConfig)
+
+    def __post_init__(self) -> None:
+        task = str(self.task or "").strip().lower().replace("_", "-")
+        if task not in {"audio-generation", "music-generation", "text-to-speech"}:
+            raise ValueError(
+                "audio config task must be audio-generation, music-generation, "
+                "or text-to-speech"
+            )
+        if not isinstance(self.routing, WerkRoutingConfig):
+            raise TypeError("routing must be a WerkRoutingConfig")
+        object.__setattr__(self, "task", task)
+        object.__setattr__(
+            self, "request_fields", _immutable_mapping(self.request_fields)
+        )
+        object.__setattr__(self, "parameters", _immutable_mapping(self.parameters))
+
+    def __repr__(self) -> str:
+        return (
+            "WerkAudioConfig("
+            f"task={self.task!r}, "
             f"request_fields={dict(self.request_fields)!r}, "
             f"parameters={dict(self.parameters)!r}, "
             f"routing={self.routing!r})"

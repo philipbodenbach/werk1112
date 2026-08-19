@@ -188,6 +188,21 @@ pub(in crate::api) async fn audio_transcriptions_handler(
     execute_direct(state, request, DirectResponseFormat::Url).await
 }
 
+pub(in crate::api) async fn audio_translations_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<AudioTranscriptionApiRequest>,
+) -> Response {
+    if let Err(response) = state.authorize(&headers) {
+        return response;
+    }
+    let request = match request.into_translation() {
+        Ok(request) => request,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error, None),
+    };
+    execute_direct(state, request, DirectResponseFormat::Url).await
+}
+
 pub(in crate::api) async fn capabilities_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,

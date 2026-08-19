@@ -290,6 +290,56 @@ fn validate_required_inputs(request: &InferenceRequest) -> Result<()> {
     {
         bail!("task {} requires a non-empty prompt or text", request.task);
     }
+    let has_prompt = request
+        .prompt
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_prompt
+        && matches!(
+            request.task,
+            InferenceTask::SpeechToText
+                | InferenceTask::SpeechTranslation
+                | InferenceTask::AudioEventDetection
+                | InferenceTask::VoiceActivityDetection
+                | InferenceTask::SpeakerIdentification
+                | InferenceTask::LanguageIdentification
+                | InferenceTask::SpeechEmotionRecognition
+                | InferenceTask::SpeakerDiarization
+                | InferenceTask::AudioClassification
+                | InferenceTask::AudioEmbedding
+                | InferenceTask::AudioEnhancement
+        )
+    {
+        bail!("task {} does not consume a prompt", request.task);
+    }
+    let has_negative_prompt = request
+        .negative_prompt
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_negative_prompt
+        && matches!(
+            request.task,
+            InferenceTask::TextToSpeech
+                | InferenceTask::SpeechToText
+                | InferenceTask::SpeechTranslation
+                | InferenceTask::AudioEventDetection
+                | InferenceTask::VoiceActivityDetection
+                | InferenceTask::SpeakerIdentification
+                | InferenceTask::LanguageIdentification
+                | InferenceTask::SpeechEmotionRecognition
+                | InferenceTask::AudioCaptioning
+                | InferenceTask::SpeakerDiarization
+                | InferenceTask::AudioClassification
+                | InferenceTask::AudioUnderstanding
+                | InferenceTask::AudioEmbedding
+                | InferenceTask::VoiceConversion
+                | InferenceTask::StemSeparation
+                | InferenceTask::AudioEnhancement
+                | InferenceTask::AudioEditing
+        )
+    {
+        bail!("task {} does not consume a negative prompt", request.task);
+    }
     for required in request.task.required_input_modalities() {
         if *required == InputModality::Text {
             continue;
@@ -356,8 +406,24 @@ fn validate_required_inputs(request: &InferenceRequest) -> Result<()> {
                 "mask video",
             )?;
         }
-        SongContinuation | SongVariation | SpeechToText | StemGeneration | StemSeparation
-        | AudioEnhancement => {
+        SongContinuation
+        | SongVariation
+        | SpeechToText
+        | SpeechTranslation
+        | AudioEventDetection
+        | VoiceActivityDetection
+        | SpeakerIdentification
+        | LanguageIdentification
+        | SpeechEmotionRecognition
+        | AudioCaptioning
+        | SpeakerDiarization
+        | AudioClassification
+        | AudioUnderstanding
+        | AudioEmbedding
+        | StemGeneration
+        | StemSeparation
+        | AudioEnhancement
+        | AudioEditing => {
             require_input_role(
                 request,
                 InputModality::Audio,
@@ -371,12 +437,6 @@ fn validate_required_inputs(request: &InferenceRequest) -> Result<()> {
                 InputModality::Audio,
                 &["input_audio", "source_audio", "audio"],
                 "source audio",
-            )?;
-            require_input_role(
-                request,
-                InputModality::Audio,
-                &["reference_audio", "voice_reference"],
-                "reference audio",
             )?;
         }
         TextGeneration | TextEmbedding | ImageGeneration | VideoGeneration | AudioGeneration

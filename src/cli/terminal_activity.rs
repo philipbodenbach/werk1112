@@ -75,12 +75,15 @@ impl ActivitySpec {
 
     pub(super) const fn for_task(task: InferenceTask) -> Self {
         use InferenceTask::{
-            AudioEnhancement, AudioGeneration, FrameInterpolation, ImageEditing, ImageGeneration,
-            ImageInpainting, ImageOutpainting, ImageToVideo, ImageUnderstanding, ImageUpscaling,
-            ImageVariation, MusicGeneration, SongContinuation, SongVariation, SpeechToText,
+            AudioCaptioning, AudioClassification, AudioEditing, AudioEmbedding, AudioEnhancement,
+            AudioEventDetection, AudioGeneration, AudioUnderstanding, FrameInterpolation,
+            ImageEditing, ImageGeneration, ImageInpainting, ImageOutpainting, ImageToVideo,
+            ImageUnderstanding, ImageUpscaling, ImageVariation, LanguageIdentification,
+            MusicGeneration, SongContinuation, SongVariation, SpeakerDiarization,
+            SpeakerIdentification, SpeechEmotionRecognition, SpeechToText, SpeechTranslation,
             StemGeneration, StemSeparation, TextEmbedding, TextGeneration, TextToSpeech,
             VideoExtension, VideoGeneration, VideoInpainting, VideoToVideo, VideoUpscaling,
-            VoiceConversion,
+            VoiceActivityDetection, VoiceConversion,
         };
 
         match task {
@@ -145,9 +148,26 @@ impl ActivitySpec {
                 kind: ActivityKind::Audio,
                 action: "Giving words a voice with",
             },
-            SpeechToText => Self {
+            SpeechToText | SpeechTranslation => Self {
                 kind: ActivityKind::Audio,
                 action: "Listening closely with",
+            },
+            AudioEventDetection
+            | VoiceActivityDetection
+            | SpeakerIdentification
+            | LanguageIdentification
+            | SpeechEmotionRecognition
+            | AudioClassification => Self {
+                kind: ActivityKind::Audio,
+                action: "Classifying the waveform with",
+            },
+            AudioCaptioning | SpeakerDiarization | AudioUnderstanding => Self {
+                kind: ActivityKind::Audio,
+                action: "Understanding the recording with",
+            },
+            AudioEmbedding => Self {
+                kind: ActivityKind::Audio,
+                action: "Mapping the waveform with",
             },
             VoiceConversion => Self {
                 kind: ActivityKind::Audio,
@@ -161,7 +181,7 @@ impl ActivitySpec {
                 kind: ActivityKind::Audio,
                 action: "Untangling the waveform with",
             },
-            AudioEnhancement => Self {
+            AudioEnhancement | AudioEditing => Self {
                 kind: ActivityKind::Audio,
                 action: "Polishing the waveform with",
             },

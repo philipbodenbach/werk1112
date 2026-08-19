@@ -1,5 +1,8 @@
 # Werk1112 media inference
 
+[Documentation home](README.md) · [HTTP API](api.md) ·
+[Backends and platform support](backends.md)
+
 Werk1112 is an inference router, not a workflow engine. A request names one
 model and one concrete task. Werk normalizes its inputs, resolves defaults,
 validates parameters, estimates the workload, scores runtime candidates,
@@ -12,12 +15,19 @@ manages outputs and metadata.
 werk chat MODEL
 werk image generate|edit|upscale MODEL
 werk video generate|animate|transform|upscale MODEL
-werk audio generate|speak|transcribe|separate MODEL
+werk audio generate speech|music|sound MODEL
+werk audio transcribe|translate MODEL
+werk audio detect event|voice|speaker|language|emotion MODEL
+werk audio analyze caption|diarize|classify|understand MODEL
+werk audio transform voice|separate|enhance|edit MODEL
+werk audio embed MODEL
 werk serve
 ```
 
 The old `werk run` parser remains hidden for compatibility. New applications
 should use `chat` for text and the typed media commands for generated files.
+The former `audio generate MODEL`, `audio speak`, and `audio separate` forms
+remain available as compatibility aliases.
 
 Interactive chat and media commands print the Werk1112 startup banner. During
 local inference, the CLI renders a transient modality-specific activity line
@@ -156,6 +166,63 @@ accelerator memory and generation time than download time. It does not validate
 Wan2.2's hybrid I2V route, new VAE, or 720P behavior, so the Wan2.2 test remains
 the acceptance test.
 
+## Audio tasks and smoke tests
+
+The audio command hierarchy separates user intent from the model and backend:
+
+```text
+generate speech|music|sound
+transcribe
+translate
+detect event|voice|speaker|language|emotion
+analyze caption|diarize|classify|understand
+transform voice|separate|enhance|edit
+embed
+```
+
+Each leaf still names one installed model. Werk derives declared tasks from
+repository configuration and architecture metadata, then probes registered
+Diffusers or Transformers adapters. `--backend auto` scores only compatible
+candidates; an explicit backend is honored, and `--fallback-policy none`
+prevents backend retry. A repository can therefore be cataloged for a task
+without being executable when no generic adapter accepts its layout.
+
+Short, independent smoke tests:
+
+```bash
+# VITS text-to-speech
+werk pull facebook/mms-tts-deu --name mms-tts-deu
+werk audio generate speech mms-tts-deu \
+  --text "Werk elf zwölf ist bereit." \
+  --output speech.wav --verbose --debug
+
+# MusicGen text-to-music
+werk pull facebook/musicgen-small --name musicgen-small
+werk audio generate music musicgen-small \
+  --prompt "Five-second cinematic technology ident, restrained analogue synth pulse" \
+  --duration 5 --seed 1112 \
+  --output music.wav --verbose --debug
+
+# Whisper transcription and speech-to-English translation
+werk pull openai/whisper-tiny --name whisper-tiny
+werk audio transcribe whisper-tiny --input speech.wav \
+  --output-format text --output transcript.txt
+werk audio translate whisper-tiny --input speech.wav \
+  --output-format text --output translation.txt
+
+# AudioSet classification
+werk pull MIT/ast-finetuned-audioset-10-10-0.4593 --name ast-audioset
+werk audio analyze classify ast-audioset \
+  --input field-recording.wav --top-k 5 --output events.json
+```
+
+Review each model's license before use; in particular the referenced MMS-TTS
+and MusicGen checkpoints are non-commercial. Generation output is
+`wav`/`flac`/`ogg`; ASR, classification, audio-to-text, and embedding adapters
+write structured text or JSON. `werk doctor --model MODEL --task TASK --debug`
+checks metadata and dependencies without loading the full model. The first
+cold execution remains the definitive model-registry and memory check.
+
 ## CLI diagnostics
 
 Every typed image, video, and audio command accepts two independent,
@@ -170,7 +237,7 @@ werk video animate wan-i2v --image first-frame.png \
   --prompt "slow camera movement" --debug
 
 # Both views for one request
-werk audio generate musicgen --prompt "quiet analogue ambience" \
+werk audio generate music musicgen --prompt "quiet analogue ambience" \
   --verbose --debug
 ```
 
@@ -253,8 +320,10 @@ The manifest and API use typed tasks rather than a matrix of booleans:
 - image generation, editing, variation, inpainting, outpainting, and upscaling;
 - video generation, image-to-video, video-to-video, inpainting, extension,
   upscaling, and frame interpolation;
-- audio and music generation, song continuation/variation, TTS, ASR, voice
-  conversion, stem generation/separation, and audio enhancement.
+- audio and music generation, song continuation/variation, TTS, ASR and speech
+  translation, event/voice/speaker/language/emotion detection, captioning,
+  diarization, classification, prompted understanding, embeddings, voice
+  conversion, stem generation/separation, enhancement, and editing.
 
 One model can declare several tasks. Input modalities (`text`, `image`,
 `video`, `audio`) and output modalities (`text`, `image`, `video`, `audio`,
@@ -371,17 +440,18 @@ Under `werk serve`, media execution runs through one persistent, serialized
 worker. Lightweight health, model-probe, and estimate preflights use independent
 one-shot calls so concurrent requests do not fail behind a long generation.
 The worker performs lazy, local-only Diffusers/Transformers execution and
-caches one fully configured Diffusers image/video pipeline by default. The
-first compatible request is cold; subsequent requests with the same model and
-runtime configuration are warm. Prompt, seed, size, steps, and count are
-request-local and do not invalidate the cache. Model, device, dtype,
-offload/tiling configuration, and LoRA changes may select a different entry and
-therefore cause a cold load. At the default cache size, the existing pipeline
-is evicted before a replacement is loaded.
+caches one configured media model by default. Diffusers image/video/audio
+pipelines and Transformers audio pipelines or processor/model pairs share this
+same bound. The first compatible request is cold; subsequent requests with the
+same model and runtime configuration are warm. Prompt, seed, size, steps, and
+count are request-local and do not invalidate the cache. Model, task adapter,
+device, dtype, offload/tiling configuration, and LoRA changes may select a
+different entry and therefore cause a cold load. At the default cache size, the
+existing entry is evicted before a replacement is loaded.
 
 `WERK_MEDIA_PIPELINE_CACHE_SIZE` controls the maximum number of resident
-Diffusers entries and defaults to `1`; `0` disables the pipeline cache while
-the worker can remain persistent. Cached pipelines retain VRAM and/or host RAM
+media entries and defaults to `1`; `0` disables the model cache while the
+worker can remain persistent. Cached models retain VRAM and/or host RAM
 until eviction or server shutdown. Execution metadata exposes
 `model_cache_hit` and `model_load_seconds` for warm/cold diagnostics. A worker
 crash or request timeout discards the process and cache, and the next request
@@ -424,19 +494,31 @@ does not treat `imageio` alone as proof that an encoder is installed.
 | Song continuation/variation | Yes | Prepared; no generic adapter yet |
 | Text-to-speech | Yes | Transformers TTS pipeline/model dependent |
 | Speech-to-text/translation | Yes | Transformers ASR pipeline/model dependent |
+| Event/VAD/speaker/language/emotion detection and classification | Yes | Transformers audio-classification pipeline/model dependent |
+| Captioning and prompted audio understanding | Yes | Transformers any-to-any pipeline/model dependent |
+| Audio embeddings | Yes | Transformers processor/model registry dependent |
+| Speaker diarization | Yes | Prepared; no generic adapter yet |
 | Voice conversion | Yes | Prepared; no generic adapter yet |
 | Stem generation/separation | Yes | Prepared; no generic adapter yet |
 | Audio enhancement | Yes | Prepared; no generic adapter yet |
+| Audio editing | Yes | Prepared; no generic adapter yet |
 
 Parameters not accepted by a concrete pipeline are reported rather than
 silently discarded.
 
 Direct companion output formats are `png`/`jpeg`/`webp` for images,
 `mp4`/`gif` for video, `wav`/`flac`/`ogg` for generated audio and TTS, and
-`json`/`text`/`srt`/`vtt`/`tsv` for ASR. Codec libraries required by the
-selected format must already be installed.
+`json`/`text`/`srt`/`vtt`/`tsv` for ASR and structured audio analysis. Audio
+input tasks decode locally through `soundfile` or `ffmpeg`; compatible
+audio-to-text processors can additionally require `librosa`. Codec libraries
+required by the selected format must already be installed.
 
 ## HTTP API and jobs
+
+This section explains how media jobs map into the inference service. The
+complete route-by-route contract, common routing fields, response schemas,
+authentication, limits and compatibility gaps are maintained in the
+[HTTP API reference](api.md).
 
 Direct endpoints:
 
@@ -450,6 +532,7 @@ POST /v1/videos/generations
 POST /v1/audio/generations
 POST /v1/audio/speech
 POST /v1/audio/transcriptions
+POST /v1/audio/translations
 GET  /v1/capabilities
 GET  /v1/parameters
 GET  /v1/outputs/{id}
@@ -486,6 +569,13 @@ POST   /v1/jobs
 GET    /v1/jobs/{id}
 DELETE /v1/jobs/{id}
 ```
+
+JSON bodies on `/v1/jobs`, `/v1/audio/transcriptions`, and
+`/v1/audio/translations` default to 128 MiB, which bounds inline Base64 audio;
+other routes retain Axum's smaller default. `WERK_API_BODY_LIMIT_BYTES` can set
+a positive media-upload limit up to 512 MiB for trusted deployments. Local-path
+inputs avoid Base64 expansion when the Werk server can read the same
+filesystem.
 
 Persisted states are `queued`, `loading`, `running`, `encoding`, `completed`,
 `failed`, and `cancelled`. `/v1/audio/speech` returns audio bytes directly;
@@ -541,8 +631,9 @@ children of `outputs/`, never models. Defaults are 30 days and 20 GiB; use
   for fast jobs.
 - Werk serves authenticated whole-file outputs. HTTP byte ranges and
   object-storage export are future work.
-- Generic adapters for voice conversion, stems, and enhancement are described
-  by the contract but not executable yet.
+- Generic adapters for song continuation/variation, speaker diarization, voice
+  conversion, stems, enhancement, and audio editing are described by the
+  contract but not executable yet.
 - The generic Transformers TTS path uses the model's native voice and sample
   rate; explicit voice, speed, pitch, and output resampling remain
   model-specific and are reported as unsupported by this adapter.

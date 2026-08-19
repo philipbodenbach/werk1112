@@ -28,11 +28,18 @@ pub(in crate::inference) fn task_defaults(task: InferenceTask) -> BTreeMap<Strin
             ("tts.sample_rate", ParameterValue::Integer(24_000)),
             ("tts.channels", ParameterValue::Integer(1)),
         ],
-        OutputModality::Text if task == InferenceTask::SpeechToText => &[
-            ("stt.beam_size", ParameterValue::Integer(5)),
-            ("stt.best_of", ParameterValue::Integer(5)),
-            ("stt.temperature", ParameterValue::Number(0.0)),
-        ],
+        OutputModality::Text
+            if matches!(
+                task,
+                InferenceTask::SpeechToText | InferenceTask::SpeechTranslation
+            ) =>
+        {
+            &[
+                ("stt.beam_size", ParameterValue::Integer(5)),
+                ("stt.best_of", ParameterValue::Integer(5)),
+                ("stt.temperature", ParameterValue::Number(0.0)),
+            ]
+        }
         OutputModality::Audio => &[
             ("audio.duration", ParameterValue::Number(30.0)),
             ("audio.variations", ParameterValue::Integer(1)),

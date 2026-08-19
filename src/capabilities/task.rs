@@ -25,20 +25,42 @@ string_enum! {
         SongVariation => "song-variation",
         TextToSpeech => "text-to-speech",
         SpeechToText => "speech-to-text",
+        SpeechTranslation => "speech-translation",
+        AudioEventDetection => "audio-event-detection",
+        VoiceActivityDetection => "voice-activity-detection",
+        SpeakerIdentification => "speaker-identification",
+        LanguageIdentification => "language-identification",
+        SpeechEmotionRecognition => "speech-emotion-recognition",
+        AudioCaptioning => "audio-captioning",
+        SpeakerDiarization => "speaker-diarization",
+        AudioClassification => "audio-classification",
+        AudioUnderstanding => "audio-understanding",
+        AudioEmbedding => "audio-embedding",
         VoiceConversion => "voice-conversion",
         StemGeneration => "stem-generation",
         StemSeparation => "stem-separation",
-        AudioEnhancement => "audio-enhancement"
+        AudioEnhancement => "audio-enhancement",
+        AudioEditing => "audio-editing"
     }
 }
 
 impl InferenceTask {
     pub const fn output_modality(self) -> OutputModality {
         match self {
-            Self::TextGeneration | Self::ImageUnderstanding | Self::SpeechToText => {
-                OutputModality::Text
-            }
-            Self::TextEmbedding => OutputModality::Embedding,
+            Self::TextGeneration
+            | Self::ImageUnderstanding
+            | Self::SpeechToText
+            | Self::SpeechTranslation
+            | Self::AudioEventDetection
+            | Self::VoiceActivityDetection
+            | Self::SpeakerIdentification
+            | Self::LanguageIdentification
+            | Self::SpeechEmotionRecognition
+            | Self::AudioCaptioning
+            | Self::SpeakerDiarization
+            | Self::AudioClassification
+            | Self::AudioUnderstanding => OutputModality::Text,
+            Self::TextEmbedding | Self::AudioEmbedding => OutputModality::Embedding,
             Self::ImageGeneration
             | Self::ImageEditing
             | Self::ImageVariation
@@ -60,7 +82,8 @@ impl InferenceTask {
             | Self::VoiceConversion
             | Self::StemGeneration
             | Self::StemSeparation
-            | Self::AudioEnhancement => OutputModality::Audio,
+            | Self::AudioEnhancement
+            | Self::AudioEditing => OutputModality::Audio,
         }
     }
 
@@ -88,10 +111,22 @@ impl InferenceTask {
             Self::SongContinuation
             | Self::SongVariation
             | Self::SpeechToText
+            | Self::SpeechTranslation
+            | Self::AudioEventDetection
+            | Self::VoiceActivityDetection
+            | Self::SpeakerIdentification
+            | Self::LanguageIdentification
+            | Self::SpeechEmotionRecognition
+            | Self::AudioCaptioning
+            | Self::SpeakerDiarization
+            | Self::AudioClassification
+            | Self::AudioUnderstanding
+            | Self::AudioEmbedding
             | Self::VoiceConversion
             | Self::StemGeneration
             | Self::StemSeparation
-            | Self::AudioEnhancement => &[InputModality::Audio],
+            | Self::AudioEnhancement
+            | Self::AudioEditing => &[InputModality::Audio],
         }
     }
 
@@ -113,6 +148,8 @@ impl InferenceTask {
                 | Self::AudioGeneration
                 | Self::MusicGeneration
                 | Self::TextToSpeech
+                | Self::AudioUnderstanding
+                | Self::AudioEditing
         )
     }
 
@@ -136,12 +173,23 @@ impl InferenceTask {
             | Self::MusicGeneration
             | Self::SongContinuation
             | Self::SongVariation
+            | Self::AudioEventDetection
+            | Self::VoiceActivityDetection
+            | Self::SpeakerIdentification
+            | Self::LanguageIdentification
+            | Self::SpeechEmotionRecognition
+            | Self::AudioCaptioning
+            | Self::SpeakerDiarization
+            | Self::AudioClassification
+            | Self::AudioUnderstanding
+            | Self::AudioEmbedding
             | Self::VoiceConversion
             | Self::StemGeneration
             | Self::StemSeparation
-            | Self::AudioEnhancement => "audio",
+            | Self::AudioEnhancement
+            | Self::AudioEditing => "audio",
             Self::TextToSpeech => "tts",
-            Self::SpeechToText => "stt",
+            Self::SpeechToText | Self::SpeechTranslation => "stt",
         }
     }
 }

@@ -2,9 +2,9 @@
 """Offline media companion for Werk.
 
 The traditional command mode handles exactly one JSON request. ``serve`` uses
-a newline-delimited resident transport so configured Diffusers pipelines can
-remain warm between requests. Model loading is deliberately local-only: this
-module never installs packages and never downloads a model.
+a newline-delimited resident transport so configured Diffusers and Transformers
+media models can remain warm between requests. Model loading is deliberately
+local-only: this module never installs packages and never downloads a model.
 """
 
 import contextlib
@@ -15,7 +15,6 @@ import importlib.util
 import inspect
 import json
 import math
-import mimetypes
 import os
 import shutil
 import subprocess
@@ -33,6 +32,8 @@ PROTOCOL_VERSION = 1
 COMPANION_VERSION = "1.0.0"
 TRANSPORT_VERSION = 1
 PIPELINE_CACHE_SIZE_ENV = "WERK_MEDIA_PIPELINE_CACHE_SIZE"
+QWEN3_TTS_ADAPTER = "qwen3_tts_voice_design"
+QWEN3_TTS_PYTHON_ENV = "WERK_QWEN_TTS_PYTHON"
 
 for _name in (
     "HF_HUB_OFFLINE",
@@ -74,7 +75,28 @@ AUDIO_GENERATION_TASKS = {
     "music_generation",
 }
 TTS_TASKS = {"text_to_speech"}
-ASR_TASKS = {"speech_to_text"}
+ASR_TASKS = {"speech_to_text", "speech_translation"}
+AUDIO_CLASSIFICATION_TASKS = {
+    "audio_event_detection",
+    "voice_activity_detection",
+    "speaker_identification",
+    "language_identification",
+    "speech_emotion_recognition",
+    "audio_classification",
+}
+AUDIO_TEXT_TASKS = {"audio_captioning", "audio_understanding"}
+AUDIO_EMBEDDING_TASKS = {"audio_embedding"}
+AUDIO_SOURCE_TASKS = (
+    ASR_TASKS
+    | AUDIO_CLASSIFICATION_TASKS
+    | AUDIO_TEXT_TASKS
+    | AUDIO_EMBEDDING_TASKS
+)
+ALL_AUDIO_TASKS = (
+    AUDIO_GENERATION_TASKS
+    | TTS_TASKS
+    | AUDIO_SOURCE_TASKS
+)
 DECLARED_UNSUPPORTED_TASKS = {
     "song_continuation",
     "song_variation",
@@ -82,6 +104,8 @@ DECLARED_UNSUPPORTED_TASKS = {
     "stem_generation",
     "stem_separation",
     "audio_enhancement",
+    "speaker_diarization",
+    "audio_editing",
 }
 
 ORCHESTRATOR_PARAMETERS = {
@@ -139,14 +163,50 @@ DIFFUSERS_AUDIO_PARAMETERS = {
     "audio.variations",
 }
 TRANSFORMERS_AUDIO_PARAMETERS = {
+    "audio.duration",
     "audio.guidance",
     "audio.lyrics",
     "audio.output_format",
     "audio.seed",
+    "audio.temperature",
+    "audio.top_k",
+    "audio.top_p",
+    "audio.variations",
 }
 TTS_ADAPTER_PARAMETERS = {
     "tts.output_format",
+    "tts.seed",
 }
+QWEN3_TTS_VOICE_DESIGN_PARAMETERS = TTS_ADAPTER_PARAMETERS | {
+    "tts.language",
+    "tts.speaking_style",
+}
+
+# Architecture-specific Python packages live outside the generic Diffusers and
+# Transformers adapters. Keep their identity, dependency and installation
+# metadata together so model probing and execution routing cannot disagree.
+# A future VoxCPM (or other audio) adapter is added as another entry rather
+# than as repository-name heuristics or a generic Transformers fallback.
+ARCHITECTURE_ADAPTER_REGISTRY = (
+    {
+        "adapter": QWEN3_TTS_ADAPTER,
+        "model_types": frozenset({"qwen3_tts"}),
+        "architectures": frozenset(),
+        "variant_field": "tts_model_type",
+        "variants": frozenset({"voice_design"}),
+        "tasks": frozenset(TTS_TASKS),
+        "dependencies": ("torch", "numpy", "qwen_tts"),
+        "required_backend": "qwen-tts",
+        "install_command": "werk backend install qwen-tts",
+        "fallback_possible": False,
+        "dependency_reason": (
+            "Qwen3-TTS VoiceDesign requires torch, numpy, and an importable "
+            "qwen-tts package in its companion Python environment; run "
+            "'werk backend install qwen-tts' or select an isolated interpreter "
+            f"with {QWEN3_TTS_PYTHON_ENV}"
+        ),
+    },
+)
 ASR_ADAPTER_PARAMETERS = {
     "stt.beam_size",
     "stt.initial_prompt",
@@ -156,6 +216,22 @@ ASR_ADAPTER_PARAMETERS = {
     "stt.segment_timestamps",
     "stt.temperature",
     "stt.word_timestamps",
+}
+AUDIO_CLASSIFICATION_PARAMETERS = {
+    "audio.output_format",
+    "audio.top_k",
+}
+AUDIO_TEXT_PARAMETERS = {
+    "audio.max_new_tokens",
+    "audio.output_format",
+    "audio.temperature",
+    "audio.top_k",
+    "audio.top_p",
+}
+AUDIO_EMBEDDING_PARAMETERS = {
+    "audio.normalize",
+    "audio.output_format",
+    "audio.pooling",
 }
 
 
@@ -222,19 +298,39 @@ class DiffusersPipelineEntry:
         self.configuration_warnings = list(configuration_warnings or [])
 
 
-def cleanup_diffusers_pipeline_entry(entry):
-    """Release a cached pipeline and return allocator caches to the runtime."""
-    if entry is None:
-        return
-    pipeline = entry.pipeline
-    entry.pipeline = None
-    del pipeline
+class TransformersAudioEntry:
+    """One cached Transformers pipeline or processor/model pair."""
+
+    def __init__(
+        self,
+        torch,
+        device,
+        dtype,
+        model_load_seconds,
+        *,
+        adapter,
+        pipeline_task,
+        pipeline=None,
+        processor=None,
+        model=None,
+    ):
+        self.torch = torch
+        self.device = device
+        self.dtype = dtype
+        self.model_load_seconds = float(model_load_seconds)
+        self.adapter = str(adapter)
+        self.pipeline_task = str(pipeline_task)
+        self.pipeline = pipeline
+        self.processor = processor
+        self.model = model
+
+
+def cleanup_torch_allocator(torch, device):
     gc.collect()
-    torch = entry.torch
     try:
-        if entry.device == "cuda" and bool(torch.cuda.is_available()):
+        if device == "cuda" and bool(torch.cuda.is_available()):
             torch.cuda.empty_cache()
-        elif entry.device == "mps":
+        elif device == "mps":
             empty_cache = getattr(getattr(torch, "mps", None), "empty_cache", None)
             if callable(empty_cache):
                 empty_cache()
@@ -244,8 +340,35 @@ def cleanup_diffusers_pipeline_entry(entry):
         pass
 
 
+def cleanup_diffusers_pipeline_entry(entry):
+    """Release a cached pipeline and return allocator caches to the runtime."""
+    if entry is None:
+        return
+    pipeline = entry.pipeline
+    entry.pipeline = None
+    del pipeline
+    cleanup_torch_allocator(entry.torch, entry.device)
+
+
+def cleanup_transformers_audio_entry(entry):
+    """Release all references owned by a Transformers audio cache entry."""
+    if entry is None:
+        return
+    entry.pipeline = None
+    entry.processor = None
+    entry.model = None
+    cleanup_torch_allocator(entry.torch, entry.device)
+
+
+def cleanup_media_pipeline_entry(entry):
+    if isinstance(entry, TransformersAudioEntry):
+        cleanup_transformers_audio_entry(entry)
+    else:
+        cleanup_diffusers_pipeline_entry(entry)
+
+
 class DiffusersPipelineCache:
-    """Synchronous bounded LRU for fully configured Diffusers pipelines."""
+    """Synchronous bounded LRU retained under its original public name."""
 
     def __init__(self, max_size=1, cleanup=cleanup_diffusers_pipeline_entry):
         try:
@@ -305,13 +428,22 @@ class DiffusersPipelineCache:
             self._cleanup(entry)
 
 
+class MediaPipelineCache(DiffusersPipelineCache):
+    """Shared resident LRU for Diffusers and Transformers media weights."""
+
+    def __init__(self, max_size=1):
+        super().__init__(max_size, cleanup=cleanup_media_pipeline_entry)
+
+
 class CompanionRuntime:
     """State that exists only for the long-lived ``serve`` transport."""
 
     def __init__(self, pipeline_cache_size=None):
         if pipeline_cache_size is None:
             pipeline_cache_size = os.environ.get(PIPELINE_CACHE_SIZE_ENV, "1")
-        self.pipeline_cache = DiffusersPipelineCache(pipeline_cache_size)
+        # One global bound prevents a Diffusers pipeline and a Transformers
+        # model from independently occupying the full resident-cache budget.
+        self.pipeline_cache = MediaPipelineCache(pipeline_cache_size)
 
     def close(self):
         self.pipeline_cache.clear()
@@ -471,28 +603,161 @@ def has_diffusers_pipeline_manifest(root):
     return bool(str(manifest.get("_class_name") or "").strip())
 
 
+def has_transformers_model_config(root):
+    if not root.is_dir():
+        return False
+    config = read_json_file(root / "config.json")
+    return bool(config)
+
+
+def qwen3_tts_model_variant(root):
+    """Return the declared Qwen3-TTS variant for a local repository.
+
+    Qwen3-TTS is not a generic Transformers text-to-audio pipeline.  Detect it
+    from its local config before the generic adapter gets a chance to claim
+    the repository.  Repository names are deliberately ignored.
+    """
+    if not root.is_dir():
+        return None
+    config = read_json_file(root / "config.json")
+    if normalized_name(config.get("model_type")) != "qwen3_tts":
+        return None
+    return normalized_name(config.get("tts_model_type")) or "unknown"
+
+
+def is_qwen3_tts_voice_design(root):
+    return qwen3_tts_model_variant(root) == "voice_design"
+
+
+def architecture_adapter_registration(config, task=None):
+    """Return an exact adapter registration and any recognized special model.
+
+    The second result deliberately survives a task or variant mismatch. It
+    lets routing block generic pipelines for a known special architecture even
+    when the companion has not implemented that particular operation yet.
+    """
+    if not isinstance(config, dict):
+        return None, None
+    model_type = normalized_name(config.get("model_type"))
+    architectures = config.get("architectures") or []
+    if not isinstance(architectures, list):
+        architectures = [architectures]
+    architecture_names = {
+        normalized_name(architecture)
+        for architecture in architectures
+        if str(architecture or "").strip()
+    }
+    requested_task = normalized_name(task)
+    identity_registration = None
+    for registration in ARCHITECTURE_ADAPTER_REGISTRY:
+        model_types = registration.get("model_types", ())
+        registered_architectures = registration.get("architectures", ())
+        identity_matches = (
+            bool(model_type) and model_type in model_types
+        ) or bool(architecture_names & set(registered_architectures))
+        if not identity_matches:
+            continue
+        if identity_registration is None:
+            identity_registration = registration
+        tasks = registration.get("tasks", ())
+        if requested_task and requested_task not in tasks:
+            continue
+        variant_field = registration.get("variant_field")
+        variants = registration.get("variants", ())
+        if variant_field and variants:
+            variant = normalized_name(config.get(variant_field))
+            if variant not in variants:
+                continue
+        return registration, identity_registration
+    return None, identity_registration
+
+
+def architecture_adapter_for_root(root, task=None):
+    if not root.is_dir():
+        return None, None
+    return architecture_adapter_registration(
+        read_json_file(root / "config.json"),
+        task,
+    )
+
+
+def architecture_adapter_by_name(adapter):
+    for registration in ARCHITECTURE_ADAPTER_REGISTRY:
+        if registration.get("adapter") == adapter:
+            return registration
+    return None
+
+
+def missing_adapter_dependencies(registration, dependencies):
+    return [
+        name
+        for name in registration.get("dependencies", ())
+        if not bool(dependencies.get(name, {}).get("available", False))
+    ]
+
+
+def architecture_backend_hint(probe, task, dependencies):
+    matched, recognized = architecture_adapter_registration(
+        probe.get("config", {}),
+        task,
+    )
+    registration = matched or recognized
+    if registration is None:
+        return None
+    missing = missing_adapter_dependencies(registration, dependencies)
+    adapter_supported = matched is not None
+    backend_available = not missing
+    return {
+        "required_backend": registration["required_backend"],
+        # Do not suggest an installation as a fix for a variant/task whose
+        # execution adapter has not been implemented in this companion.
+        "install_command": (
+            registration["install_command"]
+            if adapter_supported and not backend_available
+            else None
+        ),
+        "backend_available": backend_available,
+        "fallback_possible": bool(registration.get("fallback_possible", False)),
+        "architecture_adapter_supported": adapter_supported,
+        "missing_dependencies": missing,
+    }
+
+
 def execution_adapter(model_path, task):
+    root = model_path if model_path.is_dir() else model_path.parent
+    registered_adapter, special_model = architecture_adapter_for_root(root, task)
+    if special_model is not None:
+        return (
+            registered_adapter.get("adapter")
+            if registered_adapter is not None
+            else None
+        )
     if task in IMAGE_TASKS | VIDEO_TASKS:
         # A Diffusers directory is identified by its component manifest.  A
         # generic config.json alone may describe a native checkpoint layout
         # (for example a framework-specific transformer shard) which
         # DiffusionPipeline.from_pretrained cannot execute.  Single-file
         # pipelines remain model-dependent and are validated while loading.
-        root = model_path if model_path.is_dir() else model_path.parent
         if model_path.is_file() or has_diffusers_pipeline_manifest(root):
             return "diffusers"
         return None
     if task in AUDIO_GENERATION_TASKS:
-        root = model_path if model_path.is_dir() else model_path.parent
-        return (
-            "diffusers_audio"
-            if (root / "model_index.json").is_file()
-            else "transformers_audio"
-        )
+        if has_diffusers_pipeline_manifest(root):
+            return "diffusers_audio"
+        if has_transformers_model_config(root):
+            return "transformers_audio"
+        return None
     if task in TTS_TASKS:
-        return "transformers_tts"
-    if task in ASR_TASKS:
+        if has_transformers_model_config(root):
+            return "transformers_tts"
+    if task in ASR_TASKS and has_transformers_model_config(root):
         return "transformers_asr"
+    if task in AUDIO_CLASSIFICATION_TASKS and has_transformers_model_config(root):
+        return "transformers_audio_classification"
+    if task in AUDIO_TEXT_TASKS and has_transformers_model_config(root):
+        return "transformers_audio_text"
+    if task in AUDIO_EMBEDDING_TASKS and has_transformers_model_config(root):
+        return "transformers_audio_embedding"
     return None
 
 
@@ -536,8 +801,16 @@ def supported_explicit_parameters(task, adapter):
         supported.update(TRANSFORMERS_AUDIO_PARAMETERS)
     elif adapter == "transformers_tts":
         supported.update(TTS_ADAPTER_PARAMETERS)
+    elif adapter == QWEN3_TTS_ADAPTER:
+        supported.update(QWEN3_TTS_VOICE_DESIGN_PARAMETERS)
     elif adapter == "transformers_asr":
         supported.update(ASR_ADAPTER_PARAMETERS)
+    elif adapter == "transformers_audio_classification":
+        supported.update(AUDIO_CLASSIFICATION_PARAMETERS)
+    elif adapter == "transformers_audio_text":
+        supported.update(AUDIO_TEXT_PARAMETERS)
+    elif adapter == "transformers_audio_embedding":
+        supported.update(AUDIO_EMBEDDING_PARAMETERS)
     return supported
 
 
@@ -608,7 +881,12 @@ def validate_adapter_inputs(task, adapter, inputs):
                 "mask_video",
             }
         )
-    elif adapter == "transformers_asr":
+    elif adapter in {
+        "transformers_asr",
+        "transformers_audio_classification",
+        "transformers_audio_text",
+        "transformers_audio_embedding",
+    }:
         allowed.update(
             {
                 "audio",
@@ -684,11 +962,41 @@ def module_status(module_name, distribution=None):
     }
 
 
+def importable_module_status(module_name, distribution=None, required_attribute=None):
+    """Report whether an optional adapter module can actually be imported.
+
+    ``find_spec`` alone is insufficient for provider packages with pinned
+    transitive dependencies: a partially installed qwen-tts distribution can
+    be discoverable while failing during import.  Capability and model probes
+    must not advertise such an environment as executable.
+    """
+    status = module_status(module_name, distribution)
+    if not status["available"]:
+        return status
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as error:
+        status["available"] = False
+        status["detail"] = f"installed but import failed: {error}"
+        return status
+    if required_attribute and not callable(getattr(module, required_attribute, None)):
+        status["available"] = False
+        status["detail"] = (
+            f"installed module does not expose required API '{required_attribute}'"
+        )
+    return status
+
+
 def dependency_snapshot():
     dependencies = {
         "torch": module_status("torch"),
         "diffusers": module_status("diffusers"),
         "transformers": module_status("transformers"),
+        "qwen_tts": importable_module_status(
+            "qwen_tts",
+            "qwen-tts",
+            "Qwen3TTSModel",
+        ),
         "PIL": module_status("PIL", "Pillow"),
         "numpy": module_status("numpy"),
         "soundfile": module_status("soundfile"),
@@ -705,6 +1013,12 @@ def dependency_snapshot():
         "version": None,
         "detail": ffmpeg or "ffmpeg executable not found (optional)",
     }
+    if not dependencies["qwen_tts"]["available"]:
+        detail = dependencies["qwen_tts"].get("detail") or "not available"
+        dependencies["qwen_tts"]["detail"] = (
+            f"{detail}; run 'werk backend install qwen-tts' or select an "
+            f"isolated interpreter with {QWEN3_TTS_PYTHON_ENV}"
+        )
     return dependencies
 
 
@@ -725,6 +1039,14 @@ def video_decoder_ready(dependencies):
         dependencies.get("imageio", {}).get("available")
     ) and bool(
         dependencies.get("imageio_ffmpeg", {}).get("available")
+    )
+
+
+def audio_decoder_ready(dependencies):
+    return bool(
+        dependencies.get("soundfile", {}).get("available")
+    ) or bool(
+        dependencies.get("ffmpeg", {}).get("available")
     )
 
 
@@ -847,6 +1169,7 @@ def command_health(_payload):
         "protocol_version": PROTOCOL_VERSION,
         "companion_version": COMPANION_VERSION,
         "python_version": sys.version.split()[0],
+        "python_executable": sys.executable,
         "offline": True,
         "dependencies": dependency_snapshot(),
         "accelerators": accelerator_snapshot(),
@@ -875,6 +1198,14 @@ def command_capabilities(_payload):
         deps["torch"]["available"]
         and deps["transformers"]["available"]
         and deps["numpy"]["available"]
+    )
+    qwen3_tts_ready = (
+        deps["torch"]["available"]
+        and deps["numpy"]["available"]
+        and deps.get("qwen_tts", {}).get("available", False)
+    )
+    transformers_audio_input_ready = (
+        transformers_audio_ready and audio_decoder_ready(deps)
     )
     generative_audio_ready = (
         deps["torch"]["available"]
@@ -929,15 +1260,55 @@ def command_capabilities(_payload):
                 else "requires torch, numpy, and either diffusers or transformers",
             )
         )
-    for task in sorted(TTS_TASKS | ASR_TASKS):
+    for task in sorted(TTS_TASKS):
+        tts_ready = transformers_audio_ready or qwen3_tts_ready
+        if tts_ready:
+            tts_reason = model_dependent_reason
+            if not qwen3_tts_ready:
+                tts_reason += (
+                    "; Qwen3-TTS models additionally require an importable "
+                    "qwen-tts package in the companion Python environment"
+                )
+        else:
+            tts_reason = (
+                "requires torch and numpy plus either transformers for generic "
+                "TTS or qwen-tts for Qwen3-TTS"
+            )
         capabilities.append(
             task_capability(
                 task,
-                transformers_audio_ready,
+                tts_ready,
+                "qwen3-tts-or-transformers",
+                tts_reason,
+            )
+        )
+    for task in sorted(AUDIO_SOURCE_TASKS - AUDIO_TEXT_TASKS):
+        capabilities.append(
+            task_capability(
+                task,
+                transformers_audio_input_ready,
                 "transformers",
                 model_dependent_reason
-                if transformers_audio_ready
-                else "requires torch, transformers and numpy",
+                if transformers_audio_input_ready
+                else (
+                    "requires torch, transformers, numpy, and either "
+                    "soundfile or ffmpeg for local audio decoding"
+                ),
+            )
+        )
+    transformers_audio_text_ready = transformers_audio_input_ready
+    for task in sorted(AUDIO_TEXT_TASKS):
+        capabilities.append(
+            task_capability(
+                task,
+                transformers_audio_text_ready,
+                "transformers",
+                model_dependent_reason
+                if transformers_audio_text_ready
+                else (
+                    "requires torch, transformers, numpy, and either "
+                    "soundfile or ffmpeg for local audio decoding"
+                ),
             )
         )
     for task in sorted(DECLARED_UNSUPPORTED_TASKS):
@@ -1021,10 +1392,28 @@ def model_probe(path):
         or generation_config.get("pipeline_tag")
         or ""
     )
+    # Repository names are intentionally excluded. Probe claims come only
+    # from the local model's declared pipeline/config classes and tags.
     searchable = " ".join(
-        [path.name, class_name, model_type, pipeline_tag]
+        [class_name, model_type, pipeline_tag]
         + [str(item) for item in architectures]
     ).lower()
+    normalized_searchable = normalized_name(searchable)
+    normalized_pipeline_tag = normalized_name(pipeline_tag)
+    architecture_names = [str(item).lower() for item in architectures]
+    audio_backbone_hints = (
+        "audio_spectrogram_transformer",
+        "clap",
+        "data2vec_audio",
+        "hubert",
+        "sew",
+        "unispeech",
+        "wav2vec2",
+        "wavlm",
+    )
+    has_audio_backbone = any(
+        word in normalized_searchable for word in audio_backbone_hints
+    ) or normalized_name(model_type) == "ast"
 
     tasks = []
     if model_index:
@@ -1038,11 +1427,38 @@ def model_probe(path):
                 tasks.append("image_inpainting")
             if any(word in searchable for word in ("img2img", "image2image")):
                 tasks.append("image_editing")
-    if any(word in searchable for word in ("whisper", "speech_to_text", "automatic-speech")):
+    if normalized_pipeline_tag == "automatic_speech_recognition" or any(
+        word in searchable
+        for word in (
+            "whisper",
+            "speech_to_text",
+            "speechrecognition",
+            "forctc",
+        )
+    ):
         tasks.append("speech_to_text")
+    task_to_id = generation_config.get("task_to_id")
+    if (
+        isinstance(task_to_id, dict)
+        and "translate" in task_to_id
+    ) or normalized_pipeline_tag in {
+        "speech_translation",
+        "automatic_speech_translation",
+    }:
+        tasks.append("speech_translation")
     if any(
         word in searchable
-        for word in ("speecht5", "bark", "vits", "fastspeech", "text-to-speech")
+        for word in (
+            "qwen3_tts",
+            "qwen3tts",
+            "speecht5",
+            "bark",
+            "vits",
+            "fastspeech",
+            "parler",
+            "text-to-speech",
+            "texttospeech",
+        )
     ):
         tasks.append("text_to_speech")
     if any(
@@ -1050,6 +1466,46 @@ def model_probe(path):
         for word in ("musicgen", "audiogen", "text-to-audio", "text_to_audio")
     ):
         tasks.extend(["audio_generation", "music_generation"])
+    classification_architecture = any(
+        "foraudioclassification" in architecture
+        or (
+            "forsequenceclassification" in architecture
+            and has_audio_backbone
+        )
+        for architecture in architecture_names
+    )
+    if normalized_pipeline_tag in {
+        "audio_classification",
+        "zero_shot_audio_classification",
+    } or classification_architecture:
+        tasks.append("audio_classification")
+    has_audio_config = any(
+        name in config
+        for name in (
+            "audio_config",
+            "audio_encoder_config",
+            "audio_tokenizer_config",
+        )
+    )
+    multimodal_generation_architecture = any(
+        "forconditionalgeneration" in architecture
+        or "formultimodalgeneration" in architecture
+        for architecture in architecture_names
+    )
+    if normalized_pipeline_tag in {
+        "any_to_any",
+        "audio_text_to_text",
+        "audio_captioning",
+    } or (
+        has_audio_config
+        and multimodal_generation_architecture
+    ):
+        tasks.extend(["audio_captioning", "audio_understanding"])
+    if normalized_pipeline_tag in {
+        "audio_feature_extraction",
+        "audio_embedding",
+    } or has_audio_backbone:
+        tasks.append("audio_embedding")
     if not tasks and config:
         # A generic Transformers repository remains cataloguable. Execution is
         # intentionally model-dependent instead of guessing a text model is media.
@@ -1074,6 +1530,7 @@ def model_probe(path):
             "feature_extractor",
             "controlnet",
             "adapter",
+            "speech_tokenizer",
         }
     )
     weight_extensions = {
@@ -1095,6 +1552,11 @@ def model_probe(path):
         "model_type": model_type or None,
         "architectures": architectures,
         "pipeline_tag": pipeline_tag or None,
+        "model_variant": (
+            normalized_name(config.get("tts_model_type")) or None
+            if normalized_name(model_type) == "qwen3_tts"
+            else None
+        ),
         "tasks": sorted(set(tasks)),
         "components": components,
         "file_count": len(files),
@@ -1134,13 +1596,32 @@ def task_dependency_ready(task, deps):
                 or deps["transformers"]["available"]
             )
         ), "requires torch, numpy, and either diffusers or transformers"
-    if task in TTS_TASKS | ASR_TASKS:
+    if task in TTS_TASKS:
         return (
             deps["torch"]["available"]
             and deps["transformers"]["available"]
             and deps["numpy"]["available"]
         ), "requires torch, transformers and numpy"
+    if task in AUDIO_SOURCE_TASKS:
+        ready = (
+            deps["torch"]["available"]
+            and deps["transformers"]["available"]
+            and deps["numpy"]["available"]
+            and audio_decoder_ready(deps)
+        )
+        return ready, (
+            "requires torch, transformers, numpy, and either soundfile or "
+            "ffmpeg for local audio decoding"
+        )
     return False, "task has no generic companion adapter"
+
+
+def adapter_dependency_ready(task, adapter, deps):
+    registration = architecture_adapter_by_name(adapter)
+    if registration is not None:
+        ready = not missing_adapter_dependencies(registration, deps)
+        return ready, registration["dependency_reason"]
+    return task_dependency_ready(task, deps)
 
 
 def command_probe_model(payload):
@@ -1150,9 +1631,14 @@ def command_probe_model(payload):
     dependencies = dependency_snapshot()
     supported = None
     reasons = []
+    adapter = None
     if requested_task:
-        ready, dependency_reason = task_dependency_ready(requested_task, dependencies)
         adapter = execution_adapter(path, requested_task)
+        ready, dependency_reason = adapter_dependency_ready(
+            requested_task,
+            adapter,
+            dependencies,
+        )
         advertised_tasks = set(probe["tasks"])
         same_media_family = (
             requested_task in IMAGE_TASKS
@@ -1160,9 +1646,16 @@ def command_probe_model(payload):
         ) or (
             requested_task in VIDEO_TASKS
             and bool(advertised_tasks & VIDEO_TASKS)
+        ) or (
+            requested_task in AUDIO_CLASSIFICATION_TASKS
+            and bool(advertised_tasks & AUDIO_CLASSIFICATION_TASKS)
+        ) or (
+            requested_task in AUDIO_TEXT_TASKS
+            and bool(advertised_tasks & AUDIO_TEXT_TASKS)
         )
         recognized = requested_task in advertised_tasks or (
-            probe["layout"] == "diffusers" and same_media_family
+            same_media_family
+            and probe["layout"] in {"diffusers", "transformers"}
         )
         supported = ready and recognized and adapter is not None
         if not ready:
@@ -1188,10 +1681,15 @@ def command_probe_model(payload):
         detail = "requested task support could not be established"
     else:
         detail = "model metadata probe completed; no task was requested"
-    return {
+    backend_hint = architecture_backend_hint(
+        probe,
+        requested_task or None,
+        dependencies,
+    )
+    result = {
         "model_path": str(path),
         "supported": supported,
-        "adapter": execution_adapter(path, requested_task) if requested_task else None,
+        "adapter": adapter,
         "reasons": reasons,
         "detail": detail,
         "probe": {
@@ -1201,6 +1699,18 @@ def command_probe_model(payload):
         },
         "offline": True,
     }
+    result.update(
+        backend_hint
+        or {
+            "required_backend": None,
+            "install_command": None,
+            "backend_available": None,
+            "fallback_possible": None,
+            "architecture_adapter_supported": None,
+            "missing_dependencies": [],
+        }
+    )
+    return result
 
 
 def safe_size(path):
@@ -1278,6 +1788,21 @@ def command_estimate(payload):
     ]
     warnings = []
     recommendations = []
+    if adapter == QWEN3_TTS_ADAPTER:
+        assumptions.append(
+            "Qwen3-TTS VoiceDesign loads the language model and bundled speech tokenizer"
+        )
+        ready, dependency_reason = adapter_dependency_ready(
+            task,
+            adapter,
+            dependency_snapshot(),
+        )
+        if not ready:
+            warnings.append(dependency_reason)
+            recommendations.append(
+                "run 'werk backend install qwen-tts' or set "
+                f"{QWEN3_TTS_PYTHON_ENV} to an isolated qwen-tts interpreter"
+            )
     # The public allow_* values are planner permissions, not execution
     # commands.  Only Werk's internal flags represent a degradation selected
     # for the concrete runtime.
@@ -1375,10 +1900,17 @@ def command_estimate(payload):
             f"{width}x{height}, {frames} frames at {fps:g} fps, active window {active_frames}"
         )
         recommendations.append("use temporal windowing or tiling when full-frame fit is marginal")
-    elif task in AUDIO_GENERATION_TASKS | TTS_TASKS | ASR_TASKS:
+    elif task in ALL_AUDIO_TASKS:
         duration = positive_float(parameters, "duration", 30.0, 0.01)
-        sample_rate = positive_int(parameters, "sample_rate", 44_100)
-        channels = positive_int(parameters, "channels", 2)
+        if adapter == QWEN3_TTS_ADAPTER:
+            # VoiceDesign emits native 24 kHz mono.  Sample-rate/channel
+            # controls are intentionally not advertised until an explicit
+            # resampling stage exists.
+            sample_rate = 24_000
+            channels = 1
+        else:
+            sample_rate = positive_int(parameters, "sample_rate", 44_100)
+            channels = positive_int(parameters, "channels", 2)
         stems = max(1, len(parameters.get("stems", []) or []))
         working_audio = int(duration * sample_rate * channels * 4 * stems)
         accelerator_peak = int(
@@ -1396,9 +1928,16 @@ def command_estimate(payload):
         assumptions.append(
             f"{duration:g}s, {sample_rate} Hz, {channels} channel(s), {stems} output stem(s)"
         )
-        if task in ASR_TASKS:
+        if task in (
+            ASR_TASKS
+            | AUDIO_CLASSIFICATION_TASKS
+            | AUDIO_TEXT_TASKS
+            | AUDIO_EMBEDDING_TASKS
+        ):
             output_size = max(4096, int(duration * 80))
-            assumptions.append("speech-to-text output is structured text rather than PCM audio")
+            assumptions.append(
+                "this task returns structured text/embedding data rather than PCM audio"
+            )
     else:
         fail("unsupported_task", f"no estimate adapter for task '{task}'")
 
@@ -1585,6 +2124,7 @@ def diffusers_pipeline_cache_key(
         except Exception:
             cuda_index = 0
     return (
+        "diffusers",
         str(payload.get("model") or ""),
         path_cache_identity(model_path),
         str(task),
@@ -1601,6 +2141,34 @@ def diffusers_pipeline_cache_key(
             (identity, float(weight))
             for _path, weight, identity in lora_specs
         ),
+    )
+
+
+def accelerator_cache_identity(torch, device):
+    if device != "cuda":
+        return None
+    try:
+        return int(torch.cuda.current_device())
+    except Exception:
+        return 0
+
+
+def transformers_audio_cache_key(
+    model_path,
+    adapter,
+    pipeline_task,
+    torch,
+    device,
+    dtype,
+):
+    return (
+        "transformers-audio",
+        path_cache_identity(model_path),
+        str(adapter),
+        str(pipeline_task),
+        str(device),
+        accelerator_cache_identity(torch, device),
+        str(dtype).replace("torch.", ""),
     )
 
 
@@ -2817,66 +3385,140 @@ def execute_prepared_diffusers_pipeline(
     }
 
 
+def declared_keyword(callable_value, keyword):
+    try:
+        return keyword in inspect.signature(callable_value).parameters
+    except Exception:
+        return False
+
+
+def diffusers_audio_duration_keyword(pipeline):
+    for keyword in ("audio_length_in_s", "audio_end_in_s"):
+        if declared_keyword(pipeline.__call__, keyword):
+            return keyword
+    return None
+
+
 def execute_diffusers_audio(
+    payload,
     model_path,
     task,
     parameters,
     output_dir,
     identifier,
     parameter_guard,
+    runtime=None,
 ):
-    model_load_started = time.perf_counter()
     torch, device, dtype = torch_runtime(parameters)
-    pipeline = load_diffusers_pipeline(
+    entry, cache_key, model_cache_hit = prepare_diffusers_pipeline(
+        runtime,
+        payload,
         model_path,
         task,
         False,
         torch,
-        dtype,
-    )
-    warnings = []
-    offload_metadata = configure_diffusers_pipeline(
-        pipeline,
         device,
-        task,
+        dtype,
         parameters,
-        warnings,
         parameter_guard,
     )
-    synchronize_torch_device(torch, device)
-    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
+    cached = runtime is not None and runtime.pipeline_cache.enabled
+    try:
+        return execute_prepared_diffusers_audio(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            torch,
+            device,
+            dtype,
+            task,
+            parameters,
+            output_dir,
+            identifier,
+            parameter_guard,
+        )
+    finally:
+        if not cached:
+            cleanup_diffusers_pipeline_entry(entry)
+
+
+def execute_prepared_diffusers_audio(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    torch,
+    device,
+    dtype,
+    task,
+    parameters,
+    output_dir,
+    identifier,
+    parameter_guard,
+):
+    pipeline = entry.pipeline
+    warnings = list(entry.configuration_warnings)
+    replay_diffusers_configuration(
+        entry.configuration_outcome,
+        parameter_guard,
+        warnings,
+    )
     prompt = prompt_with_lyrics(
         parameters.get("prompt") or parameters.get("description"),
         parameters.get("lyrics"),
     )
     prompt = required_string(prompt, "effective_parameters.prompt/description")
     generator, seed = seeded_generator(torch, device, parameters)
+    duration = parameters.get("duration")
+    duration_keyword = diffusers_audio_duration_keyword(pipeline)
+    if duration is not None and duration_keyword is None:
+        parameter_guard.reject(
+            "audio.duration",
+            "the selected Diffusers audio pipeline exposes no duration keyword",
+        )
+        if "audio.duration" not in parameter_guard.explicit:
+            warnings.append(
+                "resolved audio.duration was not applied because the selected "
+                "Diffusers pipeline exposes no duration control"
+            )
+    count = positive_int(
+        {
+            "variations": parameters.get(
+                "num_variations",
+                parameters.get("variations", 1),
+            )
+        },
+        "variations",
+        1,
+    )
     values = {
         "prompt": prompt,
         "negative_prompt": parameters.get("negative_prompt"),
         "num_inference_steps": parameters.get("steps"),
         "guidance_scale": parameters.get("guidance_scale", parameters.get("guidance")),
-        "audio_length_in_s": parameters.get("duration"),
-        "num_waveforms_per_prompt": parameters.get(
-            "num_variations",
-            parameters.get("batch_size"),
-        ),
+        "num_waveforms_per_prompt": count,
         "generator": generator,
+        "output_type": "np",
     }
+    parameter_paths = {
+        "negative_prompt": "negative_prompt",
+        "num_inference_steps": "audio.steps",
+        "guidance_scale": "audio.guidance",
+        "num_waveforms_per_prompt": "audio.variations",
+        "generator": "audio.seed",
+    }
+    if duration_keyword is not None:
+        values[duration_keyword] = duration
+        parameter_paths[duration_keyword] = "audio.duration"
     kwargs = filtered_kwargs(
         pipeline.__call__,
         values,
         required=("prompt",),
         parameter_guard=parameter_guard,
-        parameter_paths={
-            "negative_prompt": "negative_prompt",
-            "num_inference_steps": "audio.steps",
-            "guidance_scale": "audio.guidance",
-            "audio_length_in_s": "audio.duration",
-            "num_waveforms_per_prompt": "audio.variations",
-            "generator": "audio.seed",
-        },
+        parameter_paths=parameter_paths,
     )
+    effective_count = count if "num_waveforms_per_prompt" in kwargs else 1
     try:
         synchronize_torch_device(torch, device)
         inference_started = time.perf_counter()
@@ -2885,6 +3527,9 @@ def execute_diffusers_audio(
         synchronize_torch_device(torch, device)
         inference_seconds = max(0.0, time.perf_counter() - inference_started)
     except Exception as error:
+        if runtime is not None and runtime.pipeline_cache.enabled:
+            pipeline = None
+            runtime.pipeline_cache.evict(cache_key)
         fail("execution_failed", f"Diffusers audio pipeline failed for '{task}'", str(error))
 
     encoding_started = time.perf_counter()
@@ -2895,58 +3540,61 @@ def execute_diffusers_audio(
             audios = result.get("audio")
     if audios is None:
         fail("backend_error", "Diffusers pipeline returned no audio")
-
-    numpy = require_module("numpy", purpose="Diffusers audio output")
-    array = numpy.asarray(audios)
-    if array.ndim <= 1:
-        waveforms = [array]
-    else:
-        waveforms = [array[index] for index in range(array.shape[0])]
-    sample_rate = 0
-    if sample_rate <= 0:
-        for component_name in ("vocoder", "vae"):
-            component = getattr(pipeline, component_name, None)
-            config = getattr(component, "config", None)
-            value = getattr(config, "sampling_rate", None)
-            if value:
-                sample_rate = int(value)
-                break
-    if sample_rate <= 0:
-        sample_rate = 16_000
-        warnings.append(
-            "pipeline did not expose a sampling rate; output metadata assumes 16000 Hz"
-        )
-    format_name = normalized_name(
-        parameters.get("output_format") or parameters.get("format") or "wav"
+    # Older Diffusers vocoders can return mono batches as (batch, samples),
+    # while newer AudioPipelineOutput implementations use a channel axis.
+    waveforms = split_audio_waveforms(
+        audios,
+        effective_count,
+        allow_2d_batch=True,
     )
-    if format_name not in {"wav", "flac", "ogg"}:
+    if len(waveforms) != effective_count:
         fail(
-            "unsupported_parameter",
-            f"unsupported direct audio output format '{format_name}'",
+            "backend_error",
+            "Diffusers audio pipeline returned a different number of variations "
+            f"than requested ({len(waveforms)} != {effective_count})",
         )
-    outputs = []
-    for index, waveform in enumerate(waveforms):
-        path = output_dir / f"{task}-{identifier}-{index + 1}.{format_name}"
-        channels, duration = write_audio(path, waveform, sample_rate, format_name)
-        outputs.append(
-            output_record(
-                path,
-                mimetypes.guess_type(path.name)[0] or f"audio/{format_name}",
-                duration=duration,
-                metadata={"sample_rate": sample_rate, "channels": channels},
-            )
+    sample_rate = pipeline_sample_rate(pipeline)
+    if sample_rate is None:
+        fail(
+            "backend_error",
+            "Diffusers audio pipeline/config did not expose its sampling rate",
         )
+    format_name = requested_audio_format(parameters)
+    outputs = write_audio_outputs(
+        task,
+        identifier,
+        output_dir,
+        waveforms,
+        sample_rate,
+        format_name,
+    )
     encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
+    translated = []
+    if duration is not None and duration_keyword in kwargs:
+        translated.append(f"audio.duration->{duration_keyword}")
+    if "num_waveforms_per_prompt" in kwargs:
+        translated.append("audio.variations->num_waveforms_per_prompt")
+    for path, keyword in (
+        ("negative_prompt", "negative_prompt"),
+        ("audio.steps", "num_inference_steps"),
+        ("audio.guidance", "guidance_scale"),
+        ("audio.seed", "generator"),
+    ):
+        if keyword in kwargs:
+            translated.append(f"{path}->{keyword}")
     return outputs, warnings, {
         "runtime": "diffusers",
+        "pipeline_task": task,
+        "pipeline_class": type(entry.pipeline).__name__,
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "seed": seed,
-        "translated_parameters": sorted(kwargs),
-        "model_load_seconds": model_load_seconds,
+        "translated_parameters": sorted(set(translated)),
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
-        **offload_metadata,
+        **entry.offload_metadata,
     }
 
 
@@ -2958,8 +3606,16 @@ def transformers_device(device):
     return -1
 
 
-def load_transformers_pipeline(model_path, pipeline_task, parameters):
-    torch, device, dtype = torch_runtime(parameters)
+def load_transformers_pipeline(
+    model_path,
+    pipeline_task,
+    parameters,
+    runtime_values=None,
+):
+    if runtime_values is None:
+        torch, device, dtype = torch_runtime(parameters)
+    else:
+        torch, device, dtype = runtime_values
     transformers = require_module("transformers", purpose=pipeline_task)
     factory = getattr(transformers, "pipeline", None)
     if factory is None:
@@ -2969,8 +3625,11 @@ def load_transformers_pipeline(model_path, pipeline_task, parameters):
         "model": str(model_path),
         "device": transformers_device(device),
         "trust_remote_code": False,
-        "model_kwargs": {"local_files_only": True},
     }
+    # Do not repeat local_files_only in model_kwargs. Transformers builds its
+    # own hub kwargs and expands both mappings into from_pretrained(), which
+    # raises for duplicate keys. Offline-only loading is enforced process-wide
+    # above through the Hugging Face/Transformers offline environment flags.
     if device != "cpu":
         try:
             factory_parameters = inspect.signature(factory).parameters
@@ -2991,62 +3650,581 @@ def load_transformers_pipeline(model_path, pipeline_task, parameters):
     return pipeline, torch, device, dtype
 
 
-def audio_array_and_rate(result, _parameters):
-    if isinstance(result, list) and result:
-        result = result[0]
-    if not isinstance(result, dict):
-        fail("backend_error", "audio pipeline returned an unsupported result shape")
-    audio = result.get("audio")
-    rate = (
-        result.get("sampling_rate")
-        or result.get("sample_rate")
-        or 44_100
-    )
-    if audio is None:
-        fail("backend_error", "audio pipeline result has no 'audio' value")
+def prepare_transformers_audio_entry(
+    runtime,
+    model_path,
+    adapter,
+    pipeline_task,
+    parameters,
+    loader,
+):
+    """Load or reuse one entry in the shared resident media LRU."""
+    cache = runtime.pipeline_cache if runtime is not None else None
+    cache_enabled = cache is not None and cache.enabled
+    runtime_values = torch_runtime(parameters)
+    cache_key = None
+    if cache_enabled:
+        torch, device, dtype = runtime_values
+        cache_key = transformers_audio_cache_key(
+            model_path,
+            adapter,
+            pipeline_task,
+            torch,
+            device,
+            dtype,
+        )
+        entry = cache.get(cache_key)
+        if entry is not None:
+            if not isinstance(entry, TransformersAudioEntry):
+                cache.evict(cache_key)
+                fail("internal_error", "resident media cache entry has an invalid type")
+            return entry, cache_key, True, True
+        # Eviction happens before loading so two heavyweight frameworks never
+        # temporarily exceed the one shared resident-cache budget.
+        cache.prepare_for_load(cache_key)
+
+    load_started = time.perf_counter()
+    entry = None
     try:
-        rate = int(rate)
-    except Exception:
-        fail("backend_error", "audio pipeline returned an invalid sampling rate")
-    return audio, rate
+        entry = loader(runtime_values)
+        synchronize_torch_device(entry.torch, entry.device)
+        entry.model_load_seconds = max(
+            0.0,
+            time.perf_counter() - load_started,
+        )
+        if cache_enabled:
+            cache.put(cache_key, entry)
+        return entry, cache_key, False, cache_enabled
+    except BaseException:
+        if entry is not None:
+            cleanup_transformers_audio_entry(entry)
+        else:
+            cleanup_torch_allocator(runtime_values[0], runtime_values[1])
+        raise
 
 
-def write_audio(path, audio, sample_rate, format_name):
+def prepare_transformers_pipeline(
+    runtime,
+    model_path,
+    adapter,
+    pipeline_task,
+    parameters,
+):
+    def loader(runtime_values):
+        pipeline, torch, device, dtype = load_transformers_pipeline(
+            model_path,
+            pipeline_task,
+            parameters,
+            runtime_values=runtime_values,
+        )
+        return TransformersAudioEntry(
+            torch,
+            device,
+            dtype,
+            0.0,
+            adapter=adapter,
+            pipeline_task=pipeline_task,
+            pipeline=pipeline,
+        )
+
+    return prepare_transformers_audio_entry(
+        runtime,
+        model_path,
+        adapter,
+        pipeline_task,
+        parameters,
+        loader,
+    )
+
+
+def evict_failed_transformers_entry(runtime, cache_key):
+    if (
+        runtime is not None
+        and cache_key is not None
+        and runtime.pipeline_cache.enabled
+    ):
+        runtime.pipeline_cache.evict(cache_key)
+
+
+def object_value(value, name):
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None) if value is not None else None
+
+
+def pipeline_sample_rate(pipeline, result=None):
+    candidates = []
+    if result is not None:
+        candidates.extend([
+            object_value(result, "sampling_rate"),
+            object_value(result, "sample_rate"),
+        ])
+    component_names = (
+        "processor",
+        "audio_processor",
+        "feature_extractor",
+        "audio_feature_extractor",
+        "audio_encoder",
+        "vocoder",
+        "codec",
+        "vae",
+        "model",
+        "config",
+    )
+    pending = [(pipeline, 0)]
+    visited = set()
+    while pending:
+        component, depth = pending.pop(0)
+        if component is None or isinstance(
+            component,
+            (str, bytes, bytearray, int, float, bool),
+        ):
+            continue
+        identity = id(component)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        candidates.extend([
+            object_value(component, "sampling_rate"),
+            object_value(component, "sample_rate"),
+        ])
+        if depth >= 4:
+            continue
+        for component_name in component_names:
+            child = object_value(component, component_name)
+            if child is not None:
+                pending.append((child, depth + 1))
+    for value in candidates:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def numpy_audio(value):
     numpy = require_module("numpy", purpose="audio output")
-    array = numpy.asarray(audio)
-    array = numpy.squeeze(array)
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        try:
+            value = value.numpy()
+        except Exception:
+            # NumPy cannot directly represent Torch bfloat16 tensors. Audio
+            # pipelines and embedding models commonly run at that dtype, so
+            # convert only the host-side value used for serialization.
+            float_value = getattr(value, "float", None)
+            if callable(float_value):
+                value = float_value()
+                if hasattr(value, "numpy"):
+                    value = value.numpy()
+    return numpy.asarray(value)
+
+
+def split_audio_waveforms(audios, expected_count=1, allow_2d_batch=False):
+    array = numpy_audio(audios)
+    if array.size == 0:
+        fail("backend_error", "audio pipeline returned an empty waveform")
+    try:
+        expected_count = max(1, int(expected_count or 1))
+    except (TypeError, ValueError):
+        expected_count = 1
+    if array.ndim == 1:
+        return [array]
+    if array.ndim == 2:
+        if array.shape[0] == 1:
+            return [array[0]]
+        if (
+            allow_2d_batch
+            and expected_count > 1
+            and array.shape[0] == expected_count
+        ):
+            return [array[index] for index in range(array.shape[0])]
+        # Transformers specifies each TextToAudio result as channel-first 2-D
+        # audio. Never reinterpret stereo channels as requested variations.
+        return [array]
+    if array.ndim == 3:
+        return [array[index] for index in range(array.shape[0])]
+    fail("backend_error", f"unsupported audio batch shape: {array.shape}")
+
+
+def audio_result_items(result, pipeline):
+    values = result if isinstance(result, list) else [result]
+    if not values:
+        fail("backend_error", "audio pipeline returned no results")
+    items = []
+    for value in values:
+        audio = object_value(value, "audio")
+        if audio is None:
+            audio = object_value(value, "audios")
+        if audio is None:
+            fail("backend_error", "audio pipeline result has no 'audio' value")
+        rate = pipeline_sample_rate(pipeline, value)
+        if rate is None:
+            fail("backend_error", "audio pipeline/config did not expose its sampling rate")
+        items.append((audio, rate))
+    return items
+
+
+def requested_audio_format(parameters):
+    format_name = normalized_name(
+        parameters.get("output_format") or parameters.get("format") or "wav"
+    )
+    if format_name not in {"wav", "flac", "mp3", "ogg"}:
+        fail(
+            "unsupported_parameter",
+            f"unsupported direct audio output format '{format_name}'",
+        )
+    return format_name
+
+
+def audio_mime_type(format_name):
+    return {
+        "wav": "audio/wav",
+        "flac": "audio/flac",
+        "mp3": "audio/mpeg",
+        "ogg": "audio/ogg",
+    }[format_name]
+
+
+def normalized_audio_array(audio):
+    numpy = require_module("numpy", purpose="audio output")
+    array = numpy.squeeze(numpy_audio(audio))
+    if array.ndim == 0:
+        array = array.reshape(1)
     if array.ndim == 1:
         channels = 1
-        interleaved = array
     elif array.ndim == 2:
         if array.shape[0] <= 8 and array.shape[0] < array.shape[1]:
             array = array.T
         channels = int(array.shape[1])
-        interleaved = array.reshape(-1)
     else:
         fail("backend_error", f"unsupported audio tensor shape: {array.shape}")
-    if format_name == "wav":
-        if interleaved.dtype.kind == "f":
-            pcm = (
-                numpy.clip(interleaved, -1.0, 1.0) * 32767.0
-            ).astype("<i2")
-        elif interleaved.dtype.itemsize <= 2:
-            pcm = interleaved.astype("<i2")
-        else:
-            pcm = numpy.clip(interleaved, -32768, 32767).astype("<i2")
-        with wave.open(str(path), "wb") as handle:
-            handle.setnchannels(channels)
-            handle.setsampwidth(2)
-            handle.setframerate(sample_rate)
-            handle.writeframes(pcm.tobytes())
+    if array.size == 0:
+        fail("backend_error", "cannot encode an empty audio waveform")
+    if channels < 1 or channels > 32:
+        fail("backend_error", f"unsupported audio channel count: {channels}")
+    if array.dtype.kind == "f":
+        array = numpy.nan_to_num(array, nan=0.0, posinf=1.0, neginf=-1.0)
+        pcm = (numpy.clip(array, -1.0, 1.0) * 32767.0).astype("<i2")
+    elif array.dtype.itemsize <= 2:
+        pcm = array.astype("<i2")
     else:
-        soundfile = require_module("soundfile", purpose=f"{format_name} audio output")
-        try:
-            soundfile.write(str(path), array, sample_rate, format=format_name.upper())
-        except Exception as error:
-            fail("encoding_failed", f"failed to encode {format_name} audio", str(error))
+        pcm = numpy.clip(array, -32768, 32767).astype("<i2")
+    interleaved = pcm.reshape(-1)
     frames = int(array.shape[0] if array.ndim > 1 else array.size)
+    return array, interleaved, channels, frames
+
+
+def encode_audio_with_ffmpeg(path, pcm, sample_rate, channels, format_name):
+    executable = shutil.which("ffmpeg")
+    if executable is None:
+        fail(
+            "missing_dependency",
+            f"ffmpeg is required for {format_name} audio output",
+        )
+    codec_arguments = {
+        "flac": ["-c:a", "flac"],
+        "mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
+        "ogg": ["-c:a", "libvorbis", "-q:a", "5"],
+    }.get(format_name)
+    if codec_arguments is None:
+        fail("internal_error", f"no ffmpeg codec mapping for '{format_name}'")
+    command = [
+        executable,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "s16le",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        str(channels),
+        "-i",
+        "pipe:0",
+        "-vn",
+        *codec_arguments,
+        "-y",
+        str(path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            input=pcm.tobytes(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except Exception as error:
+        fail("encoding_failed", f"failed to start ffmpeg for {format_name} output", str(error))
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        fail("encoding_failed", f"ffmpeg failed to encode {format_name} audio", detail)
+
+
+def write_audio(path, audio, sample_rate, format_name):
+    try:
+        sample_rate = int(sample_rate)
+    except (TypeError, ValueError):
+        fail("backend_error", "audio sampling rate must be an integer")
+    if sample_rate <= 0:
+        fail("backend_error", "audio sampling rate must be positive")
+    array, pcm, channels, frames = normalized_audio_array(audio)
+    if format_name == "wav":
+        try:
+            with wave.open(str(path), "wb") as handle:
+                handle.setnchannels(channels)
+                handle.setsampwidth(2)
+                handle.setframerate(sample_rate)
+                handle.writeframes(pcm.tobytes())
+        except Exception as error:
+            fail("encoding_failed", "failed to encode wav audio", str(error))
+    elif format_name in {"flac", "ogg"}:
+        try:
+            soundfile = importlib.import_module("soundfile")
+            soundfile.write(
+                str(path),
+                array,
+                sample_rate,
+                format=format_name.upper(),
+            )
+        except Exception:
+            encode_audio_with_ffmpeg(
+                path,
+                pcm,
+                sample_rate,
+                channels,
+                format_name,
+            )
+    elif format_name == "mp3":
+        encode_audio_with_ffmpeg(path, pcm, sample_rate, channels, format_name)
+    else:
+        fail("unsupported_parameter", f"unsupported audio output format '{format_name}'")
     return channels, frames / float(sample_rate)
+
+
+def write_audio_outputs(
+    task,
+    identifier,
+    output_dir,
+    waveforms,
+    sample_rate,
+    format_name,
+):
+    outputs = []
+    multiple = len(waveforms) > 1
+    for index, waveform in enumerate(waveforms, start=1):
+        suffix = f"-{index}" if multiple else ""
+        path = output_dir / f"{task}-{identifier}{suffix}.{format_name}"
+        channels, duration = write_audio(path, waveform, sample_rate, format_name)
+        outputs.append(
+            output_record(
+                path,
+                audio_mime_type(format_name),
+                duration=duration,
+                metadata={"sample_rate": sample_rate, "channels": channels},
+            )
+        )
+    return outputs
+
+
+def local_audio_source(inputs, parameters):
+    source = (
+        inputs.get("input_audio")
+        or inputs.get("source_audio")
+        or inputs.get("audio")
+        or inputs.get("source")
+        or inputs.get("input")
+        or parameters.get("input_audio")
+    )
+    return local_input_path(source, "input audio")
+
+
+def resample_audio(array, source_rate, target_rate):
+    numpy = require_module("numpy", purpose="audio input")
+    if array.size == 0:
+        fail("invalid_input", "decoded input audio is empty")
+    if source_rate == target_rate:
+        return array.astype("float32", copy=False)
+    try:
+        scipy_signal = importlib.import_module("scipy.signal")
+        divisor = math.gcd(int(source_rate), int(target_rate))
+        result = scipy_signal.resample_poly(
+            array,
+            int(target_rate) // divisor,
+            int(source_rate) // divisor,
+        )
+    except Exception:
+        target_frames = max(1, round(array.size * target_rate / source_rate))
+        source_positions = numpy.linspace(0.0, 1.0, num=array.size, endpoint=False)
+        target_positions = numpy.linspace(0.0, 1.0, num=target_frames, endpoint=False)
+        result = numpy.interp(target_positions, source_positions, array)
+    return numpy.asarray(result, dtype="float32")
+
+
+def decode_local_audio(path, target_sample_rate):
+    numpy = require_module("numpy", purpose="audio input")
+    try:
+        target_sample_rate = int(target_sample_rate)
+    except (TypeError, ValueError):
+        fail("backend_configuration_failed", "selected pipeline exposes no valid audio sampling rate")
+    if target_sample_rate <= 0:
+        fail("backend_configuration_failed", "selected pipeline exposes no valid audio sampling rate")
+    errors = []
+    try:
+        soundfile = importlib.import_module("soundfile")
+        array, source_rate = soundfile.read(
+            str(path),
+            dtype="float32",
+            always_2d=False,
+        )
+        array = numpy.asarray(array, dtype="float32")
+        if array.ndim == 2:
+            array = array.mean(axis=1)
+        elif array.ndim != 1:
+            raise ValueError(f"unsupported decoded audio shape {array.shape}")
+        return {
+            "raw": resample_audio(array, int(source_rate), target_sample_rate),
+            "sampling_rate": target_sample_rate,
+        }
+    except Exception as error:
+        errors.append(f"soundfile: {error}")
+    executable = shutil.which("ffmpeg")
+    if executable is not None:
+        command = [
+            executable,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(target_sample_rate),
+            "-f",
+            "f32le",
+            "pipe:1",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if completed.returncode == 0 and completed.stdout:
+                return {
+                    "raw": numpy.frombuffer(completed.stdout, dtype="<f4").copy(),
+                    "sampling_rate": target_sample_rate,
+                }
+            errors.append(
+                "ffmpeg: "
+                + completed.stderr.decode("utf-8", "replace").strip()
+            )
+        except Exception as error:
+            errors.append(f"ffmpeg: {error}")
+    else:
+        errors.append("ffmpeg: executable not found")
+    fail("invalid_input", f"failed to decode input audio: {path}", errors)
+
+
+def decoded_audio_for_pipeline(pipeline, source_path):
+    sample_rate = pipeline_sample_rate(pipeline)
+    if sample_rate is None:
+        fail(
+            "backend_configuration_failed",
+            "selected Transformers pipeline/config exposes no audio sampling rate",
+        )
+    return decode_local_audio(source_path, sample_rate)
+
+
+def seed_transformers_runtime(torch, parameters):
+    seed = parameters.get("seed")
+    if seed is None:
+        return None
+    try:
+        seed = int(seed)
+    except (TypeError, ValueError):
+        fail("invalid_parameter", "seed must be an integer")
+    seed = seed & ((1 << 63) - 1)
+    manual_seed = getattr(torch, "manual_seed", None)
+    if callable(manual_seed):
+        manual_seed(seed)
+    cuda = getattr(torch, "cuda", None)
+    manual_seed_all = getattr(cuda, "manual_seed_all", None)
+    if callable(manual_seed_all):
+        manual_seed_all(seed)
+    return seed
+
+
+def transformer_audio_frame_rate(pipeline):
+    model = getattr(pipeline, "model", None)
+    config = getattr(model, "config", None)
+    candidates = [
+        object_value(object_value(config, "audio_encoder"), "frame_rate"),
+        object_value(
+            object_value(getattr(model, "audio_encoder", None), "config"),
+            "frame_rate",
+        ),
+        object_value(config, "frame_rate"),
+    ]
+    for value in candidates:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+    return None
+
+
+def transformer_duration_tokens(
+    pipeline,
+    parameters,
+    parameter_guard,
+    warnings,
+):
+    duration = parameters.get("duration")
+    if duration is None:
+        return None
+    duration = positive_float({"duration": duration}, "duration", 30.0, 0.01)
+    model_type = normalized_name(
+        object_value(getattr(getattr(pipeline, "model", None), "config", None), "model_type")
+    )
+    if model_type in {"musicgen", "musicgen_melody"} and duration > 30.0:
+        parameter_guard.reject(
+            "audio.duration",
+            "MusicGen supports at most 30 seconds per generated clip",
+        )
+        if "audio.duration" not in parameter_guard.explicit:
+            warnings.append(
+                "resolved audio.duration exceeds MusicGen's 30-second limit; "
+                "the model default duration is used"
+            )
+        return None
+    frame_rate = transformer_audio_frame_rate(pipeline)
+    if frame_rate is None:
+        parameter_guard.reject(
+            "audio.duration",
+            "the selected Transformers model/config exposes no audio token frame rate",
+        )
+        if "audio.duration" not in parameter_guard.explicit:
+            warnings.append(
+                "resolved audio.duration was not applied because the selected "
+                "Transformers model exposes no audio token frame rate; the model "
+                "generation default is used"
+            )
+        return None
+    return max(1, math.ceil(duration * frame_rate))
 
 
 def execute_audio_generation(
@@ -3056,78 +4234,171 @@ def execute_audio_generation(
     output_dir,
     identifier,
     parameter_guard,
+    runtime=None,
 ):
-    model_load_started = time.perf_counter()
-    pipeline, torch, device, dtype = load_transformers_pipeline(
+    entry, cache_key, model_cache_hit, resident = prepare_transformers_pipeline(
+        runtime,
         model_path,
+        "transformers_audio",
         "text-to-audio",
         parameters,
     )
-    synchronize_torch_device(torch, device)
-    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
+    try:
+        return execute_prepared_audio_generation(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            task,
+            parameters,
+            output_dir,
+            identifier,
+            parameter_guard,
+        )
+    finally:
+        if not resident:
+            cleanup_transformers_audio_entry(entry)
+
+
+def execute_prepared_audio_generation(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    task,
+    parameters,
+    output_dir,
+    identifier,
+    parameter_guard,
+):
+    pipeline = entry.pipeline
+    torch = entry.torch
+    device = entry.device
+    dtype = entry.dtype
     prompt = prompt_with_lyrics(
         parameters.get("prompt") or parameters.get("description"),
         parameters.get("lyrics"),
     )
     prompt = required_string(prompt, "effective_parameters.prompt/description")
-    generator, seed = seeded_generator(torch, device, parameters)
-    call_values = {
-        "forward_params": {
-            key: value
-            for key, value in {
-                "guidance_scale": parameters.get("guidance_scale", parameters.get("guidance")),
-                "do_sample": parameters.get("temperature", 1.0) != 0,
-                "temperature": parameters.get("temperature"),
-                "top_k": parameters.get("top_k"),
-                "top_p": parameters.get("top_p"),
-                "max_new_tokens": parameters.get("max_new_tokens"),
-                "generator": generator,
-            }.items()
-            if value is not None
-        }
+    seed = seed_transformers_runtime(torch, parameters)
+    warnings = []
+    max_new_tokens = transformer_duration_tokens(
+        pipeline,
+        parameters,
+        parameter_guard,
+        warnings,
+    )
+    temperature = parameters.get("temperature")
+    if temperature is not None:
+        temperature = positive_float(parameters, "temperature", 0.0)
+    top_k = parameters.get("top_k")
+    if top_k is not None:
+        top_k = positive_int(parameters, "top_k", 0, minimum=0)
+    top_p = parameters.get("top_p")
+    if top_p is not None:
+        top_p = positive_float(parameters, "top_p", 1.0)
+        if top_p > 1.0:
+            fail("invalid_parameter", "top_p must not exceed 1")
+    guidance = parameters.get("guidance_scale", parameters.get("guidance"))
+    if guidance is not None:
+        guidance = positive_float({"guidance": guidance}, "guidance", 0.0)
+    sampling_requested = any(
+        value is not None for value in (temperature, top_k, top_p)
+    )
+    generate_kwargs = {
+        key: value
+        for key, value in {
+            "guidance_scale": guidance,
+            "temperature": temperature if temperature not in {None, 0, 0.0} else None,
+            "do_sample": False if temperature == 0.0 else (
+                True if sampling_requested else None
+            ),
+            "top_k": top_k,
+            "top_p": top_p,
+            "max_new_tokens": max_new_tokens,
+        }.items()
+        if value is not None
     }
-    if not call_values["forward_params"]:
-        call_values = {}
+    call_values = {"generate_kwargs": generate_kwargs} if generate_kwargs else {}
+    count = positive_int(
+        {"variations": parameters.get("num_variations", parameters.get("variations", 1))},
+        "variations",
+        1,
+    )
+    prompts = prompt if count == 1 else [prompt] * count
     synchronize_torch_device(torch, device)
     inference_started = time.perf_counter()
     try:
-        result = pipeline(prompt, **call_values)
-    except TypeError:
-        if call_values:
-            for path in ("audio.seed", "audio.guidance"):
-                parameter_guard.reject(
-                    path,
-                    "the selected Transformers audio pipeline rejected generation kwargs",
-                )
-        try:
-            result = pipeline(prompt)
-        except Exception as error:
-            fail("execution_failed", f"Transformers audio pipeline failed for '{task}'", str(error))
+        with torch.inference_mode():
+            result = pipeline(prompts, **call_values)
     except Exception as error:
+        pipeline = None
+        evict_failed_transformers_entry(runtime, cache_key)
         fail("execution_failed", f"Transformers audio pipeline failed for '{task}'", str(error))
     synchronize_torch_device(torch, device)
     inference_seconds = max(0.0, time.perf_counter() - inference_started)
 
     encoding_started = time.perf_counter()
-    audio, sample_rate = audio_array_and_rate(result, parameters)
-    format_name = normalized_name(parameters.get("output_format") or parameters.get("format") or "wav")
-    if format_name not in {"wav", "flac", "ogg"}:
-        fail("unsupported_parameter", f"unsupported direct audio output format '{format_name}'")
-    path = output_dir / f"{task}-{identifier}.{format_name}"
-    channels, duration = write_audio(path, audio, sample_rate, format_name)
+    items = audio_result_items(result, pipeline)
+    if len(items) == 1 and count > 1:
+        audio, sample_rate = items[0]
+        waveforms = split_audio_waveforms(audio, count)
+        if len(waveforms) != count:
+            fail(
+                "backend_error",
+                "Transformers audio pipeline did not return the requested number of variations",
+            )
+        items = [(waveform, sample_rate) for waveform in waveforms]
+    if len(items) != count:
+        fail(
+            "backend_error",
+            "Transformers audio pipeline returned a different number of variations "
+            f"than requested ({len(items)} != {count})",
+        )
+    format_name = requested_audio_format(parameters)
+    outputs = []
+    for index, (audio, sample_rate) in enumerate(items, start=1):
+        suffix = f"-{index}" if count > 1 else ""
+        path = output_dir / f"{task}-{identifier}{suffix}.{format_name}"
+        channels, duration = write_audio(path, audio, sample_rate, format_name)
+        outputs.append(
+            output_record(
+                path,
+                audio_mime_type(format_name),
+                duration=duration,
+                metadata={"sample_rate": sample_rate, "channels": channels},
+            )
+        )
     encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
-    return [output_record(
-        path,
-        mimetypes.guess_type(path.name)[0] or f"audio/{format_name}",
-        duration=duration,
-        metadata={"sample_rate": sample_rate, "channels": channels},
-    )], [], {
+    translated_parameters = []
+    if max_new_tokens is not None:
+        translated_parameters.append("audio.duration->generate_kwargs.max_new_tokens")
+    if count > 1:
+        translated_parameters.append("audio.variations->batched prompts")
+    if seed is not None:
+        translated_parameters.append("audio.seed->torch.manual_seed")
+    if parameters.get("lyrics"):
+        translated_parameters.append("audio.lyrics->prompt")
+    for path, keyword in (
+        ("audio.guidance", "guidance_scale"),
+        ("audio.temperature", "temperature"),
+        ("audio.top_k", "top_k"),
+        ("audio.top_p", "top_p"),
+    ):
+        if keyword in generate_kwargs:
+            translated_parameters.append(f"{path}->generate_kwargs.{keyword}")
+    if "do_sample" in generate_kwargs:
+        translated_parameters.append("audio.sampling->generate_kwargs.do_sample")
+    return outputs, warnings, {
         "runtime": "transformers",
         "pipeline_task": "text-to-audio",
+        "pipeline_class": type(pipeline).__name__,
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "seed": seed,
-        "model_load_seconds": model_load_seconds,
+        "translated_parameters": sorted(translated_parameters),
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
         "offload_mode": "none",
@@ -3135,16 +4406,324 @@ def execute_audio_generation(
     }
 
 
-def execute_tts(model_path, task, parameters, output_dir, identifier):
-    model_load_started = time.perf_counter()
-    pipeline, torch, device, dtype = load_transformers_pipeline(
+QWEN3_TTS_LANGUAGE_NAMES = {
+    "auto": "Auto",
+    "zh": "Chinese",
+    "zho": "Chinese",
+    "chinese": "Chinese",
+    "en": "English",
+    "eng": "English",
+    "english": "English",
+    "ja": "Japanese",
+    "jpn": "Japanese",
+    "japanese": "Japanese",
+    "ko": "Korean",
+    "kor": "Korean",
+    "korean": "Korean",
+    "de": "German",
+    "de_de": "German",
+    "deu": "German",
+    "ger": "German",
+    "german": "German",
+    "fr": "French",
+    "fra": "French",
+    "fre": "French",
+    "french": "French",
+    "ru": "Russian",
+    "rus": "Russian",
+    "russian": "Russian",
+    "pt": "Portuguese",
+    "por": "Portuguese",
+    "portuguese": "Portuguese",
+    "es": "Spanish",
+    "spa": "Spanish",
+    "spanish": "Spanish",
+    "it": "Italian",
+    "ita": "Italian",
+    "italian": "Italian",
+}
+
+
+def qwen3_tts_language(value):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "Auto"
+    normalized = normalized_name(value)
+    language = QWEN3_TTS_LANGUAGE_NAMES.get(normalized)
+    if language is None:
+        supported = sorted(set(QWEN3_TTS_LANGUAGE_NAMES.values()))
+        fail(
+            "invalid_parameter",
+            f"unsupported Qwen3-TTS language '{value}'",
+            {"supported_languages": supported},
+        )
+    return language
+
+
+def qwen3_tts_device_map(torch, device):
+    if device == "cuda":
+        try:
+            index = int(torch.cuda.current_device())
+        except Exception:
+            index = 0
+        return f"cuda:{index}"
+    return device
+
+
+def load_qwen3_tts_voice_design(
+    model_path,
+    parameters,
+    runtime_values=None,
+):
+    if runtime_values is None:
+        torch, device, dtype = torch_runtime(parameters)
+    else:
+        torch, device, dtype = runtime_values
+    model_root = model_path if model_path.is_dir() else model_path.parent
+    if not is_qwen3_tts_voice_design(model_root):
+        variant = qwen3_tts_model_variant(model_root)
+        fail(
+            "unsupported_model",
+            "the Qwen3-TTS adapter currently supports only VoiceDesign models",
+            {"tts_model_type": variant},
+        )
+    qwen_tts = require_module(
+        "qwen_tts",
+        "qwen-tts",
+        "Qwen3-TTS VoiceDesign inference; run 'werk backend install qwen-tts' "
+        f"or configure {QWEN3_TTS_PYTHON_ENV} with an isolated interpreter",
+    )
+    model_class = getattr(qwen_tts, "Qwen3TTSModel", None)
+    from_pretrained = getattr(model_class, "from_pretrained", None)
+    if not callable(from_pretrained):
+        fail(
+            "missing_dependency",
+            "installed qwen-tts package does not expose Qwen3TTSModel.from_pretrained",
+        )
+    load_kwargs = {
+        "device_map": qwen3_tts_device_map(torch, device),
+        "dtype": dtype,
+    }
+    try:
+        model = from_pretrained(str(model_root), **load_kwargs)
+    except Exception as error:
+        fail(
+            "model_load_failed",
+            f"failed to load local Qwen3-TTS VoiceDesign model from {model_root}",
+            str(error),
+        )
+    if not callable(getattr(model, "generate_voice_design", None)):
+        fail(
+            "model_load_failed",
+            "loaded qwen-tts model does not expose generate_voice_design",
+        )
+    return model, torch, device, dtype
+
+
+def prepare_qwen3_tts_voice_design(runtime, model_path, parameters):
+    def loader(runtime_values):
+        model, torch, device, dtype = load_qwen3_tts_voice_design(
+            model_path,
+            parameters,
+            runtime_values=runtime_values,
+        )
+        return TransformersAudioEntry(
+            torch,
+            device,
+            dtype,
+            0.0,
+            adapter=QWEN3_TTS_ADAPTER,
+            pipeline_task="voice-design",
+            model=model,
+        )
+
+    return prepare_transformers_audio_entry(
+        runtime,
         model_path,
-        "text-to-speech",
+        QWEN3_TTS_ADAPTER,
+        "voice-design",
+        parameters,
+        loader,
+    )
+
+
+def execute_qwen3_tts_voice_design(
+    model_path,
+    task,
+    parameters,
+    output_dir,
+    identifier,
+    runtime=None,
+):
+    entry, cache_key, model_cache_hit, resident = prepare_qwen3_tts_voice_design(
+        runtime,
+        model_path,
         parameters,
     )
+    try:
+        return execute_prepared_qwen3_tts_voice_design(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            task,
+            parameters,
+            output_dir,
+            identifier,
+        )
+    finally:
+        if not resident:
+            cleanup_transformers_audio_entry(entry)
+
+
+def execute_prepared_qwen3_tts_voice_design(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    task,
+    parameters,
+    output_dir,
+    identifier,
+):
+    model = entry.model
+    torch = entry.torch
+    device = entry.device
+    dtype = entry.dtype
+    text = required_string(
+        parameters.get("text") or parameters.get("prompt"),
+        "effective_parameters.text",
+    )
+    language = qwen3_tts_language(parameters.get("language"))
+    raw_instruct = parameters.get("speaking_style")
+    warnings = []
+    if raw_instruct is None:
+        instruct = "A clear, natural, high-quality studio voice with precise articulation."
+        warnings.append(
+            "tts.speaking_style was not supplied; a neutral high-quality VoiceDesign instruction was used"
+        )
+    else:
+        instruct = required_string(
+            raw_instruct,
+            "effective_parameters.tts.speaking_style",
+        )
+    seed = seed_transformers_runtime(torch, parameters)
     synchronize_torch_device(torch, device)
-    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
+    inference_started = time.perf_counter()
+    try:
+        with torch.inference_mode():
+            result = model.generate_voice_design(
+                text=text,
+                language=language,
+                instruct=instruct,
+                non_streaming_mode=True,
+            )
+    except Exception as error:
+        model = None
+        evict_failed_transformers_entry(runtime, cache_key)
+        fail("execution_failed", "Qwen3-TTS VoiceDesign generation failed", str(error))
+    synchronize_torch_device(torch, device)
+    inference_seconds = max(0.0, time.perf_counter() - inference_started)
+    if not isinstance(result, (tuple, list)) or len(result) != 2:
+        fail(
+            "backend_error",
+            "Qwen3-TTS generate_voice_design returned an invalid result",
+        )
+    waveforms, sample_rate = result
+    if not isinstance(waveforms, (tuple, list)) or len(waveforms) != 1:
+        fail(
+            "backend_error",
+            "Qwen3-TTS VoiceDesign must return exactly one waveform",
+        )
+
+    encoding_started = time.perf_counter()
+    format_name = requested_audio_format(parameters)
+    outputs = write_audio_outputs(
+        task,
+        identifier,
+        output_dir,
+        waveforms,
+        sample_rate,
+        format_name,
+    )
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
+    translated = [
+        "tts.language->language",
+        "tts.speaking_style->instruct"
+        if raw_instruct is not None
+        else "adapter_default->instruct",
+    ]
+    if seed is not None:
+        translated.append("tts.seed->torch.manual_seed")
+    if parameters.get("precision") is not None:
+        translated.append("routing.precision->dtype")
+    if parameters.get("accelerator") is not None or parameters.get("device") is not None:
+        translated.append("routing.accelerator->device_map")
+    return outputs, warnings, {
+        "runtime": "qwen-tts",
+        "pipeline_task": "text-to-speech",
+        "pipeline_class": type(entry.model).__name__,
+        "model_variant": "voice_design",
+        "device": device,
+        "dtype": str(dtype).replace("torch.", ""),
+        "language": language,
+        "seed": seed,
+        "translated_parameters": sorted(translated),
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
+        "offload_mode": "none",
+        "offload_request": "none",
+    }
+
+
+def execute_tts(
+    model_path,
+    task,
+    parameters,
+    output_dir,
+    identifier,
+    runtime=None,
+):
+    entry, cache_key, model_cache_hit, resident = prepare_transformers_pipeline(
+        runtime,
+        model_path,
+        "transformers_tts",
+        "text-to-audio",
+        parameters,
+    )
+    try:
+        return execute_prepared_tts(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            task,
+            parameters,
+            output_dir,
+            identifier,
+        )
+    finally:
+        if not resident:
+            cleanup_transformers_audio_entry(entry)
+
+
+def execute_prepared_tts(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    task,
+    parameters,
+    output_dir,
+    identifier,
+):
+    pipeline = entry.pipeline
+    torch = entry.torch
+    device = entry.device
+    dtype = entry.dtype
     text = required_string(parameters.get("text") or parameters.get("prompt"), "effective_parameters.text")
+    seed = seed_transformers_runtime(torch, parameters)
     kwargs = {}
     for key in ("speaker_embeddings", "vocoder", "generate_kwargs"):
         if key in parameters:
@@ -3152,31 +4731,41 @@ def execute_tts(model_path, task, parameters, output_dir, identifier):
     synchronize_torch_device(torch, device)
     inference_started = time.perf_counter()
     try:
-        result = pipeline(text, **kwargs)
+        with torch.inference_mode():
+            result = pipeline(text, **kwargs)
     except Exception as error:
+        pipeline = None
+        evict_failed_transformers_entry(runtime, cache_key)
         fail("execution_failed", "Transformers text-to-speech pipeline failed", str(error))
     synchronize_torch_device(torch, device)
     inference_seconds = max(0.0, time.perf_counter() - inference_started)
 
     encoding_started = time.perf_counter()
-    audio, sample_rate = audio_array_and_rate(result, parameters)
-    format_name = normalized_name(parameters.get("output_format") or parameters.get("format") or "wav")
-    if format_name not in {"wav", "flac", "ogg"}:
-        fail("unsupported_parameter", f"unsupported direct audio output format '{format_name}'")
+    items = audio_result_items(result, pipeline)
+    if len(items) != 1:
+        fail("backend_error", "text-to-speech pipeline returned multiple audio results")
+    audio, sample_rate = items[0]
+    format_name = requested_audio_format(parameters)
     path = output_dir / f"{task}-{identifier}.{format_name}"
     channels, duration = write_audio(path, audio, sample_rate, format_name)
     encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
     return [output_record(
         path,
-        mimetypes.guess_type(path.name)[0] or f"audio/{format_name}",
+        audio_mime_type(format_name),
         duration=duration,
         metadata={"sample_rate": sample_rate, "channels": channels},
     )], [], {
         "runtime": "transformers",
-        "pipeline_task": "text-to-speech",
+        "pipeline_task": "text-to-audio",
+        "pipeline_class": type(pipeline).__name__,
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
-        "model_load_seconds": model_load_seconds,
+        "seed": seed,
+        "translated_parameters": (
+            ["tts.seed->torch.manual_seed"] if seed is not None else []
+        ),
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
         "offload_mode": "none",
@@ -3266,6 +4855,70 @@ def save_transcription_outputs(result, output_dir, task, identifier, parameters)
     return [output_record(path, mime_type)]
 
 
+def asr_supports_generation(pipeline):
+    model = getattr(pipeline, "model", None)
+    can_generate = getattr(model, "can_generate", None)
+    if callable(can_generate):
+        try:
+            return bool(can_generate())
+        except Exception:
+            pass
+    return normalized_name(getattr(pipeline, "type", "")).startswith("seq2seq")
+
+
+def asr_supports_translation(pipeline):
+    if normalized_name(getattr(pipeline, "type", "")) == "seq2seq_whisper":
+        return True
+    for owner in (pipeline, getattr(pipeline, "model", None)):
+        generation_config = getattr(owner, "generation_config", None)
+        task_to_id = object_value(generation_config, "task_to_id")
+        if isinstance(task_to_id, dict) and "translate" in task_to_id:
+            return True
+    return False
+
+
+def asr_timestamp_value(pipeline, parameters, parameter_guard, warnings):
+    word = bool(parameters.get("word_timestamps"))
+    segment = bool(parameters.get("segment_timestamps"))
+    if word and segment:
+        parameter_guard.reject_overridden(
+            "stt.segment_timestamps",
+            "stt.word_timestamps",
+        )
+    if not word and not segment:
+        return None, []
+    pipeline_type = normalized_name(getattr(pipeline, "type", ""))
+    paths = ["stt.word_timestamps" if word else "stt.segment_timestamps"]
+    if word:
+        if pipeline_type == "seq2seq":
+            parameter_guard.reject(
+                paths[0],
+                "the selected non-Whisper seq2seq ASR pipeline cannot return timestamps",
+            )
+            if paths[0] not in parameter_guard.explicit:
+                warnings.append(
+                    "resolved word timestamps were not requested because the selected "
+                    "ASR pipeline cannot produce them"
+                )
+            return None, paths
+        return "word", paths
+    if pipeline_type == "seq2seq_whisper" or not pipeline_type:
+        return True, paths
+    if pipeline_type in {"ctc", "ctc_with_lm"}:
+        # CTC registries expose timestamped chunks at word granularity.
+        return "word", paths
+    parameter_guard.reject(
+        paths[0],
+        "the selected ASR pipeline cannot return segment timestamps",
+    )
+    if paths[0] not in parameter_guard.explicit:
+        warnings.append(
+            "resolved segment timestamps were not requested because the selected "
+            "ASR pipeline cannot produce them"
+        )
+    return None, paths
+
+
 def execute_asr(
     model_path,
     task,
@@ -3274,60 +4927,122 @@ def execute_asr(
     output_dir,
     identifier,
     parameter_guard,
+    runtime=None,
 ):
-    model_load_started = time.perf_counter()
-    pipeline, torch, device, dtype = load_transformers_pipeline(
+    entry, cache_key, model_cache_hit, resident = prepare_transformers_pipeline(
+        runtime,
         model_path,
+        "transformers_asr",
         "automatic-speech-recognition",
         parameters,
     )
-    synchronize_torch_device(torch, device)
-    model_load_seconds = max(0.0, time.perf_counter() - model_load_started)
-    source = (
-        inputs.get("input_audio")
-        or inputs.get("source_audio")
-        or inputs.get("audio")
-        or inputs.get("source")
-        or inputs.get("input")
-        or parameters.get("input_audio")
-    )
-    source_path = local_input_path(source, "input audio")
+    try:
+        return execute_prepared_asr(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            task,
+            parameters,
+            inputs,
+            output_dir,
+            identifier,
+            parameter_guard,
+        )
+    finally:
+        if not resident:
+            cleanup_transformers_audio_entry(entry)
+
+
+def execute_prepared_asr(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    task,
+    parameters,
+    inputs,
+    output_dir,
+    identifier,
+    parameter_guard,
+):
+    pipeline = entry.pipeline
+    torch = entry.torch
+    device = entry.device
+    dtype = entry.dtype
+    source_path = local_audio_source(inputs, parameters)
+    decoded_audio = decoded_audio_for_pipeline(pipeline, source_path)
+    warnings = []
     kwargs = {}
-    return_timestamps = parameters.get("word_timestamps")
-    timestamp_paths = []
-    if return_timestamps:
-        kwargs["return_timestamps"] = "word"
-        timestamp_paths.append("stt.word_timestamps")
-        if parameters.get("segment_timestamps"):
-            parameter_guard.reject_overridden(
-                "stt.segment_timestamps",
-                "stt.word_timestamps",
+    return_timestamps, timestamp_paths = asr_timestamp_value(
+        pipeline,
+        parameters,
+        parameter_guard,
+        warnings,
+    )
+    if return_timestamps is not None:
+        kwargs["return_timestamps"] = return_timestamps
+    requested_operation = normalized_name(
+        parameters.get("operation")
+        or parameters.get("mode")
+        or parameters.get("transcription_task")
+        or "transcribe"
+    )
+    if task == "speech_translation":
+        if requested_operation not in {"", "translate", "transcribe"}:
+            fail("invalid_parameter", f"unsupported ASR operation '{requested_operation}'")
+        if (
+            requested_operation == "transcribe"
+            and "stt.operation" in parameter_guard.explicit
+        ):
+            parameter_guard.reject(
+                "stt.operation",
+                "speech-translation requires operation=translate",
             )
-    elif parameters.get("segment_timestamps"):
-        kwargs["return_timestamps"] = True
-        timestamp_paths.append("stt.segment_timestamps")
+        requested_operation = "translate"
+    if requested_operation not in {"transcribe", "translate"}:
+        fail("invalid_parameter", f"unsupported ASR operation '{requested_operation}'")
+    if requested_operation == "translate" and not asr_supports_translation(pipeline):
+        if task == "speech_translation":
+            fail(
+                "unsupported_task",
+                "the selected ASR architecture does not advertise speech translation",
+            )
+        parameter_guard.reject(
+            "stt.operation",
+            "the selected ASR architecture does not advertise translation",
+        )
+        requested_operation = "transcribe"
+    generative = asr_supports_generation(pipeline)
     generate_kwargs = {
         key: value
         for key, value in {
-            "language": parameters.get("language"),
-            "task": (
-                parameters.get("operation")
-                or parameters.get("mode")
-                or parameters.get("transcription_task")
-            ),
-            "temperature": parameters.get("temperature"),
-            "num_beams": parameters.get("beam_size"),
+            "language": parameters.get("language") if generative else None,
+            "task": requested_operation if generative else None,
+            "temperature": parameters.get("temperature") if generative else None,
+            "num_beams": parameters.get("beam_size") if generative else None,
         }.items()
         if value is not None
     }
+    if not generative:
+        for path, value in (
+            ("stt.language", parameters.get("language")),
+            ("stt.temperature", parameters.get("temperature")),
+            ("stt.beam_size", parameters.get("beam_size")),
+        ):
+            if value is not None:
+                parameter_guard.reject(
+                    path,
+                    "the selected CTC/forward-only ASR architecture has no generation controls",
+                )
     generate_paths = []
-    if parameters.get("language") is not None:
+    if generative and parameters.get("language") is not None:
         generate_paths.append("stt.language")
-    if parameters.get("operation") is not None:
+    if generative and requested_operation is not None:
         generate_paths.append("stt.operation")
-    if parameters.get("temperature") is not None:
+    if generative and parameters.get("temperature") is not None:
         generate_paths.append("stt.temperature")
-    if parameters.get("beam_size") is not None:
+    if generative and parameters.get("beam_size") is not None:
         generate_paths.append("stt.beam_size")
     initial_prompt = parameters.get("initial_prompt") or parameters.get("prompt")
     if initial_prompt:
@@ -3367,8 +5082,11 @@ def execute_asr(
     synchronize_torch_device(torch, device)
     inference_started = time.perf_counter()
     try:
-        result = pipeline(str(source_path), **kwargs)
+        with torch.inference_mode():
+            result = pipeline(decoded_audio, **kwargs)
     except Exception as error:
+        pipeline = None
+        evict_failed_transformers_entry(runtime, cache_key)
         fail("execution_failed", "Transformers speech-to-text pipeline failed", str(error))
     synchronize_torch_device(torch, device)
     inference_seconds = max(0.0, time.perf_counter() - inference_started)
@@ -3385,13 +5103,625 @@ def execute_asr(
         parameters,
     )
     encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
-    return outputs, [], {
+    translated_parameters = []
+    if "return_timestamps" in kwargs:
+        translated_parameters.append("stt.timestamps->return_timestamps")
+    if "generate_kwargs" in kwargs:
+        translated_parameters.extend(
+            f"stt.{key}->generate_kwargs.{target}"
+            for key, target in (
+                ("language", "language"),
+                ("operation", "task"),
+                ("temperature", "temperature"),
+                ("beam_size", "num_beams"),
+                ("initial_prompt", "prompt_ids"),
+            )
+            if target in kwargs["generate_kwargs"]
+        )
+    return outputs, warnings, {
         "runtime": "transformers",
         "pipeline_task": "automatic-speech-recognition",
+        "pipeline_class": type(pipeline).__name__,
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "text": text,
-        "model_load_seconds": model_load_seconds,
+        "translated_parameters": sorted(translated_parameters),
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
+        "offload_mode": "none",
+        "offload_request": "none",
+    }
+
+
+def requested_text_output_format(parameters, parameter_guard=None):
+    format_name = normalized_name(parameters.get("output_format") or "json")
+    format_name = {"txt": "text"}.get(format_name, format_name)
+    if format_name in {"wav", "flac", "mp3", "ogg"} and (
+        parameter_guard is None
+        or "audio.output_format" not in parameter_guard.explicit
+    ):
+        # Audio schema defaults can be inherited while a text-producing task
+        # uses its own deterministic JSON default.
+        return "json"
+    if format_name not in {"json", "text"}:
+        fail(
+            "unsupported_parameter",
+            f"unsupported structured audio-analysis output format '{format_name}'",
+        )
+    return format_name
+
+
+def save_structured_audio_text(
+    value,
+    text,
+    output_dir,
+    task,
+    identifier,
+    format_name,
+):
+    if format_name == "json":
+        path = output_dir / f"{task}-{identifier}.json"
+        atomic_json_write(path, value)
+        return [output_record(path, "application/json")]
+    path = output_dir / f"{task}-{identifier}.txt"
+    path.write_text(f"{str(text).rstrip()}\n", encoding="utf-8")
+    return [output_record(path, "text/plain")]
+
+
+def normalized_classification_results(result):
+    if isinstance(result, dict):
+        result = [result]
+    if not isinstance(result, list):
+        fail("backend_error", "audio classification returned an unsupported result shape")
+    labels = []
+    for item in result:
+        if not isinstance(item, dict) or "label" not in item or "score" not in item:
+            fail("backend_error", "audio classification result lacks label/score values")
+        try:
+            score = float(item["score"])
+        except (TypeError, ValueError):
+            fail("backend_error", "audio classification returned an invalid score")
+        if not math.isfinite(score):
+            fail("backend_error", "audio classification returned a non-finite score")
+        labels.append({"label": str(item["label"]), "score": score})
+    labels.sort(key=lambda item: (-item["score"], item["label"]))
+    return labels
+
+
+def execute_audio_classification(
+    model_path,
+    task,
+    parameters,
+    inputs,
+    output_dir,
+    identifier,
+    parameter_guard,
+    runtime=None,
+):
+    entry, cache_key, model_cache_hit, resident = prepare_transformers_pipeline(
+        runtime,
+        model_path,
+        "transformers_audio_classification",
+        "audio-classification",
+        parameters,
+    )
+    try:
+        return execute_prepared_audio_classification(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            task,
+            parameters,
+            inputs,
+            output_dir,
+            identifier,
+            parameter_guard,
+        )
+    finally:
+        if not resident:
+            cleanup_transformers_audio_entry(entry)
+
+
+def execute_prepared_audio_classification(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    task,
+    parameters,
+    inputs,
+    output_dir,
+    identifier,
+    parameter_guard,
+):
+    format_name = requested_text_output_format(parameters, parameter_guard)
+    top_k = parameters.get("top_k")
+    if top_k is not None:
+        top_k = positive_int(parameters, "top_k", 1)
+    pipeline = entry.pipeline
+    torch = entry.torch
+    device = entry.device
+    dtype = entry.dtype
+    source_path = local_audio_source(inputs, parameters)
+    decoded_audio = decoded_audio_for_pipeline(pipeline, source_path)
+    kwargs = {}
+    if top_k is not None:
+        kwargs["top_k"] = top_k
+    synchronize_torch_device(torch, device)
+    inference_started = time.perf_counter()
+    try:
+        with torch.inference_mode():
+            result = pipeline(decoded_audio, **kwargs)
+    except Exception as error:
+        pipeline = None
+        evict_failed_transformers_entry(runtime, cache_key)
+        fail(
+            "execution_failed",
+            f"Transformers audio-classification pipeline failed for '{task}'",
+            str(error),
+        )
+    synchronize_torch_device(torch, device)
+    inference_seconds = max(0.0, time.perf_counter() - inference_started)
+    encoding_started = time.perf_counter()
+    labels = normalized_classification_results(result)
+    text = "\n".join(
+        f"{item['label']}\t{item['score']:.9g}" for item in labels
+    )
+    outputs = save_structured_audio_text(
+        {"labels": labels},
+        text,
+        output_dir,
+        task,
+        identifier,
+        format_name,
+    )
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
+    return outputs, [], {
+        "runtime": "transformers",
+        "pipeline_task": "audio-classification",
+        "pipeline_class": type(pipeline).__name__,
+        "device": device,
+        "dtype": str(dtype).replace("torch.", ""),
+        "text": text,
+        "translated_parameters": ["audio.top_k->top_k"] if "top_k" in kwargs else [],
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
+        "offload_mode": "none",
+        "offload_request": "none",
+    }
+
+
+def generated_audio_text(result):
+    values = result if isinstance(result, list) else [result]
+    texts = []
+    for item in values:
+        value = object_value(item, "generated_text")
+        if isinstance(value, list) and value:
+            last = value[-1]
+            value = last.get("content") if isinstance(last, dict) else last
+        if value is not None:
+            texts.append(str(value))
+    if not texts:
+        fail("backend_error", "audio text pipeline returned no generated text")
+    return "\n".join(texts).strip()
+
+
+def execute_audio_text(
+    model_path,
+    task,
+    parameters,
+    inputs,
+    output_dir,
+    identifier,
+    parameter_guard,
+    runtime=None,
+):
+    entry, cache_key, model_cache_hit, resident = prepare_transformers_pipeline(
+        runtime,
+        model_path,
+        "transformers_audio_text",
+        "any-to-any",
+        parameters,
+    )
+    try:
+        return execute_prepared_audio_text(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            task,
+            parameters,
+            inputs,
+            output_dir,
+            identifier,
+            parameter_guard,
+        )
+    finally:
+        if not resident:
+            cleanup_transformers_audio_entry(entry)
+
+
+def execute_prepared_audio_text(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    task,
+    parameters,
+    inputs,
+    output_dir,
+    identifier,
+    parameter_guard,
+):
+    format_name = requested_text_output_format(parameters, parameter_guard)
+    pipeline = entry.pipeline
+    torch = entry.torch
+    device = entry.device
+    dtype = entry.dtype
+    source_path = local_audio_source(inputs, parameters)
+    decoded_audio = decoded_audio_for_pipeline(pipeline, source_path)
+    prompt = parameters.get("prompt") or parameters.get("description")
+    if task == "audio_captioning" and not str(prompt or "").strip():
+        prompt = "Describe this audio."
+    prompt = required_string(prompt, "effective_parameters.prompt/description")
+    max_new_tokens = parameters.get("max_new_tokens")
+    if max_new_tokens is not None:
+        max_new_tokens = positive_int(parameters, "max_new_tokens", 1)
+    temperature = parameters.get("temperature")
+    if temperature is not None:
+        temperature = positive_float(parameters, "temperature", 0.0)
+    top_k = parameters.get("top_k")
+    if top_k is not None:
+        top_k = positive_int(parameters, "top_k", 0, minimum=0)
+    top_p = parameters.get("top_p")
+    if top_p is not None:
+        top_p = positive_float(parameters, "top_p", 1.0)
+        if top_p > 1.0:
+            fail("invalid_parameter", "top_p must not exceed 1")
+    sampling_requested = any(
+        value is not None for value in (temperature, top_k, top_p)
+    )
+    generate_kwargs = {
+        key: value
+        for key, value in {
+            "temperature": temperature if temperature not in {None, 0.0} else None,
+            "top_k": top_k,
+            "top_p": top_p,
+            "do_sample": False if temperature == 0.0 else (
+                True if sampling_requested else None
+            ),
+        }.items()
+        if value is not None
+    }
+    kwargs = {"return_full_text": False}
+    if max_new_tokens is not None:
+        kwargs["max_new_tokens"] = max_new_tokens
+    if generate_kwargs:
+        kwargs["generate_kwargs"] = generate_kwargs
+    synchronize_torch_device(torch, device)
+    inference_started = time.perf_counter()
+    try:
+        with torch.inference_mode():
+            result = pipeline(prompt, audio=decoded_audio["raw"], **kwargs)
+    except Exception as error:
+        pipeline = None
+        evict_failed_transformers_entry(runtime, cache_key)
+        fail(
+            "execution_failed",
+            f"Transformers any-to-any audio pipeline failed for '{task}'",
+            str(error),
+        )
+    synchronize_torch_device(torch, device)
+    inference_seconds = max(0.0, time.perf_counter() - inference_started)
+    encoding_started = time.perf_counter()
+    text = generated_audio_text(result)
+    outputs = save_structured_audio_text(
+        {"text": text},
+        text,
+        output_dir,
+        task,
+        identifier,
+        format_name,
+    )
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
+    return outputs, [], {
+        "runtime": "transformers",
+        "pipeline_task": "any-to-any",
+        "pipeline_class": type(pipeline).__name__,
+        "device": device,
+        "dtype": str(dtype).replace("torch.", ""),
+        "text": text,
+        "translated_parameters": sorted(
+            (
+                ["audio.max_new_tokens->max_new_tokens"]
+                if max_new_tokens is not None
+                else []
+            )
+            + [
+                f"audio.{key}->generate_kwargs.{key}"
+                for key in generate_kwargs
+            ]
+        ),
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
+        "inference_seconds": inference_seconds,
+        "encoding_seconds": encoding_seconds,
+        "offload_mode": "none",
+        "offload_request": "none",
+    }
+
+
+def load_transformers_audio_embedder(
+    model_path,
+    parameters,
+    runtime_values=None,
+):
+    if runtime_values is None:
+        torch, device, dtype = torch_runtime(parameters)
+    else:
+        torch, device, dtype = runtime_values
+    transformers = require_module("transformers", purpose="audio embedding")
+    processor = None
+    processor_errors = []
+    for class_name in ("AutoProcessor", "AutoFeatureExtractor"):
+        factory = getattr(transformers, class_name, None)
+        if factory is None:
+            continue
+        try:
+            processor = factory.from_pretrained(
+                str(model_path),
+                local_files_only=True,
+                trust_remote_code=False,
+            )
+            break
+        except Exception as error:
+            processor_errors.append(f"{class_name}: {error}")
+    if processor is None:
+        fail(
+            "model_load_failed",
+            "failed to load a local audio processor/feature extractor",
+            processor_errors,
+        )
+    auto_model = getattr(transformers, "AutoModel", None)
+    if auto_model is None:
+        fail("missing_dependency", "installed transformers has no AutoModel registry")
+    model_kwargs = {
+        "local_files_only": True,
+        "trust_remote_code": False,
+    }
+    if device != "cpu":
+        model_kwargs["dtype"] = dtype
+    try:
+        model = auto_model.from_pretrained(str(model_path), **model_kwargs)
+        if hasattr(model, "eval"):
+            model.eval()
+        if hasattr(model, "to"):
+            model.to(device)
+    except Exception as error:
+        fail("model_load_failed", "failed to load local audio embedding model", str(error))
+    return processor, model, torch, device, dtype
+
+
+def prepare_transformers_audio_embedder(runtime, model_path, parameters):
+    adapter = "transformers_audio_embedding"
+    pipeline_task = "audio-embedding"
+
+    def loader(runtime_values):
+        processor, model, torch, device, dtype = (
+            load_transformers_audio_embedder(
+                model_path,
+                parameters,
+                runtime_values=runtime_values,
+            )
+        )
+        return TransformersAudioEntry(
+            torch,
+            device,
+            dtype,
+            0.0,
+            adapter=adapter,
+            pipeline_task=pipeline_task,
+            processor=processor,
+            model=model,
+        )
+
+    return prepare_transformers_audio_entry(
+        runtime,
+        model_path,
+        adapter,
+        pipeline_task,
+        parameters,
+        loader,
+    )
+
+
+def process_audio_waveform(processor, waveform, sample_rate):
+    """Call a registered processor without confusing audio for another modality."""
+    call_kwargs = {
+        "sampling_rate": sample_rate,
+        "return_tensors": "pt",
+    }
+    try:
+        parameters = inspect.signature(processor.__call__).parameters
+    except Exception:
+        parameters = {}
+    for keyword in ("audio", "audios", "raw_speech", "raw_audio", "waveform"):
+        if keyword in parameters:
+            call_kwargs[keyword] = waveform
+            return processor(**call_kwargs)
+    return processor(waveform, **call_kwargs)
+
+
+def embedding_vector(value, inputs, normalize):
+    torch = require_module("torch", purpose="audio embedding")
+    if value is None:
+        fail("backend_error", "audio embedding model returned no hidden representation")
+    if not hasattr(value, "ndim"):
+        value = torch.as_tensor(value)
+    if value.ndim >= 3:
+        attention_mask = inputs.get("attention_mask") if isinstance(inputs, dict) else None
+        if (
+            attention_mask is not None
+            and value.ndim == 3
+            and attention_mask.ndim == 2
+            and attention_mask.shape[1] == value.shape[1]
+        ):
+            mask = attention_mask.to(value.device, dtype=value.dtype).unsqueeze(-1)
+            value = (value * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            while value.ndim > 2:
+                value = value.mean(dim=1)
+    if value.ndim == 2:
+        if value.shape[0] != 1:
+            fail("backend_error", "audio embedding model returned an unexpected batch size")
+        value = value[0]
+    value = value.reshape(-1)
+    if normalize:
+        norm = value.float().norm(p=2)
+        norm_value = norm.item() if hasattr(norm, "item") else float(norm)
+        if float(norm_value) > 0:
+            value = value / norm.to(value.dtype)
+    array = numpy_audio(value).astype("float32", copy=False)
+    if array.size == 0 or not bool(require_module("numpy").isfinite(array).all()):
+        fail("backend_error", "audio embedding contains no finite values")
+    return [float(item) for item in array.tolist()]
+
+
+def execute_audio_embedding(
+    model_path,
+    task,
+    parameters,
+    inputs,
+    output_dir,
+    identifier,
+    parameter_guard,
+    runtime=None,
+):
+    format_name = requested_text_output_format(parameters, parameter_guard)
+    pooling = normalized_name(parameters.get("pooling") or "mean")
+    if pooling != "mean":
+        parameter_guard.reject(
+            "audio.pooling",
+            "the generic audio embedding adapter supports only mean pooling",
+        )
+    entry, cache_key, model_cache_hit, resident = (
+        prepare_transformers_audio_embedder(
+            runtime,
+            model_path,
+            parameters,
+        )
+    )
+    try:
+        return execute_prepared_audio_embedding(
+            entry,
+            cache_key,
+            model_cache_hit,
+            runtime,
+            task,
+            parameters,
+            inputs,
+            output_dir,
+            identifier,
+            format_name,
+        )
+    finally:
+        if not resident:
+            cleanup_transformers_audio_entry(entry)
+
+
+def execute_prepared_audio_embedding(
+    entry,
+    cache_key,
+    model_cache_hit,
+    runtime,
+    task,
+    parameters,
+    inputs,
+    output_dir,
+    identifier,
+    format_name,
+):
+    processor = entry.processor
+    model = entry.model
+    torch = entry.torch
+    device = entry.device
+    dtype = entry.dtype
+    holder = type("AudioEmbeddingPipeline", (), {"processor": processor, "model": model})()
+    source_path = local_audio_source(inputs, parameters)
+    decoded_audio = decoded_audio_for_pipeline(holder, source_path)
+    try:
+        model_inputs = process_audio_waveform(
+            processor,
+            decoded_audio["raw"],
+            decoded_audio["sampling_rate"],
+        )
+    except Exception as error:
+        fail("invalid_input", "audio processor rejected the decoded waveform", str(error))
+    if not isinstance(model_inputs, dict):
+        model_inputs = dict(model_inputs)
+    model_inputs = {
+        key: value.to(device) if hasattr(value, "to") else value
+        for key, value in model_inputs.items()
+    }
+    synchronize_torch_device(torch, device)
+    inference_started = time.perf_counter()
+    try:
+        with torch.inference_mode():
+            get_audio_features = getattr(model, "get_audio_features", None)
+            if callable(get_audio_features):
+                representation = get_audio_features(**model_inputs)
+            else:
+                result = model(**model_inputs)
+                representation = object_value(result, "audio_embeds")
+                if representation is None:
+                    representation = object_value(result, "embeddings")
+                if representation is None:
+                    representation = object_value(result, "last_hidden_state")
+                if representation is None:
+                    hidden_states = object_value(result, "hidden_states")
+                    if isinstance(hidden_states, (list, tuple)) and hidden_states:
+                        representation = hidden_states[-1]
+    except Exception as error:
+        model = None
+        evict_failed_transformers_entry(runtime, cache_key)
+        fail("execution_failed", "Transformers audio embedding model failed", str(error))
+    synchronize_torch_device(torch, device)
+    inference_seconds = max(0.0, time.perf_counter() - inference_started)
+    encoding_started = time.perf_counter()
+    normalize = bool(parameters.get("normalize", True))
+    vector = embedding_vector(representation, model_inputs, normalize)
+    output_value = {"embedding": vector, "dimensions": len(vector)}
+    outputs = save_structured_audio_text(
+        output_value,
+        " ".join(f"{value:.9g}" for value in vector),
+        output_dir,
+        task,
+        identifier,
+        format_name,
+    )
+    outputs[0]["metadata"] = {
+        "dimensions": len(vector),
+        "normalized": normalize,
+    }
+    encoding_seconds = max(0.0, time.perf_counter() - encoding_started)
+    return outputs, [], {
+        "runtime": "transformers",
+        "pipeline_task": "audio-embedding",
+        "pipeline_class": type(model).__name__,
+        "device": device,
+        "dtype": str(dtype).replace("torch.", ""),
+        "embedding_dimensions": len(vector),
+        "translated_parameters": [
+            "audio.normalize->l2_normalize",
+            "audio.pooling->mean_pooling",
+        ],
+        "model_load_seconds": 0.0 if model_cache_hit else entry.model_load_seconds,
+        "model_cache_hit": model_cache_hit,
         "inference_seconds": inference_seconds,
         "encoding_seconds": encoding_seconds,
         "offload_mode": "none",
@@ -3431,6 +5761,24 @@ def atomic_json_write(path, value):
                 temporary.unlink()
         except Exception:
             pass
+
+
+def metadata_effective_parameters(parameters, adapter):
+    values = dict(parameters)
+    if adapter == QWEN3_TTS_ADAPTER:
+        # Generated speech and natural-language voice instructions can contain
+        # user-sensitive content.  Keep only parameter names/translation
+        # metadata, never their text, in persisted Qwen execution metadata.
+        for key in (
+            "text",
+            "prompt",
+            "tts.speaking_style",
+            "speaking_style",
+            "tts.instruct",
+            "instruct",
+        ):
+            values.pop(key, None)
+    return values
 
 
 def command_execute(payload, runtime=None):
@@ -3474,12 +5822,14 @@ def command_execute(payload, runtime=None):
         )
     elif adapter == "diffusers_audio":
         outputs, warnings, backend_metadata = execute_diffusers_audio(
+            payload,
             model_path,
             task,
             parameters,
             output_dir,
             identifier,
             parameter_guard,
+            runtime=runtime,
         )
     elif adapter == "transformers_audio":
         outputs, warnings, backend_metadata = execute_audio_generation(
@@ -3489,6 +5839,7 @@ def command_execute(payload, runtime=None):
             output_dir,
             identifier,
             parameter_guard,
+            runtime=runtime,
         )
     elif adapter == "transformers_tts":
         outputs, warnings, backend_metadata = execute_tts(
@@ -3497,6 +5848,16 @@ def command_execute(payload, runtime=None):
             parameters,
             output_dir,
             identifier,
+            runtime=runtime,
+        )
+    elif adapter == QWEN3_TTS_ADAPTER:
+        outputs, warnings, backend_metadata = execute_qwen3_tts_voice_design(
+            model_path,
+            task,
+            parameters,
+            output_dir,
+            identifier,
+            runtime=runtime,
         )
     elif adapter == "transformers_asr":
         outputs, warnings, backend_metadata = execute_asr(
@@ -3507,6 +5868,40 @@ def command_execute(payload, runtime=None):
             output_dir,
             identifier,
             parameter_guard,
+            runtime=runtime,
+        )
+    elif adapter == "transformers_audio_classification":
+        outputs, warnings, backend_metadata = execute_audio_classification(
+            model_path,
+            task,
+            parameters,
+            inputs,
+            output_dir,
+            identifier,
+            parameter_guard,
+            runtime=runtime,
+        )
+    elif adapter == "transformers_audio_text":
+        outputs, warnings, backend_metadata = execute_audio_text(
+            model_path,
+            task,
+            parameters,
+            inputs,
+            output_dir,
+            identifier,
+            parameter_guard,
+            runtime=runtime,
+        )
+    elif adapter == "transformers_audio_embedding":
+        outputs, warnings, backend_metadata = execute_audio_embedding(
+            model_path,
+            task,
+            parameters,
+            inputs,
+            output_dir,
+            identifier,
+            parameter_guard,
+            runtime=runtime,
         )
     else:
         fail("internal_error", f"unknown execution adapter '{adapter}'")
@@ -3521,7 +5916,7 @@ def command_execute(payload, runtime=None):
         "model_path": str(model_path),
         "runtime": "werk-media-companion",
         "backend": backend_metadata,
-        "effective_parameters": parameters,
+        "effective_parameters": metadata_effective_parameters(parameters, adapter),
         "outputs": outputs,
         "warnings": warnings,
         "created_unix": int(created_unix),

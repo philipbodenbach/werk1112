@@ -4,6 +4,7 @@ mod external;
 mod llama_fast;
 mod llama_server;
 mod onnxruntime;
+mod qwen_tts;
 mod vllm;
 
 use anyhow::Result;
@@ -25,6 +26,11 @@ pub use llama_server::{
 pub use onnxruntime::{
     OnnxProvisionOptions, OnnxRuntimeAvailability, OnnxRuntimeBackend, OnnxRuntimeMode,
     install_managed_onnx_runtime, managed_runner_path,
+};
+pub use qwen_tts::{
+    QwenTtsDiscovery, QwenTtsDiscoveryAttempt, QwenTtsPythonStatus, discover_qwen_tts,
+    install_managed_qwen_tts, managed_qwen_tts_dir, managed_qwen_tts_python,
+    qwen_tts_python_status, require_qwen_tts_python,
 };
 pub use vllm::{
     VllmBackend, VllmDiscovery, install_managed_vllm, managed_vllm_dir, vllm_doctor_checks,
@@ -206,7 +212,7 @@ const TEXT_EMBEDDING_STREAMING: RuntimeCapabilities = RuntimeCapabilities {
 const MEDIA_CAPABILITIES: RuntimeCapabilities = RuntimeCapabilities {
     text_generation: false,
     vision_language: false,
-    embeddings: false,
+    embeddings: true,
     streaming: false,
 };
 
@@ -263,6 +269,16 @@ const MEDIA_TASKS: &[InferenceTask] = &[
     InferenceTask::MusicGeneration,
     InferenceTask::TextToSpeech,
     InferenceTask::SpeechToText,
+    InferenceTask::SpeechTranslation,
+    InferenceTask::AudioEventDetection,
+    InferenceTask::VoiceActivityDetection,
+    InferenceTask::SpeakerIdentification,
+    InferenceTask::LanguageIdentification,
+    InferenceTask::SpeechEmotionRecognition,
+    InferenceTask::AudioClassification,
+    InferenceTask::AudioCaptioning,
+    InferenceTask::AudioUnderstanding,
+    InferenceTask::AudioEmbedding,
 ];
 
 const GGUF_LAYOUTS: &[RepositoryLayout] = &[
@@ -343,6 +359,9 @@ const MEDIA_PARAMETER_SUPPORT: &[ParameterSupportRule] = &[
     ParameterSupportRule::exact("tts.voice", ParameterSupportStatus::Unsupported),
     ParameterSupportRule::exact("tts.speed", ParameterSupportStatus::Unsupported),
     ParameterSupportRule::exact("tts.pitch", ParameterSupportStatus::Unsupported),
+    ParameterSupportRule::exact("tts.language", ParameterSupportStatus::Translated),
+    ParameterSupportRule::exact("tts.speaking_style", ParameterSupportStatus::Translated),
+    ParameterSupportRule::exact("tts.seed", ParameterSupportStatus::Translated),
     ParameterSupportRule::exact("tts.sample_rate", ParameterSupportStatus::Unsupported),
     ParameterSupportRule::exact("tts.streaming", ParameterSupportStatus::Unsupported),
     ParameterSupportRule::exact("tts.output_format", ParameterSupportStatus::Native),
@@ -1078,6 +1097,7 @@ mod tests {
         assert_eq!(companions.len(), 4);
         for descriptor in companions {
             assert!(descriptor.implemented);
+            assert!(descriptor.capabilities.embeddings);
             assert!(descriptor.supports_offloading);
             assert!(!descriptor.supports_quantization);
             assert!(!descriptor.supports_compile);
@@ -1121,6 +1141,17 @@ mod tests {
         );
         assert_eq!(
             descriptor.parameter_support_status("image.output_format"),
+            ParameterSupportStatus::Native
+        );
+        for path in ["tts.language", "tts.speaking_style", "tts.seed"] {
+            assert_eq!(
+                descriptor.parameter_support_status(path),
+                ParameterSupportStatus::Translated,
+                "unexpected support status for {path}"
+            );
+        }
+        assert_eq!(
+            descriptor.parameter_support_status("tts.output_format"),
             ParameterSupportStatus::Native
         );
         assert_eq!(

@@ -44,10 +44,10 @@ use crate::{
         backend_supports_accelerator, backend_supports_format,
         backend_supports_images as runtime_supports_images, candle_gguf_tokenizer_rejection,
         install_managed_llama_server, install_managed_llama_server_with_options,
-        install_managed_onnx_runtime, install_managed_vllm, llama_server_help_ok,
-        managed_backend_dir, managed_runner_path as managed_onnx_runner_path, managed_vllm_dir,
-        probe_device, runtime_descriptor, runtime_registry, runtime_supports_model,
-        vllm_doctor_checks,
+        install_managed_onnx_runtime, install_managed_qwen_tts, install_managed_vllm,
+        llama_server_help_ok, managed_backend_dir, managed_runner_path as managed_onnx_runner_path,
+        managed_vllm_dir, probe_device, runtime_descriptor, runtime_registry,
+        runtime_supports_model, vllm_doctor_checks,
     },
     banner::print_banner,
     capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
@@ -58,8 +58,10 @@ use crate::{
     },
     inference_service::{InferenceResult, InferenceService, OutputStore, RuntimeAttemptTiming},
     media_cli::{
-        AudioCommands, ImageCommands, RoutingArgs, VideoCommands, collect_raw_overrides,
-        parse_set_overrides,
+        AudioAnalyzeCommands, AudioCommands, AudioDetectCommands, AudioGenerateCommands,
+        AudioGenerationOptions, AudioInputTaskArgs, AudioSeparateArgs, AudioSpeakArgs,
+        AudioTranscribeArgs, AudioTransformCommands, AudioVoiceTransformArgs, ImageCommands,
+        RoutingArgs, SpeechToTextTask, VideoCommands, collect_raw_overrides, parse_set_overrides,
     },
     media_companion::CompanionClient,
     model_store::{
@@ -368,6 +370,8 @@ pub enum BackendInstallArg {
     OnnxCpu,
     #[value(name = "vllm")]
     Vllm,
+    #[value(name = "qwen-tts")]
+    QwenTts,
 }
 
 impl BackendInstallArg {
@@ -378,7 +382,7 @@ impl BackendInstallArg {
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaMetal => Some(LlamaCppMode::Metal),
             Self::LlamaCpu => Some(LlamaCppMode::Cpu),
-            Self::OnnxCuda | Self::OnnxRocm | Self::OnnxCpu | Self::Vllm => None,
+            Self::OnnxCuda | Self::OnnxRocm | Self::OnnxCpu | Self::Vllm | Self::QwenTts => None,
         }
     }
 
@@ -582,7 +586,7 @@ pub enum Commands {
         command: VideoCommands,
     },
 
-    #[command(about = "Generate audio, synthesize speech, transcribe, or separate stems")]
+    #[command(about = "Generate, understand, analyze, and transform audio")]
     Audio {
         #[command(subcommand)]
         command: AudioCommands,
@@ -834,20 +838,20 @@ pub enum DoctorCommands {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackendCommands {
-    #[command(about = "Install a managed llama.cpp server backend")]
+    #[command(about = "Install a managed runtime backend")]
     Install {
         #[arg(
             value_enum,
             value_name = "BACKEND",
-            help = "Backend to install, for example llama-cuda, onnx-cuda, or onnx-cpu"
+            help = "Backend to install, for example llama-cuda, onnx-cuda, vllm, or qwen-tts"
         )]
         target: BackendInstallArg,
     },
 
-    #[command(about = "List discovered llama-server backends")]
+    #[command(about = "List discovered runtime backends")]
     List,
 
-    #[command(about = "Check tools required for managed backend builds")]
+    #[command(about = "Check runtime discovery and managed backend prerequisites")]
     Doctor {
         #[arg(
             long,
@@ -1378,6 +1382,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     } else if target == BackendInstallArg::Vllm {
                         let python = install_managed_vllm(&store)?;
                         println!("Installed vLLM backend: {}", python.display());
+                    } else if target == BackendInstallArg::QwenTts {
+                        let python = install_managed_qwen_tts(&store)?;
+                        println!("Installed Qwen-TTS backend: {}", python.display());
                     }
                     Ok(())
                 }
@@ -1834,152 +1841,407 @@ fn run_audio_command(
     command: AudioCommands,
 ) -> Result<()> {
     match command {
-        AudioCommands::Generate(mut args) => {
-            let task = store
-                .get(&args.model)
-                .map(|manifest| {
-                    if args.conditioning.source_audio.is_some()
-                        && (args.conditioning.continuation_start.is_some()
-                            || args.conditioning.continuation_duration.is_some())
-                        && manifest.supports_task(InferenceTask::SongContinuation)
-                    {
-                        InferenceTask::SongContinuation
-                    } else if args.conditioning.source_audio.is_some()
-                        && manifest.supports_task(InferenceTask::SongVariation)
-                    {
-                        InferenceTask::SongVariation
-                    } else if args.conditioning.source_audio.is_some()
-                        && manifest.supports_task(InferenceTask::SongContinuation)
-                    {
-                        InferenceTask::SongContinuation
-                    } else if manifest.supports_task(InferenceTask::MusicGeneration) {
-                        InferenceTask::MusicGeneration
-                    } else {
-                        InferenceTask::AudioGeneration
-                    }
-                })
-                .unwrap_or(InferenceTask::AudioGeneration);
-            let lyrics = resolve_optional_text(
-                args.lyrics.lyrics.as_deref(),
-                args.lyrics.lyrics_file.as_deref(),
-            )?;
-            let prompt = if lyrics.is_some() {
-                resolve_optional_text(
-                    args.prompt.prompt.as_deref(),
-                    args.prompt.prompt_file.as_deref(),
-                )?
-            } else {
-                resolve_primary_text(
-                    args.prompt.prompt.as_deref(),
-                    args.prompt.prompt_file.as_deref(),
-                    false,
-                    "prompt",
-                )?
-            };
-            args.lyrics.lyrics = lyrics.clone();
-            args.lyrics.lyrics_file = None;
-            let prompt = match (prompt, lyrics.as_deref()) {
-                (Some(prompt), _) => Some(prompt),
-                // The canonical lyrics value remains available as
-                // `audio.lyrics`. Reuse its text as the required generative
-                // prompt without decorating it; the companion can then merge
-                // prompt and lyrics idempotently.
-                (None, Some(lyrics)) => Some(lyrics.to_string()),
-                (None, None) if task.requires_prompt() => {
-                    resolve_primary_text(None, None, true, "prompt")?
-                }
-                (None, None) => None,
-            };
-            let negative_prompt = resolve_optional_text(
-                args.prompt.negative_prompt.as_deref(),
-                args.prompt.negative_prompt_file.as_deref(),
-            )?;
-            let mut inputs = Vec::new();
-            for (role, path) in [
-                ("input_audio", args.conditioning.source_audio.as_deref()),
-                (
-                    "reference_audio",
-                    args.conditioning.reference_audio.as_deref(),
-                ),
-                (
-                    "instrumental_audio",
-                    args.conditioning.instrumental_audio.as_deref(),
-                ),
-                ("vocal_audio", args.conditioning.vocal_audio.as_deref()),
-                ("melody_audio", args.conditioning.melody_audio.as_deref()),
-                ("rhythm_audio", args.conditioning.rhythm_audio.as_deref()),
-                ("chord_audio", args.conditioning.chord_audio.as_deref()),
-            ] {
-                if let Some(path) = path {
-                    inputs.push(path_input(InputModality::Audio, role, path));
-                }
+        AudioCommands::Generate(mut args) => match args.command.take() {
+            Some(AudioGenerateCommands::Speech(args)) => {
+                run_audio_speech(store, backend, device, args)
             }
-            execute_media_args(
+            Some(AudioGenerateCommands::Music(mut variant)) => {
+                let (prompt, negative_prompt, inputs) =
+                    prepare_audio_generation(&mut variant.options, InferenceTask::MusicGeneration)?;
+                execute_media_args(
+                    store,
+                    backend,
+                    device,
+                    &variant.model,
+                    InferenceTask::MusicGeneration,
+                    prompt,
+                    negative_prompt,
+                    inputs,
+                    &variant.options.routing,
+                    &variant,
+                )
+            }
+            Some(AudioGenerateCommands::Sound(mut variant)) => {
+                let (prompt, negative_prompt, inputs) =
+                    prepare_audio_generation(&mut variant.options, InferenceTask::AudioGeneration)?;
+                execute_media_args(
+                    store,
+                    backend,
+                    device,
+                    &variant.model,
+                    InferenceTask::AudioGeneration,
+                    prompt,
+                    negative_prompt,
+                    inputs,
+                    &variant.options.routing,
+                    &variant,
+                )
+            }
+            None => {
+                let model = args.model.clone().ok_or_else(|| {
+                    anyhow!(
+                        "audio generate requires speech, music, sound, or a legacy MODEL argument"
+                    )
+                })?;
+                let task = legacy_audio_generation_task(store, &model, &args.options);
+                let (prompt, negative_prompt, inputs) =
+                    prepare_audio_generation(&mut args.options, task)?;
+                execute_media_args(
+                    store,
+                    backend,
+                    device,
+                    &model,
+                    task,
+                    prompt,
+                    negative_prompt,
+                    inputs,
+                    &args.options.routing,
+                    &args,
+                )
+            }
+        },
+        AudioCommands::Speak(args) => run_audio_speech(store, backend, device, args),
+        AudioCommands::Transcribe(args) => {
+            run_audio_transcription(store, backend, device, args, false)
+        }
+        AudioCommands::Translate(args) => {
+            run_audio_transcription(store, backend, device, args, true)
+        }
+        AudioCommands::Detect(args) => match args.command {
+            AudioDetectCommands::Event(args) => run_audio_input_task(
                 store,
                 backend,
                 device,
-                &args.model,
-                task,
-                prompt,
-                negative_prompt,
-                inputs,
-                &args.routing,
-                &args,
-            )
-        }
-        AudioCommands::Speak(args) => {
-            let text = resolve_primary_text(
-                args.text.text.as_deref(),
-                args.text.text_file.as_deref(),
-                true,
-                "text",
-            )?;
-            execute_media_args(
+                args,
+                InferenceTask::AudioEventDetection,
+            ),
+            AudioDetectCommands::Voice(args) => run_audio_input_task(
                 store,
                 backend,
                 device,
-                &args.model,
-                InferenceTask::TextToSpeech,
-                text,
-                None,
-                Vec::new(),
-                &args.routing,
-                &args,
-            )
+                args,
+                InferenceTask::VoiceActivityDetection,
+            ),
+            AudioDetectCommands::Speaker(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::SpeakerIdentification,
+            ),
+            AudioDetectCommands::Language(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::LanguageIdentification,
+            ),
+            AudioDetectCommands::Emotion(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::SpeechEmotionRecognition,
+            ),
+        },
+        AudioCommands::Analyze(args) => match args.command {
+            AudioAnalyzeCommands::Caption(args) => {
+                run_audio_input_task(store, backend, device, args, InferenceTask::AudioCaptioning)
+            }
+            AudioAnalyzeCommands::Diarize(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::SpeakerDiarization,
+            ),
+            AudioAnalyzeCommands::Classify(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::AudioClassification,
+            ),
+            AudioAnalyzeCommands::Understand(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::AudioUnderstanding,
+            ),
+        },
+        AudioCommands::Transform(args) => match args.command {
+            AudioTransformCommands::Voice(args) => {
+                run_audio_voice_transform(store, backend, device, args)
+            }
+            AudioTransformCommands::Separate(args) => {
+                run_audio_separation(store, backend, device, args)
+            }
+            AudioTransformCommands::Enhance(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::AudioEnhancement,
+            ),
+            AudioTransformCommands::Edit(args) => {
+                run_audio_input_task(store, backend, device, args, InferenceTask::AudioEditing)
+            }
+        },
+        AudioCommands::Embed(args) => {
+            run_audio_input_task(store, backend, device, args, InferenceTask::AudioEmbedding)
         }
-        AudioCommands::Transcribe(args) => execute_media_args(
-            store,
-            backend,
-            device,
-            &args.model,
-            InferenceTask::SpeechToText,
-            None,
-            None,
-            vec![path_input(
-                InputModality::Audio,
-                "input_audio",
-                &args.input_audio,
-            )],
-            &args.routing,
-            &args,
-        ),
-        AudioCommands::Separate(args) => execute_media_args(
-            store,
-            backend,
-            device,
-            &args.model,
-            InferenceTask::StemSeparation,
-            None,
-            None,
-            vec![path_input(
-                InputModality::Audio,
-                "input_audio",
-                &args.input_audio,
-            )],
-            &args.routing,
-            &args,
-        ),
+        AudioCommands::Separate(args) => run_audio_separation(store, backend, device, args),
     }
+}
+
+fn legacy_audio_generation_task(
+    store: &ModelStore,
+    model: &str,
+    options: &AudioGenerationOptions,
+) -> InferenceTask {
+    store
+        .get(model)
+        .map(|manifest| {
+            if options.conditioning.source_audio.is_some()
+                && (options.conditioning.continuation_start.is_some()
+                    || options.conditioning.continuation_duration.is_some())
+                && manifest.supports_task(InferenceTask::SongContinuation)
+            {
+                InferenceTask::SongContinuation
+            } else if options.conditioning.source_audio.is_some()
+                && manifest.supports_task(InferenceTask::SongVariation)
+            {
+                InferenceTask::SongVariation
+            } else if options.conditioning.source_audio.is_some()
+                && manifest.supports_task(InferenceTask::SongContinuation)
+            {
+                InferenceTask::SongContinuation
+            } else if manifest.supports_task(InferenceTask::MusicGeneration) {
+                InferenceTask::MusicGeneration
+            } else {
+                InferenceTask::AudioGeneration
+            }
+        })
+        .unwrap_or(InferenceTask::AudioGeneration)
+}
+
+fn prepare_audio_generation(
+    options: &mut AudioGenerationOptions,
+    task: InferenceTask,
+) -> Result<(Option<String>, Option<String>, Vec<InferenceInput>)> {
+    let lyrics = resolve_optional_text(
+        options.lyrics.lyrics.as_deref(),
+        options.lyrics.lyrics_file.as_deref(),
+    )?;
+    let prompt = if lyrics.is_some() {
+        resolve_optional_text(
+            options.prompt.prompt.as_deref(),
+            options.prompt.prompt_file.as_deref(),
+        )?
+    } else {
+        resolve_primary_text(
+            options.prompt.prompt.as_deref(),
+            options.prompt.prompt_file.as_deref(),
+            false,
+            "prompt",
+        )?
+    };
+    options.lyrics.lyrics = lyrics.clone();
+    options.lyrics.lyrics_file = None;
+    let prompt = match (prompt, lyrics.as_deref()) {
+        (Some(prompt), _) => Some(prompt),
+        // Keep the canonical lyrics value as `audio.lyrics` while also using
+        // it as the required generative prompt when no prose prompt exists.
+        (None, Some(lyrics)) => Some(lyrics.to_string()),
+        (None, None) if task.requires_prompt() => resolve_primary_text(None, None, true, "prompt")?,
+        (None, None) => None,
+    };
+    let negative_prompt = resolve_optional_text(
+        options.prompt.negative_prompt.as_deref(),
+        options.prompt.negative_prompt_file.as_deref(),
+    )?;
+    let mut inputs = Vec::new();
+    for (role, path) in [
+        ("input_audio", options.conditioning.source_audio.as_deref()),
+        (
+            "reference_audio",
+            options.conditioning.reference_audio.as_deref(),
+        ),
+        (
+            "instrumental_audio",
+            options.conditioning.instrumental_audio.as_deref(),
+        ),
+        ("vocal_audio", options.conditioning.vocal_audio.as_deref()),
+        ("melody_audio", options.conditioning.melody_audio.as_deref()),
+        ("rhythm_audio", options.conditioning.rhythm_audio.as_deref()),
+        ("chord_audio", options.conditioning.chord_audio.as_deref()),
+    ] {
+        if let Some(path) = path {
+            inputs.push(path_input(InputModality::Audio, role, path));
+        }
+    }
+    Ok((prompt, negative_prompt, inputs))
+}
+
+fn run_audio_speech(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: AudioSpeakArgs,
+) -> Result<()> {
+    let text = resolve_primary_text(
+        args.text.text.as_deref(),
+        args.text.text_file.as_deref(),
+        true,
+        "text",
+    )?;
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        InferenceTask::TextToSpeech,
+        text,
+        None,
+        Vec::new(),
+        &args.routing,
+        &args,
+    )
+}
+
+fn run_audio_transcription(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    mut args: AudioTranscribeArgs,
+    translate: bool,
+) -> Result<()> {
+    let task = prepare_audio_transcription_task(&mut args, translate)?;
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        task,
+        None,
+        None,
+        vec![path_input(
+            InputModality::Audio,
+            "input_audio",
+            &args.input_audio,
+        )],
+        &args.routing,
+        &args,
+    )
+}
+
+fn prepare_audio_transcription_task(
+    args: &mut AudioTranscribeArgs,
+    translate: bool,
+) -> Result<InferenceTask> {
+    if translate {
+        if args.transcription.task == Some(SpeechToTextTask::Transcribe) {
+            bail!("audio translate conflicts with --task transcribe");
+        }
+        args.transcription.task = Some(SpeechToTextTask::Translate);
+        Ok(InferenceTask::SpeechTranslation)
+    } else if args.transcription.task == Some(SpeechToTextTask::Translate) {
+        Ok(InferenceTask::SpeechTranslation)
+    } else {
+        Ok(InferenceTask::SpeechToText)
+    }
+}
+
+fn run_audio_input_task(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: AudioInputTaskArgs,
+    task: InferenceTask,
+) -> Result<()> {
+    let prompt = resolve_primary_text(
+        args.prompt.prompt.as_deref(),
+        args.prompt.prompt_file.as_deref(),
+        task.requires_prompt(),
+        "prompt",
+    )?;
+    let negative_prompt = resolve_optional_text(
+        args.prompt.negative_prompt.as_deref(),
+        args.prompt.negative_prompt_file.as_deref(),
+    )?;
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        task,
+        prompt,
+        negative_prompt,
+        vec![path_input(
+            InputModality::Audio,
+            "input_audio",
+            &args.input_audio,
+        )],
+        &args.routing,
+        &args,
+    )
+}
+
+fn run_audio_voice_transform(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: AudioVoiceTransformArgs,
+) -> Result<()> {
+    let mut inputs = vec![path_input(
+        InputModality::Audio,
+        "input_audio",
+        &args.input_audio,
+    )];
+    if let Some(reference) = args.reference_audio.as_deref() {
+        inputs.push(path_input(
+            InputModality::Audio,
+            "reference_audio",
+            reference,
+        ));
+    }
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        InferenceTask::VoiceConversion,
+        None,
+        None,
+        inputs,
+        &args.routing,
+        &args,
+    )
+}
+
+fn run_audio_separation(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: AudioSeparateArgs,
+) -> Result<()> {
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        InferenceTask::StemSeparation,
+        None,
+        None,
+        vec![path_input(
+            InputModality::Audio,
+            "input_audio",
+            &args.input_audio,
+        )],
+        &args.routing,
+        &args,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2593,6 +2855,13 @@ const MEDIA_TRANSPORT_FIELDS: &[&str] = &[
     "mask",
     "video",
     "input_audio",
+    "source_audio",
+    "reference_audio",
+    "instrumental_audio",
+    "vocal_audio",
+    "melody_audio",
+    "rhythm_audio",
+    "chord_audio",
     "initial_image",
     "output",
     "output_path",
@@ -2790,7 +3059,7 @@ fn normalize_media_parameter_path(task: InferenceTask, path: &str) -> String {
             | InferenceTask::FrameInterpolation,
             "loop",
         ) => "looping",
-        (InferenceTask::SpeechToText, "task") => "operation",
+        (InferenceTask::SpeechToText | InferenceTask::SpeechTranslation, "task") => "operation",
         (
             InferenceTask::AudioGeneration
             | InferenceTask::MusicGeneration
@@ -2988,12 +3257,25 @@ fn estimate_inputs_for_task(task: InferenceTask) -> Vec<InferenceInput> {
             placeholder(InputModality::Video, "source_video"),
             placeholder(InputModality::Video, "mask_video"),
         ],
-        SongContinuation | SongVariation | SpeechToText | StemGeneration | StemSeparation
-        | AudioEnhancement => vec![placeholder(InputModality::Audio, "input_audio")],
-        VoiceConversion => vec![
-            placeholder(InputModality::Audio, "input_audio"),
-            placeholder(InputModality::Audio, "reference_audio"),
-        ],
+        SongContinuation
+        | SongVariation
+        | SpeechToText
+        | SpeechTranslation
+        | AudioEventDetection
+        | VoiceActivityDetection
+        | SpeakerIdentification
+        | LanguageIdentification
+        | SpeechEmotionRecognition
+        | AudioCaptioning
+        | SpeakerDiarization
+        | AudioClassification
+        | AudioUnderstanding
+        | AudioEmbedding
+        | StemGeneration
+        | StemSeparation
+        | AudioEnhancement
+        | AudioEditing => vec![placeholder(InputModality::Audio, "input_audio")],
+        VoiceConversion => vec![placeholder(InputModality::Audio, "input_audio")],
         TextGeneration | TextEmbedding | ImageGeneration | VideoGeneration | AudioGeneration
         | MusicGeneration | TextToSpeech => Vec::new(),
     }
@@ -8881,6 +9163,14 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "qwen-tts"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Backend {
+                command: BackendCommands::Install { target },
+            } => assert_eq!(target, BackendInstallArg::QwenTts),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
         let cli = Cli::try_parse_from(["werk", "backend", "install", "onnx-rocm"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
@@ -9366,7 +9656,7 @@ mod tests {
             "werk",
             "audio",
             "generate",
-            "music",
+            "music-model",
             "--prompt",
             "slow synthwave",
             "--lyrics",
@@ -9380,12 +9670,248 @@ mod tests {
             panic!("audio generate command expected");
         };
         let parameters =
-            media_parameters(&args, &args.routing, InferenceTask::MusicGeneration).unwrap();
+            media_parameters(&args, &args.options.routing, InferenceTask::MusicGeneration).unwrap();
         assert_eq!(
             parameters.get("audio.lyrics"),
             Some(&ParameterValue::String("we cross the night".to_string()))
         );
         assert!(!parameters.contains_key("audio.prompt"));
+    }
+
+    #[test]
+    fn qwen3_tts_cli_controls_become_canonical_tts_parameters() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "speak",
+            "qwen3-tts",
+            "--text",
+            "Hallo Welt",
+            "--language",
+            "de",
+            "--speaking-style",
+            "Warm, ruhig und natürlich",
+            "--seed",
+            "17",
+            "--format",
+            "wav",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Speak(args),
+        } = cli.command.unwrap()
+        else {
+            panic!("audio speak command expected");
+        };
+
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::TextToSpeech).unwrap();
+        assert_eq!(
+            parameters.get("tts.language"),
+            Some(&ParameterValue::String("de".to_string()))
+        );
+        assert_eq!(
+            parameters.get("tts.speaking_style"),
+            Some(&ParameterValue::String(
+                "Warm, ruhig und natürlich".to_string()
+            ))
+        );
+        assert_eq!(
+            parameters.get("tts.seed"),
+            Some(&ParameterValue::Integer(17))
+        );
+        assert_eq!(
+            parameters.get("tts.output_format"),
+            Some(&ParameterValue::String("wav".to_string()))
+        );
+        assert!(!parameters.contains_key("tts.text"));
+    }
+
+    #[test]
+    fn audio_translation_and_classification_build_canonical_parameters() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "translate",
+            "whisper",
+            "--input",
+            "speech.wav",
+            "--language",
+            "de",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Translate(mut args),
+        } = cli.command.unwrap()
+        else {
+            panic!("audio translate command expected");
+        };
+        assert_eq!(
+            prepare_audio_transcription_task(&mut args, true).unwrap(),
+            InferenceTask::SpeechTranslation
+        );
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::SpeechTranslation).unwrap();
+        assert_eq!(
+            parameters.get("stt.operation"),
+            Some(&ParameterValue::String("translate".to_string()))
+        );
+        assert_eq!(
+            parameters.get("stt.language"),
+            Some(&ParameterValue::String("de".to_string()))
+        );
+
+        let conflict = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "translate",
+            "whisper",
+            "--input",
+            "speech.wav",
+            "--task",
+            "transcribe",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Translate(mut args),
+        } = conflict.command.unwrap()
+        else {
+            panic!("audio translate command expected");
+        };
+        assert!(prepare_audio_transcription_task(&mut args, true).is_err());
+
+        let legacy_translate = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "transcribe",
+            "whisper",
+            "--input",
+            "speech.wav",
+            "--task",
+            "translate",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Transcribe(mut args),
+        } = legacy_translate.command.unwrap()
+        else {
+            panic!("audio transcribe command expected");
+        };
+        assert_eq!(
+            prepare_audio_transcription_task(&mut args, false).unwrap(),
+            InferenceTask::SpeechTranslation
+        );
+
+        let classifier = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "detect",
+            "event",
+            "classifier",
+            "--input",
+            "clip.wav",
+            "--top-k",
+            "5",
+            "--output-format",
+            "json",
+            "--accelerator",
+            "cuda",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command:
+                AudioCommands::Detect(crate::media_cli::AudioDetectArgs {
+                    command: AudioDetectCommands::Event(args),
+                }),
+        } = classifier.command.unwrap()
+        else {
+            panic!("audio event detection command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::AudioEventDetection).unwrap();
+        assert_eq!(
+            parameters.get("audio.top_k"),
+            Some(&ParameterValue::Integer(5))
+        );
+        assert_eq!(
+            parameters.get("audio.output_format"),
+            Some(&ParameterValue::String("json".to_string()))
+        );
+        let routing = media_routing(&args.routing, BackendArg::Auto, None).unwrap();
+        assert_eq!(routing.accelerator.as_deref(), Some("cuda"));
+
+        let understand = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "analyze",
+            "understand",
+            "multimodal-audio",
+            "--input",
+            "clip.wav",
+            "--prompt",
+            "What is happening?",
+            "--max-new-tokens",
+            "64",
+            "--temperature",
+            "0.2",
+            "--top-p",
+            "0.9",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command:
+                AudioCommands::Analyze(crate::media_cli::AudioAnalyzeArgs {
+                    command: AudioAnalyzeCommands::Understand(args),
+                }),
+        } = understand.command.unwrap()
+        else {
+            panic!("audio understanding command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::AudioUnderstanding).unwrap();
+        assert_eq!(
+            parameters.get("audio.max_new_tokens"),
+            Some(&ParameterValue::Integer(64))
+        );
+        assert_eq!(
+            parameters.get("audio.temperature"),
+            Some(&ParameterValue::Number(0.2))
+        );
+        assert_eq!(
+            parameters.get("audio.top_p"),
+            Some(&ParameterValue::Number(0.9))
+        );
+
+        let embed = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "embed",
+            "audio-embedder",
+            "--input",
+            "clip.wav",
+            "--no-normalize",
+            "--pooling",
+            "mean",
+            "--output-format",
+            "json",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Embed(args),
+        } = embed.command.unwrap()
+        else {
+            panic!("audio embedding command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::AudioEmbedding).unwrap();
+        assert_eq!(
+            parameters.get("audio.normalize"),
+            Some(&ParameterValue::Boolean(false))
+        );
+        assert_eq!(
+            parameters.get("audio.pooling"),
+            Some(&ParameterValue::String("mean".to_string()))
+        );
     }
 
     #[test]

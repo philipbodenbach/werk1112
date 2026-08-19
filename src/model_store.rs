@@ -2260,13 +2260,30 @@ fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
         }
     }
 
+    if let Some(family) = qwen3_tts_family(root_config.as_ref()) {
+        // Older manifests classified qwen3_tts by its `qwen3` prefix and
+        // persisted it as text generation backed by ONNX Runtime. The local
+        // config is authoritative enough to migrate that stale state during
+        // every store.get(): all supported Qwen3-TTS variants are speech-only
+        // models with audio output.
+        manifest.architecture = Some("qwen3_tts".to_string());
+        manifest.metadata.family = Some(family);
+        manifest.metadata.tasks = vec![InferenceTask::TextToSpeech];
+        manifest.metadata.input_modalities = vec![InputModality::Text];
+        manifest.metadata.output_modalities = vec![OutputModality::Audio];
+        manifest.metadata.compatible_runtimes.clear();
+    }
+
     if manifest.metadata.family.is_none() {
         manifest.metadata.family =
             infer_model_family(manifest, model_index.as_ref(), root_config.as_ref());
     }
+    let inferred_tasks =
+        infer_inference_tasks(manifest, model_index.as_ref(), root_config.as_ref());
     if manifest.metadata.tasks.is_empty() {
-        manifest.metadata.tasks =
-            infer_inference_tasks(manifest, model_index.as_ref(), root_config.as_ref());
+        manifest.metadata.tasks = inferred_tasks;
+    } else {
+        supplement_derived_audio_tasks(&mut manifest.metadata.tasks, &inferred_tasks);
     }
     if manifest.metadata.input_modalities.is_empty()
         || manifest.metadata.output_modalities.is_empty()
@@ -2300,11 +2317,45 @@ fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
     if manifest.metadata.compatible_runtimes.is_empty() {
         manifest.metadata.compatible_runtimes = compatible_runtimes_for_manifest(manifest);
     }
+    if is_qwen3_tts_config(root_config.as_ref()) {
+        // SafeTensors' generic format hint is ONNX Runtime, but Qwen3-TTS is
+        // an audio model executed through the media companion. Keep the
+        // human-facing backend classification aligned with actual routing.
+        manifest.backend = "media-companion".to_string();
+    }
     if manifest.metadata.optimized_artifacts.is_empty() {
         manifest.metadata.optimized_artifacts = optimized_artifact_info(&manifest.artifacts);
     }
     if manifest.metadata.chat_template.is_none() {
         manifest.metadata.chat_template = resolve_chat_template(model_dir, manifest);
+    }
+}
+
+fn supplement_derived_audio_tasks(existing: &mut Vec<InferenceTask>, inferred: &[InferenceTask]) {
+    // Speech translation is a capability refinement of ASR, not a replacement
+    // for a curated task list. Older manifests predate the separate canonical
+    // task and commonly contain only SpeechToText for Whisper-like models.
+    if existing.contains(&InferenceTask::SpeechToText)
+        && inferred.contains(&InferenceTask::SpeechTranslation)
+    {
+        push_unique(existing, InferenceTask::SpeechTranslation);
+    }
+
+    // A generic audio-classification manifest may gain a more precise label
+    // from newly understood architecture or pipeline metadata. Add only these
+    // refinements and never remove curated tasks.
+    if existing.contains(&InferenceTask::AudioClassification) {
+        for task in [
+            InferenceTask::AudioEventDetection,
+            InferenceTask::VoiceActivityDetection,
+            InferenceTask::SpeakerIdentification,
+            InferenceTask::LanguageIdentification,
+            InferenceTask::SpeechEmotionRecognition,
+        ] {
+            if inferred.contains(&task) {
+                push_unique(existing, task);
+            }
+        }
     }
 }
 
@@ -2783,6 +2834,9 @@ fn infer_model_family(
     model_index: Option<&Value>,
     root_config: Option<&Value>,
 ) -> Option<String> {
+    if let Some(family) = qwen3_tts_family(root_config) {
+        return Some(family);
+    }
     let mut hints = vec![manifest.id.to_ascii_lowercase()];
     match &manifest.source {
         ModelSource::HuggingFace { repo } => hints.push(repo.to_ascii_lowercase()),
@@ -2864,18 +2918,33 @@ fn infer_model_family(
         (&["ltxvideo", "ltx-video"][..], "ltx-video"),
         (&["animatediff"][..], "animatediff"),
         (&["stableaudio", "stable-audio"][..], "stable-audio"),
+        (&["musicldm", "music-ldm"][..], "musicldm"),
         (&["audioldm"][..], "audioldm"),
+        (
+            &["dancediffusion", "dance-diffusion"][..],
+            "dance-diffusion",
+        ),
+        (
+            &["spectrogramdiffusion", "spectrogram-diffusion"][..],
+            "spectrogram-diffusion",
+        ),
         (&["musicgen"][..], "musicgen"),
+        (&["audiogen"][..], "audiogen"),
         (&["whisper"][..], "whisper"),
+        (&["wav2vec2", "wav2vec-2"][..], "wav2vec2"),
+        (&["hubert"][..], "hubert"),
+        (&["wavlm"][..], "wavlm"),
         (&["speecht5"][..], "speecht5"),
         (&["parler"][..], "parler-tts"),
         (&["bark"][..], "bark"),
+        (&["vits"][..], "vits"),
         (&["demucs"][..], "demucs"),
         (&["llava"][..], "llava"),
         (&["paligemma"][..], "paligemma"),
         (&["qwen2_vl", "qwen2-vl"][..], "qwen2-vl"),
         (&["gemma4"][..], "gemma4"),
         (&["gemma3"][..], "gemma3"),
+        (&["qwen3-tts", "qwen3_tts", "qwen3tts"][..], "qwen3-tts"),
         (&["qwen3"][..], "qwen3"),
         (&["qwen2"][..], "qwen2"),
         (&["phi3", "phi-3"][..], "phi3"),
@@ -2893,6 +2962,34 @@ fn infer_model_family(
         .and_then(json_model_identifier)
         .or_else(|| manifest.architecture.clone())
         .map(|identifier| normalize_model_identifier(&identifier))
+}
+
+fn is_qwen3_tts_config(root_config: Option<&Value>) -> bool {
+    root_config
+        .and_then(|config| config.get("model_type"))
+        .and_then(Value::as_str)
+        .is_some_and(|model_type| {
+            normalize_model_identifier(model_type).eq_ignore_ascii_case("qwen3_tts")
+        })
+}
+
+fn qwen3_tts_family(root_config: Option<&Value>) -> Option<String> {
+    if !is_qwen3_tts_config(root_config) {
+        return None;
+    }
+    let variant = root_config
+        .and_then(|config| config.get("tts_model_type"))
+        .and_then(Value::as_str)
+        .map(normalize_model_identifier);
+    Some(
+        match variant.as_deref() {
+            Some("voice_design") => "qwen3-tts-voice-design",
+            Some("custom_voice") => "qwen3-tts-custom-voice",
+            Some("base") => "qwen3-tts-base",
+            _ => "qwen3-tts",
+        }
+        .to_string(),
+    )
 }
 
 fn infer_inference_tasks(
@@ -2986,30 +3083,193 @@ fn infer_inference_tasks(
     let audio = contains_any(
         &hint,
         &[
-            "audio", "music", "speech", "whisper", "bark", "vocoder", "tts",
+            "audio",
+            "music",
+            "speech",
+            "whisper",
+            "wav2vec",
+            "hubert",
+            "wavlm",
+            "bark",
+            "vits",
+            "vocoder",
+            "spectrogram",
+            "dancediffusion",
+            "dance-diffusion",
+            "tts",
         ],
     );
 
+    let whisper_like = contains_any(
+        &hint,
+        &["whisper", "speech-translation", "speech_translation"],
+    );
+    let speech_recognition = whisper_like
+        || contains_any(
+            &hint,
+            &[
+                "speech-to-text",
+                "speech_to_text",
+                "automatic-speech-recognition",
+                "automatic_speech_recognition",
+                "wav2vec2forctc",
+                "hubertforctc",
+                "wavlmforctc",
+                "mctctforctc",
+                "speech2textforconditionalgeneration",
+                " asr",
+            ],
+        );
+    let audio_classification_architecture = contains_any(
+        &hint,
+        &["foraudioclassification", "foraudioframeclassification"],
+    ) || (contains_any(
+        &hint,
+        &[
+            "wav2vec2",
+            "hubert",
+            "wavlm",
+            "audio-spectrogram-transformer",
+            "astforsequenceclassification",
+        ],
+    ) && hint.contains("forsequenceclassification"));
+    let xvector_architecture = contains_any(&hint, &["forxvector", "x-vector", "xvector"]);
+    let has_audio_config = root_config.is_some_and(|config| {
+        [
+            "audio_config",
+            "audio_encoder_config",
+            "audio_tokenizer_config",
+        ]
+        .iter()
+        .any(|key| config.get(*key).is_some())
+    });
+    let multimodal_generation_architecture = contains_any(
+        &hint,
+        &["forconditionalgeneration", "formultimodalgeneration"],
+    );
+    if speech_recognition {
+        push_unique(&mut tasks, InferenceTask::SpeechToText);
+    }
+    if whisper_like {
+        push_unique(&mut tasks, InferenceTask::SpeechTranslation);
+    }
     if contains_any(
         &hint,
         &[
-            "whisper",
-            "speech-to-text",
-            "speech_to_text",
-            "automatic-speech-recognition",
-            "asr",
+            "audio-event-detection",
+            "audio_event_detection",
+            "sound-event-detection",
+            "sound_event_detection",
+            "audio-tagging",
+            "audio_tagging",
         ],
     ) {
-        push_unique(&mut tasks, InferenceTask::SpeechToText);
+        push_unique(&mut tasks, InferenceTask::AudioEventDetection);
+    }
+    if contains_any(
+        &hint,
+        &[
+            "voice-activity-detection",
+            "voice_activity_detection",
+            "voiceactivitydetection",
+            " vad ",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::VoiceActivityDetection);
+    }
+    if xvector_architecture
+        || contains_any(
+            &hint,
+            &[
+                "speaker-identification",
+                "speaker_identification",
+                "speaker-recognition",
+                "speaker_recognition",
+                "speaker-verification",
+                "speaker_verification",
+            ],
+        )
+    {
+        push_unique(&mut tasks, InferenceTask::SpeakerIdentification);
+    }
+    if contains_any(
+        &hint,
+        &[
+            "language-identification",
+            "language_identification",
+            "spoken-language-identification",
+            "spoken_language_identification",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::LanguageIdentification);
+    }
+    if contains_any(
+        &hint,
+        &[
+            "speech-emotion-recognition",
+            "speech_emotion_recognition",
+            "audio-emotion-recognition",
+            "audio_emotion_recognition",
+            "emotion-recognition",
+            "emotion_recognition",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::SpeechEmotionRecognition);
+    }
+    if audio_classification_architecture
+        || contains_any(&hint, &["audio-classification", "audio_classification"])
+    {
+        push_unique(&mut tasks, InferenceTask::AudioClassification);
+    }
+    if (has_audio_config && multimodal_generation_architecture)
+        || contains_any(
+            &hint,
+            &["audio-captioning", "audio_captioning", "audiocaption"],
+        )
+    {
+        push_unique(&mut tasks, InferenceTask::AudioCaptioning);
+    }
+    if contains_any(
+        &hint,
+        &[
+            "speaker-diarization",
+            "speaker_diarization",
+            "speakerdiarization",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::SpeakerDiarization);
+    }
+    if (has_audio_config && multimodal_generation_architecture)
+        || contains_any(&hint, &["audio-understanding", "audio_understanding"])
+    {
+        push_unique(&mut tasks, InferenceTask::AudioUnderstanding);
+    }
+    if xvector_architecture
+        || contains_any(
+            &hint,
+            &[
+                "audio-embedding",
+                "audio_embedding",
+                "audio-feature-extraction",
+                "audio_feature_extraction",
+                "clapmodel",
+            ],
+        )
+    {
+        push_unique(&mut tasks, InferenceTask::AudioEmbedding);
     }
     if contains_any(
         &hint,
         &[
             "text-to-speech",
             "text_to_speech",
+            "qwen3-tts",
+            "qwen3_tts",
+            "qwen3tts",
             "speecht5",
             "parler",
             "bark",
+            "vits",
             " tts",
         ],
     ) {
@@ -3042,6 +3302,12 @@ fn infer_inference_tasks(
     ) {
         push_unique(&mut tasks, InferenceTask::AudioEnhancement);
     }
+    if contains_any(
+        &hint,
+        &["audio-editing", "audio_editing", "audio-edit", "audio_edit"],
+    ) {
+        push_unique(&mut tasks, InferenceTask::AudioEditing);
+    }
     if contains_any(&hint, &["song-continuation", "song_continuation"]) {
         push_unique(&mut tasks, InferenceTask::SongContinuation);
     }
@@ -3055,6 +3321,8 @@ fn infer_inference_tasks(
             "music-generation",
             "music_generation",
             "stable-audio",
+            "musicldm",
+            "music-ldm",
         ],
     ) {
         push_unique(&mut tasks, InferenceTask::AudioGeneration);
@@ -3067,6 +3335,11 @@ fn infer_inference_tasks(
             "audio_generation",
             "text-to-audio",
             "text_to_audio",
+            "audioldm",
+            "dancediffusion",
+            "dance-diffusion",
+            "spectrogramdiffusion",
+            "spectrogram-diffusion",
         ],
     ) || (audio
         && manifest.metadata.repository_layout == RepositoryLayout::Diffusers
@@ -3133,7 +3406,6 @@ fn infer_inference_tasks(
             "vision-language",
             "vision_language",
             "vision2seq",
-            "vlm",
             "llava",
             "paligemma",
             "idefics",
@@ -3141,7 +3413,8 @@ fn infer_inference_tasks(
             "qwen2-vl",
             "gemma4",
         ],
-    ) || root_config.is_some_and(|config| config.get("vision_config").is_some())
+    ) || (!audio && hint.contains("vlm"))
+        || root_config.is_some_and(|config| config.get("vision_config").is_some())
     {
         push_unique(&mut tasks, InferenceTask::TextGeneration);
         push_unique(&mut tasks, InferenceTask::ImageUnderstanding);
@@ -3246,15 +3519,30 @@ fn modalities_for_tasks(tasks: &[InferenceTask]) -> (Vec<InputModality>, Vec<Out
                 push_unique(&mut inputs, InputModality::Text);
                 push_unique(&mut outputs, OutputModality::Audio);
             }
-            InferenceTask::SpeechToText => {
+            InferenceTask::SpeechToText
+            | InferenceTask::SpeechTranslation
+            | InferenceTask::AudioEventDetection
+            | InferenceTask::VoiceActivityDetection
+            | InferenceTask::SpeakerIdentification
+            | InferenceTask::LanguageIdentification
+            | InferenceTask::SpeechEmotionRecognition
+            | InferenceTask::AudioCaptioning
+            | InferenceTask::SpeakerDiarization
+            | InferenceTask::AudioClassification
+            | InferenceTask::AudioUnderstanding => {
                 push_unique(&mut inputs, InputModality::Audio);
                 push_unique(&mut outputs, OutputModality::Text);
             }
             InferenceTask::VoiceConversion
             | InferenceTask::StemSeparation
-            | InferenceTask::AudioEnhancement => {
+            | InferenceTask::AudioEnhancement
+            | InferenceTask::AudioEditing => {
                 push_unique(&mut inputs, InputModality::Audio);
                 push_unique(&mut outputs, OutputModality::Audio);
+            }
+            InferenceTask::AudioEmbedding => {
+                push_unique(&mut inputs, InputModality::Audio);
+                push_unique(&mut outputs, OutputModality::Embedding);
             }
             InferenceTask::StemGeneration => {
                 push_unique(&mut inputs, InputModality::Text);
@@ -3454,41 +3742,41 @@ fn copy_known_json_fields(
 
 fn compatible_runtimes_for_manifest(manifest: &ModelManifest) -> Vec<String> {
     let has_media_task = manifest.metadata.tasks.iter().copied().any(is_media_task);
-    if has_media_task {
-        if manifest
+    let mut compatible = if has_media_task
+        && manifest
             .metadata
             .tasks
             .iter()
             .copied()
             .any(is_executable_media_companion_task)
-            && matches!(
-                manifest.metadata.repository_layout,
-                RepositoryLayout::Diffusers
-                    | RepositoryLayout::Transformers
-                    | RepositoryLayout::SingleFile
-                    | RepositoryLayout::Custom
-            )
-            && matches!(
-                manifest.format,
-                ModelFormat::SafeTensors | ModelFormat::PyTorch
-            )
-        {
-            return [
-                "media-companion-cuda",
-                "media-companion-rocm",
-                "media-companion-metal",
-                "media-companion-cpu",
-            ]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect();
-        }
-        if manifest.metadata.tasks.iter().copied().all(is_media_task) {
-            return Vec::new();
-        }
+        && matches!(
+            manifest.metadata.repository_layout,
+            RepositoryLayout::Diffusers
+                | RepositoryLayout::Transformers
+                | RepositoryLayout::SingleFile
+                | RepositoryLayout::Custom
+        )
+        && matches!(
+            manifest.format,
+            ModelFormat::SafeTensors | ModelFormat::PyTorch
+        ) {
+        [
+            "media-companion-cuda",
+            "media-companion-rocm",
+            "media-companion-metal",
+            "media-companion-cpu",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if has_media_task && manifest.metadata.tasks.iter().copied().all(is_media_task) {
+        return compatible;
     }
 
-    match manifest.metadata.repository_layout {
+    let general = match manifest.metadata.repository_layout {
         RepositoryLayout::Gguf => vec![
             "llama-server-cuda",
             "llama-server-rocm",
@@ -3541,7 +3829,11 @@ fn compatible_runtimes_for_manifest(manifest: &ModelManifest) -> Vec<String> {
     }
     .into_iter()
     .map(ToString::to_string)
-    .collect()
+    .collect::<Vec<_>>();
+    for runtime in general {
+        push_unique(&mut compatible, runtime);
+    }
+    compatible
 }
 
 fn is_media_task(task: InferenceTask) -> bool {
@@ -3573,6 +3865,16 @@ fn is_executable_media_companion_task(task: InferenceTask) -> bool {
             | InferenceTask::MusicGeneration
             | InferenceTask::TextToSpeech
             | InferenceTask::SpeechToText
+            | InferenceTask::SpeechTranslation
+            | InferenceTask::AudioEventDetection
+            | InferenceTask::VoiceActivityDetection
+            | InferenceTask::SpeakerIdentification
+            | InferenceTask::LanguageIdentification
+            | InferenceTask::SpeechEmotionRecognition
+            | InferenceTask::AudioClassification
+            | InferenceTask::AudioCaptioning
+            | InferenceTask::AudioUnderstanding
+            | InferenceTask::AudioEmbedding
     )
 }
 
@@ -4228,6 +4530,302 @@ mod tests {
                 .contains(&InferenceTask::TextGeneration)
         );
         assert_eq!(musicgen.metadata.compatible_runtimes, expected_runtimes);
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn audio_architectures_drive_generation_speech_and_classification_tasks() {
+        let tmp = test_dir("audio-architecture-tasks");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+
+        let cases = [
+            (
+                "musicgen",
+                r#"{"model_type":"musicgen","architectures":["MusicgenForConditionalGeneration"]}"#,
+                vec![
+                    InferenceTask::AudioGeneration,
+                    InferenceTask::MusicGeneration,
+                ],
+            ),
+            (
+                "whisper",
+                r#"{"model_type":"whisper","architectures":["WhisperForConditionalGeneration"]}"#,
+                vec![
+                    InferenceTask::SpeechToText,
+                    InferenceTask::SpeechTranslation,
+                ],
+            ),
+            (
+                "wav2vec-ctc",
+                r#"{"model_type":"wav2vec2","architectures":["Wav2Vec2ForCTC"]}"#,
+                vec![InferenceTask::SpeechToText],
+            ),
+            (
+                "audio-classifier",
+                r#"{"model_type":"wav2vec2","architectures":["Wav2Vec2ForSequenceClassification"]}"#,
+                vec![InferenceTask::AudioClassification],
+            ),
+            (
+                "audio-frame-classifier",
+                r#"{"model_type":"wav2vec2","architectures":["Wav2Vec2ForAudioFrameClassification"]}"#,
+                vec![InferenceTask::AudioClassification],
+            ),
+            (
+                "hubert-classifier",
+                r#"{"model_type":"hubert","architectures":["HubertForSequenceClassification"]}"#,
+                vec![InferenceTask::AudioClassification],
+            ),
+            (
+                "ast-classifier",
+                r#"{"model_type":"audio-spectrogram-transformer","architectures":["ASTForAudioClassification"]}"#,
+                vec![InferenceTask::AudioClassification],
+            ),
+            (
+                "wavlm-xvector",
+                r#"{"model_type":"wavlm","architectures":["WavLMForXVector"]}"#,
+                vec![
+                    InferenceTask::SpeakerIdentification,
+                    InferenceTask::AudioEmbedding,
+                ],
+            ),
+            (
+                "emotion-classifier",
+                r#"{"model_type":"wav2vec2","architectures":["Wav2Vec2ForSequenceClassification"],"pipeline_tag":"audio-classification","task":"speech-emotion-recognition"}"#,
+                vec![
+                    InferenceTask::SpeechEmotionRecognition,
+                    InferenceTask::AudioClassification,
+                ],
+            ),
+            (
+                "vits",
+                r#"{"model_type":"vits","architectures":["VitsModel"]}"#,
+                vec![InferenceTask::TextToSpeech],
+            ),
+        ];
+
+        for (id, config, expected) in cases {
+            let source = tmp.join(format!("source-{id}"));
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("config.json"), config).unwrap();
+            fs::write(source.join("model.safetensors"), b"weights").unwrap();
+
+            let manifest = store.import_path(&source, id).unwrap();
+            assert_eq!(manifest.metadata.tasks, expected, "{id}");
+            assert!(
+                !manifest
+                    .metadata
+                    .tasks
+                    .contains(&InferenceTask::TextGeneration),
+                "{id} fell back to text generation"
+            );
+        }
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn qwen3_tts_variants_are_audio_only_media_models_and_migrate_stale_manifests() {
+        let tmp = test_dir("qwen3-tts-variants");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let expected_runtimes = vec![
+            "media-companion-cuda".to_string(),
+            "media-companion-rocm".to_string(),
+            "media-companion-metal".to_string(),
+            "media-companion-cpu".to_string(),
+        ];
+        let cases = [
+            ("voice_design", "qwen3-tts-voice-design"),
+            ("custom_voice", "qwen3-tts-custom-voice"),
+            ("base", "qwen3-tts-base"),
+        ];
+
+        for (index, (tts_model_type, family)) in cases.into_iter().enumerate() {
+            let source = tmp.join(format!("source-{index}"));
+            fs::create_dir_all(&source).unwrap();
+            fs::write(
+                source.join("config.json"),
+                format!(r#"{{"model_type":"qwen3_tts","tts_model_type":"{tts_model_type}"}}"#),
+            )
+            .unwrap();
+            fs::write(source.join("model.safetensors"), b"weights").unwrap();
+
+            let id = format!("neutral-tts-{index}");
+            let manifest = store.import_path(&source, &id).unwrap();
+            assert_eq!(manifest.architecture.as_deref(), Some("qwen3_tts"));
+            assert_eq!(manifest.metadata.family.as_deref(), Some(family));
+            assert_eq!(manifest.metadata.tasks, vec![InferenceTask::TextToSpeech]);
+            assert_eq!(
+                manifest.metadata.input_modalities,
+                vec![InputModality::Text]
+            );
+            assert_eq!(
+                manifest.metadata.output_modalities,
+                vec![OutputModality::Audio]
+            );
+            assert_eq!(manifest.backend, "media-companion");
+            assert_eq!(manifest.metadata.compatible_runtimes, expected_runtimes);
+            assert!(
+                !manifest
+                    .metadata
+                    .tasks
+                    .contains(&InferenceTask::TextGeneration)
+            );
+            assert!(
+                !manifest.metadata.compatible_runtimes.iter().any(|runtime| {
+                    runtime.contains("onnx")
+                        || runtime.contains("candle")
+                        || runtime == "transformers"
+                })
+            );
+
+            if tts_model_type == "voice_design" {
+                let mut stale = manifest;
+                stale.architecture = Some("qwen3".to_string());
+                stale.backend = "onnxruntime".to_string();
+                stale.metadata.family = Some("qwen3".to_string());
+                stale.metadata.tasks = vec![InferenceTask::TextGeneration];
+                stale.metadata.input_modalities = vec![InputModality::Text];
+                stale.metadata.output_modalities = vec![OutputModality::Text];
+                stale.metadata.compatible_runtimes = vec![
+                    "onnxruntime-cpu".to_string(),
+                    "transformers".to_string(),
+                    "candle-cpu".to_string(),
+                ];
+                store.write_manifest(&stale).unwrap();
+
+                let migrated = store.get(&id).unwrap();
+                assert_eq!(migrated.architecture.as_deref(), Some("qwen3_tts"));
+                assert_eq!(
+                    migrated.metadata.family.as_deref(),
+                    Some("qwen3-tts-voice-design")
+                );
+                assert_eq!(migrated.metadata.tasks, vec![InferenceTask::TextToSpeech]);
+                assert_eq!(
+                    migrated.metadata.output_modalities,
+                    vec![OutputModality::Audio]
+                );
+                assert_eq!(migrated.backend, "media-companion");
+                assert_eq!(migrated.metadata.compatible_runtimes, expected_runtimes);
+            }
+        }
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn multimodal_conditional_generation_with_audio_config_infers_audio_text_tasks() {
+        let tmp = test_dir("multimodal-audio-architecture-tasks");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("config.json"),
+            r#"{"model_type":"multimodal","architectures":["GenericForConditionalGeneration"],"audio_config":{},"vision_config":{}}"#,
+        )
+        .unwrap();
+        fs::write(source.join("model.safetensors"), b"weights").unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "neutral-multimodal").unwrap();
+        assert_eq!(
+            manifest.metadata.tasks,
+            vec![
+                InferenceTask::AudioCaptioning,
+                InferenceTask::AudioUnderstanding,
+                InferenceTask::TextGeneration,
+                InferenceTask::ImageUnderstanding,
+            ]
+        );
+        assert!(
+            manifest
+                .metadata
+                .compatible_runtimes
+                .contains(&"media-companion-cpu".to_string())
+        );
+        assert!(
+            manifest
+                .metadata
+                .compatible_runtimes
+                .contains(&"transformers".to_string())
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn legacy_whisper_manifest_gains_translation_without_losing_curated_tasks() {
+        let tmp = test_dir("legacy-whisper-translation-task");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("config.json"),
+            r#"{"model_type":"whisper","architectures":["WhisperForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        fs::write(source.join("model.safetensors"), b"weights").unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let mut manifest = store.import_path(&source, "legacy-whisper").unwrap();
+        manifest.metadata.tasks = vec![
+            InferenceTask::SpeechToText,
+            InferenceTask::AudioUnderstanding,
+        ];
+        store.write_manifest(&manifest).unwrap();
+
+        let migrated = store.get("legacy-whisper").unwrap();
+        assert_eq!(
+            migrated.metadata.tasks,
+            vec![
+                InferenceTask::SpeechToText,
+                InferenceTask::AudioUnderstanding,
+                InferenceTask::SpeechTranslation,
+            ]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn diffusers_audio_pipeline_classes_do_not_fall_back_to_image_generation() {
+        let tmp = test_dir("diffusers-audio-pipeline-tasks");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let cases = [
+            (
+                "audioldm",
+                "AudioLDM2Pipeline",
+                vec![InferenceTask::AudioGeneration],
+            ),
+            (
+                "stable-audio",
+                "StableAudioPipeline",
+                vec![
+                    InferenceTask::AudioGeneration,
+                    InferenceTask::MusicGeneration,
+                ],
+            ),
+            (
+                "dance-diffusion",
+                "DanceDiffusionPipeline",
+                vec![InferenceTask::AudioGeneration],
+            ),
+            (
+                "spectrogram",
+                "SpectrogramDiffusionPipeline",
+                vec![InferenceTask::AudioGeneration],
+            ),
+        ];
+
+        for (id, pipeline, expected) in cases {
+            let source = tmp.join(format!("source-{id}"));
+            write_diffusers_pipeline_fixture(&source, pipeline);
+            let manifest = store.import_path(&source, id).unwrap();
+            assert_eq!(manifest.metadata.tasks, expected, "{pipeline}");
+            assert_eq!(
+                manifest.metadata.output_modalities,
+                vec![OutputModality::Audio],
+                "{pipeline}"
+            );
+        }
 
         let _ = fs::remove_dir_all(tmp);
     }

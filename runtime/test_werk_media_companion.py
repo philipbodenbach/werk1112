@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -171,6 +172,10 @@ class AdapterOffloadValidationTests(unittest.TestCase):
 
     def test_execute_rejects_selected_offload_before_loading_transformers(self):
         with tempfile.TemporaryDirectory() as model_path:
+            (Path(model_path) / "config.json").write_text(
+                json.dumps({"model_type": "whisper"}),
+                encoding="utf-8",
+            )
             with self.assertRaises(COMPANION.CompanionFailure) as failure:
                 COMPANION.command_execute(
                     {
@@ -1151,6 +1156,1566 @@ class ResidentDiffusersExecutionTests(unittest.TestCase):
                 runtime.close()
                 cleanup.assert_called_once()
                 self.assertIs(cleanup.call_args.args[0].pipeline, pipeline)
+
+
+class AudioRuntimeTests(unittest.TestCase):
+    class RuntimeTorch:
+        def __init__(self):
+            self.seed = None
+            self.cuda = types.SimpleNamespace(
+                manual_seed_all=lambda value: setattr(self, "cuda_seed", value)
+            )
+
+        def inference_mode(self):
+            return contextlib.nullcontext()
+
+        def manual_seed(self, value):
+            self.seed = value
+
+    @staticmethod
+    def guard(task, adapter, parameters, *, explicit=(), policy="strict"):
+        return COMPANION.ExplicitParameterGuard(
+            {
+                "explicit_parameters": list(explicit),
+                "parameter_policy": policy,
+            },
+            task,
+            adapter,
+            parameters,
+        )
+
+    def test_pipeline_sample_rate_finds_nested_audio_processor_feature_extractor(self):
+        feature_extractor = types.SimpleNamespace(sampling_rate=24_000)
+        audio_processor = types.SimpleNamespace(
+            feature_extractor=feature_extractor,
+        )
+        processor = types.SimpleNamespace(audio_processor=audio_processor)
+        pipeline = types.SimpleNamespace(processor=processor)
+
+        self.assertEqual(COMPANION.pipeline_sample_rate(pipeline), 24_000)
+
+    def test_text_to_audio_loader_does_not_duplicate_local_files_only(self):
+        calls = []
+
+        def fake_pipeline(
+            *,
+            task,
+            model,
+            device,
+            trust_remote_code,
+            model_kwargs=None,
+            **hub_kwargs,
+        ):
+            # Mirrors the relevant Transformers factory behavior: it owns a
+            # hub-level local_files_only value and separately expands caller
+            # model kwargs into the same from_pretrained call.
+            owned_hub_kwargs = {
+                "local_files_only": hub_kwargs.get("local_files_only", False),
+            }
+
+            def from_pretrained(**kwargs):
+                calls.append(kwargs)
+
+            from_pretrained(**owned_hub_kwargs, **(model_kwargs or {}))
+            calls.append(
+                {
+                    "task": task,
+                    "model": model,
+                    "device": device,
+                    "trust_remote_code": trust_remote_code,
+                }
+            )
+            return object()
+
+        fake_transformers = types.SimpleNamespace(pipeline=fake_pipeline)
+        runtime_values = (self.RuntimeTorch(), "cpu", "float32")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            COMPANION,
+            "require_module",
+            return_value=fake_transformers,
+        ):
+            pipeline, _torch, device, dtype = COMPANION.load_transformers_pipeline(
+                Path(directory),
+                "text-to-audio",
+                {},
+                runtime_values=runtime_values,
+            )
+
+        self.assertIsNotNone(pipeline)
+        self.assertEqual(device, "cpu")
+        self.assertEqual(dtype, "float32")
+        self.assertEqual(calls[0], {"local_files_only": False})
+        self.assertEqual(calls[1]["task"], "text-to-audio")
+        self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+        self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_transformers_tts_writes_pipeline_audio(self):
+        import numpy
+
+        class TextToSpeechPipeline:
+            def __init__(self):
+                self.text = None
+
+            def __call__(self, text):
+                self.text = text
+                return {
+                    "audio": numpy.linspace(-0.25, 0.25, 16, dtype="float32"),
+                    "sampling_rate": 16_000,
+                }
+
+        pipeline = TextToSpeechPipeline()
+        torch = self.RuntimeTorch()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            COMPANION,
+            "load_transformers_pipeline",
+            return_value=(pipeline, torch, "cpu", "float32"),
+        ):
+            outputs, warnings, metadata = COMPANION.execute_tts(
+                Path(directory),
+                "text_to_speech",
+                {
+                    "text": "Hello from Werk.",
+                    "output_format": "wav",
+                    "seed": 23,
+                },
+                Path(directory),
+                "test",
+            )
+
+        self.assertEqual(pipeline.text, "Hello from Werk.")
+        self.assertEqual(outputs[0]["mime_type"], "audio/wav")
+        self.assertEqual(outputs[0]["metadata"]["sample_rate"], 16_000)
+        self.assertEqual(warnings, [])
+        self.assertEqual(metadata["pipeline_task"], "text-to-audio")
+        self.assertEqual(torch.seed, 23)
+        self.assertEqual(metadata["seed"], 23)
+        self.assertIn(
+            "tts.seed",
+            COMPANION.supported_explicit_parameters(
+                "text_to_speech",
+                "transformers_tts",
+            ),
+        )
+        self.assertIn(
+            "tts.seed->torch.manual_seed",
+            metadata["translated_parameters"],
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_transformers_generation_applies_duration_and_splits_variations(self):
+        import numpy
+
+        class GenerationPipeline:
+            def __init__(self):
+                self.model = types.SimpleNamespace(
+                    config=types.SimpleNamespace(
+                        model_type="musicgen",
+                        audio_encoder=types.SimpleNamespace(frame_rate=50),
+                    )
+                )
+                self.calls = []
+
+            def __call__(self, prompts, generate_kwargs=None):
+                self.calls.append((prompts, generate_kwargs))
+                return [
+                    {
+                        "audio": numpy.zeros(16, dtype="float32"),
+                        "sampling_rate": 8_000,
+                    },
+                    {
+                        "audio": numpy.full(16, 0.5, dtype="float32"),
+                        "sampling_rate": 8_000,
+                    },
+                ]
+
+        pipeline = GenerationPipeline()
+        torch = self.RuntimeTorch()
+        parameters = {
+            "prompt": "short drum loop",
+            "duration": 2.0,
+            "variations": 2,
+            "output_format": "wav",
+            "seed": 17,
+            "temperature": 0.0,
+        }
+        guard = self.guard(
+            "music_generation",
+            "transformers_audio",
+            parameters,
+            explicit=("audio.duration", "audio.variations"),
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            COMPANION,
+            "load_transformers_pipeline",
+            return_value=(pipeline, torch, "cpu", "float32"),
+        ):
+            outputs, warnings, metadata = COMPANION.execute_audio_generation(
+                Path(directory),
+                "music_generation",
+                parameters,
+                Path(directory),
+                "test",
+                guard,
+            )
+
+        prompts, generate_kwargs = pipeline.calls[0]
+        self.assertEqual(prompts, ["short drum loop", "short drum loop"])
+        self.assertEqual(generate_kwargs["max_new_tokens"], 100)
+        self.assertFalse(generate_kwargs["do_sample"])
+        self.assertEqual(torch.seed, 17)
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual([item["metadata"]["channels"] for item in outputs], [1, 1])
+        self.assertEqual(warnings, [])
+        self.assertIn(
+            "audio.duration->generate_kwargs.max_new_tokens",
+            metadata["translated_parameters"],
+        )
+        self.assertIn(
+            "audio.variations->batched prompts",
+            metadata["translated_parameters"],
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_transformers_variations_do_not_treat_stereo_as_a_batch(self):
+        import numpy
+
+        class StereoPipeline:
+            sampling_rate = 8_000
+            model = types.SimpleNamespace(
+                config=types.SimpleNamespace(
+                    model_type="audiogen",
+                    audio_encoder=types.SimpleNamespace(frame_rate=50),
+                )
+            )
+
+            def __call__(self, _prompts):
+                return {
+                    "audio": numpy.zeros((2, 16), dtype="float32"),
+                    "sampling_rate": self.sampling_rate,
+                }
+
+        pipeline = StereoPipeline()
+        torch = self.RuntimeTorch()
+        parameters = {
+            "prompt": "stereo ambience",
+            "variations": 2,
+            "output_format": "wav",
+        }
+        guard = self.guard(
+            "audio_generation",
+            "transformers_audio",
+            parameters,
+            explicit=("audio.variations",),
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            COMPANION,
+            "load_transformers_pipeline",
+            return_value=(pipeline, torch, "cpu", "float32"),
+        ):
+            with self.assertRaises(COMPANION.CompanionFailure) as failure:
+                COMPANION.execute_audio_generation(
+                    Path(directory),
+                    "audio_generation",
+                    parameters,
+                    Path(directory),
+                    "test",
+                    guard,
+                )
+
+        self.assertEqual(failure.exception.code, "backend_error")
+
+    def test_musicgen_rejects_explicit_duration_over_thirty_seconds(self):
+        pipeline = types.SimpleNamespace(
+            model=types.SimpleNamespace(
+                config=types.SimpleNamespace(
+                    model_type="musicgen",
+                    audio_encoder=types.SimpleNamespace(frame_rate=50),
+                )
+            )
+        )
+        parameters = {"duration": 30.1}
+        guard = self.guard(
+            "music_generation",
+            "transformers_audio",
+            parameters,
+            explicit=("audio.duration",),
+        )
+
+        with self.assertRaises(COMPANION.CompanionFailure) as failure:
+            COMPANION.transformer_duration_tokens(
+                pipeline,
+                parameters,
+                guard,
+                [],
+            )
+
+        self.assertEqual(failure.exception.code, "unsupported_parameter")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_diffusers_audio_maps_stable_audio_duration_and_variations(self):
+        import numpy
+
+        class StableAudioPipeline:
+            sampling_rate = 8_000
+
+            def __init__(self):
+                self.call = None
+
+            def __call__(
+                self,
+                prompt,
+                audio_end_in_s=None,
+                num_waveforms_per_prompt=None,
+                output_type=None,
+            ):
+                self.call = {
+                    "prompt": prompt,
+                    "audio_end_in_s": audio_end_in_s,
+                    "num_waveforms_per_prompt": num_waveforms_per_prompt,
+                    "output_type": output_type,
+                }
+                return types.SimpleNamespace(
+                    audios=numpy.stack(
+                        [
+                            numpy.zeros(12, dtype="float32"),
+                            numpy.ones(12, dtype="float32") * 0.25,
+                        ]
+                    )
+                )
+
+        pipeline = StableAudioPipeline()
+        torch = self.RuntimeTorch()
+        entry = COMPANION.DiffusersPipelineEntry(
+            pipeline,
+            torch,
+            "cpu",
+            "float32",
+            {"offload_mode": "none", "offload_request": "none"},
+            None,
+            0.1,
+        )
+        parameters = {
+            "prompt": "ocean ambience",
+            "duration": 1.5,
+            "variations": 2,
+            "output_format": "wav",
+        }
+        guard = self.guard(
+            "audio_generation",
+            "diffusers_audio",
+            parameters,
+            explicit=("audio.duration", "audio.variations"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            outputs, warnings, metadata = (
+                COMPANION.execute_prepared_diffusers_audio(
+                    entry,
+                    "cache-key",
+                    False,
+                    None,
+                    torch,
+                    "cpu",
+                    "float32",
+                    "audio_generation",
+                    parameters,
+                    Path(directory),
+                    "test",
+                    guard,
+                )
+            )
+
+        self.assertEqual(pipeline.call["audio_end_in_s"], 1.5)
+        self.assertEqual(pipeline.call["num_waveforms_per_prompt"], 2)
+        self.assertEqual(pipeline.call["output_type"], "np")
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(warnings, [])
+        self.assertIn(
+            "audio.duration->audio_end_in_s",
+            metadata["translated_parameters"],
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_speech_translation_uses_local_waveform_and_translate_generation(self):
+        import numpy
+
+        class WhisperPipeline:
+            type = "seq2seq_whisper"
+            feature_extractor = types.SimpleNamespace(sampling_rate=16_000)
+            model = types.SimpleNamespace(can_generate=lambda: True)
+
+            def __init__(self):
+                self.call = None
+
+            def __call__(self, audio, generate_kwargs=None):
+                self.call = (audio, generate_kwargs)
+                return {"text": "translated speech"}
+
+        pipeline = WhisperPipeline()
+        torch = self.RuntimeTorch()
+        parameters = {
+            "output_format": "json",
+            "language": "de",
+            "beam_size": 3,
+        }
+        guard = self.guard(
+            "speech_translation",
+            "transformers_asr",
+            parameters,
+            explicit=("stt.language", "stt.beam_size"),
+        )
+        decoded = {
+            "raw": numpy.zeros(32, dtype="float32"),
+            "sampling_rate": 16_000,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "speech.wav"
+            source.write_bytes(b"fixture")
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "load_transformers_pipeline",
+                    return_value=(pipeline, torch, "cpu", "float32"),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "decode_local_audio",
+                    return_value=decoded,
+                ) as decoder,
+            ):
+                outputs, warnings, metadata = COMPANION.execute_asr(
+                    Path(directory),
+                    "speech_translation",
+                    parameters,
+                    {"audio": str(source)},
+                    Path(directory),
+                    "test",
+                    guard,
+                )
+
+        decoder.assert_called_once_with(source.resolve(), 16_000)
+        self.assertIs(pipeline.call[0], decoded)
+        self.assertEqual(pipeline.call[1]["task"], "translate")
+        self.assertEqual(pipeline.call[1]["language"], "de")
+        self.assertEqual(pipeline.call[1]["num_beams"], 3)
+        self.assertEqual(outputs[0]["mime_type"], "application/json")
+        self.assertEqual(warnings, [])
+        self.assertIn(
+            "stt.operation->generate_kwargs.task",
+            metadata["translated_parameters"],
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_classification_decodes_locally_and_writes_sorted_json(self):
+        import numpy
+
+        class ClassificationPipeline:
+            feature_extractor = types.SimpleNamespace(sampling_rate=16_000)
+
+            def __init__(self):
+                self.call = None
+
+            def __call__(self, audio, top_k=None):
+                self.call = (audio, top_k)
+                return [
+                    {"label": "silence", "score": 0.1},
+                    {"label": "speech", "score": 0.9},
+                ]
+
+        pipeline = ClassificationPipeline()
+        torch = self.RuntimeTorch()
+        parameters = {
+            # The shared schema's materialized audio default must not produce
+            # a WAV for a structured analysis task.
+            "output_format": "wav",
+            "top_k": 2,
+        }
+        guard = self.guard(
+            "voice_activity_detection",
+            "transformers_audio_classification",
+            parameters,
+            explicit=("audio.top_k",),
+        )
+        decoded = {
+            "raw": numpy.zeros(24, dtype="float32"),
+            "sampling_rate": 16_000,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "speech.wav"
+            source.write_bytes(b"fixture")
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "load_transformers_pipeline",
+                    return_value=(pipeline, torch, "cpu", "float32"),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "decode_local_audio",
+                    return_value=decoded,
+                ) as decoder,
+            ):
+                outputs, warnings, metadata = (
+                    COMPANION.execute_audio_classification(
+                        Path(directory),
+                        "voice_activity_detection",
+                        parameters,
+                        {"audio": str(source)},
+                        Path(directory),
+                        "test",
+                        guard,
+                    )
+                )
+                contents = json.loads(Path(outputs[0]["path"]).read_text("utf-8"))
+
+        decoder.assert_called_once_with(source.resolve(), 16_000)
+        self.assertIs(pipeline.call[0], decoded)
+        self.assertEqual(pipeline.call[1], 2)
+        self.assertEqual(
+            [item["label"] for item in contents["labels"]],
+            ["speech", "silence"],
+        )
+        self.assertEqual(outputs[0]["mime_type"], "application/json")
+        self.assertEqual(warnings, [])
+        self.assertEqual(metadata["pipeline_task"], "audio-classification")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_any_to_any_audio_controls_are_forwarded_as_generation_kwargs(self):
+        import numpy
+
+        class AudioTextPipeline:
+            feature_extractor = types.SimpleNamespace(sampling_rate=16_000)
+
+            def __init__(self):
+                self.call = None
+
+            def __call__(
+                self,
+                prompt,
+                audio=None,
+                max_new_tokens=None,
+                generate_kwargs=None,
+                return_full_text=None,
+            ):
+                self.call = {
+                    "prompt": prompt,
+                    "audio": audio,
+                    "max_new_tokens": max_new_tokens,
+                    "generate_kwargs": generate_kwargs,
+                    "return_full_text": return_full_text,
+                }
+                return [{"generated_text": "A dog barks twice."}]
+
+        pipeline = AudioTextPipeline()
+        torch = self.RuntimeTorch()
+        parameters = {
+            "prompt": "Describe the sound.",
+            "max_new_tokens": 12,
+            "temperature": 0.7,
+            "top_k": 8,
+            "top_p": 0.9,
+            "output_format": "json",
+        }
+        guard = self.guard(
+            "audio_understanding",
+            "transformers_audio_text",
+            parameters,
+        )
+        decoded = {
+            "raw": numpy.zeros(24, dtype="float32"),
+            "sampling_rate": 16_000,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sound.wav"
+            source.write_bytes(b"fixture")
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "load_transformers_pipeline",
+                    return_value=(pipeline, torch, "cpu", "float32"),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "decoded_audio_for_pipeline",
+                    return_value=decoded,
+                ),
+            ):
+                outputs, _warnings, metadata = COMPANION.execute_audio_text(
+                    Path(directory),
+                    "audio_understanding",
+                    parameters,
+                    {"audio": str(source)},
+                    Path(directory),
+                    "test",
+                    guard,
+                )
+
+        self.assertIs(pipeline.call["audio"], decoded["raw"])
+        self.assertEqual(pipeline.call["max_new_tokens"], 12)
+        self.assertFalse(pipeline.call["return_full_text"])
+        self.assertEqual(
+            pipeline.call["generate_kwargs"],
+            {
+                "temperature": 0.7,
+                "top_k": 8,
+                "top_p": 0.9,
+                "do_sample": True,
+            },
+        )
+        self.assertEqual(outputs[0]["mime_type"], "application/json")
+        self.assertEqual(metadata["text"], "A dog barks twice.")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy") and importlib.util.find_spec("torch"),
+        "NumPy and PyTorch are optional audio dependencies",
+    )
+    def test_embedding_accepts_multidimensional_tensor_without_bool_coercion(self):
+        import numpy
+        import torch
+
+        class Processor:
+            feature_extractor = types.SimpleNamespace(sampling_rate=16_000)
+
+            def __call__(self, *, audio, sampling_rate=None, return_tensors=None):
+                self.audio = audio
+                self.call = (sampling_rate, return_tensors)
+                return {"input_values": torch.zeros((1, 8))}
+
+        class EmbeddingModel:
+            def __call__(self, **_inputs):
+                return types.SimpleNamespace(
+                    audio_embeds=torch.tensor([[3.0, 4.0]])
+                )
+
+        processor = Processor()
+        model = EmbeddingModel()
+        parameters = {
+            "normalize": True,
+            "pooling": "mean",
+            "output_format": "wav",
+        }
+        guard = self.guard(
+            "audio_embedding",
+            "transformers_audio_embedding",
+            parameters,
+        )
+        decoded = {
+            "raw": numpy.zeros(24, dtype="float32"),
+            "sampling_rate": 16_000,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sound.wav"
+            source.write_bytes(b"fixture")
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "load_transformers_audio_embedder",
+                    return_value=(processor, model, torch, "cpu", torch.float32),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "decoded_audio_for_pipeline",
+                    return_value=decoded,
+                ),
+            ):
+                outputs, warnings, metadata = COMPANION.execute_audio_embedding(
+                    Path(directory),
+                    "audio_embedding",
+                    parameters,
+                    {"audio": str(source)},
+                    Path(directory),
+                    "test",
+                    guard,
+                )
+                contents = json.loads(Path(outputs[0]["path"]).read_text("utf-8"))
+
+        self.assertEqual(processor.call, (16_000, "pt"))
+        self.assertIs(processor.audio, decoded["raw"])
+        self.assertAlmostEqual(contents["embedding"][0], 0.6, places=6)
+        self.assertAlmostEqual(contents["embedding"][1], 0.8, places=6)
+        self.assertEqual(contents["dimensions"], 2)
+        self.assertEqual(outputs[0]["mime_type"], "application/json")
+        self.assertEqual(warnings, [])
+        self.assertEqual(metadata["embedding_dimensions"], 2)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy") and importlib.util.find_spec("torch"),
+        "NumPy and PyTorch are optional audio dependencies",
+    )
+    def test_numpy_audio_converts_torch_bfloat16_on_host(self):
+        import numpy
+        import torch
+
+        result = COMPANION.numpy_audio(
+            torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
+        )
+
+        self.assertEqual(result.dtype, numpy.dtype("float32"))
+        numpy.testing.assert_allclose(result, [0.25, -0.5])
+
+    def test_probe_recognizes_audio_classification_architecture(self):
+        dependencies = {
+            name: {"available": name in {"torch", "transformers", "numpy", "soundfile"}}
+            for name in ("torch", "transformers", "numpy", "soundfile", "ffmpeg")
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "wav2vec2",
+                        "architectures": ["Wav2Vec2ForSequenceClassification"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=dependencies,
+            ):
+                result = COMPANION.command_probe_model(
+                    {
+                        "model_path": str(model),
+                        "task": "speaker_identification",
+                    }
+                )
+
+        self.assertTrue(result["supported"])
+        self.assertEqual(result["adapter"], "transformers_audio_classification")
+        self.assertIn("audio_classification", result["probe"]["tasks"])
+
+    def test_probe_does_not_claim_ctc_model_for_speech_translation(self):
+        dependencies = {
+            name: {"available": name in {"torch", "transformers", "numpy", "soundfile"}}
+            for name in ("torch", "transformers", "numpy", "soundfile", "ffmpeg")
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "wav2vec2",
+                        "architectures": ["Wav2Vec2ForCTC"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=dependencies,
+            ):
+                result = COMPANION.command_probe_model(
+                    {
+                        "model_path": str(model),
+                        "task": "speech_translation",
+                    }
+                )
+
+        self.assertFalse(result["supported"])
+        self.assertIn("speech_to_text", result["probe"]["tasks"])
+        self.assertNotIn("speech_translation", result["probe"]["tasks"])
+
+    def test_probe_recognizes_declared_asr_translation_support(self):
+        dependencies = {
+            name: {"available": name in {"torch", "transformers", "numpy", "soundfile"}}
+            for name in ("torch", "transformers", "numpy", "soundfile", "ffmpeg")
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "whisper",
+                        "architectures": ["WhisperForConditionalGeneration"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model / "generation_config.json").write_text(
+                json.dumps(
+                    {
+                        "task_to_id": {
+                            "transcribe": 1,
+                            "translate": 2,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=dependencies,
+            ):
+                result = COMPANION.command_probe_model(
+                    {
+                        "model_path": str(model),
+                        "task": "speech_translation",
+                    }
+                )
+
+        self.assertTrue(result["supported"])
+        self.assertIn("speech_translation", result["probe"]["tasks"])
+
+    def test_probe_recognizes_gemma3n_audio_config_without_hub_metadata(self):
+        dependencies = {
+            name: {
+                "available": name
+                in {"torch", "transformers", "numpy", "soundfile"}
+            }
+            for name in (
+                "torch",
+                "transformers",
+                "numpy",
+                "soundfile",
+                "ffmpeg",
+                "librosa",
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "gemma3n",
+                        "architectures": ["Gemma3nForConditionalGeneration"],
+                        "audio_config": {"model_type": "gemma3n_audio"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=dependencies,
+            ):
+                result = COMPANION.command_probe_model(
+                    {
+                        "model_path": str(model),
+                        "task": "audio_understanding",
+                    }
+                )
+
+        self.assertTrue(result["supported"])
+        self.assertEqual(result["adapter"], "transformers_audio_text")
+        self.assertIn("audio_understanding", result["probe"]["tasks"])
+
+    def test_command_execute_dispatches_each_new_transformers_adapter(self):
+        cases = (
+            ("audio_classification", "execute_audio_classification"),
+            ("audio_captioning", "execute_audio_text"),
+            ("audio_embedding", "execute_audio_embedding"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps({"model_type": "fixture"}),
+                encoding="utf-8",
+            )
+            for task, executor_name in cases:
+                with self.subTest(task=task), mock.patch.object(
+                    COMPANION,
+                    executor_name,
+                    return_value=([], [], {"runtime": "transformers"}),
+                ) as executor:
+                    result = COMPANION.command_execute(
+                        {
+                            "model_path": str(model),
+                            "task": task,
+                            "output_dir": str(root / "outputs"),
+                        }
+                    )
+
+                executor.assert_called_once()
+                self.assertEqual(result["task"], task)
+
+
+class ResidentTransformersAudioCacheTests(unittest.TestCase):
+    class RuntimeTorch:
+        def inference_mode(self):
+            return contextlib.nullcontext()
+
+    @staticmethod
+    def guard(task="audio_classification"):
+        return COMPANION.ExplicitParameterGuard(
+            {"explicit_parameters": []},
+            task,
+            "transformers_audio_classification",
+            {},
+        )
+
+    def test_shared_limit_evicts_diffusers_before_transformers_load(self):
+        runtime = COMPANION.CompanionRuntime(1)
+        torch = self.RuntimeTorch()
+        diffusers_pipeline = object()
+        diffusers_entry = COMPANION.DiffusersPipelineEntry(
+            diffusers_pipeline,
+            torch,
+            "cpu",
+            "float32",
+            {"offload_mode": "none", "offload_request": "none"},
+            None,
+            0.1,
+        )
+        runtime.pipeline_cache.put(("diffusers-fixture",), diffusers_entry)
+        observed = []
+
+        def load_pipeline(*_args, **_kwargs):
+            observed.append(diffusers_entry.pipeline is None)
+            return object(), torch, "cpu", "float32"
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "torch_runtime",
+                    return_value=(torch, "cpu", "float32"),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "load_transformers_pipeline",
+                    side_effect=load_pipeline,
+                ),
+            ):
+                entry, _key, hit, resident = (
+                    COMPANION.prepare_transformers_pipeline(
+                        runtime,
+                        Path(directory),
+                        "transformers_audio_classification",
+                        "audio-classification",
+                        {},
+                    )
+                )
+
+        self.assertEqual(observed, [True])
+        self.assertFalse(hit)
+        self.assertTrue(resident)
+        self.assertEqual(len(runtime.pipeline_cache), 1)
+        self.assertIsNotNone(entry.pipeline)
+        runtime.close()
+        self.assertIsNone(entry.pipeline)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_repeated_classification_reuses_pipeline_and_reports_cache_hit(self):
+        import numpy
+
+        class ClassificationPipeline:
+            feature_extractor = types.SimpleNamespace(sampling_rate=16_000)
+
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, _audio, top_k=None):
+                self.calls += 1
+                return [{"label": "speech", "score": 0.9}][:top_k]
+
+        runtime = COMPANION.CompanionRuntime(1)
+        torch = self.RuntimeTorch()
+        pipeline = ClassificationPipeline()
+        decoded = {
+            "raw": numpy.zeros(16, dtype="float32"),
+            "sampling_rate": 16_000,
+        }
+        parameters = {"output_format": "json", "top_k": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps({"model_type": "wav2vec2"}),
+                encoding="utf-8",
+            )
+            source = root / "audio.wav"
+            source.write_bytes(b"fixture")
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "torch_runtime",
+                    return_value=(torch, "cpu", "float32"),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "load_transformers_pipeline",
+                    return_value=(pipeline, torch, "cpu", "float32"),
+                ) as loader,
+                mock.patch.object(
+                    COMPANION,
+                    "decode_local_audio",
+                    return_value=decoded,
+                ),
+            ):
+                first = COMPANION.execute_audio_classification(
+                    model,
+                    "audio_classification",
+                    parameters,
+                    {"audio": str(source)},
+                    root,
+                    "first",
+                    self.guard(),
+                    runtime=runtime,
+                )[2]
+                second = COMPANION.execute_audio_classification(
+                    model,
+                    "audio_classification",
+                    parameters,
+                    {"audio": str(source)},
+                    root,
+                    "second",
+                    self.guard(),
+                    runtime=runtime,
+                )[2]
+
+        loader.assert_called_once()
+        self.assertEqual(pipeline.calls, 2)
+        self.assertFalse(first["model_cache_hit"])
+        self.assertGreaterEqual(first["model_load_seconds"], 0.0)
+        self.assertTrue(second["model_cache_hit"])
+        self.assertEqual(second["model_load_seconds"], 0.0)
+        cached_entry = next(iter(runtime.pipeline_cache._entries.values()))
+        runtime.close()
+        self.assertIsNone(cached_entry.pipeline)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_pipeline_failure_evicts_transformers_entry_and_reloads(self):
+        import numpy
+
+        class ClassificationPipeline:
+            feature_extractor = types.SimpleNamespace(sampling_rate=16_000)
+
+            def __init__(self):
+                self.fail = True
+
+            def __call__(self, _audio, top_k=None):
+                if self.fail:
+                    raise RuntimeError("broken inference")
+                return [{"label": "speech", "score": 0.9}][:top_k]
+
+        runtime = COMPANION.CompanionRuntime(1)
+        torch = self.RuntimeTorch()
+        pipeline = ClassificationPipeline()
+        decoded = {
+            "raw": numpy.zeros(16, dtype="float32"),
+            "sampling_rate": 16_000,
+        }
+        parameters = {"output_format": "json", "top_k": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps({"model_type": "wav2vec2"}),
+                encoding="utf-8",
+            )
+            source = root / "audio.wav"
+            source.write_bytes(b"fixture")
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "torch_runtime",
+                    return_value=(torch, "cpu", "float32"),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "load_transformers_pipeline",
+                    return_value=(pipeline, torch, "cpu", "float32"),
+                ) as loader,
+                mock.patch.object(
+                    COMPANION,
+                    "decode_local_audio",
+                    return_value=decoded,
+                ),
+            ):
+                with self.assertRaises(COMPANION.CompanionFailure) as failure:
+                    COMPANION.execute_audio_classification(
+                        model,
+                        "audio_classification",
+                        parameters,
+                        {"audio": str(source)},
+                        root,
+                        "failure",
+                        self.guard(),
+                        runtime=runtime,
+                    )
+                self.assertEqual(len(runtime.pipeline_cache), 0)
+                pipeline.fail = False
+                metadata = COMPANION.execute_audio_classification(
+                    model,
+                    "audio_classification",
+                    parameters,
+                    {"audio": str(source)},
+                    root,
+                    "success",
+                    self.guard(),
+                    runtime=runtime,
+                )[2]
+
+        self.assertEqual(failure.exception.code, "execution_failed")
+        self.assertEqual(loader.call_count, 2)
+        self.assertFalse(metadata["model_cache_hit"])
+        runtime.close()
+
+    def test_embedding_processor_and_model_share_one_cached_entry(self):
+        runtime = COMPANION.CompanionRuntime(1)
+        torch = self.RuntimeTorch()
+        processor = object()
+        model = object()
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "torch_runtime",
+                    return_value=(torch, "cpu", "float32"),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "load_transformers_audio_embedder",
+                    return_value=(processor, model, torch, "cpu", "float32"),
+                ) as loader,
+            ):
+                first, first_key, first_hit, _resident = (
+                    COMPANION.prepare_transformers_audio_embedder(
+                        runtime,
+                        Path(directory),
+                        {},
+                    )
+                )
+                second, second_key, second_hit, _resident = (
+                    COMPANION.prepare_transformers_audio_embedder(
+                        runtime,
+                        Path(directory),
+                        {},
+                    )
+                )
+
+        loader.assert_called_once()
+        self.assertIs(first, second)
+        self.assertEqual(first_key, second_key)
+        self.assertFalse(first_hit)
+        self.assertTrue(second_hit)
+        self.assertIs(first.processor, processor)
+        self.assertIs(first.model, model)
+        runtime.close()
+        self.assertIsNone(first.processor)
+        self.assertIsNone(first.model)
+
+
+class Qwen3TTSVoiceDesignTests(unittest.TestCase):
+    class RuntimeTorch:
+        def __init__(self):
+            self.seed = None
+            self.cuda_seed = None
+            self.cuda = types.SimpleNamespace(
+                manual_seed_all=lambda value: setattr(self, "cuda_seed", value),
+                current_device=lambda: 0,
+            )
+
+        def inference_mode(self):
+            return contextlib.nullcontext()
+
+        def manual_seed(self, value):
+            self.seed = value
+
+    @staticmethod
+    def write_model(root, variant="voice_design"):
+        (root / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_tts",
+                    "tts_model_type": variant,
+                    "architectures": ["Qwen3TTSForConditionalGeneration"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        speech_tokenizer = root / "speech_tokenizer"
+        speech_tokenizer.mkdir()
+        (speech_tokenizer / "model.safetensors").write_bytes(b"tokenizer")
+        (root / "model.safetensors").write_bytes(b"model")
+
+    @staticmethod
+    def dependencies(*, qwen_tts):
+        return {
+            name: {
+                "available": name in {"torch", "numpy", "transformers"}
+                or (name == "qwen_tts" and qwen_tts)
+            }
+            for name in (
+                "torch",
+                "numpy",
+                "transformers",
+                "qwen_tts",
+                "diffusers",
+                "PIL",
+                "soundfile",
+                "imageio",
+                "imageio_ffmpeg",
+                "av",
+                "ffmpeg",
+            )
+        }
+
+    def test_capabilities_advertise_tts_from_isolated_qwen_environment(self):
+        dependencies = self.dependencies(qwen_tts=True)
+        dependencies["transformers"]["available"] = False
+        with mock.patch.object(
+            COMPANION,
+            "dependency_snapshot",
+            return_value=dependencies,
+        ):
+            result = COMPANION.command_capabilities({})
+
+        tts = next(
+            item
+            for item in result["capabilities"]
+            if item["task"] == "text_to_speech"
+        )
+        self.assertTrue(tts["available"])
+        self.assertEqual(tts["runtime"], "qwen3-tts-or-transformers")
+
+    def test_dependency_status_rejects_installed_but_broken_qwen_package(self):
+        with (
+            mock.patch.object(
+                COMPANION,
+                "module_status",
+                return_value={"available": True, "version": "0.1.1", "detail": None},
+            ),
+            mock.patch.object(
+                COMPANION.importlib,
+                "import_module",
+                side_effect=RuntimeError("transformers mismatch"),
+            ),
+        ):
+            status = COMPANION.importable_module_status(
+                "qwen_tts",
+                "qwen-tts",
+                "Qwen3TTSModel",
+            )
+
+        self.assertFalse(status["available"])
+        self.assertIn("transformers mismatch", status["detail"])
+
+    def test_probe_recognizes_voice_design_and_requires_qwen_tts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            self.write_model(model)
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=self.dependencies(qwen_tts=False),
+            ):
+                missing = COMPANION.command_probe_model(
+                    {"model_path": str(model), "task": "text_to_speech"}
+                )
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=self.dependencies(qwen_tts=True),
+            ):
+                ready = COMPANION.command_probe_model(
+                    {"model_path": str(model), "task": "text_to_speech"}
+                )
+
+        self.assertEqual(missing["adapter"], COMPANION.QWEN3_TTS_ADAPTER)
+        self.assertFalse(missing["supported"])
+        self.assertTrue(any("qwen-tts" in reason for reason in missing["reasons"]))
+        self.assertIn("werk backend install qwen-tts", missing["detail"])
+        self.assertIn("WERK_QWEN_TTS_PYTHON", missing["detail"])
+        self.assertEqual(missing["required_backend"], "qwen-tts")
+        self.assertEqual(
+            missing["install_command"],
+            "werk backend install qwen-tts",
+        )
+        self.assertFalse(missing["backend_available"])
+        self.assertFalse(missing["fallback_possible"])
+        self.assertTrue(missing["architecture_adapter_supported"])
+        self.assertEqual(missing["missing_dependencies"], ["qwen_tts"])
+        self.assertTrue(ready["supported"])
+        self.assertEqual(ready["required_backend"], "qwen-tts")
+        self.assertIsNone(ready["install_command"])
+        self.assertTrue(ready["backend_available"])
+        self.assertFalse(ready["fallback_possible"])
+        self.assertTrue(ready["architecture_adapter_supported"])
+        self.assertEqual(ready["missing_dependencies"], [])
+        self.assertIn("text_to_speech", ready["probe"]["tasks"])
+        self.assertIn("speech_tokenizer", ready["probe"]["components"])
+        self.assertEqual(ready["probe"]["model_variant"], "voice_design")
+
+    def test_other_qwen_tts_variants_do_not_fall_through_to_transformers(self):
+        for variant in ("custom_voice", "base"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                model = Path(directory)
+                self.write_model(model, variant=variant)
+
+                for task in (
+                    "text_to_speech",
+                    "audio_generation",
+                    "audio_classification",
+                ):
+                    self.assertIsNone(COMPANION.execution_adapter(model, task))
+
+                with mock.patch.object(
+                    COMPANION,
+                    "dependency_snapshot",
+                    return_value=self.dependencies(qwen_tts=False),
+                ):
+                    result = COMPANION.command_probe_model(
+                        {"model_path": str(model), "task": "text_to_speech"}
+                    )
+
+            self.assertFalse(result["supported"])
+            self.assertEqual(result["required_backend"], "qwen-tts")
+            self.assertFalse(result["backend_available"])
+            self.assertFalse(result["fallback_possible"])
+            self.assertFalse(result["architecture_adapter_supported"])
+            self.assertIsNone(result["install_command"])
+
+    def test_generic_transformers_probe_has_no_architecture_install_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "speecht5",
+                        "architectures": ["SpeechT5ForTextToSpeech"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=self.dependencies(qwen_tts=False),
+            ):
+                result = COMPANION.command_probe_model(
+                    {"model_path": str(model), "task": "text_to_speech"}
+                )
+
+        self.assertTrue(result["supported"])
+        self.assertEqual(result["adapter"], "transformers_tts")
+        self.assertIsNone(result["required_backend"])
+        self.assertIsNone(result["install_command"])
+        self.assertIsNone(result["backend_available"])
+        self.assertIsNone(result["fallback_possible"])
+        self.assertIsNone(result["architecture_adapter_supported"])
+        self.assertEqual(result["missing_dependencies"], [])
+
+    def test_estimate_remains_available_but_reports_missing_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            self.write_model(model)
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=self.dependencies(qwen_tts=False),
+            ):
+                estimate = COMPANION.command_estimate(
+                    {
+                        "model_path": str(model),
+                        "task": "text_to_speech",
+                        "effective_parameters": {
+                            "tts.language": "de",
+                            "tts.speaking_style": "warm and precise",
+                            "tts.output_format": "wav",
+                        },
+                        "explicit_parameters": [
+                            "tts.language",
+                            "tts.speaking_style",
+                            "tts.output_format",
+                        ],
+                    }
+                )
+
+        self.assertTrue(any("bundled speech tokenizer" in item for item in estimate["assumptions"]))
+        self.assertTrue(any("qwen-tts" in item for item in estimate["warnings"]))
+        self.assertIn("tts.language", estimate["parameter_support"]["explicit_parameters"])
+
+    def test_loader_uses_only_local_model_path_and_official_api(self):
+        calls = []
+
+        class FakeModel:
+            def generate_voice_design(self, **_kwargs):
+                return [], 24_000
+
+        class FakeModelClass:
+            @classmethod
+            def from_pretrained(cls, path, **kwargs):
+                calls.append((path, kwargs))
+                return FakeModel()
+
+        fake_qwen = types.SimpleNamespace(Qwen3TTSModel=FakeModelClass)
+        torch = self.RuntimeTorch()
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            self.write_model(model)
+            with mock.patch.object(
+                COMPANION,
+                "require_module",
+                return_value=fake_qwen,
+            ):
+                loaded, loaded_torch, device, dtype = (
+                    COMPANION.load_qwen3_tts_voice_design(
+                        model,
+                        {},
+                        runtime_values=(torch, "cuda", "bfloat16"),
+                    )
+                )
+
+        self.assertIsInstance(loaded, FakeModel)
+        self.assertIs(loaded_torch, torch)
+        self.assertEqual(device, "cuda")
+        self.assertEqual(dtype, "bfloat16")
+        self.assertEqual(calls, [(str(model), {"device_map": "cuda:0", "dtype": "bfloat16"})])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_execute_maps_german_style_seed_and_writes_wav(self):
+        import numpy
+
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate_voice_design(self, **kwargs):
+                self.calls.append(kwargs)
+                return [numpy.linspace(-0.2, 0.2, 24, dtype="float32")], 24_000
+
+        model = FakeModel()
+        torch = self.RuntimeTorch()
+        entry = COMPANION.TransformersAudioEntry(
+            torch,
+            "cpu",
+            "bfloat16",
+            0.25,
+            adapter=COMPANION.QWEN3_TTS_ADAPTER,
+            pipeline_task="voice-design",
+            model=model,
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            COMPANION,
+            "prepare_qwen3_tts_voice_design",
+            return_value=(entry, ("qwen",), False, False),
+        ):
+            outputs, warnings, metadata = (
+                COMPANION.execute_qwen3_tts_voice_design(
+                    Path(directory),
+                    "text_to_speech",
+                    {
+                        "text": "Werk elf zwölf ist bereit.",
+                        "language": "de-DE",
+                        "speaking_style": "Warm, ruhig und präzise.",
+                        "seed": 1112,
+                        "output_format": "wav",
+                    },
+                    Path(directory),
+                    "hq",
+                )
+            )
+            output_path = Path(outputs[0]["path"])
+            self.assertTrue(output_path.is_file())
+            self.assertGreater(output_path.stat().st_size, 44)
+
+        self.assertEqual(
+            model.calls,
+            [
+                {
+                    "text": "Werk elf zwölf ist bereit.",
+                    "language": "German",
+                    "instruct": "Warm, ruhig und präzise.",
+                    "non_streaming_mode": True,
+                }
+            ],
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(torch.seed, 1112)
+        self.assertEqual(torch.cuda_seed, 1112)
+        self.assertEqual(metadata["runtime"], "qwen-tts")
+        self.assertEqual(metadata["language"], "German")
+        self.assertIn("tts.speaking_style->instruct", metadata["translated_parameters"])
+        self.assertIn("tts.seed->torch.manual_seed", metadata["translated_parameters"])
+        self.assertEqual(outputs[0]["metadata"]["sample_rate"], 24_000)
+
+    def test_supported_parameters_are_voice_design_specific(self):
+        supported = COMPANION.supported_explicit_parameters(
+            "text_to_speech",
+            COMPANION.QWEN3_TTS_ADAPTER,
+        )
+
+        self.assertIn("tts.language", supported)
+        self.assertIn("tts.speaking_style", supported)
+        self.assertIn("tts.seed", supported)
+        self.assertIn("tts.output_format", supported)
+        self.assertNotIn("tts.voice", supported)
+
+    def test_command_execute_dispatches_qwen_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model"
+            model.mkdir()
+            self.write_model(model)
+            with mock.patch.object(
+                COMPANION,
+                "execute_qwen3_tts_voice_design",
+                return_value=([], [], {"runtime": "qwen-tts"}),
+            ) as executor:
+                result = COMPANION.command_execute(
+                    {
+                        "model_path": str(model),
+                        "task": "text_to_speech",
+                        "prompt": "Werk elf zwölf ist bereit.",
+                        "effective_parameters": {
+                            "tts.speaking_style": "warm and precise",
+                        },
+                        "explicit_parameters": ["tts.speaking_style"],
+                        "output_dir": str(root / "outputs"),
+                    }
+                )
+                persisted = Path(result["metadata"]["metadata_path"]).read_text(
+                    encoding="utf-8"
+                )
+
+        executor.assert_called_once()
+        self.assertEqual(result["task"], "text_to_speech")
+        self.assertEqual(result["metadata"]["backend"]["runtime"], "qwen-tts")
+        effective = result["metadata"]["effective_parameters"]
+        self.assertNotIn("text", effective)
+        self.assertNotIn("prompt", effective)
+        self.assertNotIn("speaking_style", effective)
+        self.assertNotIn("tts.speaking_style", effective)
+        self.assertNotIn("Werk elf zwölf ist bereit.", persisted)
+        self.assertNotIn("warm and precise", persisted)
 
 
 if __name__ == "__main__":

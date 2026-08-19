@@ -1795,11 +1795,8 @@ pub struct AudioExportArgs {
     pub output: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Args, Serialize)]
-pub struct AudioGenerateArgs {
-    #[arg(value_name = "MODEL")]
-    pub model: String,
-
+#[derive(Debug, Clone, Args, Serialize, Default)]
+pub struct AudioGenerationOptions {
     #[command(flatten)]
     #[serde(flatten)]
     pub prompt: PromptArgs,
@@ -1831,6 +1828,56 @@ pub struct AudioGenerateArgs {
     #[command(flatten)]
     #[serde(flatten)]
     pub export: AudioExportArgs,
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct AudioGenerateVariantArgs {
+    #[arg(value_name = "MODEL")]
+    pub model: String,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub options: AudioGenerationOptions,
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioGenerateCommands {
+    #[command(about = "Synthesize speech from text")]
+    Speech(AudioSpeakArgs),
+
+    #[command(about = "Generate music or a song")]
+    Music(AudioGenerateVariantArgs),
+
+    #[command(about = "Generate a sound effect or general-purpose audio")]
+    Sound(AudioGenerateVariantArgs),
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct AudioGenerateArgs {
+    /// Typed generation surface. Omit it for the legacy `audio generate MODEL` form.
+    #[command(subcommand)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<AudioGenerateCommands>,
+
+    #[arg(value_name = "MODEL")]
+    pub model: Option<String>,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub options: AudioGenerationOptions,
+}
+
+impl AudioGenerateArgs {
+    pub fn routing(&self) -> &RoutingArgs {
+        match self.command.as_ref() {
+            Some(AudioGenerateCommands::Speech(args)) => &args.routing,
+            Some(AudioGenerateCommands::Music(args)) | Some(AudioGenerateCommands::Sound(args)) => {
+                &args.options.routing
+            }
+            None => &self.options.routing,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -2180,29 +2227,218 @@ pub struct AudioSeparateArgs {
     pub separation: AudioSeparationArgs,
 }
 
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct AudioInputTaskArgs {
+    #[arg(value_name = "MODEL")]
+    pub model: String,
+
+    #[arg(long = "input", value_name = "AUDIO", required = true)]
+    pub input_audio: PathBuf,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub prompt: PromptArgs,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub routing: RoutingArgs,
+
+    #[arg(long = "max-new-tokens")]
+    pub max_new_tokens: Option<u32>,
+
+    #[arg(long)]
+    pub temperature: Option<f64>,
+
+    #[arg(long)]
+    pub top_k: Option<u32>,
+
+    #[arg(long)]
+    pub top_p: Option<f64>,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        conflicts_with = "no_normalize"
+    )]
+    pub normalize: bool,
+
+    #[arg(
+        long = "no-normalize",
+        action = ArgAction::SetTrue,
+        conflicts_with = "normalize"
+    )]
+    pub no_normalize: bool,
+
+    #[arg(long)]
+    pub pooling: Option<String>,
+
+    #[arg(long = "output-format")]
+    pub output_format: Option<String>,
+
+    #[arg(
+        long = "output",
+        alias = "output-path",
+        value_name = "PATH",
+        help = "Output file or directory; defaults to WERK_HOME/outputs with a generated name"
+    )]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct AudioVoiceTransformArgs {
+    #[arg(value_name = "MODEL")]
+    pub model: String,
+
+    #[arg(long = "input", value_name = "AUDIO", required = true)]
+    pub input_audio: PathBuf,
+
+    #[arg(long = "reference-audio", value_name = "AUDIO")]
+    pub reference_audio: Option<PathBuf>,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub routing: RoutingArgs,
+
+    #[arg(
+        long = "output",
+        alias = "output-path",
+        value_name = "PATH",
+        help = "Output file or directory; defaults to WERK_HOME/outputs with a generated name"
+    )]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioDetectCommands {
+    #[command(about = "Detect acoustic events")]
+    Event(AudioInputTaskArgs),
+
+    #[command(about = "Detect speech or voice activity")]
+    Voice(AudioInputTaskArgs),
+
+    #[command(about = "Identify a speaker")]
+    Speaker(AudioInputTaskArgs),
+
+    #[command(about = "Identify the spoken language")]
+    Language(AudioInputTaskArgs),
+
+    #[command(about = "Recognize emotion in speech")]
+    Emotion(AudioInputTaskArgs),
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct AudioDetectArgs {
+    #[command(subcommand)]
+    pub command: AudioDetectCommands,
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioAnalyzeCommands {
+    #[command(about = "Caption an audio recording")]
+    Caption(AudioInputTaskArgs),
+
+    #[command(about = "Diarize speakers in a recording")]
+    Diarize(AudioInputTaskArgs),
+
+    #[command(about = "Classify an audio recording")]
+    Classify(AudioInputTaskArgs),
+
+    #[command(about = "Analyze or answer a prompt about audio")]
+    Understand(AudioInputTaskArgs),
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct AudioAnalyzeArgs {
+    #[command(subcommand)]
+    pub command: AudioAnalyzeCommands,
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioTransformCommands {
+    #[command(about = "Convert a voice using an optional reference")]
+    Voice(AudioVoiceTransformArgs),
+
+    #[command(about = "Separate audio into stems")]
+    Separate(AudioSeparateArgs),
+
+    #[command(about = "Enhance or restore audio")]
+    Enhance(AudioInputTaskArgs),
+
+    #[command(about = "Edit audio from a text instruction")]
+    Edit(AudioInputTaskArgs),
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct AudioTransformArgs {
+    #[command(subcommand)]
+    pub command: AudioTransformCommands,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioCommands {
-    #[command(about = "Generate audio or music with an installed model")]
+    #[command(about = "Generate speech, music, or sound")]
     Generate(AudioGenerateArgs),
 
-    #[command(about = "Synthesize speech with an installed model")]
+    #[command(about = "Synthesize speech with an installed model", hide = true)]
     Speak(AudioSpeakArgs),
 
-    #[command(about = "Transcribe or translate speech with an installed model")]
+    #[command(about = "Transcribe speech")]
     Transcribe(AudioTranscribeArgs),
 
-    #[command(about = "Separate audio into stems with an installed model")]
+    #[command(about = "Translate speech into English")]
+    Translate(AudioTranscribeArgs),
+
+    #[command(about = "Detect events, voice activity, speakers, language, or emotion")]
+    Detect(AudioDetectArgs),
+
+    #[command(about = "Caption, diarize, classify, or understand audio")]
+    Analyze(AudioAnalyzeArgs),
+
+    #[command(about = "Convert, separate, enhance, or edit audio")]
+    Transform(AudioTransformArgs),
+
+    #[command(about = "Create an embedding for an audio recording")]
+    Embed(AudioInputTaskArgs),
+
+    #[command(
+        about = "Separate audio into stems with an installed model",
+        hide = true
+    )]
     Separate(AudioSeparateArgs),
 }
 
 impl AudioCommands {
     pub fn routing(&self) -> &RoutingArgs {
         match self {
-            Self::Generate(args) => &args.routing,
+            Self::Generate(args) => args.routing(),
             Self::Speak(args) => &args.routing,
-            Self::Transcribe(args) => &args.routing,
+            Self::Transcribe(args) | Self::Translate(args) => &args.routing,
+            Self::Detect(args) => match &args.command {
+                AudioDetectCommands::Event(args)
+                | AudioDetectCommands::Voice(args)
+                | AudioDetectCommands::Speaker(args)
+                | AudioDetectCommands::Language(args)
+                | AudioDetectCommands::Emotion(args) => &args.routing,
+            },
+            Self::Analyze(args) => match &args.command {
+                AudioAnalyzeCommands::Caption(args)
+                | AudioAnalyzeCommands::Diarize(args)
+                | AudioAnalyzeCommands::Classify(args)
+                | AudioAnalyzeCommands::Understand(args) => &args.routing,
+            },
+            Self::Transform(args) => match &args.command {
+                AudioTransformCommands::Voice(args) => &args.routing,
+                AudioTransformCommands::Separate(args) => &args.routing,
+                AudioTransformCommands::Enhance(args) | AudioTransformCommands::Edit(args) => {
+                    &args.routing
+                }
+            },
+            Self::Embed(args) => &args.routing,
             Self::Separate(args) => &args.routing,
         }
     }
@@ -2710,23 +2946,23 @@ mod tests {
         let AudioCommands::Generate(args) = cli.command else {
             panic!("expected audio generate");
         };
-        assert_eq!(args.model, "musicgen-large");
+        assert_eq!(args.model.as_deref(), Some("musicgen-large"));
         assert_eq!(
-            args.lyrics.lyrics_file.as_deref(),
+            args.options.lyrics.lyrics_file.as_deref(),
             Some(PathBuf::from("lyrics.txt").as_path())
         );
-        assert_eq!(args.composition.genres, vec!["metal", "soundtrack"]);
-        assert_eq!(args.composition.instruments.len(), 1);
-        assert!(args.vocals.vocals);
-        assert!(args.vocals.backing_vocals);
+        assert_eq!(args.options.composition.genres, vec!["metal", "soundtrack"]);
+        assert_eq!(args.options.composition.instruments.len(), 1);
+        assert!(args.options.vocals.vocals);
+        assert!(args.options.vocals.backing_vocals);
         assert_eq!(
-            args.conditioning.reference_audio.as_deref(),
+            args.options.conditioning.reference_audio.as_deref(),
             Some(PathBuf::from("reference.wav").as_path())
         );
-        assert_eq!(args.sampling.top_k, Some(250));
-        assert!(args.export.normalization);
-        assert!(args.export.export_stems);
-        assert_eq!(args.export.stems, vec!["vocals", "drums"]);
+        assert_eq!(args.options.sampling.top_k, Some(250));
+        assert!(args.options.export.normalization);
+        assert!(args.options.export.export_stems);
+        assert_eq!(args.options.export.stems, vec!["vocals", "drums"]);
     }
 
     #[test]
@@ -2873,6 +3109,172 @@ mod tests {
     }
 
     #[test]
+    fn parses_typed_audio_generation_taxonomy_and_keeps_legacy_generate() {
+        let speech = AudioCli::try_parse_from([
+            "werk-audio",
+            "generate",
+            "speech",
+            "speech-model",
+            "--text",
+            "hello",
+            "--accelerator",
+            "cuda",
+        ])
+        .unwrap();
+        let AudioCommands::Generate(args) = speech.command else {
+            panic!("expected audio generate");
+        };
+        let Some(AudioGenerateCommands::Speech(args)) = args.command else {
+            panic!("expected typed speech generation");
+        };
+        assert_eq!(args.model, "speech-model");
+        assert_eq!(args.text.text.as_deref(), Some("hello"));
+        assert_eq!(args.routing.accelerator.as_deref(), Some("cuda"));
+
+        for (kind, expected_music) in [("music", true), ("sound", false)] {
+            let command = AudioCli::try_parse_from([
+                "werk-audio",
+                "generate",
+                kind,
+                "audio-model",
+                "--prompt",
+                "ocean waves",
+                "--duration",
+                "8",
+            ])
+            .unwrap()
+            .command;
+            let AudioCommands::Generate(args) = command else {
+                panic!("expected audio generate");
+            };
+            let variant = match args.command {
+                Some(AudioGenerateCommands::Music(args)) if expected_music => args,
+                Some(AudioGenerateCommands::Sound(args)) if !expected_music => args,
+                _ => panic!("unexpected typed generation command"),
+            };
+            assert_eq!(variant.model, "audio-model");
+            assert_eq!(variant.options.composition.duration, Some(8.0));
+        }
+
+        let legacy = AudioCli::try_parse_from([
+            "werk-audio",
+            "generate",
+            "legacy-model",
+            "--prompt",
+            "rain",
+        ])
+        .unwrap();
+        let AudioCommands::Generate(args) = legacy.command else {
+            panic!("expected legacy audio generate");
+        };
+        assert!(args.command.is_none());
+        assert_eq!(args.model.as_deref(), Some("legacy-model"));
+        assert_eq!(args.options.prompt.prompt.as_deref(), Some("rain"));
+    }
+
+    #[test]
+    fn parses_audio_detection_analysis_transform_and_embedding_taxonomy() {
+        for kind in ["event", "voice", "speaker", "language", "emotion"] {
+            AudioCli::try_parse_from([
+                "werk-audio",
+                "detect",
+                kind,
+                "classifier",
+                "--input",
+                "clip.wav",
+                "--top-k",
+                "3",
+            ])
+            .unwrap();
+        }
+        for kind in ["caption", "diarize", "classify", "understand"] {
+            let mut argv = vec![
+                "werk-audio",
+                "analyze",
+                kind,
+                "analyzer",
+                "--input",
+                "clip.wav",
+            ];
+            if kind == "understand" {
+                argv.extend([
+                    "--prompt",
+                    "What is happening?",
+                    "--max-new-tokens",
+                    "64",
+                    "--temperature",
+                    "0.2",
+                    "--top-p",
+                    "0.9",
+                    "--output-format",
+                    "json",
+                ]);
+            }
+            AudioCli::try_parse_from(argv).unwrap();
+        }
+        for argv in [
+            vec![
+                "werk-audio",
+                "transform",
+                "voice",
+                "voice-model",
+                "--input",
+                "source.wav",
+            ],
+            vec![
+                "werk-audio",
+                "transform",
+                "separate",
+                "separator",
+                "--input",
+                "mix.wav",
+            ],
+            vec![
+                "werk-audio",
+                "transform",
+                "enhance",
+                "enhancer",
+                "--input",
+                "noisy.wav",
+            ],
+            vec![
+                "werk-audio",
+                "transform",
+                "edit",
+                "editor",
+                "--input",
+                "clip.wav",
+                "--prompt",
+                "remove the siren",
+            ],
+            vec![
+                "werk-audio",
+                "embed",
+                "embedder",
+                "--input",
+                "clip.wav",
+                "--normalize",
+                "--pooling",
+                "mean",
+                "--output-format",
+                "json",
+            ],
+        ] {
+            AudioCli::try_parse_from(argv).unwrap();
+        }
+
+        let translate = AudioCli::try_parse_from([
+            "werk-audio",
+            "translate",
+            "whisper",
+            "--input",
+            "speech.wav",
+        ])
+        .unwrap();
+        assert!(matches!(translate.command, AudioCommands::Translate(_)));
+    }
+
+    #[test]
     fn audio_source_commands_require_input() {
         assert!(AudioCli::try_parse_from(["werk-audio", "transcribe", "whisper"]).is_err());
         assert!(AudioCli::try_parse_from(["werk-audio", "separate", "demucs"]).is_err());
@@ -2985,6 +3387,14 @@ mod tests {
             vec!["werk-audio", "generate", "model", "--verbose", "--debug"],
             vec![
                 "werk-audio",
+                "generate",
+                "music",
+                "model",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-audio",
                 "speak",
                 "model",
                 "--text",
@@ -2995,6 +3405,54 @@ mod tests {
             vec![
                 "werk-audio",
                 "transcribe",
+                "model",
+                "--input",
+                "input.wav",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-audio",
+                "translate",
+                "model",
+                "--input",
+                "input.wav",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-audio",
+                "detect",
+                "event",
+                "model",
+                "--input",
+                "input.wav",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-audio",
+                "analyze",
+                "classify",
+                "model",
+                "--input",
+                "input.wav",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-audio",
+                "transform",
+                "voice",
+                "model",
+                "--input",
+                "input.wav",
+                "--verbose",
+                "--debug",
+            ],
+            vec![
+                "werk-audio",
+                "embed",
                 "model",
                 "--input",
                 "input.wav",

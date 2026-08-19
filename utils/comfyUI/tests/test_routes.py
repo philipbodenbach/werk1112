@@ -93,7 +93,10 @@ def test_connection_discovery_returns_safe_status_and_model_lists():
             },
         },
     }
-    assert result["status"] == "Connected · 5 models · 1 image · 2 videos"
+    assert result["audio_models"]["declared"] == []
+    assert result["status"] == (
+        "Connected · 5 models · 1 image · 2 videos · 0 audio models"
+    )
     assert "never-return-this" not in repr(result)
 
 
@@ -111,7 +114,50 @@ def test_connection_discovery_tolerates_optional_capabilities_failure():
     assert result["ok"] is True
     assert result["image_models"] == {"declared": [], "available": []}
     assert result["video_models"]["declared"] == []
+    assert result["audio_models"]["declared"] == []
     assert "not supported" in result["warning"]
+
+
+def test_connection_discovery_exposes_audio_models_per_exact_task():
+    class AudioClient(FakeClient):
+        def get_json(self, path, query=None):
+            if path == "/v1/models":
+                return {"data": [{"id": "tts"}, {"id": "understander"}]}
+            if path == "/v1/capabilities":
+                return {
+                    "models": [
+                        {
+                            "id": "tts",
+                            "tasks": ["text_to_speech"],
+                            "available_tasks": ["text_to_speech"],
+                        },
+                        {
+                            "id": "understander",
+                            "tasks": ["audio_understanding"],
+                            "available_tasks": [],
+                        },
+                    ]
+                }
+            raise AssertionError(path)
+
+    result = discover_connection(
+        {
+            "server_url": "http://werk",
+            "api_key": "",
+            "timeout_seconds": 30,
+            "verify_tls": True,
+        },
+        client_factory=AudioClient,
+    )
+    assert result["audio_models"]["available"] == ["tts"]
+    assert result["audio_models"]["by_task"]["text-to-speech"] == {
+        "declared": ["tts"],
+        "available": ["tts"],
+    }
+    assert result["audio_models"]["by_task"]["audio-understanding"] == {
+        "declared": ["understander"],
+        "available": [],
+    }
 
 
 @pytest.mark.parametrize(

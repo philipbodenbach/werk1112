@@ -199,7 +199,7 @@ impl MediaInferenceBackend for MockMediaBackend {
             Option<u32>,
             Option<f64>,
         ) = match request.task {
-            InferenceTask::SpeechToText => (
+            InferenceTask::SpeechToText | InferenceTask::SpeechTranslation => (
                 "transcript.txt",
                 "text/plain",
                 b"mock transcript",
@@ -271,6 +271,7 @@ pub(super) fn install_media_model(store: &ModelStore) {
             InferenceTask::MusicGeneration,
             InferenceTask::TextToSpeech,
             InferenceTask::SpeechToText,
+            InferenceTask::SpeechTranslation,
         ],
         input_modalities: vec![
             InputModality::Text,

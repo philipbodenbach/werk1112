@@ -55,6 +55,34 @@ fn assert_schema_flags_exist_on_subcommand<C: CommandFactory>(
     );
 }
 
+fn assert_schema_flags_exist_on_nested_subcommand<C: CommandFactory>(
+    task: InferenceTask,
+    parent: &str,
+    subcommand: &str,
+) {
+    let command = C::command();
+    let parent_command = command
+        .find_subcommand(parent)
+        .unwrap_or_else(|| panic!("missing public subcommand {parent}"));
+    let public_flags = parent_command
+        .find_subcommand(subcommand)
+        .unwrap_or_else(|| panic!("missing public subcommand {parent} {subcommand}"))
+        .get_arguments()
+        .filter_map(|argument| argument.get_long())
+        .map(|flag| format!("--{flag}"))
+        .collect::<BTreeSet<_>>();
+    let missing = parameter_schema(task)
+        .into_iter()
+        .filter(|descriptor| !descriptor.path.starts_with("routing."))
+        .filter(|descriptor| !public_flags.contains(&descriptor.cli_flag))
+        .map(|descriptor| (descriptor.path, descriptor.cli_flag))
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "{task} advertises flags absent from '{parent} {subcommand}': {missing:?}"
+    );
+}
+
 fn image_manifest() -> ModelManifest {
     let mut metadata = ModelMetadata {
         schema_version: CURRENT_MANIFEST_SCHEMA_VERSION,
@@ -529,8 +557,42 @@ fn task_schemas_only_advertise_flags_on_their_public_subcommands() {
         "transcribe",
     );
     assert_schema_flags_exist_on_subcommand::<AudioSchemaCli>(
+        InferenceTask::SpeechTranslation,
+        "translate",
+    );
+    assert_schema_flags_exist_on_subcommand::<AudioSchemaCli>(
         InferenceTask::StemSeparation,
         "separate",
+    );
+    for (task, subcommand) in [
+        (InferenceTask::AudioEventDetection, "event"),
+        (InferenceTask::VoiceActivityDetection, "voice"),
+        (InferenceTask::SpeakerIdentification, "speaker"),
+        (InferenceTask::LanguageIdentification, "language"),
+        (InferenceTask::SpeechEmotionRecognition, "emotion"),
+    ] {
+        assert_schema_flags_exist_on_nested_subcommand::<AudioSchemaCli>(
+            task, "detect", subcommand,
+        );
+    }
+    assert_schema_flags_exist_on_nested_subcommand::<AudioSchemaCli>(
+        InferenceTask::AudioClassification,
+        "analyze",
+        "classify",
+    );
+    assert_schema_flags_exist_on_nested_subcommand::<AudioSchemaCli>(
+        InferenceTask::AudioCaptioning,
+        "analyze",
+        "caption",
+    );
+    assert_schema_flags_exist_on_nested_subcommand::<AudioSchemaCli>(
+        InferenceTask::AudioUnderstanding,
+        "analyze",
+        "understand",
+    );
+    assert_schema_flags_exist_on_subcommand::<AudioSchemaCli>(
+        InferenceTask::AudioEmbedding,
+        "embed",
     );
 }
 
@@ -540,6 +602,8 @@ fn prepared_tasks_without_public_subcommands_do_not_advertise_task_flags() {
         InferenceTask::VoiceConversion,
         InferenceTask::StemGeneration,
         InferenceTask::AudioEnhancement,
+        InferenceTask::SpeakerDiarization,
+        InferenceTask::AudioEditing,
     ] {
         assert!(
             parameter_schema(task)
@@ -548,6 +612,154 @@ fn prepared_tasks_without_public_subcommands_do_not_advertise_task_flags() {
             "{task}"
         );
     }
+}
+
+#[test]
+fn audio_classification_and_translation_schemas_expose_runtime_parameters() {
+    assert!(InferenceTask::AudioUnderstanding.requires_prompt());
+    assert!(!InferenceTask::AudioCaptioning.requires_prompt());
+    for task in [
+        InferenceTask::AudioEventDetection,
+        InferenceTask::VoiceActivityDetection,
+        InferenceTask::SpeakerIdentification,
+        InferenceTask::LanguageIdentification,
+        InferenceTask::SpeechEmotionRecognition,
+        InferenceTask::AudioClassification,
+    ] {
+        let paths = parameter_schema(task)
+            .into_iter()
+            .map(|descriptor| descriptor.path)
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("audio.top_k"), "{task}");
+        assert!(paths.contains("audio.output_format"), "{task}");
+    }
+
+    let translation = parameter_schema(InferenceTask::SpeechTranslation)
+        .into_iter()
+        .map(|descriptor| descriptor.path)
+        .collect::<BTreeSet<_>>();
+    assert!(translation.contains("stt.operation"));
+    assert!(translation.contains("stt.language"));
+    assert!(translation.contains("stt.output_format"));
+
+    for task in [
+        InferenceTask::AudioCaptioning,
+        InferenceTask::AudioUnderstanding,
+    ] {
+        let paths = parameter_schema(task)
+            .into_iter()
+            .map(|descriptor| descriptor.path)
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("audio.max_new_tokens"), "{task}");
+        assert!(paths.contains("audio.temperature"), "{task}");
+        assert!(paths.contains("audio.top_k"), "{task}");
+        assert!(paths.contains("audio.top_p"), "{task}");
+        assert!(paths.contains("audio.output_format"), "{task}");
+    }
+
+    let embedding = parameter_schema(InferenceTask::AudioEmbedding)
+        .into_iter()
+        .map(|descriptor| descriptor.path)
+        .collect::<BTreeSet<_>>();
+    assert!(embedding.contains("audio.normalize"));
+    assert!(embedding.contains("audio.pooling"));
+    assert!(embedding.contains("audio.output_format"));
+}
+
+#[test]
+fn audio_analysis_rejects_prompts_that_the_runtime_would_ignore() {
+    let mut manifest = image_manifest();
+    manifest.id = "audio".to_string();
+    manifest.metadata.tasks = vec![
+        InferenceTask::SpeechToText,
+        InferenceTask::SpeechTranslation,
+        InferenceTask::TextToSpeech,
+        InferenceTask::AudioClassification,
+        InferenceTask::AudioCaptioning,
+        InferenceTask::AudioEmbedding,
+    ];
+    manifest.metadata.input_modalities = vec![InputModality::Audio, InputModality::Text];
+    manifest.metadata.output_modalities = vec![
+        OutputModality::Text,
+        OutputModality::Embedding,
+        OutputModality::Audio,
+    ];
+    let audio_input = || InferenceInput {
+        modality: InputModality::Audio,
+        role: "input_audio".to_string(),
+        source: InferenceInputSource::Path {
+            path: "clip.wav".to_string(),
+        },
+        mime_type: Some("audio/wav".to_string()),
+    };
+
+    let mut transcription = InferenceRequest::new("audio", InferenceTask::SpeechToText);
+    transcription.prompt = Some("ignored ASR hint".to_string());
+    transcription.inputs.push(audio_input());
+    assert!(
+        resolve_request(&manifest, transcription, &ResolutionContext::default())
+            .unwrap_err()
+            .to_string()
+            .contains("does not consume a prompt")
+    );
+
+    let mut contradictory_translation =
+        InferenceRequest::new("audio", InferenceTask::SpeechTranslation);
+    contradictory_translation.inputs.push(audio_input());
+    contradictory_translation.parameters.insert(
+        "stt.operation".to_string(),
+        ParameterValue::String("transcribe".to_string()),
+    );
+    assert!(
+        resolve_request(
+            &manifest,
+            contradictory_translation,
+            &ResolutionContext::default()
+        )
+        .is_err()
+    );
+
+    let mut speech = InferenceRequest::new("audio", InferenceTask::TextToSpeech);
+    speech.prompt = Some("Read this aloud".to_string());
+    speech.negative_prompt = Some("ignored delivery constraint".to_string());
+    let error = resolve_request(&manifest, speech, &ResolutionContext::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("does not consume a negative prompt"),
+        "{error}"
+    );
+
+    let mut classification = InferenceRequest::new("audio", InferenceTask::AudioClassification);
+    classification.prompt = Some("ignored label hint".to_string());
+    classification.inputs.push(audio_input());
+    assert!(
+        resolve_request(&manifest, classification, &ResolutionContext::default())
+            .unwrap_err()
+            .to_string()
+            .contains("does not consume a prompt")
+    );
+
+    let mut embedding = InferenceRequest::new("audio", InferenceTask::AudioEmbedding);
+    embedding.prompt = Some("ignored embedding hint".to_string());
+    embedding.inputs.push(audio_input());
+    assert!(
+        resolve_request(&manifest, embedding, &ResolutionContext::default())
+            .unwrap_err()
+            .to_string()
+            .contains("does not consume a prompt")
+    );
+
+    let mut caption = InferenceRequest::new("audio", InferenceTask::AudioCaptioning);
+    caption.prompt = Some("Describe only the foreground sound".to_string());
+    caption.negative_prompt = Some("silence".to_string());
+    caption.inputs.push(audio_input());
+    assert!(
+        resolve_request(&manifest, caption, &ResolutionContext::default())
+            .unwrap_err()
+            .to_string()
+            .contains("does not consume a negative prompt")
+    );
 }
 
 #[test]

@@ -295,17 +295,24 @@ pub(in crate::api) struct AudioTranscriptionApiRequest {
 
 impl AudioTranscriptionApiRequest {
     pub(super) fn into_inference(self) -> Result<InferenceRequest, String> {
-        let mut request = media_request(
-            self.model,
-            InferenceTask::SpeechToText,
-            self.prompt,
-            None,
-            self.werk,
-        )?;
+        self.into_inference_task(InferenceTask::SpeechToText)
+    }
+
+    pub(super) fn into_translation(self) -> Result<InferenceRequest, String> {
+        self.into_inference_task(InferenceTask::SpeechTranslation)
+    }
+
+    fn into_inference_task(self, task: InferenceTask) -> Result<InferenceRequest, String> {
+        let mut request = media_request(self.model, task, None, None, self.werk)?;
         request.inputs.push(
             self.file
                 .into_inference(InputModality::Audio, "input_audio")?,
         );
+        if let Some(prompt) = self.prompt {
+            request
+                .parameters
+                .insert("stt.initial_prompt".to_string(), prompt.into());
+        }
         if let Some(language) = self.language {
             request
                 .parameters
@@ -315,6 +322,11 @@ impl AudioTranscriptionApiRequest {
             request
                 .parameters
                 .insert("stt.temperature".to_string(), temperature.into());
+        }
+        if task == InferenceTask::SpeechTranslation {
+            request
+                .parameters
+                .insert("stt.operation".to_string(), "translate".to_string().into());
         }
         apply_output_format(&mut request, "stt", self.response_format.as_deref());
         Ok(request)

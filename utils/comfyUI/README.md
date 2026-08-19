@@ -95,8 +95,9 @@ werk serve --image-model tiny-sd --allow-unauthenticated
 ```
 
 `--image-model` supplies the alias used by image compatibility endpoints; the
-Werk-native image and video model nodes discover installed models and select
-one explicitly in the graph. They do not need a server-wide video-model alias.
+Werk-native image, video, and audio model nodes discover installed models and
+select one explicitly in the graph. They do not need server-wide video/audio
+aliases.
 
 The normal address is `http://127.0.0.1:11434`. Put the address and key into a
 **WERK Connection** node, or set `WERK_BASE_URL` and `WERK_API_KEY` before
@@ -162,6 +163,26 @@ is not required by these HTTP-backed Werk nodes.
   sanitized metadata, seed, job/result IDs, and output IDs. Its `model` socket
   must come from **WERK Video Models**. Connecting one `initial_image` changes
   the generated request to I2V.
+- **WERK Audio Models** discovers models per exact audio task, including
+  generation, transcription, detection, analysis, transformation, and
+  embedding. Only models declared/runtime-available for the selected task are
+  offered.
+- **WERK Audio Parameters** reads the live task/model/runtime schema. Use it
+  before adding model-specific fields to the JSON inputs.
+- **WERK Audio Config** covers `audio-generation`, `music-generation`, and
+  `text-to-speech`. Zero sample rate/channels inherit model defaults; TTS seed
+  `0` is also omitted so strict adapters without deterministic synthesis are
+  not rejected.
+- **WERK Audio Generate** uses the specialized generation/speech endpoints and
+  returns one or more native ComfyUI `AUDIO` dictionaries (`waveform` shaped
+  `[B,C,T]` plus `sample_rate`).
+- **WERK Audio Process** accepts native source audio for `voice-conversion`,
+  `stem-separation`, `audio-enhancement`, and `audio-editing`, then returns
+  native `AUDIO`. Voice conversion may also receive `reference_audio`.
+- **WERK Audio Analyze** accepts native audio for transcription/translation,
+  detection, captioning/diarization/classification/understanding, and audio
+  embedding. Its first output is a list of UTF-8 text or normalized JSON
+  strings, matching the artifact MIME type.
 
 The interactive verification and dropdown discovery run through a local
 ComfyUI route. The browser sends the connection settings only to its own
@@ -254,6 +275,48 @@ reports 8.19 GB VRAM and about four minutes for five seconds of 480P video on an
 RTX 4090 without quantization. This checks transport, job polling, download,
 native `VIDEO` conversion, and saving, but not Wan2.2 I2V or 720P behavior.
 
+### Recommended audio workflows
+
+Generation and TTS use the typed config path:
+
+```text
+WERK Connection.connection --------+--> WERK Audio Models.connection
+                                    +--> WERK Audio Generate.connection
+
+WERK Audio Models.model ----------------> WERK Audio Generate.model
+WERK Routing Config.routing ------------> WERK Audio Config.routing
+WERK Audio Config.config ---------------> WERK Audio Generate.config
+WERK Audio Generate.audio --------------> Preview Audio.audio
+```
+
+Select the same task on Models, Config, and Generate. Valid generation tasks
+are `audio-generation`, `music-generation`, and `text-to-speech`. A TTS prompt
+is the spoken text; TTS rejects a non-empty negative prompt. Config fields left
+at their inherit values are omitted instead of forcing adapter-dependent
+options.
+
+Audio-input workflows connect ComfyUI's **Load Audio** to either Process or
+Analyze:
+
+```text
+Load Audio.AUDIO ------------------------> WERK Audio Process.source_audio
+Load Audio.AUDIO ------------------------> WERK Audio Analyze.source_audio
+```
+
+For `voice-conversion`, a second **Load Audio** may connect to
+`reference_audio`; it is transported with the distinct `reference_audio` role.
+Other transform tasks reject that input. `audio-editing` and
+`audio-understanding` require a non-empty prompt. Remaining task parameters
+belong in `additional_audio_parameters_json`, using the live schema from
+**WERK Audio Parameters**. Speech-to-text/translation keys normalize to the
+`stt.*` namespace; other input-audio task keys normalize to `audio.*`.
+
+All long audio operations are persisted jobs. The nodes poll the same terminal
+states as video and issue a best-effort `DELETE /v1/jobs/{id}` when ComfyUI is
+interrupted or the connection timeout expires. Audio outputs are downloaded
+with authentication and converted through PyAV. Source `AUDIO` is encoded as
+PCM16 WAV and embedded in the generic job request.
+
 Video generation is asynchronous at the Werk API boundary. The generator polls
 states `queued`, `loading`, `running`, and `encoding`, and requests best-effort
 job cancellation when ComfyUI interrupts or the connection timeout expires.
@@ -263,19 +326,26 @@ override and does not extend a shorter client connection timeout.
 
 Ready API-prompt examples are provided for
 [text-to-video](examples/werk_video_generation_api.json) and
-[image-to-video](examples/werk_image_to_video_api.json). They contain no
+[image-to-video](examples/werk_image_to_video_api.json), plus
+[music generation](examples/werk_music_generation_api.json),
+[text-to-speech](examples/werk_text_to_speech_api.json),
+[audio understanding](examples/werk_audio_understanding_api.json), and
+[voice conversion](examples/werk_voice_conversion_api.json). They contain no
 credential; read the [example assumptions](examples/README.md) before
-submitting them to ComfyUI.
+submitting them to ComfyUI. Voice conversion demonstrates the prepared node
+contract only; the bundled companion currently advertises no executable
+generic adapter for it.
 
 When these nodes call `werk serve`, the bundled media execution worker stays
 running and serializes generation requests. Health, discovery, and estimation
 preflights remain independent of that queue. Its Diffusers image/video cache
-holds one fully configured pipeline by default: the first generation is a cold
-load, and later generations with the same model/runtime configuration should
-be substantially faster to start. Changing prompt, seed, dimensions, steps, or
-count keeps the pipeline warm. Changing model, device, dtype, offload/tiling
-settings, or LoRAs may reload it; the previous entry is evicted before the new
-one is loaded at the default cache size. Set
+and Transformers audio cache share one resident entry by default: the first
+generation or analysis is a cold load, and later runs with the same
+model/runtime configuration should be substantially faster to start. Changing
+prompt, seed, dimensions, steps, or count keeps the model warm. Changing model,
+task adapter, device, dtype, offload/tiling settings, or LoRAs may reload it;
+the previous entry is evicted before the new one is loaded at the default cache
+size. Set
 `WERK_MEDIA_PIPELINE_CACHE_SIZE=0` before starting Werk to disable pipeline
 caching, or set a larger non-negative entry count when system memory permits.
 Resident entries retain VRAM and/or RAM until eviction or Werk shuts down.
@@ -460,6 +530,33 @@ Werk output URLs, bounded by `WERK_MAX_VIDEO_BYTES`, and wrapped with
 native `VIDEO` support and connect the result to its
 [Save Video node](https://docs.comfy.org/built-in-nodes/SaveVideo).
 
+### WERK Audio Config and task groups
+
+Audio Config maps portable controls without overriding inherited runtime
+choices unnecessarily:
+
+| Node input | Werk request |
+| --- | --- |
+| `duration` | `audio.duration` for audio/music generation |
+| `variations` | generation API `n` |
+| non-zero `seed` | `audio.seed` or `tts.seed` |
+| non-zero `sample_rate`, `channels` | task namespace parameter |
+| `output_format` | API `response_format` (`wav`, `flac`, or `ogg`) |
+| `instrumental` | tri-state `audio.instrumental` |
+| non-empty `voice`, non-default `speed` | TTS request fields |
+
+The Models and Parameters selectors expose the Rust task taxonomy in this
+order: generation (`audio-generation`, `music-generation`, `text-to-speech`),
+transcription (`speech-to-text`, `speech-translation`), detection
+(`audio-event-detection`, `voice-activity-detection`,
+`speaker-identification`, `language-identification`,
+`speech-emotion-recognition`), analysis (`audio-captioning`,
+`speaker-diarization`, `audio-classification`, `audio-understanding`),
+transformation (`voice-conversion`, `stem-separation`, `audio-enhancement`,
+`audio-editing`), and `audio-embedding`. Discovery means the server declares
+the task; a backend may still fail honestly at execution time if the selected
+runtime cannot execute that particular model/task pair.
+
 ## Discovery and diagnostics
 
 CLI equivalents:
@@ -469,6 +566,10 @@ werk inspect MODEL
 werk parameters MODEL --task image-generation --json
 werk parameters MODEL --task video-generation --json
 werk parameters MODEL --task image-to-video --json
+werk parameters MODEL --task music-generation --json
+werk parameters MODEL --task speech-to-text --json
+werk parameters MODEL --task audio-understanding --json
+werk parameters MODEL --task voice-conversion --json
 werk doctor --model MODEL --task image-generation
 werk doctor --model MODEL --task video-generation
 werk doctor --model MODEL --task image-to-video
@@ -482,8 +583,12 @@ GET /v1/capabilities
 GET /v1/parameters?task=image-generation&model=MODEL&backend=auto
 GET /v1/parameters?task=video-generation&model=MODEL&backend=auto
 GET /v1/parameters?task=image-to-video&model=MODEL&backend=auto
+GET /v1/parameters?task=AUDIO_TASK&model=MODEL&backend=auto
 POST /v1/images/generations
 POST /v1/videos/generations
+POST /v1/audio/generations
+POST /v1/audio/speech
+POST /v1/jobs
 GET /v1/jobs/{id}
 DELETE /v1/jobs/{id}
 GET /v1/outputs/{id}
@@ -519,7 +624,12 @@ Image decoding defaults to a 67,108,864-pixel allocation limit. Set
 `WERK_MAX_IMAGE_PIXELS` before starting ComfyUI to choose another positive
 limit. Video downloads default to a 536,870,912-byte (512 MiB) limit; set
 `WERK_MAX_VIDEO_BYTES` to another positive byte count when a trusted workflow
-needs larger artifacts.
+needs larger artifacts. Audio downloads default to 268,435,456 bytes (256 MiB)
+and use `WERK_MAX_AUDIO_BYTES`. Source audio has a separate aggregate
+67,108,864-byte (64 MiB) PCM-WAV limit controlled by
+`WERK_MAX_AUDIO_INPUT_BYTES`; it is enforced before Base64 allocation. The
+smaller input default keeps Base64 plus JSON safely below Werk's default
+128-MiB HTTP body limit, including the two-input voice-conversion path.
 
 ## Tests
 

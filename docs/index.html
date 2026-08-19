@@ -429,10 +429,11 @@
     </a>
     <nav class="nav-links" aria-label="Primary navigation">
       <a href="#features">Features</a>
-      <a href="#topics">Topics</a>
+      <a href="#documentation">Documentation</a>
+      <a href="api.md">HTTP API</a>
+      <a href="backends.md">Backends</a>
       <a href="media-inference.md">Media inference</a>
       <a href="https://github.com/philipbodenbach/werk1112">Repository</a>
-      <a href="https://github.com/philipbodenbach">Author</a>
     </nav>
   </header>
 
@@ -447,7 +448,7 @@
         </p>
         <div class="actions" aria-label="Project links">
           <a class="button primary" href="https://github.com/philipbodenbach/werk1112">View the GitHub repository</a>
-          <a class="button secondary" href="media-inference.md">Read the media inference guide</a>
+          <a class="button secondary" href="README.md">Read the documentation</a>
         </div>
       </div>
 
@@ -479,6 +480,29 @@ werk serve --model local-model</code></pre>
         <article class="feature-card">
           <h3>Inspectable defaults</h3>
           <p>Resolve model, runtime, hardware, profile and request defaults with machine-readable provenance.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="documentation" aria-labelledby="documentation-title">
+      <h2 id="documentation-title">Versioned documentation</h2>
+      <p class="section-copy">
+        The project README is intentionally short. Detailed API contracts, backend and operating-system
+        support, fallback behavior, media tasks and known limitations live in versioned documentation.
+      </p>
+
+      <div class="feature-grid">
+        <article class="feature-card">
+          <h3><a href="api.md">HTTP API</a></h3>
+          <p>All routes, fields, responses, task coverage, authentication, jobs, retention and compatibility gaps.</p>
+        </article>
+        <article class="feature-card">
+          <h3><a href="backends.md">Backends</a></h3>
+          <p>Routing, fallback policies, managed installation, platform support, Qwen-TTS and cleanup.</p>
+        </article>
+        <article class="feature-card">
+          <h3><a href="media-inference.md">Media inference</a></h3>
+          <p>Canonical image, video and audio tasks, model layouts, parameters, planning and examples.</p>
         </article>
       </div>
     </section>
@@ -528,6 +552,7 @@ werk serve --model local-model</code></pre>
   <footer class="site-footer">
     <span>Werk1112 local-first AI inference router.</span>
     <span class="footer-links">
+      <a href="README.md">Documentation</a>
       <a href="https://github.com/philipbodenbach/werk1112">GitHub repository</a>
       <a href="https://github.com/philipbodenbach">GitHub profile</a>
     </span>

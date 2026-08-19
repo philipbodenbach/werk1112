@@ -4,6 +4,86 @@ use super::builders::{
 };
 use crate::capabilities::InferenceTask;
 
+pub(super) fn audio_classification_descriptors() -> Vec<ParameterDescriptor> {
+    vec![
+        integer_descriptor(
+            "audio.top_k",
+            "--top-k",
+            "Top labels",
+            "Maximum number of classification labels to return",
+            "classification",
+            5,
+            1,
+            10_000,
+        ),
+        enum_descriptor(
+            "audio.output_format",
+            "--output-format",
+            "Output format",
+            "Classification result format",
+            "output",
+            "json",
+            &["json", "text"],
+        ),
+    ]
+}
+
+pub(super) fn audio_text_descriptors() -> Vec<ParameterDescriptor> {
+    let mut values = Vec::new();
+    add_named_descriptors(
+        &mut values,
+        "audio",
+        "generation",
+        &[
+            ("max_new_tokens", ParameterType::Integer),
+            ("temperature", ParameterType::Number),
+            ("top_k", ParameterType::Integer),
+            ("top_p", ParameterType::Number),
+        ],
+    );
+    values.push(enum_descriptor(
+        "audio.output_format",
+        "--output-format",
+        "Output format",
+        "Structured audio-text result format",
+        "output",
+        "json",
+        &["json", "text"],
+    ));
+    values
+}
+
+pub(super) fn audio_embedding_descriptors() -> Vec<ParameterDescriptor> {
+    vec![
+        bool_descriptor(
+            "audio.normalize",
+            "--normalize",
+            "Normalize",
+            "L2-normalize the embedding vector",
+            "embedding",
+            true,
+        ),
+        enum_descriptor(
+            "audio.pooling",
+            "--pooling",
+            "Pooling",
+            "Frame pooling strategy",
+            "embedding",
+            "mean",
+            &["mean"],
+        ),
+        enum_descriptor(
+            "audio.output_format",
+            "--output-format",
+            "Output format",
+            "Embedding result format",
+            "output",
+            "json",
+            &["json", "text"],
+        ),
+    ]
+}
+
 pub(super) fn audio_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor> {
     let mut values = vec![
         number_descriptor(
@@ -366,16 +446,22 @@ pub(super) fn tts_descriptors() -> Vec<ParameterDescriptor> {
     values
 }
 
-pub(super) fn stt_descriptors() -> Vec<ParameterDescriptor> {
+pub(super) fn stt_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor> {
+    let (operation, allowed_operations): (&str, &[&str]) =
+        if task == InferenceTask::SpeechTranslation {
+            ("translate", &["translate"])
+        } else {
+            ("transcribe", &["transcribe"])
+        };
     let mut values = vec![
         enum_descriptor(
             "stt.operation",
             "--task",
             "Operation",
-            "Transcribe or translate",
+            "Canonical speech operation",
             "transcription",
-            "transcribe",
-            &["transcribe", "translate"],
+            operation,
+            allowed_operations,
         ),
         integer_descriptor(
             "stt.beam_size",

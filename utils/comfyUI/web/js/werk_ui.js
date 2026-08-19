@@ -4,6 +4,7 @@ import { api } from "../../scripts/api.js";
 const CONNECTION_CLASS = "WerkConnection";
 const IMAGE_MODELS_CLASS = "WerkImageModels";
 const VIDEO_MODELS_CLASS = "WerkVideoModels";
+const AUDIO_MODELS_CLASS = "WerkAudioModels";
 const STATUS_MARGIN = 4;
 const STATUS_CONTENT_HEIGHT = 28;
 const STATUS_WIDGET_HEIGHT = STATUS_CONTENT_HEIGHT + (2 * STATUS_MARGIN);
@@ -217,6 +218,26 @@ function updateVideoModelsNode(node, discovery) {
     node._werkModelStatus?.setWerkStatus?.(message, values.length ? "success" : "error");
 }
 
+function updateAudioModelsNode(node, discovery) {
+    if (!node?._werkModelCombo || !node?._werkModelBacking) return;
+    const requireAvailable = Boolean(widget(node, "require_available")?.value ?? true);
+    const task = String(widget(node, "task")?.value ?? "audio-generation");
+    const taskModels = discovery?.audio_models?.by_task?.[task];
+    const rawValues = requireAvailable ? taskModels?.available : taskModels?.declared;
+    const values = Array.isArray(rawValues)
+        ? rawValues.filter((value) => typeof value === "string")
+        : [];
+    setComboValues(node, node._werkModelCombo, node._werkModelBacking, values);
+    const declared = taskModels?.declared?.length ?? 0;
+    const available = taskModels?.available?.length ?? 0;
+    const message = values.length
+        ? `${available} available · ${declared} declared · ${task}`
+        : requireAvailable && declared
+          ? `No runtime-available ${task} model (${declared} declared)`
+          : `No ${task} model found`;
+    node._werkModelStatus?.setWerkStatus?.(message, values.length ? "success" : "error");
+}
+
 function propagateDiscovery(connectionNode, discovery) {
     connectionNode._werkDiscovery = discovery;
     for (const node of app.graph?._nodes ?? []) {
@@ -224,6 +245,7 @@ function propagateDiscovery(connectionNode, discovery) {
         const className = nodeClass(node);
         if (className === IMAGE_MODELS_CLASS) updateImageModelsNode(node, discovery);
         if (className === VIDEO_MODELS_CLASS) updateVideoModelsNode(node, discovery);
+        if (className === AUDIO_MODELS_CLASS) updateAudioModelsNode(node, discovery);
     }
 }
 
@@ -360,12 +382,72 @@ function installVideoModelsUi(nodeType) {
     });
 }
 
+function installAudioModelsUi(nodeType) {
+    chainLifecycle(nodeType, "onNodeCreated", function () {
+        const node = this;
+        const backing = widget(node, "preferred_model");
+        if (!backing) return;
+        backing.hidden = true;
+        backing.options ??= {};
+        backing.options.hidden = true;
+        const values = [];
+        const combo = makeUnserialized(node.addWidget("combo", "available_model", backing.value ?? "", (value) => {
+            backing.value = value;
+            backing.callback?.(value);
+        }, { values }));
+        node._werkModelBacking = backing;
+        node._werkModelCombo = combo;
+        node._werkModelStatus = createStatusWidget(node, "model_discovery_status", "Connect and refresh models");
+
+        for (const name of ["task", "require_available"]) {
+            const control = widget(node, name);
+            if (!control) continue;
+            const original = control.callback;
+            control.callback = function (...args) {
+                const result = original?.apply(this, args);
+                const connectionNode = linkedConnection(node);
+                if (connectionNode?._werkDiscovery) {
+                    updateAudioModelsNode(node, connectionNode._werkDiscovery);
+                }
+                return result;
+            };
+        }
+
+        const button = makeUnserialized(node.addWidget("button", "Refresh Models", null, async () => {
+            const connectionNode = linkedConnection(node);
+            if (!connectionNode) {
+                node._werkModelStatus.setWerkStatus("Connect a WERK Connection first", "error");
+                return;
+            }
+            node._werkModelStatus.setWerkStatus("Refreshing models…", "checking");
+            button.disabled = true;
+            try {
+                const discovery = await verifyConnection(connectionNode);
+                updateAudioModelsNode(node, discovery);
+                const refresh = widget(node, "refresh_token");
+                if (refresh) refresh.value = Number(refresh.value ?? 0) + 1;
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                node._werkModelStatus.setWerkStatus(`Failed: ${message}`, "error");
+            } finally {
+                button.disabled = false;
+            }
+        }));
+        fitWerkNode(node);
+    });
+    chainLifecycle(nodeType, "onConnectionsChange", function () {
+        const connectionNode = linkedConnection(this);
+        if (connectionNode?._werkDiscovery) updateAudioModelsNode(this, connectionNode._werkDiscovery);
+    });
+}
+
 app.registerExtension({
     name: "werk1112.dynamic-discovery",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === CONNECTION_CLASS) installConnectionUi(nodeType);
         if (nodeData.name === IMAGE_MODELS_CLASS) installImageModelsUi(nodeType);
         if (nodeData.name === VIDEO_MODELS_CLASS) installVideoModelsUi(nodeType);
+        if (nodeData.name === AUDIO_MODELS_CLASS) installAudioModelsUi(nodeType);
     },
     loadedGraphNode(node) {
         const className = nodeClass(node);
@@ -373,6 +455,7 @@ app.registerExtension({
             className === CONNECTION_CLASS
             || className === IMAGE_MODELS_CLASS
             || className === VIDEO_MODELS_CLASS
+            || className === AUDIO_MODELS_CLASS
         ) {
             fitWerkNode(node);
             syncStatusWidgetWidths(node);

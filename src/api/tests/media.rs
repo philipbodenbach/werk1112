@@ -1,5 +1,66 @@
 use super::support::*;
 
+#[tokio::test]
+async fn generic_audio_jobs_accept_large_bounded_json_bodies() {
+    let store = test_store();
+    let body_limit = 3 * 1024 * 1024;
+    let app = crate::api::router::router_with_body_limit(
+        ApiState::new(store, Arc::new(MockBackend)),
+        body_limit,
+    );
+    let payload = |encoded_size| {
+        json!({
+            "model": "missing-audio-model",
+            "task": "speech-to-text",
+            "inputs": [{
+                "modality": "audio",
+                "role": "input_audio",
+                "source": {"kind": "base64", "data": "A".repeat(encoded_size)}
+            }]
+        })
+    };
+
+    let above_default_size = 2 * 1024 * 1024 + 64 * 1024;
+    let above_axum_default = post_json(&app, "/v1/jobs", payload(above_default_size), None).await;
+    assert_eq!(above_axum_default.status(), StatusCode::BAD_REQUEST);
+
+    for endpoint in ["/v1/audio/transcriptions", "/v1/audio/translations"] {
+        let response = post_json(
+            &app,
+            endpoint,
+            json!({
+                "model": "missing-audio-model",
+                "file": {
+                    "base64": "A".repeat(above_default_size),
+                    "mime_type": "audio/wav"
+                }
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{endpoint}");
+    }
+
+    let unrelated_large_body = post_json(
+        &app,
+        "/v1/chat/completions",
+        json!({
+            "model": "missing-chat-model",
+            "messages": [{"role": "user", "content": "A".repeat(above_default_size)}]
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(unrelated_large_body.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let above_configured_limit =
+        post_json(&app, "/v1/jobs", payload(body_limit + 1024), None).await;
+    assert_eq!(
+        above_configured_limit.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
+
 #[test]
 fn media_request_shapes_normalize_openai_and_werk_fields() {
     let parsed: ImageGenerationApiRequest = serde_json::from_value(json!({
@@ -280,6 +341,7 @@ async fn direct_media_routes_return_openai_data_and_werk_metadata() {
         json!({
             "model": "media",
             "file": {"base64": "AAEC", "mime_type": "audio/wav"},
+            "prompt": "Names and technical terms",
             "response_format": "text"
         }),
         None,
@@ -289,12 +351,50 @@ async fn direct_media_routes_return_openai_data_and_werk_metadata() {
     let value = response_json(response).await;
     assert_eq!(value["werk"]["task"], "speech_to_text");
     assert_eq!(value["data"][0]["text"], "mock transcript");
+    assert_eq!(
+        value["werk"]["effective_request"]["parameters"]["stt.initial_prompt"]["value"],
+        "Names and technical terms"
+    );
+    assert!(value["werk"]["effective_request"]["prompt"].is_null());
     let transcript_output_id = value["data"][0]["id"].as_str().unwrap();
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri(format!("/v1/outputs/{transcript_output_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = post_json(
+        &app,
+        "/v1/audio/translations",
+        json!({
+            "model": "media",
+            "file": {"base64": "AAEC", "mime_type": "audio/wav"},
+            "response_format": "text"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["werk"]["task"], "speech_translation");
+    assert_eq!(value["data"][0]["text"], "mock transcript");
+    assert!(value["data"][0]["url"].is_null());
+    assert_eq!(
+        value["werk"]["effective_request"]["parameters"]["stt.operation"]["value"],
+        "translate"
+    );
+    let translation_output_id = value["data"][0]["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/outputs/{translation_output_id}"))
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -1,0 +1,52 @@
+{
+  "1": {
+    "class_type": "WerkConnection",
+    "inputs": {
+      "server_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout_seconds": 1800,
+      "verify_tls": true
+    }
+  },
+  "2": {
+    "class_type": "WerkAudioModels",
+    "inputs": {
+      "connection": ["1", 0],
+      "task": "voice-conversion",
+      "refresh_token": 0,
+      "preferred_model": "voice-conversion-model",
+      "require_available": true
+    }
+  },
+  "3": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": "source.wav"
+    }
+  },
+  "4": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": "reference.wav"
+    }
+  },
+  "5": {
+    "class_type": "WerkAudioProcess",
+    "inputs": {
+      "connection": ["1", 0],
+      "model": ["2", 0],
+      "task": "voice-conversion",
+      "source_audio": ["3", 0],
+      "reference_audio": ["4", 0],
+      "prompt": "",
+      "negative_prompt": "",
+      "additional_audio_parameters_json": "{}"
+    }
+  },
+  "6": {
+    "class_type": "PreviewAudio",
+    "inputs": {
+      "audio": ["5", 0]
+    }
+  }
+}

@@ -22,6 +22,27 @@ The I2V prompt additionally connects `LoadImage` to `initial_image`; upload
 `station.png` to ComfyUI's input directory or change that filename before
 submitting it.
 
+The audio API prompts exercise each native path:
+
+- `werk_music_generation_api.json` uses Audio Models, Audio Config, Audio
+  Generate, and ComfyUI's native `PreviewAudio`;
+- `werk_text_to_speech_api.json` demonstrates asynchronous TTS without forcing
+  a model-dependent seed, voice, sample rate, or channel count;
+- `werk_audio_understanding_api.json` connects `LoadAudio` to Audio Analyze and
+  supplies the required understanding prompt; and
+- `werk_voice_conversion_api.json` connects separate source and reference
+  `LoadAudio` nodes to Audio Process, then previews the native `AUDIO` result.
+  This last prompt documents the prepared interface: Werk's bundled generic
+  companion currently reports voice conversion as unavailable, so it requires
+  a compatible external media backend before it can execute.
+
+Upload/change `example.wav`, `source.wav`, and `reference.wav` before submitting
+the input-audio prompts. Replace the illustrative preferred aliases
+`music-model`, `tts-model`, `audio-understanding-model`, and
+`voice-conversion-model` with installed aliases that declare the selected
+task. Analysis is itself an output node, so its text/JSON values and metadata
+are returned in ComfyUI history without an additional third-party text node.
+
 The examples assume:
 
 - this directory is installed as `custom_nodes/comfyui-werk1112`;
@@ -32,6 +53,11 @@ The examples assume:
 - the video examples' preferred alias was installed with
   `werk pull Wan-AI/Wan2.2-TI2V-5B-Diffusers --name wan22-ti2v-5b`, and current
   ComfyUI supplies native `VIDEO` and `SaveVideo` support.
+- the audio examples use a current ComfyUI with native `AUDIO`, `LoadAudio`,
+  and `PreviewAudio` support, and their illustrative aliases are replaced with
+  discovered executable Werk audio models. The voice-conversion example is
+  intentionally unavailable with the bundled companion until a reliable
+  generic adapter exists.
 
 No credential is included. The example explicitly enables CPU and component
 offload for the FLUX model. Update the model, routing choices, and connection

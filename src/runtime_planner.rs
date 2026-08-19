@@ -68,7 +68,10 @@ impl RequestCapabilities {
             image_input: task
                 .required_input_modalities()
                 .contains(&InputModality::Image),
-            embeddings: task == InferenceTask::TextEmbedding,
+            embeddings: matches!(
+                task,
+                InferenceTask::TextEmbedding | InferenceTask::AudioEmbedding
+            ),
             streaming,
             task: Some(task),
             input_modality: task.required_input_modalities().first().copied(),
@@ -1123,6 +1126,18 @@ mod tests {
 
         assert_eq!(selected.runtime_id, RuntimeId::MediaCompanionCuda);
         assert_eq!(selected.accelerator, BackendAccelerator::Cuda);
+    }
+
+    #[test]
+    fn audio_embedding_requests_advertise_embedding_capability() {
+        let capabilities = RequestCapabilities::for_task(InferenceTask::AudioEmbedding);
+
+        assert!(capabilities.embeddings);
+        assert_eq!(capabilities.input_modality, Some(InputModality::Audio));
+        assert_eq!(
+            capabilities.output_modality,
+            Some(OutputModality::Embedding)
+        );
     }
 
     #[test]

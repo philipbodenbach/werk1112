@@ -108,7 +108,10 @@ pub(super) async fn execute_direct(
             .execute(request)
             .map_err(|error| DirectExecutionError::Inference(error.to_string()))?;
         let release_result = matches!(response_format, DirectResponseFormat::Base64)
-            || result.task == InferenceTask::SpeechToText;
+            || matches!(
+                result.task,
+                InferenceTask::SpeechToText | InferenceTask::SpeechTranslation
+            );
         let result_id = result.id.clone();
         let response = direct_media_response(result, response_format);
         match response {
@@ -255,11 +258,16 @@ fn direct_media_response(
         .map(|output| direct_media_output(result.task, output, response_format))
         .collect::<Result<Vec<_>, _>>()?;
     if data.is_empty() {
-        return Err(if result.task == InferenceTask::SpeechToText {
-            "speech-to-text backend did not produce a transcript".to_string()
-        } else {
-            "inference backend did not produce an output".to_string()
-        });
+        return Err(
+            if matches!(
+                result.task,
+                InferenceTask::SpeechToText | InferenceTask::SpeechTranslation
+            ) {
+                "speech transcription backend did not produce text".to_string()
+            } else {
+                "inference backend did not produce an output".to_string()
+            },
+        );
     }
     Ok(DirectMediaResponse {
         created: result.created_unix,
@@ -273,9 +281,12 @@ fn direct_media_output(
     output: &OutputMetadata,
     response_format: DirectResponseFormat,
 ) -> Result<DirectMediaOutput, String> {
-    let text = if task == InferenceTask::SpeechToText {
+    let text = if matches!(
+        task,
+        InferenceTask::SpeechToText | InferenceTask::SpeechTranslation
+    ) {
         let body = fs::read_to_string(&output.path)
-            .map_err(|error| format!("failed to read transcription output: {error}"))?;
+            .map_err(|error| format!("failed to read speech text output: {error}"))?;
         if output.mime_type == "application/json" {
             serde_json::from_str::<Value>(&body)
                 .ok()

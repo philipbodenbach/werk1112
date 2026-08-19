@@ -11,15 +11,19 @@ try:
     from .client import WerkApiError, WerkClient
     from .config import (
         DEFAULT_TIMEOUT_SECONDS,
+        WerkAudioConfig,
         WerkConnection,
         WerkImageConfig,
         WerkRoutingConfig,
         WerkVideoConfig,
         environment_api_key,
+        environment_max_audio_input_bytes,
+        environment_max_audio_bytes,
         environment_max_image_pixels,
         environment_max_video_bytes,
         environment_server_url,
     )
+    from .audio_utils import audio_bytes_to_comfy, comfy_audio_to_api_input
     from .image_utils import (
         batch_image_tensors,
         decode_base64_image,
@@ -30,15 +34,19 @@ except ImportError:  # pragma: no cover - direct-module development
     from client import WerkApiError, WerkClient
     from config import (
         DEFAULT_TIMEOUT_SECONDS,
+        WerkAudioConfig,
         WerkConnection,
         WerkImageConfig,
         WerkRoutingConfig,
         WerkVideoConfig,
         environment_api_key,
+        environment_max_audio_input_bytes,
+        environment_max_audio_bytes,
         environment_max_image_pixels,
         environment_max_video_bytes,
         environment_server_url,
     )
+    from audio_utils import audio_bytes_to_comfy, comfy_audio_to_api_input
     from image_utils import (
         batch_image_tensors,
         decode_base64_image,
@@ -51,6 +59,50 @@ IMAGE_TASK = "image-generation"
 VIDEO_GENERATION_TASK = "video-generation"
 IMAGE_TO_VIDEO_TASK = "image-to-video"
 VIDEO_TASKS = (VIDEO_GENERATION_TASK, IMAGE_TO_VIDEO_TASK)
+AUDIO_GENERATION_TASK = "audio-generation"
+MUSIC_GENERATION_TASK = "music-generation"
+TEXT_TO_SPEECH_TASK = "text-to-speech"
+AUDIO_GENERATION_TASKS = (
+    AUDIO_GENERATION_TASK,
+    MUSIC_GENERATION_TASK,
+    TEXT_TO_SPEECH_TASK,
+)
+AUDIO_TRANSCRIPTION_TASKS = ("speech-to-text", "speech-translation")
+AUDIO_DETECTION_TASKS = (
+    "audio-event-detection",
+    "voice-activity-detection",
+    "speaker-identification",
+    "language-identification",
+    "speech-emotion-recognition",
+)
+AUDIO_ANALYSIS_TASKS = (
+    "audio-captioning",
+    "speaker-diarization",
+    "audio-classification",
+    "audio-understanding",
+)
+AUDIO_TRANSFORM_TASKS = (
+    "voice-conversion",
+    "stem-separation",
+    "audio-enhancement",
+    "audio-editing",
+)
+AUDIO_EMBEDDING_TASKS = ("audio-embedding",)
+AUDIO_TEXT_OUTPUT_TASKS = (
+    *AUDIO_TRANSCRIPTION_TASKS,
+    *AUDIO_DETECTION_TASKS,
+    *AUDIO_ANALYSIS_TASKS,
+    *AUDIO_EMBEDDING_TASKS,
+)
+AUDIO_TASKS = (
+    *AUDIO_GENERATION_TASKS,
+    *AUDIO_TRANSCRIPTION_TASKS,
+    *AUDIO_DETECTION_TASKS,
+    *AUDIO_ANALYSIS_TASKS,
+    *AUDIO_TRANSFORM_TASKS,
+    *AUDIO_EMBEDDING_TASKS,
+)
+MAX_AUDIO_TEXT_BYTES = 16 * 1024 * 1024
 DEDICATED_PARAMETERS = {
     "image.width",
     "image.height",
@@ -77,6 +129,23 @@ VIDEO_CONFIG_DEDICATED_PARAMETERS = {
     "video.seed",
     "video.temporal_vae_tiling",
     "video.output_format",
+}
+AUDIO_CONFIG_DEDICATED_PARAMETERS = {
+    "audio.duration",
+    "audio.variations",
+    "audio.seed",
+    "audio.sample_rate",
+    "audio.channels",
+    "audio.instrumental",
+    "audio.output_format",
+}
+TTS_CONFIG_DEDICATED_PARAMETERS = {
+    "tts.voice",
+    "tts.speed",
+    "tts.seed",
+    "tts.sample_rate",
+    "tts.channels",
+    "tts.output_format",
 }
 ROUTING_OPTION_PATHS = {
     "backend": "routing.backend",
@@ -117,6 +186,13 @@ RESERVED_ADDITIONAL_KEYS = {
     "prompt",
     "negative_prompt",
     "initial_image",
+    "input",
+    "task",
+    "async",
+    "background",
+    "job",
+    "voice",
+    "speed",
     "n",
     "size",
     "response_format",
@@ -155,6 +231,8 @@ ALLOWED_IMAGE_REQUEST_FIELDS = {
     "style",
 }
 ALLOWED_VIDEO_REQUEST_FIELDS = {"n", "size", "response_format"}
+ALLOWED_AUDIO_GENERATION_REQUEST_FIELDS = {"n", "response_format"}
+ALLOWED_TTS_REQUEST_FIELDS = {"voice", "speed", "response_format"}
 
 
 def _json_text(value: Any) -> str:
@@ -297,11 +375,84 @@ def classify_video_models(
     }
 
 
+def classify_audio_models(
+    models_payload: Any, capabilities_payload: Any
+) -> dict[str, Any]:
+    """Classify every audio task accepted by Werk's generic job API."""
+
+    installed = _model_entries(models_payload)
+    installed_ids = [entry["id"] for entry in installed]
+    capability_by_id = {
+        entry["id"]: entry for entry in _capability_entries(capabilities_payload)
+    }
+    by_task = {task: {"declared": [], "available": []} for task in AUDIO_TASKS}
+    declared: list[str] = []
+    available: list[str] = []
+    metadata: list[dict[str, Any]] = []
+    for model in installed:
+        model_id = model["id"]
+        capability = capability_by_id.get(model_id, model)
+        tasks = _normalized_tasks(capability.get("tasks", model.get("tasks", [])))
+        available_tasks = _normalized_tasks(
+            capability.get("available_tasks", model.get("available_tasks", []))
+        )
+        for task in AUDIO_TASKS:
+            if task in tasks:
+                by_task[task]["declared"].append(model_id)
+                if model_id not in declared:
+                    declared.append(model_id)
+            if task in available_tasks:
+                by_task[task]["available"].append(model_id)
+                if model_id not in available:
+                    available.append(model_id)
+        metadata.append(
+            {
+                "id": model_id,
+                "declares_audio_generation": AUDIO_GENERATION_TASK in tasks,
+                "audio_generation_probe_eligible": (
+                    AUDIO_GENERATION_TASK in available_tasks
+                ),
+                "declares_music_generation": MUSIC_GENERATION_TASK in tasks,
+                "music_generation_probe_eligible": (
+                    MUSIC_GENERATION_TASK in available_tasks
+                ),
+                "declares_text_to_speech": TEXT_TO_SPEECH_TASK in tasks,
+                "text_to_speech_probe_eligible": TEXT_TO_SPEECH_TASK in available_tasks,
+                "tasks": tasks,
+                "available_tasks": available_tasks,
+            }
+        )
+    return {
+        "installed": installed_ids,
+        "declared": declared,
+        "available": available,
+        "by_task": by_task,
+        "models": metadata,
+    }
+
+
 def _video_task(value: str) -> str:
     task = str(value or "").strip().lower().replace("_", "-")
     if task not in VIDEO_TASKS:
         raise ValueError(
             "task must be video-generation or image-to-video"
+        )
+    return task
+
+
+def _audio_task(value: str) -> str:
+    task = str(value or "").strip().lower().replace("_", "-")
+    if task not in AUDIO_TASKS:
+        raise ValueError("task is not a supported Werk audio task")
+    return task
+
+
+def _audio_generation_task(value: str) -> str:
+    task = _audio_task(value)
+    if task not in AUDIO_GENERATION_TASKS:
+        raise ValueError(
+            "generation task must be audio-generation, music-generation, "
+            "or text-to-speech"
         )
     return task
 
@@ -385,6 +536,22 @@ def normalize_video_config_parameters(value: str) -> dict[str, Any]:
         namespace="video",
         dedicated_parameters=VIDEO_CONFIG_DEDICATED_PARAMETERS,
         label="additional_video_parameters_json",
+    )
+
+
+def normalize_audio_config_parameters(value: str, task: str) -> dict[str, Any]:
+    selected_task = _audio_generation_task(task)
+    namespace = "tts" if selected_task == TEXT_TO_SPEECH_TASK else "audio"
+    dedicated = (
+        TTS_CONFIG_DEDICATED_PARAMETERS
+        if namespace == "tts"
+        else AUDIO_CONFIG_DEDICATED_PARAMETERS
+    )
+    return _normalize_parameter_object(
+        value,
+        namespace=namespace,
+        dedicated_parameters=dedicated,
+        label="additional_audio_parameters_json",
     )
 
 
@@ -692,6 +859,114 @@ def video_config_payload(config: WerkVideoConfig) -> dict[str, Any]:
     }
 
 
+def build_audio_config(
+    *,
+    task: str = AUDIO_GENERATION_TASK,
+    duration: float = 30.0,
+    variations: int = 1,
+    seed: int = 0,
+    sample_rate: int = 0,
+    channels: int = 0,
+    output_format: str = "wav",
+    instrumental: str = "inherit",
+    voice: str = "",
+    speed: float = 1.0,
+    additional_audio_parameters_json: str = "{}",
+    routing: WerkRoutingConfig | None = None,
+) -> WerkAudioConfig:
+    """Build portable audio-generation or speech-synthesis controls."""
+
+    selected_task = _audio_generation_task(task)
+    duration_value = float(duration)
+    variations_value = int(variations)
+    seed_value = int(seed)
+    sample_rate_value = int(sample_rate)
+    channels_value = int(channels)
+    output_value = str(output_format or "").strip().lower()
+    speed_value = float(speed)
+    voice_value = str(voice or "").strip()
+    if not 0.1 <= duration_value <= 86_400.0:
+        raise ValueError("duration must be between 0.1 and 86400 seconds")
+    if not 1 <= variations_value <= 1024:
+        raise ValueError("variations must be between 1 and 1024")
+    if not 0 <= seed_value <= 0x7FFFFFFFFFFFFFFF:
+        raise ValueError("seed must be between 0 and 9223372036854775807")
+    if sample_rate_value != 0 and not 8_000 <= sample_rate_value <= 384_000:
+        raise ValueError("sample_rate must be 0 (inherit) or between 8000 and 384000")
+    if channels_value != 0 and not 1 <= channels_value <= 32:
+        raise ValueError("channels must be 0 (inherit) or between 1 and 32")
+    if output_value not in {"wav", "flac", "ogg"}:
+        raise ValueError("output_format must be wav, flac, or ogg")
+    if not 0.1 <= speed_value <= 10.0:
+        raise ValueError("speed must be between 0.1 and 10")
+
+    request_fields: dict[str, Any] = {"response_format": output_value}
+    parameters: dict[str, Any]
+    if selected_task == TEXT_TO_SPEECH_TASK:
+        if variations_value != 1:
+            raise ValueError("text-to-speech supports exactly one variation")
+        if duration_value != 30.0:
+            raise ValueError("duration applies only to audio or music generation")
+        if str(instrumental or "inherit").strip().lower() != "inherit":
+            raise ValueError("instrumental applies only to audio or music generation")
+        if voice_value:
+            request_fields["voice"] = voice_value
+        if speed_value != 1.0:
+            request_fields["speed"] = speed_value
+        # Zero is the portable inherit/default value.  Sending it explicitly
+        # would make strict backends reject otherwise valid TTS requests when
+        # they do not expose deterministic synthesis.
+        parameters = {}
+        if seed_value:
+            parameters["tts.seed"] = seed_value
+        namespace = "tts"
+    else:
+        if voice_value:
+            raise ValueError("voice applies only to text-to-speech")
+        if speed_value != 1.0:
+            raise ValueError("speed applies only to text-to-speech")
+        request_fields["n"] = variations_value
+        parameters = {
+            "audio.duration": duration_value,
+            "audio.seed": seed_value,
+        }
+        instrumental_value = _optional_bool("audio.instrumental", instrumental)
+        if instrumental_value is not None:
+            parameters["audio.instrumental"] = instrumental_value
+        namespace = "audio"
+    if sample_rate_value:
+        parameters[f"{namespace}.sample_rate"] = sample_rate_value
+    if channels_value:
+        parameters[f"{namespace}.channels"] = channels_value
+    parameters.update(
+        normalize_audio_config_parameters(
+            additional_audio_parameters_json,
+            selected_task,
+        )
+    )
+
+    routing_config = routing or WerkRoutingConfig()
+    if not isinstance(routing_config, WerkRoutingConfig):
+        raise TypeError("routing must be a WerkRoutingConfig")
+    return WerkAudioConfig(
+        task=selected_task,
+        request_fields=request_fields,
+        parameters=parameters,
+        routing=routing_config,
+    )
+
+
+def audio_config_payload(config: WerkAudioConfig) -> dict[str, Any]:
+    if not isinstance(config, WerkAudioConfig):
+        raise TypeError("config must be a WerkAudioConfig")
+    return {
+        "task": config.task,
+        "request_fields": dict(config.request_fields),
+        "parameters": dict(config.parameters),
+        "routing": routing_config_payload(config.routing),
+    }
+
+
 def build_configured_image_request(
     *,
     model: str,
@@ -796,6 +1071,181 @@ def build_configured_video_request(
         request["negative_prompt"] = str(negative_prompt)
     if initial_image is not None:
         request["initial_image"] = image_tensor_to_api_input(initial_image)
+    return request
+
+
+def build_configured_audio_request(
+    *,
+    task: str,
+    model: str,
+    prompt: str,
+    negative_prompt: str = "",
+    config: WerkAudioConfig | None = None,
+) -> dict[str, Any]:
+    """Merge one task-specific audio config into its public Werk API shape."""
+
+    selected_task = _audio_generation_task(task)
+    model_value = str(model or "").strip()
+    if not model_value:
+        raise ValueError("model must not be empty; connect WERK Audio Models")
+    prompt_value = str(prompt or "")
+    if not prompt_value.strip():
+        raise ValueError("prompt must not be empty")
+    audio_config = config or build_audio_config(task=selected_task)
+    if not isinstance(audio_config, WerkAudioConfig):
+        raise TypeError("config must be a WerkAudioConfig")
+    if audio_config.task != selected_task:
+        raise ValueError(
+            f"audio config task '{audio_config.task}' does not match generator task "
+            f"'{selected_task}'"
+        )
+
+    allowed_request_fields = (
+        ALLOWED_TTS_REQUEST_FIELDS
+        if selected_task == TEXT_TO_SPEECH_TASK
+        else ALLOWED_AUDIO_GENERATION_REQUEST_FIELDS
+    )
+    unknown_request_fields = set(audio_config.request_fields) - allowed_request_fields
+    if unknown_request_fields:
+        raise ValueError(
+            "audio config contains unsupported request field(s): "
+            + ", ".join(sorted(unknown_request_fields))
+        )
+    unknown_routing_fields = set(audio_config.routing.request_options) - set(
+        ROUTING_OPTION_PATHS
+    )
+    if unknown_routing_fields:
+        raise ValueError(
+            "routing config contains unsupported request option(s): "
+            + ", ".join(sorted(unknown_routing_fields))
+        )
+
+    parameters = dict(audio_config.routing.parameters)
+    duplicates = set(parameters) & set(audio_config.parameters)
+    if duplicates:
+        raise ValueError("config parameter collision: " + ", ".join(sorted(duplicates)))
+    parameters.update(audio_config.parameters)
+    request: dict[str, Any] = {
+        "model": model_value,
+        **dict(audio_config.request_fields),
+        **dict(audio_config.routing.request_options),
+        "parameters": parameters,
+    }
+    negative_value = str(negative_prompt or "")
+    if selected_task == TEXT_TO_SPEECH_TASK:
+        if negative_value.strip():
+            raise ValueError("negative_prompt is not supported for text-to-speech")
+        request["input"] = prompt_value
+        request["async"] = True
+    else:
+        request["task"] = selected_task
+        request["prompt"] = prompt_value
+        if negative_value.strip():
+            request["negative_prompt"] = negative_value
+    return request
+
+
+def normalize_audio_job_parameters(value: str, task: str) -> dict[str, Any]:
+    """Normalize free-form parameters for an audio-input generic job."""
+
+    selected_task = _audio_task(task)
+    if selected_task in AUDIO_GENERATION_TASKS:
+        raise ValueError("audio-input jobs do not accept generation-only tasks")
+    namespace = "stt" if selected_task in AUDIO_TRANSCRIPTION_TASKS else "audio"
+    return _normalize_parameter_object(
+        value,
+        namespace=namespace,
+        dedicated_parameters=set(),
+        label="additional_audio_parameters_json",
+    )
+
+
+def build_audio_input_job_request(
+    *,
+    task: str,
+    model: str,
+    audio: Any,
+    reference_audio: Any | None = None,
+    prompt: str = "",
+    negative_prompt: str = "",
+    additional_audio_parameters_json: str = "{}",
+    routing: WerkRoutingConfig | None = None,
+) -> dict[str, Any]:
+    """Build a generic ``/v1/jobs`` request from native ComfyUI audio."""
+
+    selected_task = _audio_task(task)
+    if selected_task in AUDIO_GENERATION_TASKS:
+        raise ValueError("use WERK Audio Generate for audio-generation tasks")
+    model_value = str(model or "").strip()
+    if not model_value:
+        raise ValueError("model must not be empty; connect WERK Audio Models")
+    prompt_value = str(prompt or "")
+    if (
+        selected_task in {"audio-understanding", "audio-editing"}
+        and not prompt_value.strip()
+    ):
+        raise ValueError(f"prompt must not be empty for {selected_task}")
+    if reference_audio is not None and selected_task != "voice-conversion":
+        raise ValueError("reference_audio is supported only for voice-conversion")
+    routing_config = routing or WerkRoutingConfig()
+    if not isinstance(routing_config, WerkRoutingConfig):
+        raise TypeError("routing must be a WerkRoutingConfig")
+    unknown_routing_fields = set(routing_config.request_options) - set(
+        ROUTING_OPTION_PATHS
+    )
+    if unknown_routing_fields:
+        raise ValueError(
+            "routing config contains unsupported request option(s): "
+            + ", ".join(sorted(unknown_routing_fields))
+        )
+    parameters = dict(routing_config.parameters)
+    task_parameters = normalize_audio_job_parameters(
+        additional_audio_parameters_json,
+        selected_task,
+    )
+    duplicates = set(parameters) & set(task_parameters)
+    if duplicates:
+        raise ValueError("config parameter collision: " + ", ".join(sorted(duplicates)))
+    parameters.update(task_parameters)
+    max_input_bytes = environment_max_audio_input_bytes()
+    primary_input = comfy_audio_to_api_input(
+        audio,
+        max_bytes=max_input_bytes,
+    )
+    inputs = [primary_input]
+    if reference_audio is not None:
+        encoded = primary_input["source"]["data"]
+        padding = len(encoded) - len(encoded.rstrip("="))
+        primary_bytes = (len(encoded) * 3 // 4) - padding
+        remaining_bytes = max_input_bytes - primary_bytes
+        if remaining_bytes <= 0:
+            raise ValueError(
+                f"combined encoded audio inputs exceed {max_input_bytes} bytes"
+            )
+        try:
+            reference_input = comfy_audio_to_api_input(
+                reference_audio,
+                max_bytes=remaining_bytes,
+                role="reference_audio",
+            )
+        except ValueError as error:
+            if "encoded audio input exceeds" in str(error):
+                raise ValueError(
+                    f"combined encoded audio inputs exceed {max_input_bytes} bytes"
+                ) from error
+            raise
+        inputs.append(reference_input)
+    request: dict[str, Any] = {
+        "model": model_value,
+        "task": selected_task,
+        "inputs": inputs,
+        **dict(routing_config.request_options),
+        "parameters": parameters,
+    }
+    if prompt_value.strip():
+        request["prompt"] = prompt_value
+    if str(negative_prompt or "").strip():
+        request["negative_prompt"] = str(negative_prompt)
     return request
 
 
@@ -916,7 +1366,7 @@ def _safe_inference_result(result: Mapping[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def safe_video_job_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
+def safe_media_job_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
     safe = {
         key: record[key]
         for key in ("id", "status", "created_unix", "updated_unix")
@@ -928,6 +1378,12 @@ def safe_video_job_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(record.get("error"), str):
         safe["error"] = record["error"]
     return safe
+
+
+def safe_video_job_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Backward-compatible video-specific name for shared job sanitization."""
+
+    return safe_media_job_metadata(record)
 
 
 def _check_comfy_interrupted() -> None:
@@ -945,10 +1401,11 @@ def _cancel_job_best_effort(client: WerkClient, job_id: str) -> None:
         pass
 
 
-def wait_for_video_job(
+def wait_for_media_job(
     client: WerkClient,
     initial_record: Mapping[str, Any],
     *,
+    media_kind: str,
     timeout_seconds: float,
     poll_interval_seconds: float = 1.0,
     sleep_fn=None,
@@ -957,16 +1414,17 @@ def wait_for_video_job(
 ) -> dict[str, Any]:
     """Poll one Werk media job and cancel it best-effort if waiting aborts."""
 
-    record = _object(initial_record, "video job")
+    kind = str(media_kind or "media").strip().lower()
+    record = _object(initial_record, f"{kind} job")
     job_id = record.get("id")
     if not isinstance(job_id, str) or not job_id.strip():
-        raise ValueError("Werk video job response contains no valid job id")
+        raise ValueError(f"Werk {kind} job response contains no valid job id")
     timeout = float(timeout_seconds)
     interval = float(poll_interval_seconds)
     if timeout <= 0:
-        raise ValueError("video job timeout must be greater than zero")
+        raise ValueError(f"{kind} job timeout must be greater than zero")
     if interval <= 0:
-        raise ValueError("video job poll interval must be greater than zero")
+        raise ValueError(f"{kind} job poll interval must be greater than zero")
     sleep = sleep_fn or time.sleep
     monotonic = monotonic_fn or time.monotonic
     check_interrupted = interrupt_check or _check_comfy_interrupted
@@ -979,72 +1437,133 @@ def wait_for_video_job(
                 active = False
                 if not isinstance(record.get("result"), dict):
                     raise ValueError(
-                        "Werk completed video job contains no inference result"
+                        f"Werk completed {kind} job contains no inference result"
                     )
                 return record
             if status == "failed":
                 active = False
                 detail = record.get("error")
                 message = detail.strip() if isinstance(detail, str) else "unknown failure"
-                raise ValueError(f"Werk video job failed: {message}")
+                raise ValueError(f"Werk {kind} job failed: {message}")
             if status == "cancelled":
                 active = False
-                raise ValueError("Werk video job was cancelled")
+                raise ValueError(f"Werk {kind} job was cancelled")
             if status not in {"queued", "loading", "running", "encoding"}:
-                raise ValueError(f"Werk video job returned unknown status '{status}'")
+                raise ValueError(f"Werk {kind} job returned unknown status '{status}'")
 
             check_interrupted()
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise TimeoutError(
-                    f"Werk video job did not complete within {timeout:g} seconds"
+                    f"Werk {kind} job did not complete within {timeout:g} seconds"
                 )
             sleep(min(interval, remaining))
             record = _object(
                 client.get_json(f"/v1/jobs/{quote(job_id, safe='')}"),
-                "video job",
+                f"{kind} job",
             )
             if record.get("id") != job_id:
-                raise ValueError("Werk video job id changed while polling")
+                raise ValueError(f"Werk {kind} job id changed while polling")
     except BaseException:
         if active:
             _cancel_job_best_effort(client, job_id)
         raise
 
 
-def execute_video_request(
+def wait_for_video_job(
+    client: WerkClient,
+    initial_record: Mapping[str, Any],
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 1.0,
+    sleep_fn=None,
+    monotonic_fn=None,
+    interrupt_check=None,
+) -> dict[str, Any]:
+    return wait_for_media_job(
+        client,
+        initial_record,
+        media_kind="video",
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        sleep_fn=sleep_fn,
+        monotonic_fn=monotonic_fn,
+        interrupt_check=interrupt_check,
+    )
+
+
+def wait_for_audio_job(
+    client: WerkClient,
+    initial_record: Mapping[str, Any],
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 1.0,
+    sleep_fn=None,
+    monotonic_fn=None,
+    interrupt_check=None,
+) -> dict[str, Any]:
+    return wait_for_media_job(
+        client,
+        initial_record,
+        media_kind="audio",
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        sleep_fn=sleep_fn,
+        monotonic_fn=monotonic_fn,
+        interrupt_check=interrupt_check,
+    )
+
+
+def _video_mime_type(value: str) -> bool:
+    return value.startswith("video/") or value == "image/gif"
+
+
+def _audio_mime_type(value: str) -> bool:
+    return value.startswith("audio/") or value == "application/ogg"
+
+
+def execute_media_job_request(
     connection: WerkConnection,
+    *,
+    endpoint: str,
+    media_kind: str,
     request: Mapping[str, Any],
     seed: int,
+    max_bytes: int,
+    mime_validator,
+    converter,
 ):
     client = WerkClient(connection)
     initial = _object(
-        client.post_json("/v1/videos/generations", dict(request)),
-        "video generation",
+        client.post_json(endpoint, dict(request)),
+        f"{media_kind} generation",
     )
-    record = wait_for_video_job(
+    record = wait_for_media_job(
         client,
         initial,
+        media_kind=media_kind,
         timeout_seconds=connection.timeout_seconds,
     )
-    result = _object(record.get("result"), "video result")
+    result = _object(record.get("result"), f"{media_kind} result")
     outputs = result.get("outputs")
     if not isinstance(outputs, list) or not outputs:
-        raise ValueError("Werk completed video job contains no outputs")
+        raise ValueError(f"Werk completed {media_kind} job contains no outputs")
 
-    videos = []
+    values = []
     output_ids = []
-    max_bytes = environment_max_video_bytes()
     for item in outputs:
         if not isinstance(item, dict):
-            raise ValueError("Werk video result contains an invalid output entry")
+            raise ValueError(
+                f"Werk {media_kind} result contains an invalid output entry"
+            )
         output_id = item.get("id")
         if not isinstance(output_id, str) or not output_id.strip():
-            raise ValueError("Werk video output contains no valid output id")
+            raise ValueError(f"Werk {media_kind} output contains no valid output id")
         mime_type = str(item.get("mime_type", "")).lower().split(";", 1)[0]
-        if not (mime_type.startswith("video/") or mime_type == "image/gif"):
+        if not mime_validator(mime_type):
             raise ValueError(
-                f"Werk video output returned non-video MIME type '{mime_type or 'unknown'}'"
+                f"Werk {media_kind} output returned non-{media_kind} MIME type "
+                f"'{mime_type or 'unknown'}'"
             )
         raw, content_type = client.download_bytes(
             f"/v1/outputs/{quote(output_id, safe='')}",
@@ -1053,24 +1572,168 @@ def execute_video_request(
         downloaded_type = (
             content_type.lower().split(";", 1)[0] if content_type else ""
         )
-        if downloaded_type and not (
-            downloaded_type.startswith("video/") or downloaded_type == "image/gif"
-        ):
+        if downloaded_type and not mime_validator(downloaded_type):
             raise ValueError(
-                f"Werk output returned non-video content type '{content_type}'"
+                f"Werk output returned non-{media_kind} content type '{content_type}'"
             )
-        videos.append(video_bytes_to_comfy(raw))
+        values.append(converter(raw))
         output_ids.append(output_id)
 
     result_id = result.get("id")
     if not isinstance(result_id, str):
         result_id = ""
     return (
-        videos,
-        _json_text(safe_video_job_metadata(record)),
+        values,
+        _json_text(safe_media_job_metadata(record)),
         int(seed),
         str(record["id"]),
         str(result_id),
+        "\n".join(output_ids),
+    )
+
+
+def execute_video_request(
+    connection: WerkConnection,
+    request: Mapping[str, Any],
+    seed: int,
+):
+    return execute_media_job_request(
+        connection,
+        endpoint="/v1/videos/generations",
+        media_kind="video",
+        request=request,
+        seed=seed,
+        max_bytes=environment_max_video_bytes(),
+        mime_validator=_video_mime_type,
+        converter=video_bytes_to_comfy,
+    )
+
+
+def execute_audio_request(
+    connection: WerkConnection,
+    task: str,
+    request: Mapping[str, Any],
+    seed: int,
+):
+    selected_task = _audio_generation_task(task)
+    endpoint = (
+        "/v1/audio/speech"
+        if selected_task == TEXT_TO_SPEECH_TASK
+        else "/v1/audio/generations"
+    )
+    return execute_media_job_request(
+        connection,
+        endpoint=endpoint,
+        media_kind="audio",
+        request=request,
+        seed=seed,
+        max_bytes=environment_max_audio_bytes(),
+        mime_validator=_audio_mime_type,
+        converter=audio_bytes_to_comfy,
+    )
+
+
+def execute_audio_process_request(
+    connection: WerkConnection,
+    task: str,
+    request: Mapping[str, Any],
+):
+    selected_task = _audio_task(task)
+    if selected_task not in AUDIO_TRANSFORM_TASKS:
+        raise ValueError("audio process task must produce audio")
+    seed = 0
+    parameters = request.get("parameters")
+    if isinstance(parameters, Mapping):
+        value = parameters.get("audio.seed", 0)
+        if isinstance(value, int) and not isinstance(value, bool):
+            seed = value
+    return execute_media_job_request(
+        connection,
+        endpoint="/v1/jobs",
+        media_kind="audio",
+        request=request,
+        seed=seed,
+        max_bytes=environment_max_audio_bytes(),
+        mime_validator=_audio_mime_type,
+        converter=audio_bytes_to_comfy,
+    )
+
+
+def _text_output_mime_type(value: str) -> bool:
+    return value.startswith("text/") or value in {
+        "application/json",
+        "application/x-ndjson",
+    }
+
+
+def _decode_text_output(data: bytes, mime_type: str) -> str:
+    try:
+        value = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("Werk audio analysis output is not valid UTF-8") from error
+    if mime_type in {"application/json", "application/x-ndjson"}:
+        if mime_type == "application/json":
+            try:
+                return _json_text(json.loads(value))
+            except json.JSONDecodeError as error:
+                raise ValueError("Werk audio analysis returned invalid JSON") from error
+    return value
+
+
+def execute_audio_analysis_request(
+    connection: WerkConnection,
+    task: str,
+    request: Mapping[str, Any],
+):
+    selected_task = _audio_task(task)
+    if selected_task not in AUDIO_TEXT_OUTPUT_TASKS:
+        raise ValueError("audio analysis task must produce text or JSON")
+    client = WerkClient(connection)
+    initial = _object(client.post_json("/v1/jobs", dict(request)), "audio analysis")
+    record = wait_for_media_job(
+        client,
+        initial,
+        media_kind="audio analysis",
+        timeout_seconds=connection.timeout_seconds,
+    )
+    result = _object(record.get("result"), "audio analysis result")
+    outputs = result.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise ValueError("Werk completed audio analysis job contains no outputs")
+    values: list[str] = []
+    output_ids: list[str] = []
+    for item in outputs:
+        if not isinstance(item, dict):
+            raise ValueError("Werk audio analysis result has an invalid output entry")
+        output_id = item.get("id")
+        if not isinstance(output_id, str) or not output_id.strip():
+            raise ValueError("Werk audio analysis output has no valid output id")
+        mime_type = str(item.get("mime_type", "")).lower().split(";", 1)[0]
+        if not _text_output_mime_type(mime_type):
+            raise ValueError(
+                "Werk audio analysis returned non-text MIME type "
+                f"'{mime_type or 'unknown'}'"
+            )
+        raw, content_type = client.download_bytes(
+            f"/v1/outputs/{quote(output_id, safe='')}",
+            max_bytes=MAX_AUDIO_TEXT_BYTES,
+        )
+        downloaded_type = (
+            content_type.lower().split(";", 1)[0] if content_type else mime_type
+        )
+        if not _text_output_mime_type(downloaded_type):
+            raise ValueError(
+                "Werk audio analysis download returned non-text content type "
+                f"'{content_type}'"
+            )
+        values.append(_decode_text_output(raw, downloaded_type))
+        output_ids.append(output_id)
+    result_id = result.get("id")
+    return (
+        values,
+        _json_text(safe_media_job_metadata(record)),
+        str(record["id"]),
+        str(result_id) if isinstance(result_id, str) else "",
         "\n".join(output_ids),
     )
 
@@ -1177,11 +1840,13 @@ class WerkServerInfoNode:
             optional_error = str(error)
         classified = classify_image_models(models, capabilities)
         video_classified = classify_video_models(models, capabilities)
+        audio_classified = classify_audio_models(models, capabilities)
         metadata = {
             "models": models,
             "capabilities": capabilities,
             "classification": classified,
             "video_classification": video_classified,
+            "audio_classification": audio_classified,
         }
         if optional_error:
             metadata["capabilities_warning"] = optional_error
@@ -1315,6 +1980,72 @@ class WerkVideoModelsNode:
         return selected, "\n".join(candidates), _json_text(metadata)
 
 
+class WerkAudioModelsNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "task": (
+                    list(AUDIO_TASKS),
+                    {"default": AUDIO_GENERATION_TASK},
+                ),
+                "refresh_token": ("INT", {"default": 0}),
+                "preferred_model": ("STRING", {"default": ""}),
+                "require_available": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("model", "available_models", "metadata_json")
+    FUNCTION = "select"
+    CATEGORY = "WERK/Discovery"
+
+    def select(
+        self,
+        connection: WerkConnection,
+        task: str,
+        refresh_token: int,
+        preferred_model: str,
+        require_available: bool,
+    ):
+        del refresh_token
+        selected_task = _audio_task(task)
+        client = WerkClient(connection)
+        models = client.get_json("/v1/models")
+        try:
+            capabilities = client.get_json("/v1/capabilities")
+        except WerkApiError:
+            capabilities = {}
+        classified = classify_audio_models(models, capabilities)
+        task_models = classified["by_task"][selected_task]
+        candidates = (
+            task_models["available"]
+            if require_available
+            else task_models["declared"]
+        )
+        preferred = preferred_model.strip()
+        if preferred and preferred in candidates:
+            selected = preferred
+        elif len(candidates) == 1:
+            selected = candidates[0]
+        elif len(candidates) > 1:
+            raise ValueError(
+                f"multiple matching Werk {selected_task} models; "
+                "set preferred_model to one of: " + ", ".join(candidates)
+            )
+        elif task_models["declared"] and require_available:
+            raise ValueError(
+                f"Werk models declare {selected_task}, but none is currently "
+                "runtime probe-eligible: " + ", ".join(task_models["declared"])
+            )
+        else:
+            raise ValueError(f"no installed Werk model declares {selected_task}")
+        metadata = dict(classified)
+        metadata["selected_task"] = selected_task
+        return selected, "\n".join(candidates), _json_text(metadata)
+
+
 class WerkImageParametersNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1384,6 +2115,58 @@ class WerkVideoParametersNode:
         if not model:
             raise ValueError("model must not be empty")
         selected_task = _video_task(task)
+        payload = WerkClient(connection).get_json(
+            "/v1/parameters",
+            {
+                "task": selected_task,
+                "model": model,
+                "backend": backend.strip() or "auto",
+            },
+        )
+        root = _object(payload, "parameters")
+        descriptors = root.get("parameters", root.get("data", []))
+        count = len(descriptors) if isinstance(descriptors, (list, dict)) else 0
+        summary = (
+            f"{model} ({selected_task}): {count} parameter descriptor(s) "
+            "returned by Werk"
+        )
+        return _json_text(payload), summary
+
+
+class WerkAudioParametersNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "model": ("STRING", {"default": ""}),
+                "task": (
+                    list(AUDIO_TASKS),
+                    {"default": AUDIO_GENERATION_TASK},
+                ),
+                "backend": ("STRING", {"default": "auto"}),
+                "refresh_token": ("INT", {"default": 0}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("parameters_json", "summary")
+    FUNCTION = "parameters"
+    CATEGORY = "WERK/Discovery"
+
+    def parameters(
+        self,
+        connection: WerkConnection,
+        model: str,
+        task: str,
+        backend: str,
+        refresh_token: int,
+    ):
+        del refresh_token
+        model = model.strip()
+        if not model:
+            raise ValueError("model must not be empty")
+        selected_task = _audio_task(task)
         payload = WerkClient(connection).get_json(
             "/v1/parameters",
             {
@@ -1557,6 +2340,73 @@ class WerkVideoConfigNode:
         return config, _json_text(video_config_payload(config))
 
 
+class WerkAudioConfigNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "task": (
+                    list(AUDIO_GENERATION_TASKS),
+                    {"default": AUDIO_GENERATION_TASK},
+                ),
+                "duration": (
+                    "FLOAT",
+                    {"default": 30.0, "min": 0.1, "max": 86_400.0, "step": 0.1},
+                ),
+                "variations": ("INT", {"default": 1, "min": 1, "max": 1024}),
+                "seed": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 0x7FFFFFFFFFFFFFFF},
+                ),
+                "sample_rate": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 384_000,
+                        "tooltip": "0 inherits the model/task sample rate.",
+                    },
+                ),
+                "channels": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 32,
+                        "tooltip": "0 inherits the model/task channel count.",
+                    },
+                ),
+                "output_format": (
+                    ["wav", "flac", "ogg"],
+                    {"default": "wav"},
+                ),
+                "instrumental": (
+                    ["inherit", "enabled", "disabled"],
+                    {"default": "inherit"},
+                ),
+                "voice": ("STRING", {"default": ""}),
+                "speed": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01},
+                ),
+                "additional_audio_parameters_json": (
+                    "STRING",
+                    {"default": "{}", "multiline": True},
+                ),
+            },
+            "optional": {"routing": ("WERK_ROUTING_CONFIG",)},
+        }
+
+    RETURN_TYPES = ("WERK_AUDIO_CONFIG", "STRING")
+    RETURN_NAMES = ("config", "config_json")
+    FUNCTION = "configure"
+    CATEGORY = "WERK/Configuration"
+
+    def configure(self, routing: WerkRoutingConfig | None = None, **inputs):
+        config = build_audio_config(routing=routing, **inputs)
+        return config, _json_text(audio_config_payload(config))
+
+
 class WerkImageGenerateNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1661,6 +2511,225 @@ class WerkVideoGenerateNode:
         return execute_video_request(connection, request, seed)
 
 
+class WerkAudioGenerateNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "model": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Connect the model output from WERK Audio Models.",
+                    },
+                ),
+                "task": (
+                    list(AUDIO_GENERATION_TASKS),
+                    {"default": AUDIO_GENERATION_TASK},
+                ),
+                "prompt": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "Text to generate from; for TTS this is the spoken text.",
+                    },
+                ),
+                "negative_prompt": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+            },
+            "optional": {"config": ("WERK_AUDIO_CONFIG",)},
+        }
+
+    RETURN_TYPES = ("AUDIO", "STRING", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = (
+        "audio",
+        "metadata_json",
+        "seed",
+        "job_id",
+        "result_id",
+        "output_ids",
+    )
+    OUTPUT_IS_LIST = (True, False, False, False, False, False)
+    FUNCTION = "generate"
+    CATEGORY = "WERK/Audio"
+    OUTPUT_NODE = True
+
+    def generate(
+        self,
+        connection: WerkConnection,
+        model: str,
+        task: str,
+        prompt: str,
+        negative_prompt: str,
+        config: WerkAudioConfig | None = None,
+    ):
+        selected_task = _audio_generation_task(task)
+        request = build_configured_audio_request(
+            task=selected_task,
+            model=model,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            config=config,
+        )
+        audio_config = config or build_audio_config(task=selected_task)
+        namespace = "tts" if selected_task == TEXT_TO_SPEECH_TASK else "audio"
+        seed = int(audio_config.parameters.get(f"{namespace}.seed", 0))
+        return execute_audio_request(connection, selected_task, request, seed)
+
+
+class WerkAudioProcessNode:
+    """Run audio-to-audio transforms through Werk's generic job API."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "model": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Connect WERK Audio Models with the same task selected.",
+                    },
+                ),
+                "task": (
+                    list(AUDIO_TRANSFORM_TASKS),
+                    {"default": AUDIO_TRANSFORM_TASKS[0]},
+                ),
+                "source_audio": ("AUDIO",),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "negative_prompt": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+                "additional_audio_parameters_json": (
+                    "STRING",
+                    {"default": "{}", "multiline": True},
+                ),
+            },
+            "optional": {
+                "routing": ("WERK_ROUTING_CONFIG",),
+                "reference_audio": (
+                    "AUDIO",
+                    {
+                        "tooltip": "Optional target voice reference for voice-conversion.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "STRING", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = (
+        "audio",
+        "metadata_json",
+        "seed",
+        "job_id",
+        "result_id",
+        "output_ids",
+    )
+    OUTPUT_IS_LIST = (True, False, False, False, False, False)
+    FUNCTION = "process"
+    CATEGORY = "WERK/Audio"
+    OUTPUT_NODE = True
+
+    def process(
+        self,
+        connection: WerkConnection,
+        model: str,
+        task: str,
+        source_audio: Any,
+        prompt: str,
+        negative_prompt: str,
+        additional_audio_parameters_json: str,
+        routing: WerkRoutingConfig | None = None,
+        reference_audio: Any | None = None,
+    ):
+        selected_task = _audio_task(task)
+        if selected_task not in AUDIO_TRANSFORM_TASKS:
+            raise ValueError("task is not an audio transform task")
+        request = build_audio_input_job_request(
+            task=selected_task,
+            model=model,
+            audio=source_audio,
+            reference_audio=reference_audio,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            additional_audio_parameters_json=additional_audio_parameters_json,
+            routing=routing,
+        )
+        return execute_audio_process_request(connection, selected_task, request)
+
+
+class WerkAudioAnalyzeNode:
+    """Transcribe, detect, analyze, or embed native ComfyUI audio."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "model": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Connect WERK Audio Models with the same task selected.",
+                    },
+                ),
+                "task": (
+                    list(AUDIO_TEXT_OUTPUT_TASKS),
+                    {"default": AUDIO_TRANSCRIPTION_TASKS[0]},
+                ),
+                "source_audio": ("AUDIO",),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "additional_audio_parameters_json": (
+                    "STRING",
+                    {"default": "{}", "multiline": True},
+                ),
+            },
+            "optional": {"routing": ("WERK_ROUTING_CONFIG",)},
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = (
+        "results",
+        "metadata_json",
+        "job_id",
+        "result_id",
+        "output_ids",
+    )
+    OUTPUT_IS_LIST = (True, False, False, False, False)
+    FUNCTION = "analyze"
+    CATEGORY = "WERK/Audio"
+    OUTPUT_NODE = True
+
+    def analyze(
+        self,
+        connection: WerkConnection,
+        model: str,
+        task: str,
+        source_audio: Any,
+        prompt: str,
+        additional_audio_parameters_json: str,
+        routing: WerkRoutingConfig | None = None,
+    ):
+        selected_task = _audio_task(task)
+        if selected_task not in AUDIO_TEXT_OUTPUT_TASKS:
+            raise ValueError("task is not an audio analysis task")
+        request = build_audio_input_job_request(
+            task=selected_task,
+            model=model,
+            audio=source_audio,
+            prompt=prompt,
+            additional_audio_parameters_json=additional_audio_parameters_json,
+            routing=routing,
+        )
+        return execute_audio_analysis_request(connection, selected_task, request)
+
+
 NODE_CLASS_MAPPINGS = {
     "WerkConnection": WerkConnectionNode,
     "WerkServerInfo": WerkServerInfoNode,
@@ -1673,6 +2742,12 @@ NODE_CLASS_MAPPINGS = {
     "WerkVideoParameters": WerkVideoParametersNode,
     "WerkVideoConfig": WerkVideoConfigNode,
     "WerkVideoGenerate": WerkVideoGenerateNode,
+    "WerkAudioModels": WerkAudioModelsNode,
+    "WerkAudioParameters": WerkAudioParametersNode,
+    "WerkAudioConfig": WerkAudioConfigNode,
+    "WerkAudioGenerate": WerkAudioGenerateNode,
+    "WerkAudioProcess": WerkAudioProcessNode,
+    "WerkAudioAnalyze": WerkAudioAnalyzeNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1687,4 +2762,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WerkVideoParameters": "WERK Video Parameters (Beta)",
     "WerkVideoConfig": "WERK Video Config (Beta)",
     "WerkVideoGenerate": "WERK Video Generate (Beta)",
+    "WerkAudioModels": "WERK Audio Models (Beta)",
+    "WerkAudioParameters": "WERK Audio Parameters (Beta)",
+    "WerkAudioConfig": "WERK Audio Config (Beta)",
+    "WerkAudioGenerate": "WERK Audio Generate (Beta)",
+    "WerkAudioProcess": "WERK Audio Process (Beta)",
+    "WerkAudioAnalyze": "WERK Audio Analyze (Beta)",
 }

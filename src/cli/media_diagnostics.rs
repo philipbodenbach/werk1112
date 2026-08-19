@@ -139,7 +139,12 @@ pub(super) fn write_media_verbose_stats<W: Write>(
         OutputModality::Audio => {
             write_media_audio_stats(writer, result, inference_seconds)?;
         }
-        OutputModality::Text if result.task == InferenceTask::SpeechToText => {
+        OutputModality::Text
+            if matches!(
+                result.task,
+                InferenceTask::SpeechToText | InferenceTask::SpeechTranslation
+            ) =>
+        {
             write_media_transcription_stats(writer, result)?;
         }
         OutputModality::Text | OutputModality::Embedding => {}

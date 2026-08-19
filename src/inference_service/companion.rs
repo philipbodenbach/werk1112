@@ -14,7 +14,9 @@ use super::{
     resources::{configured_media_accelerator, detected_accelerator},
 };
 use crate::{
-    backend::{BackendAccelerator, BackendRuntime, RuntimeId, runtime_registry},
+    backend::{
+        BackendAccelerator, BackendRuntime, RuntimeId, require_qwen_tts_python, runtime_registry,
+    },
     capabilities::{InferenceTask, RepositoryLayout},
     inference::{
         EffectiveInferenceRequest, InferenceRuntimeCandidate, ParameterSource,
@@ -28,6 +30,8 @@ use crate::{
 pub struct CompanionMediaBackend {
     client: std::result::Result<CompanionClient, String>,
     health_cache: Arc<OnceLock<CompanionHealth>>,
+    qwen_client_cache: Arc<OnceLock<std::result::Result<CompanionClient, String>>>,
+    qwen_health_cache: Arc<OnceLock<CompanionHealth>>,
 }
 
 impl CompanionMediaBackend {
@@ -37,6 +41,8 @@ impl CompanionMediaBackend {
                 .map(CompanionClient::with_resident_worker)
                 .map_err(|error| error.to_string()),
             health_cache: Arc::new(OnceLock::new()),
+            qwen_client_cache: Arc::new(OnceLock::new()),
+            qwen_health_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -44,11 +50,39 @@ impl CompanionMediaBackend {
         Self {
             client: Ok(client),
             health_cache: Arc::new(OnceLock::new()),
+            qwen_client_cache: Arc::new(OnceLock::new()),
+            qwen_health_cache: Arc::new(OnceLock::new()),
         }
     }
 
-    fn health(&self, client: &CompanionClient) -> std::result::Result<CompanionHealth, String> {
-        if let Some(health) = self.health_cache.get() {
+    fn client_for_manifest(
+        &self,
+        store: &ModelStore,
+        manifest: &ModelManifest,
+    ) -> std::result::Result<(CompanionClient, bool), String> {
+        if !is_qwen3_tts_manifest(manifest) {
+            return self.client.clone().map(|client| (client, false));
+        }
+        self.qwen_client_cache
+            .get_or_init(|| {
+                let python = require_qwen_tts_python(store).map_err(|error| error.to_string())?;
+                CompanionClient::from_python(python).map_err(|error| error.to_string())
+            })
+            .clone()
+            .map(|client| (client, true))
+    }
+
+    fn health(
+        &self,
+        client: &CompanionClient,
+        qwen_tts: bool,
+    ) -> std::result::Result<CompanionHealth, String> {
+        let cache = if qwen_tts {
+            &self.qwen_health_cache
+        } else {
+            &self.health_cache
+        };
+        if let Some(health) = cache.get() {
             return Ok(health.clone());
         }
         // Preflight operations must not queue behind a long resident media
@@ -59,7 +93,7 @@ impl CompanionMediaBackend {
             .without_resident_worker()
             .health()
             .map_err(|error| error.to_string())?;
-        let _ = self.health_cache.set(health.clone());
+        let _ = cache.set(health.clone());
         Ok(health)
     }
 }
@@ -70,6 +104,15 @@ impl Default for CompanionMediaBackend {
     }
 }
 
+fn is_qwen3_tts_manifest(manifest: &ModelManifest) -> bool {
+    manifest.architecture.as_deref() == Some("qwen3_tts")
+        || manifest
+            .metadata
+            .family
+            .as_deref()
+            .is_some_and(|family| family.starts_with("qwen3-tts"))
+}
+
 impl MediaInferenceBackend for CompanionMediaBackend {
     fn probe(
         &self,
@@ -78,7 +121,7 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         task: InferenceTask,
         schema_paths: &[String],
     ) -> BackendProbe {
-        let client = match &self.client {
+        let (client, qwen_tts) = match self.client_for_manifest(store, manifest) {
             Ok(client) => client,
             Err(error) => {
                 return BackendProbe {
@@ -86,7 +129,7 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                     detail: error.clone(),
                     candidates: companion_candidates_for_model(
                         false,
-                        Some(error.clone()),
+                        Some(error),
                         schema_paths,
                         task,
                         manifest.metadata.repository_layout,
@@ -96,7 +139,7 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                 };
             }
         };
-        let health = match self.health(client) {
+        let health = match self.health(&client, qwen_tts) {
             Ok(health) => health,
             Err(error) => {
                 return BackendProbe {
@@ -116,7 +159,7 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         };
         let probe_request = json!({
             "model_path": companion_model_path(store, manifest),
-            "task": task.to_string(),
+            "task": companion_wire_task(task).to_string(),
             "layout": manifest.metadata.repository_layout.to_string(),
             "family": manifest.metadata.family,
             "architecture": manifest.architecture,
@@ -163,7 +206,9 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         output_dir: &Path,
         runtime: &str,
     ) -> Result<BackendExecution> {
-        let client = self.client.as_ref().map_err(|error| anyhow!("{error}"))?;
+        let (client, _) = self
+            .client_for_manifest(store, manifest)
+            .map_err(|error| anyhow!("{error}"))?;
         let client = request
             .u64_parameter("routing.timeout")
             .filter(|seconds| *seconds > 0)
@@ -172,7 +217,7 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                     .clone()
                     .with_execute_timeout(Duration::from_secs(seconds))
             })
-            .unwrap_or_else(|| client.clone());
+            .unwrap_or(client);
         let model_path = companion_model_path(store, manifest);
         let mut parameters = companion_execution_parameters(request, runtime);
         if let Some(accelerator) = companion_runtime_accelerator(runtime) {
@@ -193,7 +238,7 @@ impl MediaInferenceBackend for CompanionMediaBackend {
             "protocol_version": 1,
             "model_path": model_path,
             "model": manifest.id,
-            "task": request.task.to_string(),
+            "task": companion_wire_task(request.task).to_string(),
             "prompt": request.prompt,
             "negative_prompt": request.negative_prompt,
             "inputs": inputs,
@@ -217,16 +262,17 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         manifest: &ModelManifest,
         request: &EffectiveInferenceRequest,
     ) -> Result<Option<WorkloadEstimate>> {
-        let client = match &self.client {
+        let (client, _) = match self.client_for_manifest(store, manifest) {
             Ok(client) => client,
             Err(_) => return Ok(None),
         };
-        let parameters = request.values_only();
+        let mut parameters = request.values_only();
+        apply_companion_task_parameters(request.task, &mut parameters);
         let companion_request = json!({
             "protocol_version": 1,
             "model_path": companion_model_path(store, manifest),
             "model": manifest.id,
-            "task": request.task.to_string(),
+            "task": companion_wire_task(request.task).to_string(),
             "prompt": request.prompt,
             "negative_prompt": request.negative_prompt,
             "parameters": parameters,
@@ -247,9 +293,29 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         {
             object.insert("fit".to_string(), fit);
         }
-        let estimate = serde_json::from_value(value)
+        let estimate: WorkloadEstimate = serde_json::from_value(value)
             .context("invalid media companion workload estimate response")?;
         Ok(Some(estimate))
+    }
+}
+
+fn companion_wire_task(task: InferenceTask) -> InferenceTask {
+    // The companion protocol supports the complete canonical task taxonomy.
+    // Preserve task identity so adapter selection, errors, and metadata retain
+    // the precise public operation instead of silently degrading to a generic
+    // adapter task.
+    task
+}
+
+fn apply_companion_task_parameters(
+    task: InferenceTask,
+    parameters: &mut BTreeMap<String, ParameterValue>,
+) {
+    if task == InferenceTask::SpeechTranslation {
+        parameters.insert(
+            "stt.operation".to_string(),
+            ParameterValue::String("translate".to_string()),
+        );
     }
 }
 
@@ -369,7 +435,9 @@ fn companion_execution(
         bail!("media companion returned an unsuccessful execution");
     }
     let response_task = response.task.trim().replace('-', "_");
-    let expected_task_name = expected_task.to_string().replace('-', "_");
+    let expected_task_name = companion_wire_task(expected_task)
+        .to_string()
+        .replace('-', "_");
     if response_task != expected_task_name {
         bail!(
             "media companion response task mismatch: expected {}, got '{}'",
@@ -807,6 +875,7 @@ pub(super) fn companion_execution_parameters(
     runtime: &str,
 ) -> BTreeMap<String, ParameterValue> {
     let mut parameters = request.values_only();
+    apply_companion_task_parameters(request.task, &mut parameters);
     let gpu_runtime = matches!(
         companion_runtime_accelerator(runtime),
         Some("cuda" | "rocm")
@@ -919,6 +988,47 @@ mod tests {
             ),
             vec![RuntimeAccelerator::Cuda]
         );
+    }
+
+    #[test]
+    fn companion_protocol_preserves_canonical_audio_tasks() {
+        for task in [
+            InferenceTask::SpeechTranslation,
+            InferenceTask::AudioEventDetection,
+            InferenceTask::VoiceActivityDetection,
+            InferenceTask::SpeakerIdentification,
+            InferenceTask::LanguageIdentification,
+            InferenceTask::SpeechEmotionRecognition,
+        ] {
+            assert_eq!(companion_wire_task(task), task);
+        }
+
+        let mut parameters = BTreeMap::new();
+        apply_companion_task_parameters(InferenceTask::SpeechTranslation, &mut parameters);
+        assert_eq!(
+            parameters.get("stt.operation"),
+            Some(&ParameterValue::String("translate".to_string()))
+        );
+
+        for (expected, legacy_alias) in [
+            (InferenceTask::SpeechTranslation, "speech_to_text"),
+            (InferenceTask::AudioEventDetection, "audio_classification"),
+        ] {
+            let error = companion_execution(
+                CompanionExecution {
+                    ok: true,
+                    task: legacy_alias.to_string(),
+                    outputs: Vec::new(),
+                    metadata: Value::Null,
+                    warnings: Vec::new(),
+                },
+                Path::new("."),
+                "media-companion-cpu",
+                expected,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("response task mismatch"));
+        }
     }
 
     #[test]

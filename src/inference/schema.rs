@@ -15,7 +15,10 @@ use crate::{
 };
 
 use self::{
-    audio::{audio_descriptors, stt_descriptors, tts_descriptors},
+    audio::{
+        audio_classification_descriptors, audio_descriptors, audio_embedding_descriptors,
+        audio_text_descriptors, stt_descriptors, tts_descriptors,
+    },
     image::image_descriptors,
     routing::routing_descriptors,
     video::video_descriptors,
@@ -286,7 +289,38 @@ fn task_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor> {
             | InferenceTask::AudioEnhancement => Vec::new(),
             _ => Vec::new(),
         },
-        OutputModality::Text if task == InferenceTask::SpeechToText => stt_descriptors(),
+        OutputModality::Text
+            if matches!(
+                task,
+                InferenceTask::AudioEventDetection
+                    | InferenceTask::VoiceActivityDetection
+                    | InferenceTask::SpeakerIdentification
+                    | InferenceTask::LanguageIdentification
+                    | InferenceTask::SpeechEmotionRecognition
+                    | InferenceTask::AudioClassification
+            ) =>
+        {
+            audio_classification_descriptors()
+        }
+        OutputModality::Text
+            if matches!(
+                task,
+                InferenceTask::SpeechToText | InferenceTask::SpeechTranslation
+            ) =>
+        {
+            stt_descriptors(task)
+        }
+        OutputModality::Text
+            if matches!(
+                task,
+                InferenceTask::AudioCaptioning | InferenceTask::AudioUnderstanding
+            ) =>
+        {
+            audio_text_descriptors()
+        }
+        OutputModality::Embedding if task == InferenceTask::AudioEmbedding => {
+            audio_embedding_descriptors()
+        }
         OutputModality::Text | OutputModality::Embedding => Vec::new(),
     }
 }

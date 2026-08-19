@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     http::{HeaderName, HeaderValue, Method, header},
     routing::{get, post},
 };
@@ -15,14 +16,22 @@ use super::{
     chat::{chat_completions_handler, model_handler, models_handler},
     media::{
         audio_generations_handler, audio_speech_handler, audio_transcriptions_handler,
-        cancel_job_handler, capabilities_handler, comfy_image_edits_unsupported_handler,
-        create_job_handler, get_job_handler, image_edits_handler, image_generations_handler,
-        output_handler, parameters_handler, video_generations_handler,
+        audio_translations_handler, cancel_job_handler, capabilities_handler,
+        comfy_image_edits_unsupported_handler, create_job_handler, get_job_handler,
+        image_edits_handler, image_generations_handler, output_handler, parameters_handler,
+        video_generations_handler,
     },
     state::ApiState,
 };
 
+const DEFAULT_API_BODY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_API_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+
 pub fn router(state: ApiState) -> Router {
+    router_with_body_limit(state, configured_api_body_limit_bytes())
+}
+
+pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: usize) -> Router {
     let cors_origins = state
         .cors_origins()
         .iter()
@@ -47,12 +56,19 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/audio/speech", post(audio_speech_handler))
         .route(
             "/v1/audio/transcriptions",
-            post(audio_transcriptions_handler),
+            post(audio_transcriptions_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(audio_translations_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
         )
         .route("/v1/capabilities", get(capabilities_handler))
         .route("/v1/parameters", get(parameters_handler))
         .route("/v1/outputs/{id}", get(output_handler))
-        .route("/v1/jobs", post(create_job_handler))
+        .route(
+            "/v1/jobs",
+            post(create_job_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
+        )
         .route(
             "/v1/jobs/{id}",
             get(get_job_handler).delete(cancel_job_handler),
@@ -71,6 +87,14 @@ pub fn router(state: ApiState) -> Router {
     } else {
         router.layer(browser_cors_layer(cors_origins))
     }
+}
+
+fn configured_api_body_limit_bytes() -> usize {
+    std::env::var("WERK_API_BODY_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=MAX_API_BODY_LIMIT_BYTES).contains(value))
+        .unwrap_or(DEFAULT_API_BODY_LIMIT_BYTES)
 }
 
 fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
