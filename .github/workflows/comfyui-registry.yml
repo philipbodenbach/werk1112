@@ -79,6 +79,7 @@ jobs:
               "client.py",
               "config.py",
               "image_utils.py",
+              "LICENSE",
               "nodes.py",
               "pyproject.toml",
               "requirements.txt",

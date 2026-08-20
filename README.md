@@ -210,5 +210,19 @@ architectures.
 
 ## License
 
-Werk1112 is licensed under the [Apache License 2.0](LICENSE). Individual model
-repositories and third-party runtimes retain their own licenses.
+Unless a file or subdirectory explicitly states otherwise, the current
+Werk1112 source tree—including the core runtime, server, APIs, media
+companions, utilities, and ComfyUI nodes—is licensed under the
+[Elastic License 2.0](LICENSE). This repository-wide default also applies to
+future integrations added here unless they explicitly declare another license.
+
+ELv2 permits use, modification, preparation of derivative works, and
+redistribution, subject to its terms. Its restrictions include not providing
+the software to third parties as a hosted or managed service where users receive
+access to a substantial set of the software's features or functionality. The
+[`LICENSE`](LICENSE) file contains the authoritative terms.
+
+Source versions and releases published before this licensing change remain
+available under the license terms under which they were originally published.
+Third-party dependencies, models, runtimes, and other materials retain their
+own licenses and are not relicensed by this repository-wide default.

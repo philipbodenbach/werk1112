@@ -41,8 +41,8 @@ The current scripts stage exactly these files:
 
 | Archive | Files |
 | --- | --- |
-| Linux/macOS tarball | `werk`, `README.md` |
-| Windows zip | `werk.exe`, `README.md` |
+| Linux/macOS tarball | `werk`, `README.md`, `LICENSE` |
+| Windows zip | `werk.exe`, `README.md`, `LICENSE` |
 
 The media companion implementation needed by the binary is embedded at build
 time. The archive does **not** contain:
@@ -53,11 +53,11 @@ time. The archive does **not** contain:
 - Diffusers, Transformers, audio/video codecs or other optional Python
   packages;
 - Rust, Cargo, Visual Studio, CMake, Git, libclang or `nvcc`;
-- the full `docs/` tree or `LICENSE` as separate archive files.
+- the full `docs/` tree.
 
-The last point describes current script behavior, not a general packaging
-recommendation. The installed binary remains governed by the repository
-license, and third-party models and runtimes retain their own licenses.
+The included `LICENSE` contains the authoritative terms for Werk1112. It does
+not relicense third-party dependencies, models, runtimes, or other materials;
+those retain their own licenses.
 
 ## Build on the matching platform
 
@@ -86,7 +86,8 @@ The shell script:
 2. runs `cargo build-linux`;
 3. verifies the expected target binary;
 4. recreates `target/package/linux` as a staging directory;
-5. copies `werk` and the current root `README.md`;
+5. copies `werk`, the current root `README.md`, and the authoritative
+   `LICENSE`;
 6. writes the gzip-compressed tar archive;
 7. writes a SHA-256 checksum with `sha256sum`, or `shasum -a 256` when
    `sha256sum` is unavailable.
@@ -120,7 +121,7 @@ default. The script:
 2. invokes `scripts/build-windows.ps1`;
 3. verifies `target\x86_64-pc-windows-msvc\release\werk.exe`;
 4. recreates `target\package\windows`;
-5. copies `werk.exe` and `README.md`;
+5. copies `werk.exe`, `README.md`, and `LICENSE`;
 6. creates the zip with `Compress-Archive`;
 7. writes a lowercase SHA-256 checksum using `Get-FileHash`.
 
@@ -247,7 +248,6 @@ externally orchestrated release process.
 - no automatic multi-platform release workflow in this repository;
 - `package-release.sh all` is not a portable cross-build environment;
 - archives include the root README but not the complete documentation tree;
-- archives do not currently include a separate `LICENSE` file;
 - the scripts do not produce SBOM, signature or provenance attestations;
 - package validation checks archive construction, not inference on every
   optional backend.

@@ -100,16 +100,17 @@ package_target() {
 
     cp "$binary_path" "$staging_dir/$binary_name"
     cp "$REPO_ROOT/README.md" "$staging_dir/README.md"
+    cp "$REPO_ROOT/LICENSE" "$staging_dir/LICENSE"
     rm -f "$artifact" "$artifact.sha256"
 
     case "$platform" in
         windows)
             require_command zip
-            (cd "$staging_dir" && zip -q "$artifact" "$binary_name" README.md)
+            (cd "$staging_dir" && zip -q "$artifact" "$binary_name" README.md LICENSE)
             ;;
         linux|macos)
             require_command tar
-            tar -czf "$artifact" -C "$staging_dir" "$binary_name" README.md
+            tar -czf "$artifact" -C "$staging_dir" "$binary_name" README.md LICENSE
             ;;
     esac
 

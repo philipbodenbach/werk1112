@@ -666,3 +666,10 @@ Published Registry versions cannot be overwritten. Fixes require another
 version increment. The workflow deliberately runs the Comfy CLI from this
 directory so the Registry archive contains the node package rather than the
 entire Werk1112 monorepo.
+
+## License
+
+These nodes are part of Werk1112 and use the repository-wide
+[Elastic License 2.0](LICENSE). The adjacent `LICENSE` is the same authoritative
+license text as the repository root and is included in standalone Comfy
+Registry packages; it is not a separate license for the nodes.

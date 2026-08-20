@@ -94,6 +94,7 @@ New-Item $ReleaseDir -ItemType Directory -Force | Out-Null
 
 Copy-Item $BinaryPath (Join-Path $StagingDir "werk.exe") -Force
 Copy-Item (Join-Path $RepoRoot "README.md") (Join-Path $StagingDir "README.md") -Force
+Copy-Item (Join-Path $RepoRoot "LICENSE") (Join-Path $StagingDir "LICENSE") -Force
 
 Remove-Item $Artifact -Force -ErrorAction Ignore
 Remove-Item "$Artifact.sha256" -Force -ErrorAction Ignore
