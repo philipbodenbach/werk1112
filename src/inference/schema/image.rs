@@ -1,6 +1,7 @@
 use super::super::types::{ParameterDescriptor, ParameterType};
 use super::builders::{
-    add_named_descriptors, bool_descriptor, enum_descriptor, integer_descriptor, number_descriptor,
+    add_named_descriptors, bool_descriptor, bounded_integer_descriptor, enum_descriptor,
+    integer_descriptor, number_descriptor,
 };
 use crate::capabilities::InferenceTask;
 
@@ -14,7 +15,6 @@ pub(super) fn image_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "geometry",
             1024,
             64,
-            32768,
         ),
         integer_descriptor(
             "image.height",
@@ -24,7 +24,6 @@ pub(super) fn image_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "geometry",
             1024,
             64,
-            32768,
         ),
         integer_descriptor(
             "image.batch_size",
@@ -34,7 +33,6 @@ pub(super) fn image_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "generation",
             1,
             1,
-            256,
         ),
         integer_descriptor(
             "image.num_images",
@@ -44,7 +42,6 @@ pub(super) fn image_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "generation",
             1,
             1,
-            1024,
         ),
         integer_descriptor(
             "image.steps",
@@ -54,7 +51,6 @@ pub(super) fn image_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "sampling",
             28,
             1,
-            1000,
         ),
         number_descriptor(
             "image.guidance",
@@ -64,10 +60,9 @@ pub(super) fn image_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "sampling",
             7.0,
             0.0,
-            100.0,
             0.1,
         ),
-        integer_descriptor(
+        bounded_integer_descriptor(
             "image.seed",
             "--seed",
             "Seed",

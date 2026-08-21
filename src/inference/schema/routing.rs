@@ -150,7 +150,6 @@ pub(super) fn routing_descriptors() -> Vec<ParameterDescriptor> {
             "routing",
             3600,
             1,
-            i64::from(u32::MAX),
         ),
     ]
 }

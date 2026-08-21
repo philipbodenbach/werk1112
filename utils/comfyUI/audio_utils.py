@@ -129,16 +129,24 @@ def comfy_audio_to_api_input(
         raise TypeError("audio waveform must be a torch.Tensor")
     if isinstance(sample_rate, bool) or not isinstance(sample_rate, int):
         raise TypeError("audio sample_rate must be an integer")
-    if sample_rate <= 0 or sample_rate > 384_000:
-        raise ValueError("audio sample_rate must be between 1 and 384000")
+    if sample_rate <= 0:
+        raise ValueError("audio sample_rate must be positive")
     if waveform.ndim != 3:
         raise ValueError("audio waveform must have shape [batch, channels, samples]")
     if waveform.shape[0] != 1:
         raise ValueError("audio input must contain exactly one batch item")
     channels = int(waveform.shape[1])
     samples = int(waveform.shape[2])
-    if not 1 <= channels <= 32:
-        raise ValueError("audio waveform must contain between 1 and 32 channels")
+    if channels < 1:
+        raise ValueError("audio waveform must contain at least one channel")
+    pcm_block_align = channels * 2
+    pcm_byte_rate = sample_rate * pcm_block_align
+    if (
+        sample_rate > 0xFFFFFFFF
+        or pcm_block_align > 0xFFFF
+        or pcm_byte_rate > 0xFFFFFFFF
+    ):
+        raise ValueError("audio metadata cannot be represented as PCM WAV")
     if samples <= 0:
         raise ValueError("audio waveform must contain at least one sample")
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:

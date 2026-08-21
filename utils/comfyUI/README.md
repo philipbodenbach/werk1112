@@ -168,14 +168,19 @@ is not required by these HTTP-backed Werk nodes.
   embedding. Only models declared/runtime-available for the selected task are
   offered.
 - **WERK Audio Parameters** reads the live task/model/runtime schema. Use it
-  before adding model-specific fields to the JSON inputs.
+  before adding model-specific fields to the JSON inputs. It is a read-only
+  schema inspector: its JSON output is not an execution config and must not be
+  connected to a generator's `model` input.
 - **WERK Audio Config** covers `audio-generation`, `music-generation`, and
   `text-to-speech`. Zero sample rate/channels inherit model defaults; TTS seed
   `0` is also omitted so strict adapters without deterministic synthesis are
-  not rejected.
+  not rejected. TTS language and speaking style are first-class optional
+  inputs; Qwen3-TTS VoiceDesign receives `speaking_style` as `instruct`.
 - **WERK Audio Generate** uses the specialized generation/speech endpoints and
-  returns one or more native ComfyUI `AUDIO` dictionaries (`waveform` shaped
-  `[B,C,T]` plus `sample_rate`).
+  requires an active **WERK Audio Config**, then returns one or more native
+  ComfyUI `AUDIO` dictionaries (`waveform` shaped `[B,C,T]` plus
+  `sample_rate`). A bypassed or disconnected config fails validation instead
+  of silently generating with defaults.
 - **WERK Audio Process** accepts native source audio for `voice-conversion`,
   `stem-separation`, `audio-enhancement`, and `audio-editing`, then returns
   native `AUDIO`. Voice conversion may also receive `reference_audio`.
@@ -293,7 +298,17 @@ Select the same task on Models, Config, and Generate. Valid generation tasks
 are `audio-generation`, `music-generation`, and `text-to-speech`. A TTS prompt
 is the spoken text; TTS rejects a non-empty negative prompt. Config fields left
 at their inherit values are omitted instead of forcing adapter-dependent
-options.
+options. Do not bypass Audio Config: ComfyUI does not execute bypassed nodes,
+so their widgets and additional JSON do not exist in the queued prompt. Audio
+Generate requires the config link and rejects that state rather than silently
+falling back to another request.
+
+For a Qwen3-TTS VoiceDesign run equivalent to an explicit CUDA CLI request,
+set Routing Config to `backend=auto`, `accelerator=cuda`, `precision=bf16`, and
+`fallback_policy=none`. Set Audio Config to `task=text-to-speech`, the desired
+non-zero seed, `output_format=wav`, `language=German`, and the complete voice
+instruction in `speaking_style`. To reproduce a CLI seed, set ComfyUI's seed
+control to `fixed`; `randomize` deliberately changes it after every run.
 
 Audio-input workflows connect ComfyUI's **Load Audio** to either Process or
 Analyze:
@@ -386,6 +401,11 @@ The routing node covers all 17 fields in Werk's current routing schema:
 `false`. The `config_json` output shows the exact normalized options and is
 useful when diagnosing a workflow.
 
+The connection timeout and a positive `inference_timeout_seconds` value have
+no static ComfyUI upper bound. Their lower-bound semantics remain unchanged:
+the HTTP connection timeout must be positive, while inference timeout `0`
+inherits. Werk and the selected runtime remain authoritative for execution.
+
 `additional_routing_parameters_json` is a forward-compatible escape hatch for
 canonical `routing.*` parameters introduced by newer Werk versions. The 17
 fields above must use their dedicated controls. Cross-namespace keys,
@@ -408,6 +428,13 @@ The image config exposes the common controls directly:
 | `style` except `none` | OpenAI-compatible prompt style hint |
 | `vae_tiling` | Tri-state `parameters["image.vae_tiling"]` |
 | `vae_slicing` | Tri-state `parameters["image.vae_slicing"]` |
+
+These inference controls have no universal upper limit in the ComfyUI node.
+The node still enforces types, minima, finite floating-point values, the
+count/batch rule below, and the signed-64-bit seed representation. The live
+Werk task/model/runtime schema and selected backend are authoritative; a value
+accepted by the portable node may still be rejected or exceed available
+resources during planning or execution.
 
 Use `count` for normal multi-image generation. `batch_size=1` is not included
 in the request, so Werk and the selected adapter retain their resolved default.
@@ -505,8 +532,11 @@ The video config exposes the portable request controls directly:
 
 `count` and `batch_size` are alternative video-count controls. The node
 rejects a config when both are greater than 1 instead of relying on
-adapter-specific precedence. The selected adapter may impose narrower bounds
-than the portable node widgets, so inspect the live task schema before tuning:
+adapter-specific precedence. The remaining inference controls have no static
+ComfyUI upper bound; types, minima, finite floating-point values, and the
+signed-64-bit seed representation are still enforced. The live task schema,
+selected model/runtime, resource planner, and backend remain authoritative, so
+inspect them before tuning:
 
 ```bash
 werk parameters MODEL --task video-generation --json
@@ -544,6 +574,20 @@ choices unnecessarily:
 | `output_format` | API `response_format` (`wav`, `flac`, or `ogg`) |
 | `instrumental` | tri-state `audio.instrumental` |
 | non-empty `voice`, non-default `speed` | TTS request fields |
+| non-empty `language` | `tts.language` |
+| non-empty `speaking_style` | `tts.speaking_style`; Qwen3-TTS VoiceDesign `instruct` |
+
+Audio duration, variation count, explicit sample rate/channel count, and TTS
+speed have no static ComfyUI upper bound. Their minima, `0` inherit sentinels,
+finite floating-point requirements, task-specific rules, enums, and the
+signed-64-bit seed representation remain enforced. The live task/model/runtime
+schema and concrete audio adapter decide which values are executable.
+
+The native `AUDIO` socket contains waveform samples and sample rate, not the
+downloaded artifact's container. Werk retains the requested WAV/FLAC/OGG file
+under its managed output store and exposes its `output_id`; ComfyUI's built-in
+**Preview Audio** may independently encode that waveform as a temporary FLAC.
+That preview container does not change the Werk artifact or its samples.
 
 The Models and Parameters selectors expose the Rust task taxonomy in this
 order: generation (`audio-generation`, `music-generation`, `text-to-speech`),

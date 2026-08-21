@@ -129,7 +129,7 @@ Schema-v2 metadata is flattened into the same JSON object:
 | `components` | Typed component paths plus optional format, precision, quantization and file lists. |
 | `precision`, `quantization` | Detected model-level hints. |
 | `generation_defaults` | Values copied from recognized generation/config metadata. |
-| `parameter_constraints` | Detected model constraints such as dimensions or sequence limits. |
+| `parameter_constraints` | Detected model capability hints such as dimensions or sequence limits. Reported maxima are visible to clients and warn when exceeded, but do not silently clamp or reject an explicit override before the selected backend sees it. |
 | `compatible_runtimes` | Planner hints derived from the current manifest; availability is checked separately. |
 | `optimized_artifacts` | Flattened summary of artifact kind, path and status. |
 | `chat_template` | Resolved GGUF/model chat-template description when one can be established without guessing. |
@@ -210,4 +210,3 @@ packages or download missing weights during inference.
 Implementation source: [`src/model_store.rs`](../../src/model_store.rs),
 [`src/capabilities`](../../src/capabilities), and
 [`src/cli.rs`](../../src/cli.rs).
-

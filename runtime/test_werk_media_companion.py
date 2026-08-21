@@ -1194,6 +1194,25 @@ class AudioRuntimeTests(unittest.TestCase):
 
         self.assertEqual(COMPANION.pipeline_sample_rate(pipeline), 24_000)
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy"),
+        "NumPy is an optional audio dependency",
+    )
+    def test_audio_normalization_preserves_more_than_thirty_two_channels(self):
+        import numpy
+
+        audio = numpy.linspace(-1.0, 1.0, 40 * 64, dtype="float32").reshape(40, 64)
+
+        normalized, interleaved, channels, frames = (
+            COMPANION.normalized_audio_array(audio)
+        )
+
+        self.assertEqual(normalized.shape, (64, 40))
+        numpy.testing.assert_array_equal(normalized, audio.T)
+        self.assertEqual(channels, 40)
+        self.assertEqual(frames, 64)
+        self.assertEqual(interleaved.size, 64 * 40)
+
     def test_text_to_audio_loader_does_not_duplicate_local_files_only(self):
         calls = []
 
@@ -1381,6 +1400,16 @@ class AudioRuntimeTests(unittest.TestCase):
             "audio.variations->batched prompts",
             metadata["translated_parameters"],
         )
+        self.assertEqual(
+            metadata["duration_control"],
+            {
+                "requested_seconds": 2.0,
+                "audio_tokens": 100,
+                "hard_limit_applied": False,
+                "model_default_seconds": 30.0,
+                "exceeds_model_default": False,
+            },
+        )
 
     @unittest.skipUnless(
         importlib.util.find_spec("numpy"),
@@ -1434,7 +1463,7 @@ class AudioRuntimeTests(unittest.TestCase):
 
         self.assertEqual(failure.exception.code, "backend_error")
 
-    def test_musicgen_rejects_explicit_duration_over_thirty_seconds(self):
+    def test_musicgen_forwards_explicit_duration_above_sixty_seconds(self):
         pipeline = types.SimpleNamespace(
             model=types.SimpleNamespace(
                 config=types.SimpleNamespace(
@@ -1443,7 +1472,7 @@ class AudioRuntimeTests(unittest.TestCase):
                 )
             )
         )
-        parameters = {"duration": 30.1}
+        parameters = {"duration": 120.0}
         guard = self.guard(
             "music_generation",
             "transformers_audio",
@@ -1451,15 +1480,62 @@ class AudioRuntimeTests(unittest.TestCase):
             explicit=("audio.duration",),
         )
 
-        with self.assertRaises(COMPANION.CompanionFailure) as failure:
-            COMPANION.transformer_duration_tokens(
+        warnings = []
+        tokens = COMPANION.transformer_duration_tokens(
+            pipeline,
+            parameters,
+            guard,
+            warnings,
+        )
+
+        self.assertEqual(tokens, 6000)
+        self.assertEqual(guard.unsupported, {})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("exceeds MusicGen's 30-second model default", warnings[0])
+        self.assertIn("does not impose a hard duration limit", warnings[0])
+        self.assertEqual(
+            COMPANION.transformer_audio_duration_metadata(
                 pipeline,
                 parameters,
-                guard,
-                [],
-            )
+                tokens,
+            ),
+            {
+                "requested_seconds": 120.0,
+                "audio_tokens": 6000,
+                "hard_limit_applied": False,
+                "model_default_seconds": 30.0,
+                "exceeds_model_default": True,
+            },
+        )
 
-        self.assertEqual(failure.exception.code, "unsupported_parameter")
+    def test_transformers_duration_still_requires_a_positive_finite_value(self):
+        pipeline = types.SimpleNamespace(
+            model=types.SimpleNamespace(
+                config=types.SimpleNamespace(
+                    model_type="musicgen",
+                    audio_encoder=types.SimpleNamespace(frame_rate=50),
+                )
+            )
+        )
+        for duration in (0, -1, float("inf"), float("nan")):
+            parameters = {"duration": duration}
+            guard = self.guard(
+                "music_generation",
+                "transformers_audio",
+                parameters,
+                explicit=("audio.duration",),
+            )
+            with self.subTest(duration=duration), self.assertRaises(
+                COMPANION.CompanionFailure
+            ) as failure:
+                COMPANION.transformer_duration_tokens(
+                    pipeline,
+                    parameters,
+                    guard,
+                    [],
+                )
+
+            self.assertEqual(failure.exception.code, "invalid_parameter")
 
     @unittest.skipUnless(
         importlib.util.find_spec("numpy"),

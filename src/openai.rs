@@ -28,7 +28,6 @@ impl ChatCompletionRequest {
         self.max_completion_tokens
             .or(self.max_tokens)
             .unwrap_or(256)
-            .min(4096)
     }
 
     pub fn stop_strings(&self) -> Vec<String> {
@@ -727,6 +726,17 @@ mod tests {
             image_urls_from_messages(&request.messages),
             vec!["file:///tmp/a.png", "data:image/png;base64,abc"]
         );
+    }
+
+    #[test]
+    fn explicit_completion_budget_is_not_silently_capped() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_completion_tokens": 8192
+        }))
+        .unwrap();
+
+        assert_eq!(request.max_completion_tokens(), 8192);
     }
 
     #[test]

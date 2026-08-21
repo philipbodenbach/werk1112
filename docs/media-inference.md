@@ -376,6 +376,14 @@ allowed values, repeatability, advanced status, and memory/quality/runtime
 impact. With a model, manifest defaults/constraints and per-runtime parameter
 support are included.
 
+Generic Werk schemas do not impose policy upper bounds on explicit numeric
+generation values. Defaults are used only when a value is omitted. A maximum
+reported by model metadata remains visible as a capability hint; an explicit
+override that exceeds it adds a warning and is forwarded unchanged so the
+concrete backend can either execute it or return its own capability error. Genuine type,
+format, minimum, model-context, memory-safety, and transport-security checks
+remain enforced.
+
 Backends report parameters as `native`, `translated`, `emulated`, `ignored`,
 `unsupported`, or `model_dependent`. Explicit ignored/unsupported values fail
 under `strict` (the API default), warn under `warn`, and continue under

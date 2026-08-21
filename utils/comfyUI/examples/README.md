@@ -26,8 +26,9 @@ The audio API prompts exercise each native path:
 
 - `werk_music_generation_api.json` uses Audio Models, Audio Config, Audio
   Generate, and ComfyUI's native `PreviewAudio`;
-- `werk_text_to_speech_api.json` demonstrates asynchronous TTS without forcing
-  a model-dependent seed, voice, sample rate, or channel count;
+- `werk_text_to_speech_api.json` mirrors the documented Qwen3-TTS VoiceDesign
+  CUDA smoke test: explicit BF16 routing, fixed seed 1112, German language,
+  first-class speaking-style instruction, and WAV output;
 - `werk_audio_understanding_api.json` connects `LoadAudio` to Audio Analyze and
   supplies the required understanding prompt; and
 - `werk_voice_conversion_api.json` connects separate source and reference
@@ -38,10 +39,12 @@ The audio API prompts exercise each native path:
 
 Upload/change `example.wav`, `source.wav`, and `reference.wav` before submitting
 the input-audio prompts. Replace the illustrative preferred aliases
-`music-model`, `tts-model`, `audio-understanding-model`, and
-`voice-conversion-model` with installed aliases that declare the selected
-task. Analysis is itself an output node, so its text/JSON values and metadata
-are returned in ComfyUI history without an additional third-party text node.
+`music-model`, `audio-understanding-model`, and `voice-conversion-model` with
+installed aliases that declare the selected task. The TTS prompt names the
+installed Qwen3-TTS VoiceDesign repository directly; replace it with its local
+alias if one was assigned during `werk pull`. Analysis is itself an output
+node, so its text/JSON values and metadata are returned in ComfyUI history
+without an additional third-party text node.
 
 The examples assume:
 

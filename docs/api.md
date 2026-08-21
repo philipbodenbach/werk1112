@@ -358,7 +358,10 @@ Accepted top-level fields:
 | <code>stop</code> | No | string or string array | Added to model/template stops |
 | <code>seed</code> | No | integer | Backend dependent |
 
-The response-token default is 256 and the hard API cap is 4096.
+The response-token default is 256 when neither field is present. Werk does not
+silently clamp an explicit response budget; the selected model context and
+backend remain authoritative and return an actionable error when they cannot
+satisfy it.
 
 Message content is either a string or an array of content parts. Supported
 parts are text plus <code>image_url</code> or <code>input_image</code> for an

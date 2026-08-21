@@ -268,6 +268,113 @@ fn defaults_follow_specificity_and_track_provenance() {
 }
 
 #[test]
+fn generic_schemas_do_not_advertise_artificial_upper_limits() {
+    for task in [
+        InferenceTask::ImageGeneration,
+        InferenceTask::VideoGeneration,
+        InferenceTask::MusicGeneration,
+        InferenceTask::TextToSpeech,
+        InferenceTask::SpeechToText,
+        InferenceTask::AudioClassification,
+    ] {
+        for descriptor in parameter_schema(task) {
+            if descriptor.path.ends_with(".seed") {
+                assert_eq!(descriptor.maximum, Some(i64::MAX.into()));
+            } else {
+                assert_eq!(
+                    descriptor.maximum, None,
+                    "{} still has a generic upper limit",
+                    descriptor.path
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn values_above_the_previous_generic_caps_are_forwarded_unchanged() {
+    let manifest = image_manifest();
+    let mut request = request();
+    for (path, value) in [
+        ("image.width", 32_769_i64.into()),
+        ("image.height", 32_769_i64.into()),
+        ("image.batch_size", 257_i64.into()),
+        ("image.num_images", 1_025_i64.into()),
+        ("image.steps", 1_001_i64.into()),
+        ("image.guidance", 100.1_f64.into()),
+    ] {
+        request.parameters.insert(path.to_string(), value);
+    }
+
+    let effective = resolve_request(&manifest, request, &ResolutionContext::default()).unwrap();
+    assert_eq!(effective.u64_parameter("image.width"), Some(32_769));
+    assert_eq!(effective.u64_parameter("image.height"), Some(32_769));
+    assert_eq!(effective.u64_parameter("image.batch_size"), Some(257));
+    assert_eq!(effective.u64_parameter("image.num_images"), Some(1_025));
+    assert_eq!(effective.u64_parameter("image.steps"), Some(1_001));
+    assert_eq!(effective.f64_parameter("image.guidance"), Some(100.1));
+}
+
+#[test]
+fn unbounded_numeric_parameters_still_require_finite_values() {
+    let manifest = image_manifest();
+    for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        let mut request = request();
+        request
+            .parameters
+            .insert("image.guidance".to_string(), value.into());
+        assert!(
+            resolve_request(&manifest, request, &ResolutionContext::default())
+                .unwrap_err()
+                .to_string()
+                .contains("must be finite")
+        );
+    }
+}
+
+#[test]
+fn model_reported_maximum_warns_but_does_not_rewrite_or_reject() {
+    let mut manifest = image_manifest();
+    manifest.metadata.parameter_constraints.insert(
+        "width".to_string(),
+        json!({
+            "maximum": 768
+        }),
+    );
+    let schema = parameter_schema_for_manifest(InferenceTask::ImageGeneration, &manifest).unwrap();
+    let width = schema
+        .iter()
+        .find(|descriptor| descriptor.path == "image.width")
+        .unwrap();
+    assert_eq!(width.minimum, Some(64_i64.into()));
+    assert_eq!(width.maximum, Some(768_i64.into()));
+
+    let mut below_minimum = request();
+    below_minimum
+        .parameters
+        .insert("image.width".to_string(), 1_i64.into());
+    assert!(
+        resolve_request(&manifest, below_minimum, &ResolutionContext::default())
+            .unwrap_err()
+            .to_string()
+            .contains("below its minimum")
+    );
+
+    let mut request = request();
+    request
+        .parameters
+        .insert("image.width".to_string(), 1_024_i64.into());
+
+    let effective = resolve_request(&manifest, request, &ResolutionContext::default()).unwrap();
+    assert_eq!(effective.u64_parameter("image.width"), Some(1_024));
+    assert!(effective.warnings.iter().any(|warning| {
+        warning.contains("image.width")
+            && warning.contains("model-reported maximum 768")
+            && warning.contains("forwarded unchanged")
+    }));
+}
+
+#[test]
 fn manifest_constraints_enrich_schema_and_validate_effective_values() {
     let mut manifest = image_manifest();
     manifest.metadata.parameter_constraints.insert(

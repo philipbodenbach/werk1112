@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from ..audio_utils import DEFAULT_MAX_AUDIO_INPUT_BYTES as UTILS_AUDIO_INPUT_LIMIT
+from ..audio_utils import comfy_audio_to_api_input
 from ..config import (
     DEFAULT_MAX_AUDIO_INPUT_BYTES,
     WerkAudioConfig,
@@ -35,6 +36,7 @@ from ..nodes import (
     build_audio_config,
     build_audio_input_job_request,
     build_configured_audio_request,
+    build_routing_config,
     classify_audio_models,
     normalize_audio_job_parameters,
 )
@@ -254,6 +256,50 @@ def test_audio_configs_are_typed_and_tts_default_does_not_send_seed():
     assert "task" not in request
 
 
+def test_audio_config_forwards_values_above_the_former_portable_caps():
+    music = build_audio_config(
+        task="music-generation",
+        duration=86_400.1,
+        variations=1_025,
+        sample_rate=384_001,
+        channels=33,
+    )
+    assert music.request_fields["n"] == 1_025
+    assert music.parameters["audio.duration"] == 86_400.1
+    assert music.parameters["audio.sample_rate"] == 384_001
+    assert music.parameters["audio.channels"] == 33
+
+    speech = build_audio_config(task="text-to-speech", speed=10.01)
+    assert speech.request_fields["speed"] == 10.01
+
+
+def test_audio_widgets_have_no_static_inference_maximum():
+    required = WerkAudioConfigNode.INPUT_TYPES()["required"]
+    for field in ("duration", "variations", "sample_rate", "channels", "speed"):
+        assert "max" not in required[field][1]
+        assert "min" in required[field][1]
+    assert required["seed"][1]["max"] == 0x7FFFFFFFFFFFFFFF
+
+
+def test_audio_config_keeps_minimum_sentinel_and_finite_checks():
+    with pytest.raises(ValueError, match="duration must be finite"):
+        build_audio_config(task="music-generation", duration=float("inf"))
+    with pytest.raises(ValueError, match="variations must be at least 1"):
+        build_audio_config(task="music-generation", variations=0)
+    with pytest.raises(ValueError, match="sample_rate must be 0 .* or at least 8000"):
+        build_audio_config(task="music-generation", sample_rate=7_999)
+    with pytest.raises(ValueError, match="channels must be 0 .* or at least 1"):
+        build_audio_config(task="music-generation", channels=-1)
+    with pytest.raises(ValueError, match="speed must be finite"):
+        build_audio_config(task="text-to-speech", speed=float("nan"))
+
+    inherited = build_audio_config(
+        task="music-generation", sample_rate=0, channels=0
+    )
+    assert "audio.sample_rate" not in inherited.parameters
+    assert "audio.channels" not in inherited.parameters
+
+
 def test_generic_audio_input_job_uses_bounded_embedded_wav_and_task_namespace(
     monkeypatch,
 ):
@@ -279,6 +325,32 @@ def test_generic_audio_input_job_uses_bounded_embedded_wav_and_task_namespace(
     with pytest.raises(ValueError, match="exceeds 51 bytes"):
         build_audio_input_job_request(
             task="speech-to-text", model="whisper", audio=native_audio()
+        )
+
+
+def test_native_audio_input_has_no_artificial_sample_rate_or_channel_cap():
+    encoded = comfy_audio_to_api_input(
+        {
+            "waveform": torch.zeros((1, 40, 2), dtype=torch.float32),
+            "sample_rate": 384_001,
+        }
+    )
+    raw = base64.b64decode(encoded["source"]["data"])
+    with wave.open(BytesIO(raw), "rb") as source:
+        assert source.getnchannels() == 40
+        assert source.getframerate() == 384_001
+
+    with pytest.raises(ValueError, match="sample_rate must be positive"):
+        comfy_audio_to_api_input(
+            {"waveform": torch.zeros((1, 1, 2)), "sample_rate": 0}
+        )
+    with pytest.raises(ValueError, match="cannot be represented as PCM WAV"):
+        comfy_audio_to_api_input(
+            {"waveform": torch.zeros((1, 1, 2)), "sample_rate": 0x1_0000_0000}
+        )
+    with pytest.raises(ValueError, match="cannot be represented as PCM WAV"):
+        comfy_audio_to_api_input(
+            {"waveform": torch.zeros((1, 32_768, 1)), "sample_rate": 1}
         )
 
 
@@ -329,6 +401,140 @@ def test_audio_generate_posts_task_specific_endpoint_and_returns_native_audio(
     assert request["task"] == "music-generation"
     assert request["negative_prompt"] == "noise"
     assert "secret" not in result[1]
+
+
+def test_qwen_voice_design_tts_node_posts_cli_equivalent_request(fake_client):
+    """The Comfy graph must be able to express the proven Qwen CLI request."""
+
+    model = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    text = (
+        "Willkommen bei WERK elf zwölf. Lokale Inferenz, intelligent geroutet – "
+        "schnell, präzise und vollständig unter deiner Kontrolle."
+    )
+    speaking_style = (
+        "Natürliche deutsche Sprecherin mit japanischem Akzent, etwa Mitte "
+        "zwanzig, fröhliche Stimme, klares Standarddeutsch, ruhig und souverän."
+    )
+    routing = build_routing_config(
+        backend="auto",
+        accelerator="cuda",
+        precision="bf16",
+        fallback_policy="none",
+    )
+    config, config_json = WerkAudioConfigNode().configure(
+        task="text-to-speech",
+        seed=1112,
+        output_format="wav",
+        language="German",
+        speaking_style=speaking_style,
+        routing=routing,
+    )
+    assert json.loads(config_json)["parameters"] == {
+        "tts.seed": 1112,
+        "tts.language": "German",
+        "tts.speaking_style": speaking_style,
+    }
+
+    fake_client.responses["/v1/audio/speech"] = completed_job()
+    fake_client.downloads["/v1/outputs/out-audio"] = (wav_bytes(), "audio/wav")
+
+    result = WerkAudioGenerateNode().generate(
+        WerkConnection("http://werk"),
+        model,
+        "text-to-speech",
+        text,
+        "",
+        config,
+    )
+
+    assert fake_client.posted == [
+        (
+            "/v1/audio/speech",
+            {
+                "model": model,
+                "response_format": "wav",
+                "backend": "auto",
+                "accelerator": "cuda",
+                "precision": "bf16",
+                "fallback_policy": "none",
+                "parameters": {
+                    "tts.seed": 1112,
+                    "tts.language": "German",
+                    "tts.speaking_style": speaking_style,
+                },
+                "input": text,
+                "async": True,
+            },
+        )
+    ]
+    assert result[0][0]["waveform"].shape == (1, 1, 4)
+    assert result[2:] == (1112, "job-audio", "result-audio", "out-audio")
+
+
+def test_qwen_voice_design_tts_legacy_json_parameters_remain_supported():
+    speaking_style = "Warm female German voice with a subtle Japanese accent."
+    config = build_audio_config(
+        task="text-to-speech",
+        seed=1112,
+        output_format="wav",
+        additional_audio_parameters_json=json.dumps(
+            {
+                "tts.language": "German",
+                "tts.speaking_style": speaking_style,
+            }
+        ),
+    )
+
+    assert dict(config.parameters) == {
+        "tts.seed": 1112,
+        "tts.language": "German",
+        "tts.speaking_style": speaking_style,
+    }
+    assert build_configured_audio_request(
+        task="text-to-speech",
+        model="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        prompt="Werk ist bereit.",
+        config=config,
+    )["parameters"] == dict(config.parameters)
+
+
+def test_audio_config_node_exposes_qwen_voice_design_controls_first_class():
+    optional = WerkAudioConfigNode.INPUT_TYPES()["optional"]
+    assert next(iter(optional)) == "routing"
+    assert optional["language"][0] == "STRING"
+    assert optional["speaking_style"][0] == "STRING"
+    assert optional["speaking_style"][1]["multiline"] is True
+
+
+def test_audio_generator_requires_active_config_instead_of_silent_defaults():
+    inputs = WerkAudioGenerateNode.INPUT_TYPES()
+    assert inputs["required"]["config"][0] == "WERK_AUDIO_CONFIG"
+    assert "optional" not in inputs or "config" not in inputs["optional"]
+    with pytest.raises(ValueError, match="connected, active WERK Audio Config"):
+        WerkAudioGenerateNode().generate(
+            WerkConnection("http://werk"),
+            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+            "text-to-speech",
+            "Werk ist bereit.",
+            "",
+            None,
+        )
+
+
+def test_audio_config_rejects_ambiguous_or_non_tts_voice_design_controls():
+    with pytest.raises(ValueError, match="duplicates a populated node input"):
+        build_audio_config(
+            task="text-to-speech",
+            language="German",
+            additional_audio_parameters_json='{"tts.language":"German"}',
+        )
+    with pytest.raises(ValueError, match="language applies only"):
+        build_audio_config(task="music-generation", language="German")
+    with pytest.raises(ValueError, match="speaking_style applies only"):
+        build_audio_config(
+            task="audio-generation",
+            speaking_style="Warm narrator",
+        )
 
 
 def test_audio_process_and_analysis_use_generic_jobs_and_bounded_outputs(fake_client):
@@ -401,8 +607,25 @@ def test_audio_api_prompt_examples_are_valid_and_keep_task_links_explicit():
     assert music["4"]["class_type"] == "WerkAudioConfig"
     assert music["5"]["inputs"]["model"] == ["2", 0]
     assert music["6"]["class_type"] == "PreviewAudio"
-    assert tts["3"]["inputs"]["task"] == "text-to-speech"
-    assert tts["4"]["inputs"]["config"] == ["3", 0]
+    assert tts["3"]["class_type"] == "WerkRoutingConfig"
+    assert {
+        field: tts["3"]["inputs"][field]
+        for field in ("backend", "accelerator", "precision", "fallback_policy")
+    } == {
+        "backend": "auto",
+        "accelerator": "cuda",
+        "precision": "bf16",
+        "fallback_policy": "none",
+    }
+    assert tts["4"]["inputs"]["task"] == "text-to-speech"
+    assert tts["4"]["inputs"]["routing"] == ["3", 0]
+    assert tts["4"]["inputs"]["seed"] == 1112
+    assert tts["4"]["inputs"]["output_format"] == "wav"
+    assert tts["4"]["inputs"]["language"] == "German"
+    assert tts["4"]["inputs"]["speaking_style"]
+    assert tts["5"]["inputs"]["model"] == ["2", 0]
+    assert tts["5"]["inputs"]["config"] == ["4", 0]
+    assert tts["6"]["inputs"]["audio"] == ["5", 0]
     assert understanding["4"]["class_type"] == "WerkAudioAnalyze"
     assert understanding["4"]["inputs"]["source_audio"] == ["3", 0]
     assert understanding["4"]["inputs"]["prompt"]

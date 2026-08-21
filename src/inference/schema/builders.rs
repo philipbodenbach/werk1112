@@ -180,7 +180,6 @@ pub(super) fn number_descriptor(
     category: &str,
     default: f64,
     minimum: f64,
-    maximum: f64,
     step: f64,
 ) -> ParameterDescriptor {
     ParameterDescriptor {
@@ -192,7 +191,7 @@ pub(super) fn number_descriptor(
         category: category.to_string(),
         default: Some(default.into()),
         minimum: Some(minimum.into()),
-        maximum: Some(maximum.into()),
+        maximum: None,
         step: Some(step.into()),
         allowed_values: Vec::new(),
         repeatable: false,
@@ -213,7 +212,6 @@ pub(super) fn integer_descriptor(
     category: &str,
     default: i64,
     minimum: i64,
-    maximum: i64,
 ) -> ParameterDescriptor {
     ParameterDescriptor {
         path: path.to_string(),
@@ -224,7 +222,7 @@ pub(super) fn integer_descriptor(
         category: category.to_string(),
         default: Some(default.into()),
         minimum: Some(minimum.into()),
-        maximum: Some(maximum.into()),
+        maximum: None,
         step: Some(1_i64.into()),
         allowed_values: Vec::new(),
         repeatable: false,
@@ -234,6 +232,29 @@ pub(super) fn integer_descriptor(
         affects_quality: affects_quality(path),
         affects_runtime: affects_runtime(path),
     }
+}
+
+pub(super) fn bounded_integer_descriptor(
+    path: &str,
+    cli_flag: &str,
+    label: &str,
+    description: &str,
+    category: &str,
+    default: i64,
+    minimum: i64,
+    maximum: i64,
+) -> ParameterDescriptor {
+    let mut descriptor = integer_descriptor(
+        path,
+        cli_flag,
+        label,
+        description,
+        category,
+        default,
+        minimum,
+    );
+    descriptor.maximum = Some(maximum.into());
+    descriptor
 }
 
 fn humanize(name: &str) -> String {

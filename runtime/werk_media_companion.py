@@ -3899,14 +3899,16 @@ def normalized_audio_array(audio):
     if array.ndim == 1:
         channels = 1
     elif array.ndim == 2:
-        if array.shape[0] <= 8 and array.shape[0] < array.shape[1]:
-            array = array.T
+        # Diffusers and Transformers audio model outputs use channel-first
+        # two-dimensional waveforms. Normalize that public adapter contract to
+        # the frame-major layout expected by soundfile and PCM interleaving.
+        array = array.T
         channels = int(array.shape[1])
     else:
         fail("backend_error", f"unsupported audio tensor shape: {array.shape}")
     if array.size == 0:
         fail("backend_error", "cannot encode an empty audio waveform")
-    if channels < 1 or channels > 32:
+    if channels < 1:
         fail("backend_error", f"unsupported audio channel count: {channels}")
     if array.dtype.kind == "f":
         array = numpy.nan_to_num(array, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -4187,6 +4189,31 @@ def transformer_audio_frame_rate(pipeline):
     return None
 
 
+def transformer_audio_duration_metadata(pipeline, parameters, max_new_tokens):
+    """Describe duration translation without turning model defaults into caps."""
+
+    duration = parameters.get("duration")
+    if duration is None or max_new_tokens is None:
+        return None
+    duration = positive_float({"duration": duration}, "duration", 30.0, 0.01)
+    model_type = normalized_name(
+        object_value(getattr(getattr(pipeline, "model", None), "config", None), "model_type")
+    )
+    metadata = {
+        "requested_seconds": duration,
+        "audio_tokens": max_new_tokens,
+        "hard_limit_applied": False,
+    }
+    if model_type in {"musicgen", "musicgen_melody"}:
+        metadata.update(
+            {
+                "model_default_seconds": 30.0,
+                "exceeds_model_default": duration > 30.0,
+            }
+        )
+    return metadata
+
+
 def transformer_duration_tokens(
     pipeline,
     parameters,
@@ -4201,16 +4228,12 @@ def transformer_duration_tokens(
         object_value(getattr(getattr(pipeline, "model", None), "config", None), "model_type")
     )
     if model_type in {"musicgen", "musicgen_melody"} and duration > 30.0:
-        parameter_guard.reject(
-            "audio.duration",
-            "MusicGen supports at most 30 seconds per generated clip",
+        warnings.append(
+            f"resolved audio.duration ({duration:g}s) exceeds MusicGen's "
+            "30-second model default; it is forwarded unchanged because the "
+            "companion does not impose a hard duration limit. The selected "
+            "model/runtime may reject the request or require continuation generation."
         )
-        if "audio.duration" not in parameter_guard.explicit:
-            warnings.append(
-                "resolved audio.duration exceeds MusicGen's 30-second limit; "
-                "the model default duration is used"
-            )
-        return None
     frame_rate = transformer_audio_frame_rate(pipeline)
     if frame_rate is None:
         parameter_guard.reject(
@@ -4287,6 +4310,11 @@ def execute_prepared_audio_generation(
         parameters,
         parameter_guard,
         warnings,
+    )
+    duration_metadata = transformer_audio_duration_metadata(
+        pipeline,
+        parameters,
+        max_new_tokens,
     )
     temperature = parameters.get("temperature")
     if temperature is not None:
@@ -4403,6 +4431,11 @@ def execute_prepared_audio_generation(
         "encoding_seconds": encoding_seconds,
         "offload_mode": "none",
         "offload_request": "none",
+        **(
+            {"duration_control": duration_metadata}
+            if duration_metadata is not None
+            else {}
+        ),
     }
 
 

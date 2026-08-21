@@ -1,6 +1,7 @@
 use super::super::types::{ParameterDescriptor, ParameterType};
 use super::builders::{
-    add_named_descriptors, bool_descriptor, enum_descriptor, integer_descriptor, number_descriptor,
+    add_named_descriptors, bool_descriptor, bounded_integer_descriptor, enum_descriptor,
+    integer_descriptor, number_descriptor,
 };
 use crate::capabilities::InferenceTask;
 
@@ -14,7 +15,6 @@ pub(super) fn audio_classification_descriptors() -> Vec<ParameterDescriptor> {
             "classification",
             5,
             1,
-            10_000,
         ),
         enum_descriptor(
             "audio.output_format",
@@ -94,7 +94,6 @@ pub(super) fn audio_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "composition",
             30.0,
             0.1,
-            86_400.0,
             0.1,
         ),
         integer_descriptor(
@@ -105,9 +104,8 @@ pub(super) fn audio_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "generation",
             1,
             1,
-            1024,
         ),
-        integer_descriptor(
+        bounded_integer_descriptor(
             "audio.seed",
             "--seed",
             "Seed",
@@ -125,7 +123,6 @@ pub(super) fn audio_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "output",
             44_100,
             8_000,
-            384_000,
         ),
         integer_descriptor(
             "audio.bit_depth",
@@ -135,7 +132,6 @@ pub(super) fn audio_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "output",
             16,
             8,
-            64,
         ),
         integer_descriptor(
             "audio.channels",
@@ -145,7 +141,6 @@ pub(super) fn audio_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "output",
             2,
             1,
-            32,
         ),
         bool_descriptor(
             "audio.instrumental",
@@ -348,7 +343,6 @@ pub(super) fn tts_descriptors() -> Vec<ParameterDescriptor> {
             "voice",
             1.0,
             0.1,
-            10.0,
             0.01,
         ),
         number_descriptor(
@@ -359,10 +353,9 @@ pub(super) fn tts_descriptors() -> Vec<ParameterDescriptor> {
             "voice",
             0.0,
             -48.0,
-            48.0,
             0.1,
         ),
-        integer_descriptor(
+        bounded_integer_descriptor(
             "tts.seed",
             "--seed",
             "Seed",
@@ -380,7 +373,6 @@ pub(super) fn tts_descriptors() -> Vec<ParameterDescriptor> {
             "output",
             24_000,
             8_000,
-            384_000,
         ),
         integer_descriptor(
             "tts.channels",
@@ -390,7 +382,6 @@ pub(super) fn tts_descriptors() -> Vec<ParameterDescriptor> {
             "output",
             1,
             1,
-            32,
         ),
         enum_descriptor(
             "tts.output_format",
@@ -471,7 +462,6 @@ pub(super) fn stt_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor> {
             "decoding",
             5,
             1,
-            1000,
         ),
         integer_descriptor(
             "stt.best_of",
@@ -481,7 +471,6 @@ pub(super) fn stt_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor> {
             "decoding",
             5,
             1,
-            1000,
         ),
         number_descriptor(
             "stt.temperature",
@@ -491,7 +480,6 @@ pub(super) fn stt_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor> {
             "decoding",
             0.0,
             0.0,
-            10.0,
             0.01,
         ),
         bool_descriptor(

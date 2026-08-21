@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import Any, Mapping
 from urllib.parse import quote
@@ -647,8 +648,8 @@ def build_routing_config(
             request_options[name] = normalized
 
     timeout = int(inference_timeout_seconds)
-    if timeout < 0 or timeout > 0xFFFFFFFF:
-        raise ValueError("inference_timeout_seconds must be between 0 and 4294967295")
+    if timeout < 0:
+        raise ValueError("inference_timeout_seconds must be at least 0")
     if timeout:
         request_options["timeout_seconds"] = timeout
 
@@ -691,21 +692,21 @@ def build_image_config(
     steps_value = int(steps)
     seed_value = int(seed)
     guidance_value = float(guidance)
-    if not 64 <= width_value <= 32768 or not 64 <= height_value <= 32768:
-        raise ValueError("width and height must be between 64 and 32768")
-    if not 1 <= count_value <= 1024:
-        raise ValueError("count must be between 1 and 1024")
-    if not 1 <= batch_value <= 256:
-        raise ValueError("batch_size must be between 1 and 256")
+    if width_value < 64 or height_value < 64:
+        raise ValueError("width and height must be at least 64")
+    if count_value < 1:
+        raise ValueError("count must be at least 1")
+    if batch_value < 1:
+        raise ValueError("batch_size must be at least 1")
     if count_value > 1 and batch_value > 1:
         raise ValueError(
             "count and batch_size cannot both be greater than 1; "
             "the selected media adapter treats them as alternative image-count controls"
         )
-    if not 1 <= steps_value <= 1000:
-        raise ValueError("steps must be between 1 and 1000")
-    if not 0.0 <= guidance_value <= 100.0:
-        raise ValueError("guidance must be between 0 and 100")
+    if steps_value < 1:
+        raise ValueError("steps must be at least 1")
+    if not math.isfinite(guidance_value) or guidance_value < 0.0:
+        raise ValueError("guidance must be finite and at least 0")
     if not 0 <= seed_value <= 0x7FFFFFFFFFFFFFFF:
         raise ValueError("seed must be between 0 and 9223372036854775807")
     if output_format not in {"png", "jpeg", "webp"}:
@@ -790,25 +791,25 @@ def build_video_config(
     guidance_value = float(guidance)
     seed_value = int(seed)
     output_value = str(output_format or "").strip().lower()
-    if not 64 <= width_value <= 16384 or not 64 <= height_value <= 16384:
-        raise ValueError("width and height must be between 64 and 16384")
-    if not 1 <= count_value <= 256:
-        raise ValueError("count must be between 1 and 256")
-    if not 1 <= batch_value <= 64:
-        raise ValueError("batch_size must be between 1 and 64")
+    if width_value < 64 or height_value < 64:
+        raise ValueError("width and height must be at least 64")
+    if count_value < 1:
+        raise ValueError("count must be at least 1")
+    if batch_value < 1:
+        raise ValueError("batch_size must be at least 1")
     if count_value > 1 and batch_value > 1:
         raise ValueError(
             "count and batch_size cannot both be greater than 1; "
             "the selected media adapter treats them as alternative video-count controls"
         )
-    if not 1 <= frames_value <= 100_000:
-        raise ValueError("frames must be between 1 and 100000")
-    if not 0.1 <= fps_value <= 1000.0:
-        raise ValueError("fps must be between 0.1 and 1000")
-    if not 1 <= steps_value <= 2000:
-        raise ValueError("steps must be between 1 and 2000")
-    if not 0.0 <= guidance_value <= 100.0:
-        raise ValueError("guidance must be between 0 and 100")
+    if frames_value < 1:
+        raise ValueError("frames must be at least 1")
+    if not math.isfinite(fps_value) or fps_value < 0.1:
+        raise ValueError("fps must be finite and at least 0.1")
+    if steps_value < 1:
+        raise ValueError("steps must be at least 1")
+    if not math.isfinite(guidance_value) or guidance_value < 0.0:
+        raise ValueError("guidance must be finite and at least 0")
     if not 0 <= seed_value <= 0x7FFFFFFFFFFFFFFF:
         raise ValueError("seed must be between 0 and 9223372036854775807")
     if output_value not in {"mp4", "gif"}:
@@ -871,6 +872,8 @@ def build_audio_config(
     instrumental: str = "inherit",
     voice: str = "",
     speed: float = 1.0,
+    language: str = "",
+    speaking_style: str = "",
     additional_audio_parameters_json: str = "{}",
     routing: WerkRoutingConfig | None = None,
 ) -> WerkAudioConfig:
@@ -885,20 +888,22 @@ def build_audio_config(
     output_value = str(output_format or "").strip().lower()
     speed_value = float(speed)
     voice_value = str(voice or "").strip()
-    if not 0.1 <= duration_value <= 86_400.0:
-        raise ValueError("duration must be between 0.1 and 86400 seconds")
-    if not 1 <= variations_value <= 1024:
-        raise ValueError("variations must be between 1 and 1024")
+    language_value = str(language or "").strip()
+    speaking_style_value = str(speaking_style or "").strip()
+    if not math.isfinite(duration_value) or duration_value < 0.1:
+        raise ValueError("duration must be finite and at least 0.1 seconds")
+    if variations_value < 1:
+        raise ValueError("variations must be at least 1")
     if not 0 <= seed_value <= 0x7FFFFFFFFFFFFFFF:
         raise ValueError("seed must be between 0 and 9223372036854775807")
-    if sample_rate_value != 0 and not 8_000 <= sample_rate_value <= 384_000:
-        raise ValueError("sample_rate must be 0 (inherit) or between 8000 and 384000")
-    if channels_value != 0 and not 1 <= channels_value <= 32:
-        raise ValueError("channels must be 0 (inherit) or between 1 and 32")
+    if sample_rate_value != 0 and sample_rate_value < 8_000:
+        raise ValueError("sample_rate must be 0 (inherit) or at least 8000")
+    if channels_value != 0 and channels_value < 1:
+        raise ValueError("channels must be 0 (inherit) or at least 1")
     if output_value not in {"wav", "flac", "ogg"}:
         raise ValueError("output_format must be wav, flac, or ogg")
-    if not 0.1 <= speed_value <= 10.0:
-        raise ValueError("speed must be between 0.1 and 10")
+    if not math.isfinite(speed_value) or speed_value < 0.1:
+        raise ValueError("speed must be finite and at least 0.1")
 
     request_fields: dict[str, Any] = {"response_format": output_value}
     parameters: dict[str, Any]
@@ -919,12 +924,20 @@ def build_audio_config(
         parameters = {}
         if seed_value:
             parameters["tts.seed"] = seed_value
+        if language_value:
+            parameters["tts.language"] = language_value
+        if speaking_style_value:
+            parameters["tts.speaking_style"] = speaking_style_value
         namespace = "tts"
     else:
         if voice_value:
             raise ValueError("voice applies only to text-to-speech")
         if speed_value != 1.0:
             raise ValueError("speed applies only to text-to-speech")
+        if language_value:
+            raise ValueError("language applies only to text-to-speech")
+        if speaking_style_value:
+            raise ValueError("speaking_style applies only to text-to-speech")
         request_fields["n"] = variations_value
         parameters = {
             "audio.duration": duration_value,
@@ -938,12 +951,17 @@ def build_audio_config(
         parameters[f"{namespace}.sample_rate"] = sample_rate_value
     if channels_value:
         parameters[f"{namespace}.channels"] = channels_value
-    parameters.update(
-        normalize_audio_config_parameters(
-            additional_audio_parameters_json,
-            selected_task,
-        )
+    additional_parameters = normalize_audio_config_parameters(
+        additional_audio_parameters_json,
+        selected_task,
     )
+    duplicates = set(parameters) & set(additional_parameters)
+    if duplicates:
+        raise ValueError(
+            "additional audio parameter duplicates a populated node input: "
+            + ", ".join(sorted(duplicates))
+        )
+    parameters.update(additional_parameters)
 
     routing_config = routing or WerkRoutingConfig()
     if not isinstance(routing_config, WerkRoutingConfig):
@@ -1795,7 +1813,7 @@ class WerkConnectionNode:
                 "api_key": ("STRING", {"default": environment_api_key()}),
                 "timeout_seconds": (
                     "INT",
-                    {"default": DEFAULT_TIMEOUT_SECONDS, "min": 1, "max": 86400},
+                    {"default": DEFAULT_TIMEOUT_SECONDS, "min": 1},
                 ),
                 "verify_tls": ("BOOLEAN", {"default": True}),
             }
@@ -2229,7 +2247,7 @@ class WerkRoutingConfigNode:
                 "compile": tri_state,
                 "inference_timeout_seconds": (
                     "INT",
-                    {"default": 0, "min": 0, "max": 0xFFFFFFFF},
+                    {"default": 0, "min": 0},
                 ),
                 "additional_routing_parameters_json": (
                     "STRING",
@@ -2254,17 +2272,17 @@ class WerkImageConfigNode:
         tri_state = (["inherit", "enabled", "disabled"], {"default": "inherit"})
         return {
             "required": {
-                "width": ("INT", {"default": 1024, "min": 64, "max": 32768, "step": 8}),
+                "width": ("INT", {"default": 1024, "min": 64, "step": 8}),
                 "height": (
                     "INT",
-                    {"default": 1024, "min": 64, "max": 32768, "step": 8},
+                    {"default": 1024, "min": 64, "step": 8},
                 ),
-                "count": ("INT", {"default": 1, "min": 1, "max": 1024}),
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 256}),
-                "steps": ("INT", {"default": 28, "min": 1, "max": 1000}),
+                "count": ("INT", {"default": 1, "min": 1}),
+                "batch_size": ("INT", {"default": 1, "min": 1}),
+                "steps": ("INT", {"default": 28, "min": 1}),
                 "guidance": (
                     "FLOAT",
-                    {"default": 7.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                    {"default": 7.0, "min": 0.0, "step": 0.1},
                 ),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0x7FFFFFFFFFFFFFFF}),
                 "output_format": (["png", "jpeg", "webp"], {"default": "png"}),
@@ -2298,23 +2316,23 @@ class WerkVideoConfigNode:
             "required": {
                 "width": (
                     "INT",
-                    {"default": 832, "min": 64, "max": 16384, "step": 8},
+                    {"default": 832, "min": 64, "step": 8},
                 ),
                 "height": (
                     "INT",
-                    {"default": 480, "min": 64, "max": 16384, "step": 8},
+                    {"default": 480, "min": 64, "step": 8},
                 ),
-                "count": ("INT", {"default": 1, "min": 1, "max": 256}),
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64}),
-                "frames": ("INT", {"default": 81, "min": 1, "max": 100000}),
+                "count": ("INT", {"default": 1, "min": 1}),
+                "batch_size": ("INT", {"default": 1, "min": 1}),
+                "frames": ("INT", {"default": 81, "min": 1}),
                 "fps": (
                     "FLOAT",
-                    {"default": 24.0, "min": 0.1, "max": 1000.0, "step": 0.1},
+                    {"default": 24.0, "min": 0.1, "step": 0.1},
                 ),
-                "steps": ("INT", {"default": 30, "min": 1, "max": 2000}),
+                "steps": ("INT", {"default": 30, "min": 1}),
                 "guidance": (
                     "FLOAT",
-                    {"default": 6.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                    {"default": 6.0, "min": 0.0, "step": 0.1},
                 ),
                 "seed": (
                     "INT",
@@ -2351,9 +2369,9 @@ class WerkAudioConfigNode:
                 ),
                 "duration": (
                     "FLOAT",
-                    {"default": 30.0, "min": 0.1, "max": 86_400.0, "step": 0.1},
+                    {"default": 30.0, "min": 0.1, "step": 0.1},
                 ),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 1024}),
+                "variations": ("INT", {"default": 1, "min": 1}),
                 "seed": (
                     "INT",
                     {"default": 0, "min": 0, "max": 0x7FFFFFFFFFFFFFFF},
@@ -2363,7 +2381,6 @@ class WerkAudioConfigNode:
                     {
                         "default": 0,
                         "min": 0,
-                        "max": 384_000,
                         "tooltip": "0 inherits the model/task sample rate.",
                     },
                 ),
@@ -2372,7 +2389,6 @@ class WerkAudioConfigNode:
                     {
                         "default": 0,
                         "min": 0,
-                        "max": 32,
                         "tooltip": "0 inherits the model/task channel count.",
                     },
                 ),
@@ -2387,14 +2403,37 @@ class WerkAudioConfigNode:
                 "voice": ("STRING", {"default": ""}),
                 "speed": (
                     "FLOAT",
-                    {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01},
+                    {"default": 1.0, "min": 0.1, "step": 0.01},
                 ),
                 "additional_audio_parameters_json": (
                     "STRING",
                     {"default": "{}", "multiline": True},
                 ),
             },
-            "optional": {"routing": ("WERK_ROUTING_CONFIG",)},
+            "optional": {
+                "routing": ("WERK_ROUTING_CONFIG",),
+                "language": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": (
+                            "TTS language, for example German. Empty inherits the "
+                            "model default. Used only for text-to-speech."
+                        ),
+                    },
+                ),
+                "speaking_style": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": (
+                            "TTS voice/style instruction. For Qwen3-TTS VoiceDesign "
+                            "this is passed as instruct."
+                        ),
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("WERK_AUDIO_CONFIG", "STRING")
@@ -2524,6 +2563,15 @@ class WerkAudioGenerateNode:
                         "tooltip": "Connect the model output from WERK Audio Models.",
                     },
                 ),
+                "config": (
+                    "WERK_AUDIO_CONFIG",
+                    {
+                        "tooltip": (
+                            "Required: connect an active WERK Audio Config. "
+                            "Bypassing it would discard all audio/TTS settings."
+                        ),
+                    },
+                ),
                 "task": (
                     list(AUDIO_GENERATION_TASKS),
                     {"default": AUDIO_GENERATION_TASK},
@@ -2540,8 +2588,7 @@ class WerkAudioGenerateNode:
                     "STRING",
                     {"default": "", "multiline": True},
                 ),
-            },
-            "optional": {"config": ("WERK_AUDIO_CONFIG",)},
+            }
         }
 
     RETURN_TYPES = ("AUDIO", "STRING", "INT", "STRING", "STRING", "STRING")
@@ -2565,9 +2612,14 @@ class WerkAudioGenerateNode:
         task: str,
         prompt: str,
         negative_prompt: str,
-        config: WerkAudioConfig | None = None,
+        config: WerkAudioConfig,
     ):
         selected_task = _audio_generation_task(task)
+        if selected_task == TEXT_TO_SPEECH_TASK and config is None:
+            raise ValueError(
+                "text-to-speech requires a connected, active WERK Audio Config; "
+                "un-bypass the config node before queueing the workflow"
+            )
         request = build_configured_audio_request(
             task=selected_task,
             model=model,

@@ -94,6 +94,9 @@ pub(super) fn validate_parameter(
         );
     }
     if let Some(number) = value.as_f64() {
+        if !number.is_finite() {
+            bail!("parameter '{}' must be finite", descriptor.path);
+        }
         if descriptor
             .minimum
             .as_ref()
@@ -101,14 +104,6 @@ pub(super) fn validate_parameter(
             .is_some_and(|minimum| number < minimum)
         {
             bail!("parameter '{}' is below its minimum", descriptor.path);
-        }
-        if descriptor
-            .maximum
-            .as_ref()
-            .and_then(ParameterValue::as_f64)
-            .is_some_and(|maximum| number > maximum)
-        {
-            bail!("parameter '{}' is above its maximum", descriptor.path);
         }
     }
     if !descriptor.allowed_values.is_empty()
@@ -223,8 +218,16 @@ fn apply_manifest_constraint(
     if let Some(default) = convert("default")? {
         descriptor.default = Some(default);
     }
-    descriptor.minimum = convert("minimum")?.or(convert("min")?);
-    descriptor.maximum = convert("maximum")?.or(convert("max")?);
+    if object.contains_key("minimum") {
+        descriptor.minimum = convert("minimum")?;
+    } else if object.contains_key("min") {
+        descriptor.minimum = convert("min")?;
+    }
+    if object.contains_key("maximum") {
+        descriptor.maximum = convert("maximum")?;
+    } else if object.contains_key("max") {
+        descriptor.maximum = convert("max")?;
+    }
     if let Some(step) = convert("step")? {
         descriptor.step = Some(step);
     }

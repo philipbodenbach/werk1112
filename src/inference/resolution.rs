@@ -151,6 +151,20 @@ pub fn resolve_request(
 
     let mut warnings = Vec::new();
     for path in &explicit_parameters {
+        if let (Some(value), Some(maximum)) = (
+            parameters
+                .get(path)
+                .and_then(|resolved| resolved.value.as_f64()),
+            descriptors
+                .get(path)
+                .and_then(|descriptor| descriptor.maximum.as_ref())
+                .and_then(ParameterValue::as_f64),
+        ) && value > maximum
+        {
+            warnings.push(format!(
+                "explicit parameter '{path}' exceeds the model-reported maximum {maximum}; it was forwarded unchanged"
+            ));
+        }
         let support = context
             .parameter_support
             .get(path)

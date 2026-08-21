@@ -17,6 +17,7 @@ from ..config import (
 )
 from .. import nodes
 from ..nodes import (
+    WerkConnectionNode,
     WerkImageConfigNode,
     WerkImageGenerateNode,
     WerkImageModelsNode,
@@ -244,6 +245,29 @@ def test_routing_config_inherit_and_empty_values_do_not_invent_overrides():
     assert dict(config.parameters) == {}
 
 
+def test_connection_and_inference_timeouts_have_no_artificial_ui_maximum():
+    connection_options = WerkConnectionNode.INPUT_TYPES()["required"][
+        "timeout_seconds"
+    ][1]
+    inference_options = WerkRoutingConfigNode.INPUT_TYPES()["required"][
+        "inference_timeout_seconds"
+    ][1]
+    assert connection_options["min"] == 1
+    assert "max" not in connection_options
+    assert inference_options["min"] == 0
+    assert "max" not in inference_options
+
+    connection, _status = WerkConnectionNode().connect(
+        "http://werk", "", 86_401, True
+    )
+    assert connection.timeout_seconds == 86_401
+
+    routing = build_routing_config(inference_timeout_seconds=0x1_0000_0000)
+    assert routing.request_options["timeout_seconds"] == 0x1_0000_0000
+    with pytest.raises(ValueError, match="must be at least 0"):
+        build_routing_config(inference_timeout_seconds=-1)
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -428,6 +452,91 @@ def test_video_count_and_batch_size_are_alternative_explicit_controls():
 
     with pytest.raises(ValueError, match="cannot both be greater than 1"):
         build_video_config(count=2, batch_size=4)
+
+
+def test_image_config_forwards_values_above_the_former_portable_caps():
+    config = build_image_config(
+        width=32_776,
+        height=32_776,
+        count=1_025,
+        batch_size=1,
+        steps=1_001,
+        guidance=100.1,
+    )
+    assert config.request_fields["size"] == "32776x32776"
+    assert config.request_fields["n"] == 1_025
+    assert config.parameters["image.steps"] == 1_001
+    assert config.parameters["image.guidance"] == 100.1
+
+    batched = build_image_config(count=1, batch_size=257)
+    assert "n" not in batched.request_fields
+    assert batched.parameters["image.batch_size"] == 257
+
+
+def test_video_config_forwards_values_above_the_former_portable_caps():
+    config = build_video_config(
+        width=16_392,
+        height=16_392,
+        count=257,
+        batch_size=1,
+        frames=100_001,
+        fps=1_000.1,
+        steps=2_001,
+        guidance=100.1,
+    )
+    assert config.request_fields["size"] == "16392x16392"
+    assert config.request_fields["n"] == 257
+    assert config.parameters["video.frames"] == 100_001
+    assert config.parameters["video.fps"] == 1_000.1
+    assert config.parameters["video.steps"] == 2_001
+    assert config.parameters["video.guidance"] == 100.1
+
+    batched = build_video_config(count=1, batch_size=65)
+    assert "n" not in batched.request_fields
+    assert batched.parameters["video.batch_size"] == 65
+
+
+@pytest.mark.parametrize(
+    ("node", "unbounded_fields"),
+    (
+        (
+            WerkImageConfigNode,
+            ("width", "height", "count", "batch_size", "steps", "guidance"),
+        ),
+        (
+            WerkVideoConfigNode,
+            (
+                "width",
+                "height",
+                "count",
+                "batch_size",
+                "frames",
+                "fps",
+                "steps",
+                "guidance",
+            ),
+        ),
+    ),
+)
+def test_image_and_video_widgets_have_no_static_inference_maximum(
+    node, unbounded_fields
+):
+    required = node.INPUT_TYPES()["required"]
+    for field in unbounded_fields:
+        assert "max" not in required[field][1]
+        assert "min" in required[field][1]
+    assert required["seed"][1]["max"] == 0x7FFFFFFFFFFFFFFF
+
+
+def test_image_and_video_configs_keep_minimum_and_finite_checks():
+    with pytest.raises(ValueError, match="width and height must be at least 64"):
+        build_image_config(width=63)
+    with pytest.raises(ValueError, match="steps must be at least 1"):
+        build_video_config(steps=0)
+    with pytest.raises(ValueError, match="guidance must be finite"):
+        build_image_config(guidance=float("nan"))
+    with pytest.raises(ValueError, match="fps must be finite"):
+        build_video_config(fps=float("inf"))
 
 
 def test_flux_request_carries_offload_as_explicit_routing_options():

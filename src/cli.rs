@@ -4939,7 +4939,7 @@ fn kv_cache_from_config(config: &EstimateConfig) -> Option<KvCacheEstimate> {
             4096
         }
     };
-    let effective_context = model_context.min(4096);
+    let effective_context = model_context;
     Some(KvCacheEstimate {
         bytes: layers
             .saturating_mul(kv_heads)
@@ -11517,7 +11517,7 @@ mod tests {
 
         let estimate = kv_cache_estimate(4 * GIB, Some("llama"), &Some(config));
 
-        assert_eq!(estimate.bytes, 24 * 8 * 64 * 2 * 4096 * 2);
+        assert_eq!(estimate.bytes, 24 * 8 * 64 * 2 * 8192 * 2);
         assert_eq!(estimate.confidence, EstimateConfidence::High);
         assert!(estimate.config_used);
     }
@@ -11602,8 +11602,11 @@ mod tests {
 
         assert!(report.config_used);
         assert_eq!(report.confidence, EstimateConfidence::High);
-        assert!(report.kv_cache_bytes < scale_bytes(3 * GIB, 0.35));
-        assert!(report.estimated_total_bytes < 5 * GIB);
+        assert_eq!(report.kv_cache_bytes, 24 * 32 * 64 * 2 * 8192 * 2);
+        assert_eq!(
+            report.estimated_total_bytes,
+            report.model_files_bytes + report.runtime_overhead_bytes + report.kv_cache_bytes
+        );
     }
 
     #[test]

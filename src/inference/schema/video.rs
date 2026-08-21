@@ -1,6 +1,7 @@
 use super::super::types::{ParameterDescriptor, ParameterType};
 use super::builders::{
-    add_named_descriptors, bool_descriptor, enum_descriptor, integer_descriptor, number_descriptor,
+    add_named_descriptors, bool_descriptor, bounded_integer_descriptor, enum_descriptor,
+    integer_descriptor, number_descriptor,
 };
 use crate::capabilities::InferenceTask;
 
@@ -14,7 +15,6 @@ pub(super) fn video_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "geometry",
             832,
             64,
-            16384,
         ),
         integer_descriptor(
             "video.height",
@@ -24,7 +24,6 @@ pub(super) fn video_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "geometry",
             480,
             64,
-            16384,
         ),
         integer_descriptor(
             "video.frames",
@@ -34,7 +33,6 @@ pub(super) fn video_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "temporal",
             81,
             1,
-            100_000,
         ),
         number_descriptor(
             "video.fps",
@@ -44,7 +42,6 @@ pub(super) fn video_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "temporal",
             24.0,
             0.1,
-            1000.0,
             0.1,
         ),
         integer_descriptor(
@@ -55,7 +52,6 @@ pub(super) fn video_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "generation",
             1,
             1,
-            64,
         ),
         integer_descriptor(
             "video.num_videos",
@@ -65,7 +61,6 @@ pub(super) fn video_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "generation",
             1,
             1,
-            256,
         ),
         integer_descriptor(
             "video.steps",
@@ -75,7 +70,6 @@ pub(super) fn video_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "sampling",
             30,
             1,
-            2000,
         ),
         number_descriptor(
             "video.guidance",
@@ -85,10 +79,9 @@ pub(super) fn video_descriptors(task: InferenceTask) -> Vec<ParameterDescriptor>
             "sampling",
             6.0,
             0.0,
-            100.0,
             0.1,
         ),
-        integer_descriptor(
+        bounded_integer_descriptor(
             "video.seed",
             "--seed",
             "Seed",
