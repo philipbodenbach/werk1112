@@ -7,7 +7,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -25,6 +25,16 @@ const DEFAULT_BATCH_SIZE: usize = 2048;
 const DEFAULT_UBATCH_SIZE: u32 = 512;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+static STRIX_HALO: OnceLock<bool> = OnceLock::new();
+static SELECTED_ROCM_DEVICE_STATUS: OnceLock<SelectedRocmDeviceStatus> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectedRocmDeviceStatus {
+    StrixHalo,
+    Other,
+    Unknown,
+}
 
 #[derive(Clone)]
 pub struct LlamaServerBackend {
@@ -1138,6 +1148,24 @@ pub fn install_managed_llama_server_with_options(
         }
         LlamaCppMode::Rocm => {
             configure.arg("-DGGML_HIP=ON");
+            if let Some(target) = rocm_gpu_targets() {
+                if options.verbose {
+                    eprintln!("Using ROCm GPU target {target}");
+                }
+                configure.arg(format!("-DGPU_TARGETS={target}"));
+            }
+            if let Some(no_vmm) = rocm_hip_no_vmm() {
+                if options.verbose {
+                    eprintln!(
+                        "HIP virtual-memory manager disabled: {}",
+                        if no_vmm { "yes" } else { "no" }
+                    );
+                }
+                configure.arg(format!(
+                    "-DGGML_HIP_NO_VMM={}",
+                    if no_vmm { "ON" } else { "OFF" }
+                ));
+            }
         }
         LlamaCppMode::Vulkan => {
             configure.arg("-DGGML_VULKAN=ON");
@@ -1191,19 +1219,28 @@ pub fn backend_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
             &["--version"],
             "required to configure/build llama.cpp",
         ),
-        command_check(
+    ];
+    if current_host_is_strix_halo() {
+        checks.push(command_check(
+            "hipcc",
+            &["--version"],
+            "required to compile the managed llama.cpp ROCm/HIP backend",
+        ));
+    } else {
+        checks.push(command_check(
             "nvidia-smi",
             &[],
             "required to verify NVIDIA driver visibility for CUDA backends",
-        ),
-        command_check(
+        ));
+        checks.push(command_check(
             "nvcc",
             &["--version"],
             "required to build llama.cpp CUDA backends from source",
-        ),
-    ];
-    checks.push(cuda_host_compiler_check());
-    checks.push(cuda_architecture_check());
+        ));
+        checks.push(cuda_host_compiler_check());
+        checks.push(cuda_architecture_check());
+    }
+    checks.push(rocm_build_profile_check());
     checks.push(cache_write_check(store));
     checks
 }
@@ -1260,6 +1297,26 @@ fn require_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<LlamaS
 }
 
 fn discover_llama_server(store: &ModelStore, mode: LlamaCppMode) -> LlamaServerDiscovery {
+    let strict_strix_rocm = strict_strix_rocm_discovery(
+        current_host_is_strix_halo(),
+        current_selected_rocm_device_status(),
+    );
+    discover_llama_server_for_host(store, mode, strict_strix_rocm)
+}
+
+fn strict_strix_rocm_discovery(
+    strix_halo_host: bool,
+    selected_device: SelectedRocmDeviceStatus,
+) -> bool {
+    selected_device == SelectedRocmDeviceStatus::StrixHalo
+        || (strix_halo_host && selected_device == SelectedRocmDeviceStatus::Unknown)
+}
+
+fn discover_llama_server_for_host(
+    store: &ModelStore,
+    mode: LlamaCppMode,
+    strict_strix_rocm_profile: bool,
+) -> LlamaServerDiscovery {
     let mut attempts = Vec::new();
     let specific_env = mode_env_name(mode);
     if let Some(path) = env::var_os(specific_env).map(PathBuf::from) {
@@ -1283,6 +1340,52 @@ fn discover_llama_server(store: &ModelStore, mode: LlamaCppMode) -> LlamaServerD
             path: None,
             exists: false,
         });
+    }
+
+    let strict_strix_rocm = strict_strix_rocm_profile && mode == LlamaCppMode::Rocm;
+    if strict_strix_rocm {
+        let managed_root = managed_backend_dir(store, mode);
+        if let Some(path) = find_managed_server(store, mode) {
+            attempts.push(LlamaServerDiscoveryAttempt {
+                label: "managed cache".to_string(),
+                path: Some(path.clone()),
+                exists: true,
+            });
+            return LlamaServerDiscovery {
+                mode,
+                path: Some(path),
+                source: "managed cache".to_string(),
+                attempts,
+            };
+        }
+        attempts.push(LlamaServerDiscoveryAttempt {
+            label: "managed cache".to_string(),
+            path: Some(managed_root),
+            exists: false,
+        });
+
+        let generic_path = env::var_os("WERK_LLAMA_SERVER").map(PathBuf::from);
+        attempts.push(LlamaServerDiscoveryAttempt {
+            label: "WERK_LLAMA_SERVER (not mode-specific for Strix Halo ROCm; use WERK_LLAMA_SERVER_ROCM)"
+                .to_string(),
+            exists: generic_path.as_ref().is_some_and(|path| path.is_file()),
+            path: generic_path,
+        });
+        let path_server = find_in_path(default_executable_name());
+        attempts.push(LlamaServerDiscoveryAttempt {
+            label: format!(
+                "PATH: {} (not mode-verified for Strix Halo ROCm)",
+                default_executable_name()
+            ),
+            exists: path_server.is_some(),
+            path: path_server,
+        });
+        return LlamaServerDiscovery {
+            mode,
+            path: None,
+            source: "missing".to_string(),
+            attempts,
+        };
     }
 
     if let Some(path) = env::var_os("WERK_LLAMA_SERVER").map(PathBuf::from) {
@@ -1497,6 +1600,283 @@ fn matching_c_compiler(cxx_compiler: &Path) -> Option<PathBuf> {
     c_compiler.is_file().then_some(c_compiler)
 }
 
+fn rocm_gpu_targets() -> Option<String> {
+    let werk_override = env::var("WERK_LLAMA_ROCM_ARCH").ok();
+    let cmake_override = env::var("GPU_TARGETS").ok();
+    select_rocm_gpu_targets(
+        current_selected_rocm_device_is_strix_halo(),
+        werk_override.as_deref(),
+        cmake_override.as_deref(),
+    )
+}
+
+fn select_rocm_gpu_targets(
+    strix_halo: bool,
+    werk_override: Option<&str>,
+    cmake_override: Option<&str>,
+) -> Option<String> {
+    werk_override
+        .and_then(non_empty_trimmed)
+        .or_else(|| cmake_override.and_then(non_empty_trimmed))
+        .map(ToString::to_string)
+        .or_else(|| strix_halo.then(|| "gfx1151".to_string()))
+}
+
+fn rocm_hip_no_vmm() -> Option<bool> {
+    let werk_override = env::var("WERK_LLAMA_HIP_NO_VMM").ok();
+    let upstream_override = env::var("GGML_HIP_NO_VMM").ok();
+    select_rocm_hip_no_vmm(
+        current_selected_rocm_device_is_strix_halo(),
+        werk_override.as_deref(),
+        upstream_override.as_deref(),
+    )
+}
+
+fn select_rocm_hip_no_vmm(
+    strix_halo: bool,
+    werk_override: Option<&str>,
+    upstream_override: Option<&str>,
+) -> Option<bool> {
+    werk_override
+        .and_then(parse_boolean_setting)
+        .or_else(|| upstream_override.and_then(parse_boolean_setting))
+        .or_else(|| strix_halo.then_some(true))
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn parse_boolean_setting(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn current_host_is_strix_halo() -> bool {
+    let supported_platform = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+    if !supported_platform {
+        return false;
+    }
+    // A specialized release artifact is itself an authoritative platform
+    // signal. This keeps the profile active in containers that hide DMI and
+    // /proc CPU names and do not expose rocminfo until runtime provisioning.
+    if strix_halo_profile_selected(
+        supported_platform,
+        cfg!(feature = "release-linux-strix-halo"),
+        false,
+    ) {
+        return true;
+    }
+    strix_halo_profile_selected(
+        supported_platform,
+        false,
+        *STRIX_HALO.get_or_init(probe_current_host_is_strix_halo),
+    )
+}
+
+/// Returns whether logical ROCm device zero resolves to Strix Halo's gfx1151
+/// architecture. Host-level Strix detection is intentionally insufficient:
+/// a workstation can expose another AMD GPU before its integrated gfx1151.
+pub(crate) fn current_selected_rocm_device_is_strix_halo() -> bool {
+    current_selected_rocm_device_status() == SelectedRocmDeviceStatus::StrixHalo
+}
+
+pub(crate) fn current_selected_rocm_device_status() -> SelectedRocmDeviceStatus {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return SelectedRocmDeviceStatus::Unknown;
+    }
+    *SELECTED_ROCM_DEVICE_STATUS.get_or_init(probe_selected_rocm_device_status)
+}
+
+fn probe_selected_rocm_device_status() -> SelectedRocmDeviceStatus {
+    let Some(output) = Command::new("rocminfo")
+        // Enumerate physical agents, then apply the process visibility selector
+        // below. This avoids depending on which aliases a given rocminfo build
+        // happens to honor.
+        .env_remove("ROCR_VISIBLE_DEVICES")
+        .env_remove("HIP_VISIBLE_DEVICES")
+        .env_remove("CUDA_VISIBLE_DEVICES")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+    else {
+        return SelectedRocmDeviceStatus::Unknown;
+    };
+    selected_rocm_device_status(
+        &String::from_utf8_lossy(&output.stdout),
+        env::var("ROCR_VISIBLE_DEVICES").ok().as_deref(),
+        env::var("HIP_VISIBLE_DEVICES").ok().as_deref(),
+        env::var("CUDA_VISIBLE_DEVICES").ok().as_deref(),
+    )
+}
+
+#[cfg(test)]
+fn selected_rocm_device_is_strix_halo(
+    rocminfo: &str,
+    rocr_visible_devices: Option<&str>,
+    hip_visible_devices: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+) -> bool {
+    selected_rocm_device_status(
+        rocminfo,
+        rocr_visible_devices,
+        hip_visible_devices,
+        cuda_visible_devices,
+    ) == SelectedRocmDeviceStatus::StrixHalo
+}
+
+fn selected_rocm_device_status(
+    rocminfo: &str,
+    rocr_visible_devices: Option<&str>,
+    hip_visible_devices: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+) -> SelectedRocmDeviceStatus {
+    let architectures = rocminfo_gfx_architectures(rocminfo);
+    let Some(index) = selected_rocm_physical_index(
+        rocr_visible_devices,
+        hip_visible_devices,
+        cuda_visible_devices,
+        &architectures,
+    ) else {
+        return SelectedRocmDeviceStatus::Unknown;
+    };
+    match architectures.get(index) {
+        Some(architecture) if architecture.eq_ignore_ascii_case("gfx1151") => {
+            SelectedRocmDeviceStatus::StrixHalo
+        }
+        Some(_) => SelectedRocmDeviceStatus::Other,
+        None => SelectedRocmDeviceStatus::Unknown,
+    }
+}
+
+fn rocminfo_gfx_architectures(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (label, value) = line.split_once(':')?;
+            if !label.trim().eq_ignore_ascii_case("name") {
+                return None;
+            }
+            let architecture = value.split_whitespace().next()?;
+            let lower = architecture.to_ascii_lowercase();
+            let suffix = lower.strip_prefix("gfx")?;
+            (!suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit()))
+                .then_some(architecture)
+        })
+        .collect()
+}
+
+fn selected_rocm_physical_index(
+    rocr_visible_devices: Option<&str>,
+    hip_visible_devices: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+    architectures: &[&str],
+) -> Option<usize> {
+    let Some(selector) = [
+        rocr_visible_devices,
+        hip_visible_devices,
+        cuda_visible_devices,
+    ]
+    .into_iter()
+    .flatten()
+    .next() else {
+        return Some(0);
+    };
+    let first = selector.split(',').next()?.trim();
+    if first.is_empty()
+        || matches!(
+            first.to_ascii_lowercase().as_str(),
+            "-1" | "none" | "disabled" | "void"
+        )
+    {
+        return None;
+    }
+    if first.eq_ignore_ascii_case("all") {
+        return Some(0);
+    }
+    if let Ok(index) = first.parse::<usize>() {
+        return Some(index);
+    }
+    let official_gpu_uuid = first
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GPU-"));
+    if official_gpu_uuid
+        && (architectures.len() == 1
+            || (!architectures.is_empty()
+                && architectures
+                    .iter()
+                    .all(|architecture| architecture.eq_ignore_ascii_case("gfx1151"))))
+    {
+        return Some(0);
+    }
+    // A UUID cannot be mapped safely to a mixed rocminfo agent list without
+    // parsing the matching agent identity. Keep hybrid selections unknown
+    // instead of accidentally enabling UMA and gfx1151 build defaults.
+    None
+}
+
+fn strix_halo_profile_selected(
+    supported_platform: bool,
+    specialized_build: bool,
+    host_signal: bool,
+) -> bool {
+    supported_platform && (specialized_build || host_signal)
+}
+
+fn probe_current_host_is_strix_halo() -> bool {
+    let cpu_info = fs::read_to_string("/proc/cpuinfo").ok();
+    let product_name = fs::read_to_string("/sys/class/dmi/id/product_name").ok();
+    let board_name = fs::read_to_string("/sys/class/dmi/id/board_name").ok();
+    if strix_halo_host_signals(
+        env::consts::ARCH,
+        [
+            cpu_info.as_deref(),
+            product_name.as_deref(),
+            board_name.as_deref(),
+        ],
+    ) {
+        return true;
+    }
+
+    let rocminfo = Command::new("rocminfo")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    strix_halo_host_signals(env::consts::ARCH, [rocminfo.as_deref()])
+}
+
+fn strix_halo_host_signals<'a>(
+    architecture: &str,
+    signals: impl IntoIterator<Item = Option<&'a str>>,
+) -> bool {
+    architecture == "x86_64"
+        && signals
+            .into_iter()
+            .flatten()
+            .any(signal_identifies_strix_halo)
+}
+
+fn signal_identifies_strix_halo(signal: &str) -> bool {
+    let lower = signal.to_ascii_lowercase();
+    lower.contains("strix halo")
+        || lower.contains("ryzen ai max")
+        || lower.contains("radeon 8060s")
+        || lower.contains("radeon 8050s")
+        || lower.contains("radeon 8040s")
+        || signal_has_exact_token(&lower, "gfx1151")
+}
+
+fn signal_has_exact_token(signal: &str, expected: &str) -> bool {
+    signal
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(expected))
+}
+
 fn cuda_major_version() -> Option<u32> {
     let compiler = cuda_compiler().unwrap_or_else(|| PathBuf::from("nvcc"));
     let output = Command::new(compiler).arg("--version").output().ok()?;
@@ -1622,6 +2002,87 @@ fn cuda_architecture_check() -> BackendDoctorCheck {
                 .to_string(),
         },
     }
+}
+
+fn rocm_build_profile_check() -> BackendDoctorCheck {
+    if !current_selected_rocm_device_is_strix_halo() {
+        return BackendDoctorCheck {
+            name: "ROCm build profile".to_string(),
+            ok: true,
+            detail: rocm_gpu_targets().map_or_else(
+                || "generic host; llama.cpp performs its normal ROCm target selection".to_string(),
+                |target| format!("explicit GPU_TARGETS={target}"),
+            ),
+        };
+    }
+
+    match Command::new("rocminfo").output() {
+        Ok(output)
+            if output.status.success()
+                && signal_has_exact_token(&String::from_utf8_lossy(&output.stdout), "gfx1151") =>
+        {
+            BackendDoctorCheck {
+                name: "ROCm build profile".to_string(),
+                ok: true,
+                detail: strix_halo_rocm_profile_detail(),
+            }
+        }
+        Ok(output) if output.status.success() => BackendDoctorCheck {
+            name: "ROCm build profile".to_string(),
+            ok: false,
+            detail: "Strix Halo host detected, but rocminfo did not report gfx1151; install a supported ROCm stack before building llama-rocm"
+                .to_string(),
+        },
+        Ok(output) => BackendDoctorCheck {
+            name: "ROCm build profile".to_string(),
+            ok: false,
+            detail: format!(
+                "Strix Halo host detected, but rocminfo exited with {}; install a supported ROCm stack before building llama-rocm",
+                output.status
+            ),
+        },
+        Err(err) => BackendDoctorCheck {
+            name: "ROCm build profile".to_string(),
+            ok: false,
+            detail: format!(
+                "Strix Halo host detected, but rocminfo is unavailable ({err}); install a supported ROCm stack before building llama-rocm"
+            ),
+        },
+    }
+}
+
+fn strix_halo_rocm_profile_detail() -> String {
+    let target = rocm_gpu_targets().unwrap_or_else(|| "gfx1151".to_string());
+    let unified_memory_override = env::var("GGML_CUDA_ENABLE_UNIFIED_MEMORY").ok();
+    format_strix_halo_rocm_profile_detail(
+        &target,
+        rocm_hip_no_vmm(),
+        unified_memory_override.as_deref(),
+    )
+}
+
+fn format_strix_halo_rocm_profile_detail(
+    target: &str,
+    hip_no_vmm: Option<bool>,
+    unified_memory_override: Option<&str>,
+) -> String {
+    let vmm = match hip_no_vmm {
+        Some(true) => "HIP VMM disabled".to_string(),
+        Some(false) => "HIP VMM enabled by explicit override".to_string(),
+        None => "HIP VMM follows the upstream default".to_string(),
+    };
+    let unified_memory = unified_memory_override.map_or_else(
+        || "GGML_CUDA_ENABLE_UNIFIED_MEMORY unset; Werk does not enable this experimental switch automatically on gfx1151".to_string(),
+        |value| {
+            format!(
+                "GGML_CUDA_ENABLE_UNIFIED_MEMORY is present with value '{}'; llama.cpp treats presence as an explicit experimental opt-in",
+                value.trim()
+            )
+        },
+    );
+    format!(
+        "Strix Halo gfx1151 verified; managed llama-rocm uses GPU_TARGETS={target}; {vmm}; {unified_memory}"
+    )
 }
 
 fn command_check(command: &str, args: &[&str], detail: &str) -> BackendDoctorCheck {
@@ -1945,6 +2406,10 @@ mod tests {
             root.join("backends").join("llama-cuda")
         );
         assert_eq!(
+            managed_backend_dir(&store, LlamaCppMode::Rocm),
+            root.join("backends").join("llama-rocm")
+        );
+        assert_eq!(
             managed_backend_dir(&store, LlamaCppMode::Vulkan),
             root.join("backends").join("llama-vulkan")
         );
@@ -1985,6 +2450,193 @@ mod tests {
             None,
             Some("NVIDIA GB100")
         ));
+    }
+
+    #[test]
+    fn strix_halo_detection_requires_x86_64_and_a_specific_gfx1151_signal() {
+        assert!(strix_halo_host_signals(
+            "x86_64",
+            [Some("Name: gfx1151\nMarketing Name: Radeon 8060S Graphics")]
+        ));
+        assert!(strix_halo_host_signals(
+            "x86_64",
+            [Some("AMD Ryzen AI Max+ PRO 395 w/ Radeon 8060S")]
+        ));
+        assert!(strix_halo_host_signals(
+            "x86_64",
+            [Some("AMD Ryzen AI Max 380 w/ Radeon 8040S")]
+        ));
+        assert!(!strix_halo_host_signals(
+            "aarch64",
+            [Some("gfx1151 Strix Halo")]
+        ));
+        assert!(!strix_halo_host_signals(
+            "x86_64",
+            [Some("AMD Radeon Graphics gfx1100")]
+        ));
+        assert!(!strix_halo_host_signals("x86_64", [Some("Name: gfx11510")]));
+        assert!(!strix_halo_host_signals("x86_64", [Some("NVIDIA GB100")]));
+    }
+
+    #[test]
+    fn selected_rocm_device_must_be_gfx1151_on_hybrid_amd_hosts() {
+        let discrete_first = r#"
+Agent 1
+  Name:                    AMD Ryzen Processor
+Agent 2
+  Name:                    gfx1100
+Agent 3
+  Name:                    gfx1151
+"#;
+        assert!(!selected_rocm_device_is_strix_halo(
+            discrete_first,
+            None,
+            None,
+            None,
+        ));
+        assert!(selected_rocm_device_is_strix_halo(
+            discrete_first,
+            Some("1"),
+            None,
+            None,
+        ));
+
+        let integrated_first = r#"
+Agent 1
+  Name:                    AMD Ryzen Processor
+Agent 2
+  Name:                    gfx1151
+Agent 3
+  Name:                    gfx1100
+"#;
+        assert!(selected_rocm_device_is_strix_halo(
+            integrated_first,
+            None,
+            None,
+            None,
+        ));
+        assert!(!selected_rocm_device_is_strix_halo(
+            integrated_first,
+            None,
+            Some("1"),
+            None,
+        ));
+        assert!(!selected_rocm_device_is_strix_halo(
+            integrated_first,
+            Some("-1"),
+            None,
+            None,
+        ));
+        assert!(!selected_rocm_device_is_strix_halo(
+            integrated_first,
+            Some(""),
+            None,
+            None,
+        ));
+        assert_eq!(
+            selected_rocm_device_status(integrated_first, Some(""), None, None),
+            SelectedRocmDeviceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn rocm_gpu_uuid_is_resolved_only_when_the_architecture_is_unambiguous() {
+        let single_strix = r#"
+Agent 1
+  Name:                    AMD Ryzen Processor
+Agent 2
+  Name:                    gfx1151
+"#;
+        assert_eq!(
+            selected_rocm_device_status(single_strix, Some("GPU-deadbeef"), None, None),
+            SelectedRocmDeviceStatus::StrixHalo
+        );
+
+        let hybrid = r#"
+Agent 1
+  Name:                    AMD Ryzen Processor
+Agent 2
+  Name:                    gfx1100
+Agent 3
+  Name:                    gfx1151
+"#;
+        assert_eq!(
+            selected_rocm_device_status(hybrid, Some("GPU-deadbeef"), None, None),
+            SelectedRocmDeviceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn strix_rocm_discovery_is_generic_only_for_a_confirmed_other_device() {
+        assert!(strict_strix_rocm_discovery(
+            true,
+            SelectedRocmDeviceStatus::StrixHalo
+        ));
+        assert!(strict_strix_rocm_discovery(
+            true,
+            SelectedRocmDeviceStatus::Unknown
+        ));
+        assert!(!strict_strix_rocm_discovery(
+            true,
+            SelectedRocmDeviceStatus::Other
+        ));
+        assert!(!strict_strix_rocm_discovery(
+            false,
+            SelectedRocmDeviceStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn specialized_strix_halo_artifact_keeps_its_profile_without_host_signals() {
+        assert!(strix_halo_profile_selected(true, true, false));
+        assert!(strix_halo_profile_selected(true, false, true));
+        assert!(!strix_halo_profile_selected(true, false, false));
+        assert!(!strix_halo_profile_selected(false, true, true));
+    }
+
+    #[cfg(feature = "release-linux-strix-halo")]
+    #[test]
+    fn specialized_strix_halo_feature_is_an_authoritative_current_host_signal() {
+        assert!(current_host_is_strix_halo());
+    }
+
+    #[test]
+    fn strix_halo_rocm_build_profile_is_targeted_without_spoofing() {
+        assert_eq!(
+            select_rocm_gpu_targets(true, None, None).as_deref(),
+            Some("gfx1151")
+        );
+        assert_eq!(
+            select_rocm_gpu_targets(true, Some(" gfx1100 "), Some("gfx1151")).as_deref(),
+            Some("gfx1100")
+        );
+        assert_eq!(
+            select_rocm_gpu_targets(true, Some("  "), Some("gfx942;gfx1151")).as_deref(),
+            Some("gfx942;gfx1151")
+        );
+        assert_eq!(select_rocm_gpu_targets(false, None, None), None);
+
+        assert_eq!(select_rocm_hip_no_vmm(true, None, None), Some(true));
+        assert_eq!(
+            select_rocm_hip_no_vmm(true, Some("off"), Some("on")),
+            Some(false)
+        );
+        assert_eq!(
+            select_rocm_hip_no_vmm(true, Some("invalid"), Some("0")),
+            Some(false)
+        );
+        assert_eq!(select_rocm_hip_no_vmm(false, None, None), None);
+
+        let overridden_detail =
+            format_strix_halo_rocm_profile_detail("gfx1100", Some(false), Some("0"));
+        assert!(overridden_detail.contains("GPU_TARGETS=gfx1100"));
+        assert!(overridden_detail.contains("HIP VMM enabled by explicit override"));
+        assert!(overridden_detail.contains("is present with value '0'"));
+        assert!(overridden_detail.contains("presence as an explicit experimental opt-in"));
+
+        let safe_default = format_strix_halo_rocm_profile_detail("gfx1151", Some(true), None);
+        assert!(safe_default.contains("HIP VMM disabled"));
+        assert!(safe_default.contains("does not enable this experimental switch automatically"));
     }
 
     #[test]
@@ -2121,6 +2773,76 @@ mod tests {
         let discovery = discover_llama_server(&store, LlamaCppMode::Cuda);
         assert_eq!(discovery.path.as_deref(), Some(cache_server.as_path()));
         assert_eq!(discovery.source, "managed cache");
+    }
+
+    #[test]
+    fn strix_halo_rocm_managed_cache_wins_over_generic_env_and_path() {
+        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_ROCM", "WERK_LLAMA_SERVER", "PATH"]);
+        let root = temp_root("strix-rocm-managed");
+        let generic = touch(root.join("generic").join(default_executable_name()));
+        let path_dir = root.join("path");
+        let _path_server = touch(path_dir.join(default_executable_name()));
+        let store = ModelStore::resolve(Some(root.join("werk-home"))).unwrap();
+        let managed = touch(
+            managed_backend_dir(&store, LlamaCppMode::Rocm)
+                .join("build")
+                .join("bin")
+                .join(default_executable_name()),
+        );
+        unsafe {
+            env::remove_var("WERK_LLAMA_SERVER_ROCM");
+            env::set_var("WERK_LLAMA_SERVER", &generic);
+            env::set_var("PATH", &path_dir);
+        }
+
+        let discovery = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        assert_eq!(discovery.path.as_deref(), Some(managed.as_path()));
+        assert_eq!(discovery.source, "managed cache");
+    }
+
+    #[test]
+    fn strix_halo_rocm_rejects_unverified_generic_servers_but_accepts_specific_env() {
+        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_ROCM", "WERK_LLAMA_SERVER", "PATH"]);
+        let root = temp_root("strix-rocm-specific");
+        let generic = touch(root.join("generic").join(default_executable_name()));
+        let path_dir = root.join("path");
+        let _path_server = touch(path_dir.join(default_executable_name()));
+        let specific = touch(root.join("specific").join(default_executable_name()));
+        let store = ModelStore::resolve(Some(root.join("werk-home"))).unwrap();
+        unsafe {
+            env::remove_var("WERK_LLAMA_SERVER_ROCM");
+            env::set_var("WERK_LLAMA_SERVER", &generic);
+            env::set_var("PATH", &path_dir);
+        }
+
+        let non_strix_device = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, false);
+        assert_eq!(non_strix_device.path.as_deref(), Some(generic.as_path()));
+        assert_eq!(non_strix_device.source, "env WERK_LLAMA_SERVER");
+
+        let rejected = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        assert_eq!(rejected.path, None);
+        assert_eq!(rejected.source, "missing");
+        assert!(
+            rejected
+                .attempts
+                .iter()
+                .any(|attempt| attempt.label.contains("not mode-specific"))
+        );
+        assert!(
+            rejected
+                .attempts
+                .iter()
+                .any(|attempt| attempt.label.contains("not mode-verified"))
+        );
+
+        unsafe {
+            env::set_var("WERK_LLAMA_SERVER_ROCM", &specific);
+        }
+        let accepted = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        assert_eq!(accepted.path.as_deref(), Some(specific.as_path()));
+        assert_eq!(accepted.source, "env WERK_LLAMA_SERVER_ROCM");
     }
 
     #[test]

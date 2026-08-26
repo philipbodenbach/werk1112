@@ -197,7 +197,7 @@ There is currently no <code>werk backend uninstall</code> command. See
 | <code>onnx-cuda</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
 | <code>onnx-rocm</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
 | <code>onnx-cpu</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
-| <code>vllm</code> | Creates an isolated virtual environment and installs vLLM with pip. On DGX Spark this target stops with container/remote-endpoint guidance instead of installing an unverified generic wheel. | Native Linux x86_64, Python/venv, pip, compatible PyTorch and accelerator stack. | Import/version and runtime health checks. |
+| <code>vllm</code> | Creates an isolated virtual environment and installs vLLM with pip on eligible generic Linux hosts. On DGX Spark and AMD Strix Halo this target stops with platform-specific container/environment guidance instead of installing an unverified generic wheel. | Native Linux x86_64, Python/venv, pip, compatible PyTorch and accelerator stack. | Import/version and runtime health checks. |
 | <code>qwen-tts</code> | Creates an isolated virtual environment and installs exactly qwen-tts 0.1.1. | Python 3.9+, venv, pip and platform-compatible PyTorch/audio dependencies. | Exact package version and Qwen3TTSModel import. |
 
 Important limitations:
@@ -216,24 +216,26 @@ Important limitations:
 The table distinguishes practical primary support from best-effort or
 upstream-unconfirmed paths.
 
-| Target | Native Linux x86_64 | Linux aarch64 / DGX Spark | WSL2 | Native Windows | macOS Apple Silicon |
-| --- | --- | --- | --- | --- | --- |
-| Werk release binary | x86_64 artifact | Spark-only arm64 `sm_121` artifact | Linux x86_64 artifact | x86_64 artifact | arm64 artifact |
-| llama CPU | Supported build path | Supported build path | Supported build path | Supported build path | Supported build path |
-| llama CUDA | Primary NVIDIA path | Primary GB10 path; build upstream natively | Best-effort Linux/CUDA path | Build path with CUDA toolchain | Not applicable |
-| llama ROCm | Primary practical ROCm path | Not applicable to GB10 | Not recommended | Not practically supported | Not applicable |
-| llama Vulkan | Build path with Vulkan SDK | Not a primary Spark path | Best effort | Build path with Vulkan SDK | Not a primary path |
-| llama Metal | Rejected | Rejected | Rejected | Rejected | Supported build path |
-| local vLLM | Eligible | Native-Linux eligible; ARM64 package/model support remains upstream-dependent | Installer allowed, local execution currently rejected/cautioned | Rejected | Rejected |
-| remote vLLM | Supported | Supported | Supported | Supported | Supported |
-| Qwen-TTS | CUDA is the primary documented path; CPU possible | Experimental/upstream-dependent | Experimental/upstream-unconfirmed | Experimental/upstream-unconfirmed | CPU/MPS experimental and upstream-unconfirmed |
-| ONNX targets | Requires matching runner bundle | Requires matching Linux aarch64 runner bundle | Requires matching Linux bundle | Requires matching Windows bundle | Requires matching macOS bundle |
+| Target | Native Linux x86_64 | AMD Strix Halo / `gfx1151` | Linux aarch64 / DGX Spark | WSL2 | Native Windows | macOS Apple Silicon |
+| --- | --- | --- | --- | --- | --- | --- |
+| Werk release binary | Generic x86_64 artifact | Backend-neutral Strix Halo x86_64 artifact | Spark-only arm64 `sm_121` artifact | Linux x86_64 artifact | x86_64 artifact | arm64 artifact |
+| llama CPU | Supported build path | Supported build path | Supported build path | Supported build path | Supported build path | Supported build path |
+| llama CUDA | Primary NVIDIA path | Not applicable | Primary GB10 path; build upstream natively | Best-effort Linux/CUDA path | Build path with CUDA toolchain | Not applicable |
+| llama ROCm | Primary practical ROCm path | Primary HIP path; real `gfx1151` smoke required | Not applicable to GB10 | Not recommended | Not practically supported | Not applicable |
+| llama Vulkan | Build path with Vulkan SDK | Implemented alternative; benchmark on target hardware | Not a primary Spark path | Best effort | Build path with Vulkan SDK | Not a primary path |
+| llama Metal | Rejected | Rejected | Rejected | Rejected | Rejected | Supported build path |
+| local vLLM | Eligible | Operator-provisioned ROCm environment only; generic managed pip install rejected | Native-Linux eligible; ARM64 package/model support remains upstream-dependent | Installer allowed, local execution currently rejected/cautioned | Rejected | Rejected |
+| remote vLLM | Supported | Supported; declare ROCm | Supported | Supported | Supported | Supported |
+| Qwen-TTS | CUDA is the primary documented path; CPU possible | ROCm/model dependent and hardware-unvalidated | Experimental/upstream-dependent | Experimental/upstream-unconfirmed | Experimental/upstream-unconfirmed | CPU/MPS experimental and upstream-unconfirmed |
+| ONNX targets | Requires matching runner bundle | Requires matching ROCm runner bundle | Requires matching Linux aarch64 runner bundle | Requires matching Linux bundle | Requires matching Windows bundle | Requires matching macOS bundle |
 
-Werk's release tooling produces artifacts for Linux x86_64, Linux aarch64/DGX
-Spark, Windows x86_64 and macOS arm64. The Spark artifact must be built and
-smoke-tested natively with a CUDA 13+ toolchain and targets GB10 compute
-capability 12.1 (`sm_121`). Windows arm64 and macOS x86_64 are not current
-release targets.
+Werk's release tooling produces profiles for generic Linux x86_64, AMD Strix
+Halo x86_64, Linux aarch64/DGX Spark, Windows x86_64 and macOS arm64. Both
+hardware profiles must be packaged and smoke-tested on their named host. The
+Spark artifact uses a CUDA 13+ toolchain and targets GB10 compute capability
+12.1 (`sm_121`); the Strix artifact remains backend-neutral and discovers ROCm
+or Vulkan companion runtimes later. Windows arm64 and macOS x86_64 are not
+current release targets.
 
 ### DGX Spark and Nemotron
 
@@ -248,6 +250,24 @@ detects GB10 and selects the architecture-specific CMake target. Werk's vLLM
 adapter remains text-only, so recognizing Nemotron-H does not imply support for
 Nemotron Omni image, audio or video inputs. See the complete
 [DGX Spark guide](integrations/dgx-spark.md).
+
+### AMD Strix Halo
+
+On Linux x86_64 Ryzen AI Max systems, Werk recognizes the Strix Halo CPU or
+the `gfx1151` ROCm agent. GGUF can use an external llama.cpp ROCm/HIP or Vulkan
+server. Supported safetensors text architectures, including eligible
+Nemotron-H repositories, can use a separately provisioned ROCm vLLM
+interpreter or endpoint. The generic managed vLLM pip install is deliberately
+disabled for this profile so it cannot install a CUDA-oriented or otherwise
+incompatible wheel.
+
+Strix Halo uses physically shared CPU/GPU memory. Model estimates must not add
+host RAM and GPU-visible capacity as independent pools, and CPU offload does
+not create another physical tier. The integration and diagnostics are
+implemented, but each runtime still requires a real `gfx1151` inference smoke
+before being called hardware-validated. NVIDIA NVFP4 checkpoints are not
+claimed as AMD-compatible. See the complete
+[Strix Halo guide](integrations/strix-halo.md).
 
 ### WSL and vLLM
 

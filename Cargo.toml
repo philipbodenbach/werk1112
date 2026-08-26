@@ -84,11 +84,13 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 vulkan = ["llama-legacy-vulkan"]
 
-# Release bundles stay one artifact per OS/architecture and compile the
-# platform accelerator path into that artifact. External/server backends
-# remain runtime-discovered and are not gated by these feature bundles.
+# Release bundles stay one artifact per platform profile. External/server
+# backends remain runtime-discovered and are not gated by these feature
+# bundles. The Strix Halo profile is deliberately backend-neutral: ROCm,
+# Vulkan and media runtimes are companion processes selected at runtime.
 release-linux = ["cuda"]
 release-linux-aarch64 = ["cuda"]
+release-linux-strix-halo = []
 release-windows = ["cuda"]
 release-macos-apple-silicon = ["metal"]
 

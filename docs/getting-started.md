@@ -12,12 +12,18 @@ Linux and macOS:
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/philipbodenbach/werk1112/main/scripts/install.sh)"
 ```
 
-The shell installer selects `linux-x86_64`, `linux-aarch64-dgx-spark`, or
-`macos-aarch64` from the current host. The ARM64 artifact is accepted only
-when `/proc/device-tree/model` or `nvidia-smi` identifies DGX Spark/GB10;
-other Linux ARM64 hosts must build from source. The installer verifies the
-published `.sha256` file before extracting any release archive. Models and
-CUDA-backed runtimes remain separate from the Werk binary.
+The shell installer selects `linux-x86_64`,
+`linux-x86_64-amd-strix-halo`, `linux-aarch64-dgx-spark`, or
+`macos-aarch64` from the current host. On Linux x86_64 it selects the Strix
+Halo profile only when specific CPU, DMI, Radeon 8050S/8060S/8040S, or
+`gfx1151` ROCm signals identify the host; other x86_64 systems keep the generic
+artifact. The ARM64
+artifact is accepted only when `/proc/device-tree/model` or `nvidia-smi`
+identifies DGX Spark/GB10; other Linux ARM64 hosts must build from source.
+The installer verifies the published `.sha256` file before extracting any
+release archive. Models and accelerator runtimes remain separate from the Werk
+binary. See the [Strix Halo](integrations/strix-halo.md) and
+[DGX Spark](integrations/dgx-spark.md) platform guides.
 
 The default destination is `$HOME/.local/bin`. Select a release or destination
 with environment variables:

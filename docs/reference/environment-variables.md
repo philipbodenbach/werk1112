@@ -65,6 +65,18 @@ The matching `werk serve` options override the resource-tuning variables.
 Managed CUDA builds additionally read `WERK_LLAMA_CUDA_COMPILER`,
 `WERK_LLAMA_CUDA_HOST_COMPILER`, and `WERK_LLAMA_CUDA_ARCH`.
 
+Managed ROCm llama.cpp builds read `WERK_LLAMA_ROCM_ARCH` before the upstream
+`GPU_TARGETS` value and `WERK_LLAMA_HIP_NO_VMM` before the upstream
+`GGML_HIP_NO_VMM` value. When the selected logical ROCm device on a detected
+Strix Halo host is `gfx1151`, their defaults are `gfx1151` and enabled
+respectively. Werk deliberately does not set llama.cpp's
+`GGML_CUDA_ENABLE_UNIFIED_MEMORY` variable on Strix Halo: current upstream
+gfx1151 behavior remains experimental, and llama.cpp treats the variable's
+presence as enabled even when its value is `0`. An operator can still opt in
+by setting the upstream variable explicitly. Werk does not set or recommend
+`HSA_OVERRIDE_GFX_VERSION`; the ROCm stack and binary must support the real
+`gfx1151` target.
+
 ## vLLM, ONNX, MLX and Transformers
 
 | Variable | Meaning |
@@ -73,7 +85,7 @@ Managed CUDA builds additionally read `WERK_LLAMA_CUDA_COMPILER`,
 | `WERK_VLLM_MODEL` | Served model ID for a remote vLLM endpoint. When omitted, Werk accepts an exact Werk-model-ID match or the endpoint's only advertised model; ambiguous endpoints fail instead of guessing. |
 | `WERK_VLLM_PYTHON` | Python interpreter for a local vLLM installation. |
 | `WERK_VLLM_ARGS` | Additional whitespace-split local vLLM arguments. |
-| `WERK_VLLM_HEALTH_TIMEOUT_SECONDS` | Positive cold-start readiness timeout for a Werk-supervised local server or explicitly configured remote endpoint. The default is 300 seconds, or 900 seconds on detected DGX Spark; this does not change request/inference timeouts. |
+| `WERK_VLLM_HEALTH_TIMEOUT_SECONDS` | Positive cold-start readiness timeout for a Werk-supervised local server or explicitly configured remote endpoint. The default is 300 seconds, or 900 seconds on detected DGX Spark and AMD Strix Halo; this does not change request/inference timeouts. |
 | `WERK_VLLM_LOG` | Truthy value enables child-runtime logging. |
 | `WERK_VLLM_ACCELERATOR=rocm` or `WERK_VLLM_ROCM=1` | Declares that a remote vLLM endpoint is ROCm-backed. This does not verify the remote server. |
 | `WERK_ONNX_RUNTIME_CUDA`, `WERK_ONNX_RUNTIME_ROCM`, `WERK_ONNX_RUNTIME_CPU` | Mode-specific `werk-onnx-runner` executable. |

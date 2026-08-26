@@ -7,17 +7,17 @@ use super::{
     companion::CompanionMediaBackend,
     helpers::{new_id, validate_safe_name, write_json_atomic},
     output::{OutputStore, output_metadata, remove_output_dir},
-    resources::detect_host_resources,
+    resources::{detect_host_resources, detected_memory_topology},
     types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome, RuntimeAttemptTiming},
 };
 use crate::{
     backend::validated_backend_install_command,
     inference::{
         EffectiveInferenceRequest, ExecutionDegradation, ExecutionPlan, HostResources,
-        InferenceRequest, ParameterSource, ParameterValue, PlanCandidateStatus, ResolutionContext,
-        ResolvedParameter, RuntimeAccelerator, TaskReadiness, TaskReadinessStatus,
-        WorkloadEstimate, classify_workload_fit, estimate_workload, parameter_schema,
-        parameter_schema_for_manifest, plan_execution, resolve_request,
+        InferenceRequest, MemoryTopology, ParameterSource, ParameterValue, PlanCandidateStatus,
+        ResolutionContext, ResolvedParameter, RuntimeAccelerator, TaskReadiness,
+        TaskReadinessStatus, WorkloadEstimate, classify_workload_fit, estimate_workload,
+        parameter_schema, parameter_schema_for_manifest, plan_execution, resolve_request,
     },
     media_companion::CompanionProtocolError,
     model_store::{ModelManifest, ModelStore, unix_ts},
@@ -510,9 +510,20 @@ impl InferenceService {
 }
 
 pub(super) fn resources_for_request(
-    mut resources: HostResources,
+    resources: HostResources,
     request: &EffectiveInferenceRequest,
 ) -> HostResources {
+    resources_for_request_with_topology_detector(resources, request, detected_memory_topology)
+}
+
+pub(super) fn resources_for_request_with_topology_detector<F>(
+    resources: HostResources,
+    request: &EffectiveInferenceRequest,
+    detect_topology: F,
+) -> HostResources
+where
+    F: FnOnce(RuntimeAccelerator) -> Option<MemoryTopology>,
+{
     let Some(requested) = request
         .string_parameter("routing.device")
         .map(str::trim)
@@ -533,11 +544,39 @@ pub(super) fn resources_for_request(
         .accelerator
         .as_deref()
         .map(normalized_accelerator_label);
+    let requested_topology = (detected.as_deref() != Some(requested.as_str()))
+        .then(|| detect_topology(runtime_accelerator_from_label(&requested)));
+    reconcile_requested_accelerator(resources, requested, requested_topology)
+}
+
+fn reconcile_requested_accelerator(
+    mut resources: HostResources,
+    requested: String,
+    replacement_topology: Option<Option<MemoryTopology>>,
+) -> HostResources {
+    let detected = resources
+        .accelerator
+        .as_deref()
+        .map(normalized_accelerator_label);
     if requested == "cpu" || detected.as_deref() != Some(requested.as_str()) {
         resources.accelerator_memory_bytes = None;
     }
+    if let Some(topology) = replacement_topology {
+        resources.memory_topology = topology;
+    }
     resources.accelerator = Some(requested);
     resources
+}
+
+fn runtime_accelerator_from_label(accelerator: &str) -> RuntimeAccelerator {
+    match normalized_accelerator_label(accelerator).as_str() {
+        "cpu" => RuntimeAccelerator::Cpu,
+        "cuda" => RuntimeAccelerator::Cuda,
+        "rocm" => RuntimeAccelerator::Rocm,
+        "metal" => RuntimeAccelerator::Mps,
+        "mlx" => RuntimeAccelerator::Mlx,
+        _ => RuntimeAccelerator::Other,
+    }
 }
 
 fn normalized_accelerator_label(accelerator: &str) -> String {

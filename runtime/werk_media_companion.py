@@ -1063,6 +1063,37 @@ def require_module(module_name, distribution=None, purpose=None):
         )
 
 
+def torch_hip_version(torch):
+    return getattr(getattr(torch, "version", None), "hip", None)
+
+
+def torch_gpu_architectures(torch):
+    """Return architectures reported by the active devices, not wheel targets."""
+    architectures = []
+    try:
+        device_count = int(torch.cuda.device_count())
+    except Exception:
+        return architectures
+    for index in range(device_count):
+        try:
+            properties = torch.cuda.get_device_properties(index)
+        except Exception:
+            continue
+        for name in ("gcnArchName", "gcn_arch_name"):
+            value = getattr(properties, name, None)
+            if value:
+                architectures.append(str(value))
+                break
+    return architectures
+
+
+def torch_is_strix_halo(torch):
+    return any(
+        "gfx1151" in architecture.lower()
+        for architecture in torch_gpu_architectures(torch)
+    )
+
+
 def accelerator_snapshot():
     snapshot = {
         "cpu": {
@@ -1089,7 +1120,7 @@ def accelerator_snapshot():
 
     torch_version = str(getattr(torch, "__version__", "unknown"))
     cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
-    hip_version = getattr(getattr(torch, "version", None), "hip", None)
+    hip_version = torch_hip_version(torch)
     try:
         torch_gpu_available = bool(torch.cuda.is_available())
     except Exception as error:
@@ -1109,6 +1140,17 @@ def accelerator_snapshot():
         except Exception as error:
             device_count = 0
             device_detail = f"GPU available; device detail unavailable: {error}"
+        architectures = torch_gpu_architectures(torch)
+        architecture_detail = (
+            f"; architecture(s): {', '.join(architectures)}"
+            if architectures
+            else ""
+        )
+        strix_detail = (
+            "; Strix Halo/gfx1151 detected; use FP16 (the validated ROCm precision) or auto"
+            if hip_version and torch_is_strix_halo(torch)
+            else ""
+        )
         kind = "rocm" if hip_version else "cuda"
         version = hip_version if hip_version else cuda_version
         snapshot[kind] = {
@@ -1116,6 +1158,7 @@ def accelerator_snapshot():
             "version": str(version) if version else None,
             "detail": (
                 f"torch {torch_version}; {device_count} device(s): {device_detail}"
+                f"{architecture_detail}{strix_detail}"
             ),
         }
         other = "cuda" if kind == "rocm" else "rocm"
@@ -2131,8 +2174,18 @@ def torch_runtime(parameters):
         or parameters.get("accelerator")
         or "auto"
     )
+    hip_version = torch_hip_version(torch)
+    try:
+        torch_gpu_available = bool(torch.cuda.is_available())
+    except Exception as error:
+        fail(
+            "accelerator_unavailable",
+            "PyTorch GPU availability check failed",
+            str(error),
+        )
+
     if requested in {"auto", ""}:
-        if bool(torch.cuda.is_available()):
+        if torch_gpu_available:
             device = "cuda"
         elif (
             getattr(torch.backends, "mps", None) is not None
@@ -2141,9 +2194,35 @@ def torch_runtime(parameters):
             device = "mps"
         else:
             device = "cpu"
-    elif requested in {"cuda", "rocm", "hip"}:
-        if not bool(torch.cuda.is_available()):
-            fail("accelerator_unavailable", f"{requested} was requested but torch reports no GPU")
+    elif requested == "cuda":
+        if hip_version:
+            fail(
+                "accelerator_unavailable",
+                "CUDA was requested, but the selected PyTorch environment is ROCm/HIP; use accelerator=rocm",
+                f"torch.version.hip={hip_version}",
+            )
+        if not torch_gpu_available:
+            fail("accelerator_unavailable", "CUDA was requested but torch reports no GPU")
+        device = "cuda"
+    elif requested in {"rocm", "hip"}:
+        if not hip_version:
+            cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+            detail = (
+                f"selected PyTorch is a CUDA build ({cuda_version})"
+                if cuda_version
+                else "torch.version.hip is not set"
+            )
+            fail(
+                "accelerator_unavailable",
+                "ROCm/HIP was requested, but the selected PyTorch environment is not ROCm-capable",
+                detail,
+            )
+        if not torch_gpu_available:
+            fail(
+                "accelerator_unavailable",
+                "ROCm/HIP was requested and torch.version.hip is set, but torch reports no GPU",
+                f"torch.version.hip={hip_version}",
+            )
         device = "cuda"
     elif requested in {"mps", "metal"}:
         if (

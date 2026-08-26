@@ -43,11 +43,12 @@ use crate::{
         TransformersCompatBackend, VllmBackend, backend_doctor_checks,
         backend_supports_accelerator, backend_supports_format,
         backend_supports_images as runtime_supports_images, candle_gguf_tokenizer_rejection,
-        install_managed_llama_server, install_managed_llama_server_with_options,
-        install_managed_onnx_runtime, install_managed_qwen_tts, install_managed_vllm,
-        llama_server_help_ok, managed_backend_dir, managed_runner_path as managed_onnx_runner_path,
-        managed_vllm_dir, probe_device, runtime_descriptor, runtime_registry,
-        runtime_supports_model, validated_backend_install_command, vllm_doctor_checks,
+        current_host_is_strix_halo, install_managed_llama_server,
+        install_managed_llama_server_with_options, install_managed_onnx_runtime,
+        install_managed_qwen_tts, install_managed_vllm, llama_server_help_ok, managed_backend_dir,
+        managed_runner_path as managed_onnx_runner_path, managed_vllm_dir, probe_device,
+        runtime_descriptor, runtime_registry, runtime_supports_model,
+        validated_backend_install_command, vllm_doctor_checks, vllm_rocm_signals,
     },
     banner::print_banner,
     capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
@@ -6765,20 +6766,28 @@ fn print_backend_list(store: &ModelStore) {
 }
 
 fn runtime_install_target_for_current_host(target: Option<&'static str>) -> Option<&'static str> {
-    runtime_install_target_for_platform(target, env::consts::OS, env::consts::ARCH)
+    runtime_install_target_for_platform(
+        target,
+        env::consts::OS,
+        env::consts::ARCH,
+        current_host_is_strix_halo(),
+    )
 }
 
 fn runtime_install_target_for_platform<'a>(
     target: Option<&'a str>,
     operating_system: &str,
     architecture: &str,
+    strix_halo: bool,
 ) -> Option<&'a str> {
     match target {
         // The managed vLLM installer is intentionally unavailable outside
         // Linux and on every Linux ARM64 host, including DGX Spark. Rendering
         // the static registry target there would contradict the actionable
         // runtime rejection printed beside it.
-        Some("vllm") if operating_system != "linux" || architecture == "aarch64" => None,
+        Some("vllm") if operating_system != "linux" || architecture == "aarch64" || strix_halo => {
+            None
+        }
         target => target,
     }
 }
@@ -7543,7 +7552,8 @@ fn build_concrete_backend(
         BackendChoice::MlxVlm => Ok(Arc::new(MlxVlmBackend::new(store))),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
         BackendChoice::TransformersCompat => Ok(Arc::new(TransformersCompatBackend::new(store))),
-        BackendChoice::Vllm | BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new(store))),
+        BackendChoice::Vllm => Ok(Arc::new(VllmBackend::new(store))),
+        BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new_rocm(store))),
     }
 }
 
@@ -7839,7 +7849,7 @@ fn backend_unavailability_reason(
         }
         BackendChoice::Vllm => VllmBackend::probe(store)
             .err()
-            .map(|_| VllmBackend::unavailable_reason(store)),
+            .map(|_| VllmBackend::cuda_unavailable_reason(store)),
         BackendChoice::VllmRocm => VllmBackend::probe_rocm(store)
             .err()
             .map(|_| VllmBackend::rocm_unavailable_reason(store)),
@@ -7892,7 +7902,8 @@ fn selected_backend_for_request(
     match backend {
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
-        | BackendChoice::Candle(CandleDeviceMode::Auto) => {
+        | BackendChoice::Candle(CandleDeviceMode::Auto)
+        | BackendChoice::Vllm => {
             select_backend_with_planner(store, backend, manifest, capabilities, selection_options)
         }
         BackendChoice::Candle(mode) => {
@@ -7914,7 +7925,6 @@ fn selected_backend_for_request(
         | BackendChoice::MlxVlm
         | BackendChoice::OnnxRuntime(_)
         | BackendChoice::TransformersCompat
-        | BackendChoice::Vllm
         | BackendChoice::VllmRocm => {
             let candidates = if matches!(backend, BackendChoice::Mlx) && has_images {
                 vec![RuntimeId::MlxVlm, RuntimeId::Mlx]
@@ -8051,13 +8061,41 @@ fn runtime_candidate_ids_for_selection(
     requested: RequestedBackend,
 ) -> Vec<RuntimeId> {
     let mut candidates = runtime_candidate_ids(manifest, requested);
+    if requested == RequestedBackend::Vllm
+        && manifest.format == ModelFormat::SafeTensors
+        && vllm_rocm_auto_probeable()
+        && !candidates.contains(&RuntimeId::VllmRocm)
+        && runtime_supports_model(
+            runtime_descriptor(RuntimeId::VllmRocm),
+            &manifest.format,
+            manifest.architecture.as_deref(),
+        )
+    {
+        candidates.insert(0, RuntimeId::VllmRocm);
+    }
     if requested == RequestedBackend::Auto
         && manifest.format == ModelFormat::Gguf
         && llama_rocm_auto_probeable(store)
         && !candidates.contains(&RuntimeId::LlamaServerRocm)
     {
-        let insert_at = llama_rocm_insert_position(&candidates);
+        let insert_at = if current_host_is_strix_halo() {
+            0
+        } else {
+            llama_rocm_insert_position(&candidates)
+        };
         candidates.insert(insert_at, RuntimeId::LlamaServerRocm);
+    }
+    if requested == RequestedBackend::Auto
+        && manifest.format == ModelFormat::SafeTensors
+        && vllm_rocm_auto_probeable()
+        && !candidates.contains(&RuntimeId::VllmRocm)
+        && runtime_supports_model(
+            runtime_descriptor(RuntimeId::VllmRocm),
+            &manifest.format,
+            manifest.architecture.as_deref(),
+        )
+    {
+        candidates.insert(0, RuntimeId::VllmRocm);
     }
     candidates
 }
@@ -8077,8 +8115,16 @@ fn llama_rocm_insert_position(candidates: &[RuntimeId]) -> usize {
 }
 
 fn llama_rocm_auto_probeable(store: &ModelStore) -> bool {
-    env::var_os("WERK_LLAMA_SERVER_ROCM").is_some()
+    current_host_is_strix_halo()
+        || env::var_os("WERK_LLAMA_SERVER_ROCM").is_some()
         || managed_backend_dir(store, LlamaCppMode::Rocm).exists()
+}
+
+fn vllm_rocm_auto_probeable() -> bool {
+    let accelerator = env::var("WERK_VLLM_ACCELERATOR").ok();
+    let legacy_rocm = env::var("WERK_VLLM_ROCM").ok();
+    current_host_is_strix_halo()
+        || vllm_rocm_signals(accelerator.as_deref(), legacy_rocm.as_deref())
 }
 
 fn should_auto_install_llama_server(mode: LlamaCppMode) -> bool {
@@ -8093,6 +8139,9 @@ fn runtime_unavailability_reason(
     selection_options: SelectionOptions,
 ) -> Option<String> {
     match runtime_id {
+        RuntimeId::VllmCuda => VllmBackend::probe(store)
+            .err()
+            .map(|_| VllmBackend::cuda_unavailable_reason(store)),
         RuntimeId::VllmRocm => VllmBackend::probe_rocm(store)
             .err()
             .map(|_| VllmBackend::rocm_unavailable_reason(store)),
@@ -10128,7 +10177,21 @@ mod tests {
             let store = test_store("gguf-auto-rocm-gating");
             let plain =
                 runtime_candidate_ids_for_selection(&store, &manifest, RequestedBackend::Auto);
-            assert!(!plain.contains(&RuntimeId::LlamaServerRocm));
+            assert_eq!(
+                plain.contains(&RuntimeId::LlamaServerRocm),
+                cfg!(feature = "release-linux-strix-halo")
+            );
+            if cfg!(feature = "release-linux-strix-halo") {
+                let rocm = plain
+                    .iter()
+                    .position(|id| *id == RuntimeId::LlamaServerRocm)
+                    .unwrap();
+                let cuda = plain
+                    .iter()
+                    .position(|id| *id == RuntimeId::LlamaServerCuda)
+                    .unwrap();
+                assert!(rocm < cuda);
+            }
 
             install_fake_managed_llama_server(&store, LlamaCppMode::Rocm);
             let gated =
@@ -10171,6 +10234,28 @@ mod tests {
             routing_candidates_for_debug(requested, &onnx),
             vec![RuntimeId::OnnxRuntimeRocm]
         );
+    }
+
+    #[test]
+    fn strix_profile_keeps_explicit_vllm_accelerator_provenance() {
+        if cfg!(feature = "release-linux-strix-halo") {
+            let store = test_store("strix-explicit-vllm-provenance");
+            let manifest = test_manifest(ModelFormat::SafeTensors, Some("nemotron_h"));
+            let candidates =
+                runtime_candidate_ids_for_selection(&store, &manifest, RequestedBackend::Vllm);
+
+            assert_eq!(candidates.first(), Some(&RuntimeId::VllmRocm));
+            assert!(candidates.contains(&RuntimeId::VllmCuda));
+
+            match selected_backend_for_manifest(&store, BackendChoice::Vllm, &manifest) {
+                Ok(selected) => assert!(matches!(selected, BackendChoice::VllmRocm)),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains("vLLM ROCm"), "{message}");
+                    assert!(message.contains("vLLM CUDA"), "{message}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -10329,8 +10414,12 @@ mod tests {
     #[test]
     fn vllm_install_hint_is_hidden_where_managed_install_is_unavailable() {
         assert_eq!(
-            runtime_install_target_for_platform(Some("vllm"), "linux", "x86_64"),
+            runtime_install_target_for_platform(Some("vllm"), "linux", "x86_64", false),
             Some("vllm")
+        );
+        assert_eq!(
+            runtime_install_target_for_platform(Some("vllm"), "linux", "x86_64", true),
+            None
         );
         for (operating_system, architecture) in [
             ("linux", "aarch64"),
@@ -10338,12 +10427,17 @@ mod tests {
             ("macos", "aarch64"),
         ] {
             assert_eq!(
-                runtime_install_target_for_platform(Some("vllm"), operating_system, architecture,),
+                runtime_install_target_for_platform(
+                    Some("vllm"),
+                    operating_system,
+                    architecture,
+                    false,
+                ),
                 None
             );
         }
         assert_eq!(
-            runtime_install_target_for_platform(Some("llama-cuda"), "linux", "aarch64"),
+            runtime_install_target_for_platform(Some("llama-cuda"), "linux", "aarch64", false,),
             Some("llama-cuda")
         );
     }

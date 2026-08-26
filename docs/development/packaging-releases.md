@@ -1,8 +1,7 @@
 # Packaging and releasing Werk1112
 
 Werk1112's release tooling produces one router artifact for each configured
-operating-system and architecture pair. It does not produce a separate archive
-for every backend.
+platform profile. It does not produce a separate archive for every backend.
 Runtime availability is determined later from compiled Werk features, managed
 backend installations, host-installed runtimes and configured remote services.
 
@@ -26,6 +25,7 @@ installation.
 | Platform | Cargo alias | Binary | Release archive |
 | --- | --- | --- | --- |
 | Linux x86_64 | `cargo +stable build-linux` | `target/x86_64-unknown-linux-gnu/release/werk` | `werk1112-v<VERSION>-linux-x86_64.tar.gz` |
+| Linux x86_64 / AMD Strix Halo | `cargo +stable build-linux-strix-halo` | `target/x86_64-unknown-linux-gnu/release/werk` | `werk1112-v<VERSION>-linux-x86_64-amd-strix-halo.tar.gz` |
 | Linux aarch64 / DGX Spark | `cargo +stable build-linux-aarch64` | `target/aarch64-unknown-linux-gnu/release/werk` | `werk1112-v<VERSION>-linux-aarch64-dgx-spark.tar.gz` |
 | Windows 10/11 x64 | `cargo +stable build-windows` or `scripts/build-windows.ps1` | `target/x86_64-pc-windows-msvc/release/werk.exe` | `werk1112-v<VERSION>-windows-x86_64.zip` |
 | macOS Apple Silicon | `cargo +stable build-macos-apple-silicon` | `target/aarch64-apple-darwin/release/werk` | `werk1112-v<VERSION>-macos-aarch64.tar.gz` |
@@ -68,6 +68,7 @@ The configured Rust target alone does not provide a foreign linker, SDK or
 accelerator toolchain. Unless a complete cross-compilation environment exists:
 
 - package Linux x86_64 from native x86_64 Linux or WSL;
+- package the Strix Halo profile natively on AMD Ryzen AI Max/`gfx1151`;
 - package Linux aarch64 natively on DGX Spark/GB10;
 - package Windows from native Windows Developer PowerShell;
 - package macOS from Apple Silicon macOS.
@@ -96,6 +97,31 @@ The shell script:
    `sha256sum` is unavailable.
 
 It requires `tar` in addition to the build prerequisites.
+
+## AMD Strix Halo / Linux x86_64 package
+
+Run the Strix Halo packaging branch natively on a Ryzen AI Max release host:
+
+~~~bash
+./scripts/package-release.sh linux-strix-halo
+~~~
+
+It invokes `cargo build-linux-strix-halo`, selects the backend-neutral
+`release-linux-strix-halo` feature, stages the normal three files and writes:
+
+~~~text
+releases/werk1112-v<VERSION>-linux-x86_64-amd-strix-halo.tar.gz
+releases/werk1112-v<VERSION>-linux-x86_64-amd-strix-halo.tar.gz.sha256
+~~~
+
+Before invoking Cargo, the packager requires native Linux x86_64 plus a
+specific Ryzen AI Max/Strix Halo signal from CPU or DMI identity, a matching
+Radeon 8050S/8060S/8040S identity, or a `gfx1151` agent from
+`rocm_agent_enumerator`/`rocminfo`. A generic x86_64 builder cannot
+label its output as Strix Halo merely because the Rust target matches. The
+gate verifies host identity, not working ROCm kernels; complete the
+[hardware smoke gate](../integrations/strix-halo.md#hardware-release-smoke-gate)
+before publishing.
 
 ## DGX Spark / Linux aarch64 package
 
@@ -162,20 +188,11 @@ The shell packager also accepts a `windows` argument and uses `zip`, but it
 still invokes the Windows Cargo alias. The native PowerShell entry point is the
 documented path for normal Windows releases.
 
-## The `all` option
-
-The shell script accepts:
-
-~~~bash
-./scripts/package-release.sh all
-~~~
-
-This means “run the Linux x86_64, Linux aarch64, Windows and macOS packaging
-branches in sequence.”
-It does not install cross-compilers or bypass native SDK requirements. On an
-ordinary single-platform host it will normally stop when the first foreign
-target cannot build. Use it only in an environment deliberately configured for
-all four targets; otherwise package each artifact on its matching host.
+There is intentionally no aggregate `all` mode. Strix Halo and DGX Spark
+artifacts require mutually exclusive native hardware identities, while the
+Windows and macOS artifacts require their own platform SDKs. Build each
+artifact on its matching host and aggregate the checksum-verified files in the
+release workflow.
 
 ## Local output layout
 
@@ -185,6 +202,8 @@ For package version `1.3.3`, the generated tree is:
 releases/
 ├── werk1112-v1.3.3-linux-x86_64.tar.gz
 ├── werk1112-v1.3.3-linux-x86_64.tar.gz.sha256
+├── werk1112-v1.3.3-linux-x86_64-amd-strix-halo.tar.gz
+├── werk1112-v1.3.3-linux-x86_64-amd-strix-halo.tar.gz.sha256
 ├── werk1112-v1.3.3-linux-aarch64-dgx-spark.tar.gz
 ├── werk1112-v1.3.3-linux-aarch64-dgx-spark.tar.gz.sha256
 ├── werk1112-v1.3.3-windows-x86_64.zip
@@ -203,6 +222,7 @@ Inspect Unix archive contents:
 
 ~~~bash
 tar -tzf releases/werk1112-v<VERSION>-linux-x86_64.tar.gz
+tar -tzf releases/werk1112-v<VERSION>-linux-x86_64-amd-strix-halo.tar.gz
 tar -tzf releases/werk1112-v<VERSION>-linux-aarch64-dgx-spark.tar.gz
 tar -tzf releases/werk1112-v<VERSION>-macos-aarch64.tar.gz
 ~~~
@@ -248,7 +268,7 @@ whose tag is `v<VERSION>`:
 
 | Installer | Supported downloads |
 | --- | --- |
-| `scripts/install.sh` | `linux-x86_64` on Linux x86_64; `linux-aarch64-dgx-spark` only when Linux arm64 identifies DGX Spark/GB10; `macos-aarch64` on Apple Silicon macOS |
+| `scripts/install.sh` | `linux-x86_64` on generic Linux x86_64; `linux-x86_64-amd-strix-halo` when specific CPU, DMI, Radeon 8050S/8060S/8040S, or `gfx1151` signals identify Strix Halo; `linux-aarch64-dgx-spark` only when Linux arm64 identifies DGX Spark/GB10; `macos-aarch64` on Apple Silicon macOS |
 | `scripts/install.ps1` | `windows-x86_64` on native Windows |
 
 Both installers accept `WERK_VERSION` with or without a leading `v`. When it is
@@ -270,7 +290,7 @@ create a GitHub release or upload artifacts.
 4. Inspect archive contents and verify every checksum.
 5. Smoke-test the extracted binary on the target operating system.
 6. Create the matching `v<VERSION>` release tag.
-7. Upload all four archives and their four checksum files to the GitHub
+7. Upload all five archives and their five checksum files to the GitHub
    release.
 8. Test each public installer against that release.
 
@@ -281,7 +301,8 @@ externally orchestrated release process.
 ## Known packaging limitations
 
 - no automatic multi-platform release workflow in this repository;
-- `package-release.sh all` is not a portable cross-build environment;
+- no single-host aggregate package command; each profile is built on its
+  matching host;
 - archives include the root README but not the complete documentation tree;
 - the scripts do not produce SBOM, signature or provenance attestations;
 - package validation checks archive construction, not inference on every

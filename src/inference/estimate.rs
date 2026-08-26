@@ -284,7 +284,7 @@ pub fn estimate_workload(
     let mut recommendations = Vec::new();
     if resources.memory_topology == Some(MemoryTopology::Unified) {
         assumptions.push(
-            "host MemAvailable is the conservative available capacity of the shared CPU/GPU unified-memory pool"
+            "host MemAvailable is treated as the conservative host-visible capacity within the shared CPU/GPU unified-memory system"
                 .to_string(),
         );
         let uses_accelerator = resources.accelerator.as_deref().is_some_and(|accelerator| {
@@ -295,13 +295,21 @@ pub fn estimate_workload(
         });
         if uses_accelerator {
             if resources.accelerator_memory_bytes.is_none() {
-                warnings.push(
-                    "DGX Spark unified memory has no independently reported VRAM capacity; accelerator fit remains unknown and CPU offload does not create a separate memory pool"
-                        .to_string(),
-                );
+                if unified_shared_capacity_oom(Some(accelerator_peak), resources) {
+                    warnings.push(format!(
+                        "estimated accelerator peak of {} reaches or exceeds the unified-memory host-visible hard bound of {}",
+                        format_memory_bytes(accelerator_peak),
+                        format_memory_bytes(resources.host_memory_bytes.unwrap_or_default())
+                    ));
+                } else {
+                    warnings.push(
+                        "unified-memory hardware has no independently reported accelerator-memory capacity; accelerator fit remains unknown and CPU offload does not create an independent memory pool"
+                            .to_string(),
+                    );
+                }
             } else {
                 warnings.push(
-                    "the configured accelerator-memory limit is part of DGX Spark's shared unified-memory pool, not additional discrete VRAM"
+                    "the configured accelerator-memory limit belongs to the same unified-memory system and is not added to host memory"
                         .to_string(),
                 );
             }
@@ -442,10 +450,11 @@ pub(crate) fn classify_workload_fit(
     let accelerator_oom = accelerator_peak
         .zip(resources.accelerator_memory_bytes)
         .is_some_and(|(peak, limit)| peak >= limit);
+    let unified_shared_oom = unified_shared_capacity_oom(accelerator_peak, resources);
     let host_oom = host_peak
         .zip(resources.host_memory_bytes)
         .is_some_and(|(peak, limit)| peak >= limit);
-    if accelerator_oom || host_oom {
+    if accelerator_oom || unified_shared_oom || host_oom {
         return FitAssessment::LikelyOom;
     }
     let accelerator_ratio = accelerator_peak
@@ -477,4 +486,12 @@ pub(crate) fn classify_workload_fit(
     } else {
         FitAssessment::Fits
     }
+}
+
+fn unified_shared_capacity_oom(accelerator_peak: Option<u64>, resources: &HostResources) -> bool {
+    resources.memory_topology == Some(MemoryTopology::Unified)
+        && resources.accelerator_memory_bytes.is_none()
+        && accelerator_peak
+            .zip(resources.host_memory_bytes)
+            .is_some_and(|(peak, limit)| peak >= limit)
 }

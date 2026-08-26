@@ -19,16 +19,19 @@ use super::{
     },
     jobs::{JobStatus, JobStore},
     output::OutputStore,
-    service::{InferenceService, complete_backend_fit, resources_for_request},
+    service::{
+        InferenceService, complete_backend_fit, resources_for_request,
+        resources_for_request_with_topology_detector,
+    },
     types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome},
 };
 use crate::{
     capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
     inference::{
         EffectiveInferenceRequest, EstimateConfidence, FitAssessment, HostResources,
-        InferenceRequest, InferenceRuntimeCandidate, ParameterPolicy, ParameterSource,
-        ParameterSupportStatus, ParameterValue, ResolutionContext, RoutingOverrides,
-        RuntimeAccelerator, TaskReadiness, TaskReadinessStatus, WorkloadEstimate,
+        InferenceRequest, InferenceRuntimeCandidate, MemoryTopology, ParameterPolicy,
+        ParameterSource, ParameterSupportStatus, ParameterValue, ResolutionContext,
+        RoutingOverrides, RuntimeAccelerator, TaskReadiness, TaskReadinessStatus, WorkloadEstimate,
         classify_workload_fit, resolve_request,
     },
     model_store::{ModelManifest, ModelStore, unix_ts},
@@ -930,6 +933,61 @@ fn explicit_cpu_device_takes_precedence_over_cuda_accelerator_for_resources() {
 
     assert_eq!(resources.accelerator.as_deref(), Some("cpu"));
     assert_eq!(resources.accelerator_memory_bytes, None);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_cuda_route_clears_auto_detected_rocm_unified_topology() {
+    let (root, store) = image_store("cuda-resource-topology-scope");
+    let manifest = store.get("flux").unwrap();
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("CUDA route".to_string());
+    request.routing.accelerator = Some("cuda".to_string());
+    let effective = resolve_request(&manifest, request, &ResolutionContext::default()).unwrap();
+    let resources = resources_for_request_with_topology_detector(
+        HostResources {
+            host_memory_bytes: Some(96 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: None,
+            accelerator: Some("rocm".to_string()),
+            memory_topology: Some(MemoryTopology::Unified),
+        },
+        &effective,
+        |accelerator| {
+            assert_eq!(accelerator, RuntimeAccelerator::Cuda);
+            None
+        },
+    );
+
+    assert_eq!(resources.accelerator.as_deref(), Some("cuda"));
+    assert_eq!(resources.memory_topology, None);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_rocm_route_recomputes_selected_strix_unified_topology() {
+    let (root, store) = image_store("rocm-resource-topology-scope");
+    let manifest = store.get("flux").unwrap();
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("ROCm route".to_string());
+    request.routing.accelerator = Some("rocm".to_string());
+    let effective = resolve_request(&manifest, request, &ResolutionContext::default()).unwrap();
+    let resources = resources_for_request_with_topology_detector(
+        HostResources {
+            host_memory_bytes: Some(96 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: Some(24 * 1024 * 1024 * 1024),
+            accelerator: Some("cuda".to_string()),
+            memory_topology: None,
+        },
+        &effective,
+        |accelerator| {
+            assert_eq!(accelerator, RuntimeAccelerator::Rocm);
+            Some(MemoryTopology::Unified)
+        },
+    );
+
+    assert_eq!(resources.accelerator.as_deref(), Some("rocm"));
+    assert_eq!(resources.accelerator_memory_bytes, None);
+    assert_eq!(resources.memory_topology, Some(MemoryTopology::Unified));
     let _ = fs::remove_dir_all(root);
 }
 

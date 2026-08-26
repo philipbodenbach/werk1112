@@ -1000,6 +1000,49 @@ fn cuda_fit_stays_unknown_without_detected_vram_unless_host_is_already_oom() {
 }
 
 #[test]
+fn unified_memory_uses_memavailable_as_accelerator_hard_bound() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let resources = HostResources {
+        host_memory_bytes: Some(96 * GIB),
+        accelerator_memory_bytes: None,
+        accelerator: Some("rocm".to_string()),
+        memory_topology: Some(MemoryTopology::Unified),
+    };
+
+    assert_eq!(
+        classify_workload_fit(Some(120 * GIB), Some(20 * GIB), &resources),
+        FitAssessment::LikelyOom
+    );
+}
+
+#[test]
+fn unified_workload_estimate_blocks_accelerator_peak_above_shared_hard_bound() {
+    let manifest = image_manifest();
+    let effective = resolve_request(&manifest, request(), &ResolutionContext::default()).unwrap();
+    let shared_limit = 1024 * 1024 * 1024;
+    let estimate = estimate_workload(
+        &manifest,
+        &effective,
+        &HostResources {
+            host_memory_bytes: Some(shared_limit),
+            accelerator_memory_bytes: None,
+            accelerator: Some("rocm".to_string()),
+            memory_topology: Some(MemoryTopology::Unified),
+        },
+    );
+
+    assert!(estimate.host_peak_bytes.unwrap() < shared_limit);
+    assert!(estimate.accelerator_peak_bytes.unwrap() >= shared_limit);
+    assert_eq!(estimate.fit, FitAssessment::LikelyOom);
+    assert!(
+        estimate
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unified-memory host-visible hard bound"))
+    );
+}
+
+#[test]
 fn unified_memory_estimate_is_explicit_about_unknown_accelerator_fit() {
     let manifest = image_manifest();
     let effective = resolve_request(&manifest, request(), &ResolutionContext::default()).unwrap();
@@ -1020,13 +1063,13 @@ fn unified_memory_estimate_is_explicit_about_unknown_accelerator_fit() {
         estimate
             .assumptions
             .iter()
-            .any(|value| value.contains("shared CPU/GPU unified-memory pool"))
+            .any(|value| value.contains("shared CPU/GPU unified-memory system"))
     );
     assert!(
         estimate
             .warnings
             .iter()
-            .any(|value| value.contains("no independently reported VRAM capacity"))
+            .any(|value| value.contains("no independently reported accelerator-memory capacity"))
     );
 
     let cpu_estimate = estimate_workload(
@@ -1043,7 +1086,27 @@ fn unified_memory_estimate_is_explicit_about_unknown_accelerator_fit() {
         !cpu_estimate
             .warnings
             .iter()
-            .any(|value| value.contains("no independently reported VRAM capacity"))
+            .any(|value| value.contains("no independently reported accelerator-memory capacity"))
+    );
+
+    let configured_limit_estimate = estimate_workload(
+        &manifest,
+        &effective,
+        &HostResources {
+            host_memory_bytes: Some(128 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: Some(96 * 1024 * 1024 * 1024),
+            accelerator: Some("rocm".to_string()),
+            memory_topology: Some(MemoryTopology::Unified),
+        },
+    );
+    assert!(configured_limit_estimate.warnings.iter().any(|value| {
+        value.contains("same unified-memory system") && value.contains("not added to host memory")
+    }));
+    assert!(
+        configured_limit_estimate
+            .warnings
+            .iter()
+            .all(|value| !value.contains("DGX Spark"))
     );
 }
 

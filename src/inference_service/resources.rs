@@ -4,10 +4,16 @@ use std::{env, fs};
 #[cfg(not(target_os = "macos"))]
 use std::{path::Path, process::Command, sync::OnceLock};
 
-use crate::inference::{HostResources, MemoryTopology, RuntimeAccelerator};
+use crate::{
+    backend::{current_host_is_strix_halo, current_selected_rocm_device_is_strix_halo},
+    inference::{HostResources, MemoryTopology, RuntimeAccelerator},
+};
 
 #[cfg(any(not(target_os = "macos"), test))]
-const CUDA_DEVICE_PATHS: [&str; 3] = ["/dev/nvidiactl", "/dev/nvidia0", "/dev/dxg"];
+const NVIDIA_DEVICE_PATHS: [&str; 2] = ["/dev/nvidiactl", "/dev/nvidia0"];
+
+#[cfg(any(not(target_os = "macos"), test))]
+const WSL_DXG_DEVICE_PATH: &str = "/dev/dxg";
 
 #[cfg(any(not(target_os = "macos"), test))]
 const MEBIBYTE_BYTES: u64 = 1024 * 1024;
@@ -27,7 +33,7 @@ pub fn detect_host_resources() -> HostResources {
             .map(|kib| kib.saturating_mul(1024))
     });
     let accelerator = detected_accelerator();
-    let memory_topology = detected_memory_topology();
+    let memory_topology = detected_memory_topology(accelerator);
     let configured_accelerator_memory_bytes = env::var("WERK_ACCELERATOR_MEMORY_BYTES")
         .ok()
         .and_then(|value| value.parse().ok());
@@ -65,13 +71,29 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn detected_memory_topology() -> Option<MemoryTopology> {
-    is_dgx_spark_environment().then_some(MemoryTopology::Unified)
+pub(super) fn detected_memory_topology(accelerator: RuntimeAccelerator) -> Option<MemoryTopology> {
+    memory_topology_for_platform(
+        accelerator,
+        is_dgx_spark_environment(),
+        current_selected_rocm_device_is_strix_halo(),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detected_memory_topology() -> Option<MemoryTopology> {
+pub(super) fn detected_memory_topology(_accelerator: RuntimeAccelerator) -> Option<MemoryTopology> {
     None
+}
+
+fn memory_topology_for_platform(
+    accelerator: RuntimeAccelerator,
+    dgx_spark: bool,
+    selected_rocm_strix_halo: bool,
+) -> Option<MemoryTopology> {
+    if dgx_spark {
+        return Some(MemoryTopology::Unified);
+    }
+    (selected_rocm_strix_halo && accelerator == RuntimeAccelerator::Rocm)
+        .then_some(MemoryTopology::Unified)
 }
 
 #[cfg(target_os = "linux")]
@@ -296,21 +318,38 @@ pub(super) fn detected_accelerator() -> RuntimeAccelerator {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let cuda = !cuda_visibility_disables_accelerator()
-            && (CUDA_DEVICE_PATHS
+        let nvidia = !cuda_visibility_disables_accelerator()
+            && (NVIDIA_DEVICE_PATHS
                 .iter()
                 .any(|path| Path::new(path).exists())
-                || accelerator_env_is_enabled("CUDA_VISIBLE_DEVICES")
-                || accelerator_env_is_enabled("NVIDIA_VISIBLE_DEVICES")
                 || nvidia_smi_memory_bytes().is_some());
-        let rocm =
-            Path::new("/dev/kfd").exists() || accelerator_env_is_enabled("ROCR_VISIBLE_DEVICES");
-        accelerator_from_hardware_signals(cuda, rocm)
+        // ROCm also honors CUDA_VISIBLE_DEVICES as an isolation alias. Keep
+        // that and /dev/dxg as compatibility signals, but do not mistake them
+        // for proof of an NVIDIA device on a detected Strix Halo host.
+        let cuda = !cuda_visibility_disables_accelerator()
+            && (nvidia
+                || Path::new(WSL_DXG_DEVICE_PATH).exists()
+                || accelerator_env_is_enabled("CUDA_VISIBLE_DEVICES")
+                || accelerator_env_is_enabled("NVIDIA_VISIBLE_DEVICES"));
+        let rocr_visible = env::var("ROCR_VISIBLE_DEVICES").ok();
+        let hip_visible = env::var("HIP_VISIBLE_DEVICES").ok();
+        let cuda_visible = env::var("CUDA_VISIBLE_DEVICES").ok();
+        let rocm = rocm_available_from_signals(
+            Path::new("/dev/kfd").exists(),
+            rocr_visible.as_deref(),
+            hip_visible.as_deref(),
+            cuda_visible.as_deref(),
+        );
+        accelerator_from_platform_signals(current_host_is_strix_halo(), nvidia, cuda, rocm)
     }
 }
 
 pub(super) fn configured_media_accelerator() -> Option<RuntimeAccelerator> {
     let value = env::var("WERK_MEDIA_ACCELERATOR").ok()?;
+    configured_media_accelerator_from_value(&value)
+}
+
+fn configured_media_accelerator_from_value(value: &str) -> Option<RuntimeAccelerator> {
     if value.trim().is_empty() {
         return None;
     }
@@ -337,6 +376,34 @@ fn accelerator_env_is_enabled(name: &str) -> bool {
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
+fn rocm_available_from_signals(
+    kfd_available: bool,
+    rocr_visible_devices: Option<&str>,
+    hip_visible_devices: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+) -> bool {
+    let selected_visibility = [
+        rocr_visible_devices,
+        hip_visible_devices,
+        cuda_visible_devices,
+    ]
+    .into_iter()
+    .flatten()
+    .next();
+    if selected_visibility.is_some_and(visibility_value_disables_accelerator) {
+        return false;
+    }
+    kfd_available
+        || rocr_visible_devices.is_some_and(visibility_value_enables_accelerator)
+        || hip_visible_devices.is_some_and(visibility_value_enables_accelerator)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn visibility_value_enables_accelerator(value: &str) -> bool {
+    !visibility_value_disables_accelerator(value)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
 fn accelerator_from_hardware_signals(
     cuda_available: bool,
     rocm_available: bool,
@@ -350,9 +417,49 @@ fn accelerator_from_hardware_signals(
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
+fn accelerator_from_platform_signals(
+    strix_halo: bool,
+    nvidia_available: bool,
+    cuda_compatible_signal: bool,
+    rocm_available: bool,
+) -> RuntimeAccelerator {
+    if strix_halo && rocm_available && !nvidia_available {
+        RuntimeAccelerator::Rocm
+    } else {
+        accelerator_from_hardware_signals(cuda_compatible_signal, rocm_available)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strix_halo_unified_memory_applies_only_to_the_integrated_rocm_path() {
+        assert_eq!(
+            memory_topology_for_platform(RuntimeAccelerator::Rocm, false, true),
+            Some(MemoryTopology::Unified)
+        );
+        assert_eq!(
+            memory_topology_for_platform(RuntimeAccelerator::Cuda, false, true),
+            None
+        );
+        assert_eq!(
+            memory_topology_for_platform(RuntimeAccelerator::Cpu, false, true),
+            None
+        );
+
+        let probe_called = std::cell::Cell::new(false);
+        let cuda_topology = memory_topology_for_platform(RuntimeAccelerator::Cuda, false, true);
+        let cuda_memory =
+            select_accelerator_memory_bytes(RuntimeAccelerator::Cuda, None, cuda_topology, || {
+                probe_called.set(true);
+                Some(24 * 1024 * 1024 * 1024)
+            });
+        assert!(probe_called.get());
+        assert_eq!(cuda_memory, Some(24 * 1024 * 1024 * 1024));
+    }
 
     #[test]
     fn spark_detection_requires_arm64_and_an_exact_spark_or_gb10_signal() {
@@ -418,10 +525,60 @@ mod tests {
 
     #[test]
     fn wsl_dxg_cuda_signal_selects_cuda() {
-        assert!(CUDA_DEVICE_PATHS.contains(&"/dev/dxg"));
+        assert_eq!(WSL_DXG_DEVICE_PATH, "/dev/dxg");
         assert_eq!(
             accelerator_from_hardware_signals(true, false),
             RuntimeAccelerator::Cuda
+        );
+    }
+
+    #[test]
+    fn strix_halo_prefers_real_rocm_over_ambiguous_cuda_visibility() {
+        assert_eq!(
+            accelerator_from_platform_signals(true, false, true, true),
+            RuntimeAccelerator::Rocm
+        );
+        assert_eq!(
+            accelerator_from_platform_signals(false, false, true, true),
+            RuntimeAccelerator::Cuda,
+            "non-Strix hosts preserve the existing CUDA-first compatibility policy"
+        );
+        assert_eq!(
+            memory_topology_for_platform(RuntimeAccelerator::Rocm, false, true),
+            Some(MemoryTopology::Unified)
+        );
+    }
+
+    #[test]
+    fn explicit_rocm_visibility_masks_override_kfd_presence() {
+        for mask in ["", "-1", "none", "disabled", "void"] {
+            assert!(!rocm_available_from_signals(true, Some(mask), None, None));
+            assert!(!rocm_available_from_signals(true, None, Some(mask), None));
+        }
+        assert!(!rocm_available_from_signals(true, None, None, Some("-1")));
+        assert!(rocm_available_from_signals(true, None, None, None));
+        assert!(rocm_available_from_signals(false, Some("0"), None, None));
+        assert!(rocm_available_from_signals(
+            true,
+            Some("0"),
+            Some(""),
+            Some("-1")
+        ));
+    }
+
+    #[test]
+    fn strix_halo_with_a_real_nvidia_gpu_keeps_cuda_and_discrete_memory() {
+        assert_eq!(
+            accelerator_from_platform_signals(true, true, true, true),
+            RuntimeAccelerator::Cuda
+        );
+        assert_eq!(
+            memory_topology_for_platform(RuntimeAccelerator::Cuda, false, true),
+            None
+        );
+        assert_eq!(
+            configured_media_accelerator_from_value("cuda"),
+            Some(RuntimeAccelerator::Cuda)
         );
     }
 

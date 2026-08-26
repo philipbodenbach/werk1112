@@ -16,24 +16,51 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     BackendDoctorCheck, ChatGenerationSession, GenerateRequest, GenerateResponse, GenerateStream,
-    GenerateStreamEvent, GenerationBackend, GenerationTimings,
+    GenerateStreamEvent, GenerationBackend, GenerationTimings, SelectedRocmDeviceStatus,
+    current_host_is_strix_halo, current_selected_rocm_device_is_strix_halo,
+    current_selected_rocm_device_status,
 };
 use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
 
 const DEFAULT_HEALTH_TIMEOUT_SECONDS: u64 = 300;
 const DGX_SPARK_HEALTH_TIMEOUT_SECONDS: u64 = 900;
+const STRIX_HALO_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HEALTH_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const WSL_VLLM_MESSAGE: &str = "vLLM is a Linux-native runtime. Your environment appears to be WSL, where vLLM can fail because required GPU memory features such as UVA/CUDA IPC are unavailable. Werk will fall back to Candle CUDA. For best vLLM support use native Linux or a remote vLLM server.";
 const DGX_SPARK_VLLM_MESSAGE: &str = "DGX Spark detected (Linux aarch64 / GB10). Use NVIDIA's Spark-compatible vLLM container and expose its OpenAI endpoint, then set WERK_VLLM_HOST, WERK_VLLM_PORT, and, when its served name differs from the Werk model ID, WERK_VLLM_MODEL. A generic managed `pip install vllm` is intentionally not offered on DGX Spark.";
+const STRIX_HALO_VLLM_MESSAGE: &str = "AMD Strix Halo detected (Linux x86_64 / gfx1151). A generic managed `pip install vllm` is intentionally not offered because Strix Halo requires a matching ROCm vLLM build. Use an official ROCm vLLM container and set WERK_VLLM_HOST plus WERK_VLLM_PORT, or set WERK_VLLM_PYTHON to a preprovisioned Python whose PyTorch reports both torch.version.hip and gfx1151. Set WERK_VLLM_ACCELERATOR=rocm (or WERK_VLLM_ROCM=1) for a remote ROCm endpoint.";
 const LINUX_ARM64_MANAGED_VLLM_MESSAGE: &str = "Linux aarch64 detected without a verified DGX Spark/GB10 signal. Werk does not offer a generic managed `pip install vllm` on ARM64 because the compatible wheel/container depends on the concrete platform. Use a vendor-supported runtime and set WERK_VLLM_PYTHON, or expose an OpenAI-compatible vLLM endpoint and set WERK_VLLM_HOST plus WERK_VLLM_PORT.";
 
 #[derive(Clone)]
 pub struct VllmBackend {
     store: ModelStore,
+    accelerator: VllmAccelerator,
     servers: Arc<Mutex<HashMap<String, Arc<VllmProcess>>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VllmAccelerator {
+    Cuda,
+    Rocm,
+}
+
+impl VllmAccelerator {
+    fn backend_label(self) -> &'static str {
+        match self {
+            Self::Cuda => "vllm-cuda",
+            Self::Rocm => "vllm-rocm",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Cuda => "CUDA",
+            Self::Rocm => "ROCm",
+        }
+    }
 }
 
 struct VllmProcess {
@@ -48,6 +75,7 @@ struct VllmProcess {
     url: String,
     pid: Option<u32>,
     log_tail: Arc<Mutex<VecDeque<String>>>,
+    accelerator: VllmAccelerator,
 }
 
 struct VllmChatSession {
@@ -99,8 +127,17 @@ struct VllmCompletion {
 
 impl VllmBackend {
     pub fn new(store: ModelStore) -> Self {
+        Self::new_with_accelerator(store, VllmAccelerator::Cuda)
+    }
+
+    pub fn new_rocm(store: ModelStore) -> Self {
+        Self::new_with_accelerator(store, VllmAccelerator::Rocm)
+    }
+
+    fn new_with_accelerator(store: ModelStore, accelerator: VllmAccelerator) -> Self {
         Self {
             store,
+            accelerator,
             servers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -114,6 +151,7 @@ impl VllmBackend {
             bail!("{}", missing_vllm_message(&discovery));
         };
         ensure_vllm_platform_eligible(command)?;
+        vllm_cuda_capability(command)?;
         match command {
             VllmCommand::Remote { host, port } => Ok(if remote_discovery_ready(&discovery) {
                 format!("vLLM OpenAI server at http://{host}:{port}")
@@ -159,12 +197,21 @@ impl VllmBackend {
     }
 
     pub fn unavailable_reason(store: &ModelStore) -> String {
+        Self::cuda_unavailable_reason(store)
+    }
+
+    pub fn cuda_unavailable_reason(store: &ModelStore) -> String {
         let discovery = discover_vllm(store);
         if let Some(reason) = local_vllm_platform_rejection_for_discovery(&discovery) {
             return reason.to_string();
         }
         if let Some(command) = discovery.command.as_ref()
             && let Err(err) = ensure_vllm_platform_eligible(command)
+        {
+            return compact_error(&err.to_string());
+        }
+        if let Some(command) = discovery.command.as_ref()
+            && let Err(err) = vllm_cuda_capability(command)
         {
             return compact_error(&err.to_string());
         }
@@ -222,6 +269,7 @@ impl VllmBackend {
             manifest,
             &model_dir,
             discovery,
+            self.accelerator,
         )?);
         let load_seconds = started.elapsed().as_secs_f64();
         self.servers
@@ -356,6 +404,7 @@ impl VllmProcess {
         manifest: &ModelManifest,
         model_dir: &Path,
         discovery: VllmDiscovery,
+        accelerator: VllmAccelerator,
     ) -> Result<Self> {
         let discovery = if discovery.command.is_some() {
             discovery
@@ -366,9 +415,13 @@ impl VllmProcess {
             .command
             .clone()
             .context("vLLM discovery had no command")?;
+        match accelerator {
+            VllmAccelerator::Cuda => vllm_cuda_capability(&command)?,
+            VllmAccelerator::Rocm => vllm_rocm_capability(&command)?,
+        };
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
         if let VllmCommand::Remote { host, port } = command {
-            eprintln!("Using remote vLLM backend");
+            eprintln!("Using remote vLLM {} backend", accelerator.display_name());
             let url = format!("http://{host}:{port}");
             let configured_model = configured_vllm_model()?;
             let timeout = configured_vllm_health_timeout(current_vllm_platform()).duration;
@@ -390,11 +443,12 @@ impl VllmProcess {
                 url,
                 pid: None,
                 log_tail,
+                accelerator,
             };
             return Ok(process);
         }
 
-        eprintln!("Using vLLM CUDA backend");
+        eprintln!("Using vLLM {} backend", accelerator.display_name());
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         let args = vllm_server_args(&command, model_dir, &manifest.id, port);
@@ -434,6 +488,7 @@ impl VllmProcess {
             url,
             pid: Some(pid),
             log_tail,
+            accelerator,
         };
         process.wait_until_ready()?;
         Ok(process)
@@ -573,7 +628,7 @@ impl VllmProcess {
         if !request.debug {
             return;
         }
-        eprintln!("selected backend: vllm-cuda");
+        eprintln!("selected backend: {}", self.accelerator.backend_label());
         eprintln!("actual engine: vLLM OpenAI-compatible server");
         eprintln!("vLLM executable: {}", self.command_label);
         eprintln!("discovery source: {}", self.discovery_source);
@@ -1275,19 +1330,16 @@ pub fn vllm_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
         ok: health.healthy,
         detail: format!("{}: {}", health.health_label, health.detail),
     });
-    if matches!(discovery.command, Some(VllmCommand::Remote { .. })) {
-        checks.push(BackendDoctorCheck {
-            name: "local NVIDIA visibility".to_string(),
-            ok: true,
-            detail: "not required for a remote vLLM endpoint".to_string(),
-        });
-    } else {
-        checks.push(command_check(
-            "nvidia-smi",
-            &[],
-            "required to verify CUDA visibility for local vLLM",
-        ));
-    }
+    let (accelerator_ok, accelerator_detail) = discovery
+        .command
+        .as_ref()
+        .map(vllm_accelerator_capability_detail)
+        .unwrap_or_else(|| (false, "no vLLM runtime discovered".to_string()));
+    checks.push(BackendDoctorCheck {
+        name: "vLLM accelerator capability".to_string(),
+        ok: accelerator_ok,
+        detail: accelerator_detail,
+    });
     checks.push(BackendDoctorCheck {
         name: "vLLM version".to_string(),
         ok: discovery.command.is_some(),
@@ -1298,6 +1350,18 @@ pub fn vllm_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
             .unwrap_or_else(|| "unknown".to_string()),
     });
     checks
+}
+
+fn vllm_accelerator_capability_detail(command: &VllmCommand) -> (bool, String) {
+    let cuda = vllm_cuda_capability(command);
+    let rocm = vllm_rocm_capability(command);
+    let ok = cuda.is_ok() || rocm.is_ok();
+    let detail = format!(
+        "CUDA: {}; ROCm: {}",
+        cuda.unwrap_or_else(|error| compact_error(&error.to_string())),
+        rocm.unwrap_or_else(|error| compact_error(&error.to_string()))
+    );
+    (ok, detail)
 }
 
 fn vllm_health(discovery: &VllmDiscovery) -> VllmHealthStatus {
@@ -1387,6 +1451,7 @@ fn ensure_vllm_platform_eligible(command: &VllmCommand) -> Result<()> {
 enum VllmPlatform {
     NativeLinux,
     DgxSpark,
+    StrixHalo,
     Wsl,
     NativeWindows,
     Macos,
@@ -1399,6 +1464,11 @@ fn current_vllm_platform() -> VllmPlatform {
             VllmPlatform::Wsl
         } else if is_dgx_spark_environment() {
             VllmPlatform::DgxSpark
+        } else if strix_halo_vllm_profile_selected(
+            current_host_is_strix_halo(),
+            current_selected_rocm_device_status(),
+        ) {
+            VllmPlatform::StrixHalo
         } else {
             VllmPlatform::NativeLinux
         }
@@ -1411,9 +1481,16 @@ fn current_vllm_platform() -> VllmPlatform {
     }
 }
 
+fn strix_halo_vllm_profile_selected(
+    strix_halo_host: bool,
+    selected_device: SelectedRocmDeviceStatus,
+) -> bool {
+    strix_halo_host && selected_device != SelectedRocmDeviceStatus::Other
+}
+
 fn local_vllm_platform_rejection(platform: VllmPlatform) -> Option<&'static str> {
     match platform {
-        VllmPlatform::NativeLinux | VllmPlatform::DgxSpark => None,
+        VllmPlatform::NativeLinux | VllmPlatform::DgxSpark | VllmPlatform::StrixHalo => None,
         VllmPlatform::Wsl => Some(WSL_VLLM_MESSAGE),
         VllmPlatform::NativeWindows => Some(
             "vLLM is a Linux-native runtime. Native Windows local vLLM is not eligible. Use native Linux or a remote vLLM server.",
@@ -1433,6 +1510,7 @@ fn managed_vllm_install_rejection_for(
 ) -> Option<&'static str> {
     match platform {
         VllmPlatform::DgxSpark => Some(DGX_SPARK_VLLM_MESSAGE),
+        VllmPlatform::StrixHalo => Some(STRIX_HALO_VLLM_MESSAGE),
         VllmPlatform::NativeLinux | VllmPlatform::Wsl if architecture == "aarch64" => {
             Some(LINUX_ARM64_MANAGED_VLLM_MESSAGE)
         }
@@ -1516,6 +1594,7 @@ fn vllm_platform_detail(platform: VllmPlatform) -> &'static str {
     match platform {
         VllmPlatform::NativeLinux => "native Linux; local or remote vLLM is eligible",
         VllmPlatform::DgxSpark => DGX_SPARK_VLLM_MESSAGE,
+        VllmPlatform::StrixHalo => STRIX_HALO_VLLM_MESSAGE,
         VllmPlatform::Wsl => WSL_VLLM_MESSAGE,
         VllmPlatform::NativeWindows => "native Windows; use a remote Linux vLLM OpenAI endpoint",
         VllmPlatform::Macos => "macOS; use a remote Linux vLLM OpenAI endpoint",
@@ -1531,10 +1610,10 @@ fn configured_vllm_health_timeout(platform: VllmPlatform) -> VllmHealthTimeout {
 }
 
 fn vllm_health_timeout_for(platform: VllmPlatform, raw: Option<&str>) -> VllmHealthTimeout {
-    let default_seconds = if platform == VllmPlatform::DgxSpark {
-        DGX_SPARK_HEALTH_TIMEOUT_SECONDS
-    } else {
-        DEFAULT_HEALTH_TIMEOUT_SECONDS
+    let default_seconds = match platform {
+        VllmPlatform::DgxSpark => DGX_SPARK_HEALTH_TIMEOUT_SECONDS,
+        VllmPlatform::StrixHalo => STRIX_HALO_HEALTH_TIMEOUT_SECONDS,
+        _ => DEFAULT_HEALTH_TIMEOUT_SECONDS,
     };
     match raw {
         None => VllmHealthTimeout {
@@ -1542,10 +1621,10 @@ fn vllm_health_timeout_for(platform: VllmPlatform, raw: Option<&str>) -> VllmHea
             valid: true,
             detail: format!(
                 "{default_seconds}s default{}; override with WERK_VLLM_HEALTH_TIMEOUT_SECONDS",
-                if platform == VllmPlatform::DgxSpark {
-                    " for DGX Spark cold starts"
-                } else {
-                    ""
+                match platform {
+                    VllmPlatform::DgxSpark => " for DGX Spark cold starts",
+                    VllmPlatform::StrixHalo => " for Strix Halo ROCm cold starts",
+                    _ => "",
                 }
             ),
         },
@@ -1688,6 +1767,7 @@ fn configured_remote_vllm(
 
 fn discover_vllm(store: &ModelStore) -> VllmDiscovery {
     let mut attempts = Vec::new();
+    let platform = current_vllm_platform();
 
     match configured_remote_vllm_from_env() {
         Ok(Some(config)) => {
@@ -1739,6 +1819,10 @@ fn discover_vllm(store: &ModelStore) -> VllmDiscovery {
     }
 
     if let Some(path) = env::var_os("WERK_VLLM_PYTHON").map(PathBuf::from) {
+        // Discovery verifies only the vLLM API surface. The selected runtime
+        // candidate performs CUDA/ROCm (and gfx1151) validation separately so
+        // a hybrid Strix host can use a CUDA dGPU or another AMD GPU without
+        // inheriting the integrated-device profile.
         let (usable, detail) = python_vllm_status(&path);
         attempts.push(VllmDiscoveryAttempt {
             label: "WERK_VLLM_PYTHON".to_string(),
@@ -1754,6 +1838,22 @@ fn discover_vllm(store: &ModelStore) -> VllmDiscovery {
                 attempts,
             };
         }
+    }
+
+    if platform == VllmPlatform::StrixHalo {
+        attempts.push(VllmDiscoveryAttempt {
+            label: "automatic local vLLM discovery".to_string(),
+            path: None,
+            exists: false,
+            usable: false,
+            detail: "disabled on Strix Halo; set WERK_VLLM_PYTHON to an explicitly provisioned ROCm vLLM environment reporting gfx1151, or configure WERK_VLLM_HOST/WERK_VLLM_PORT"
+                .to_string(),
+        });
+        return VllmDiscovery {
+            command: None,
+            source: "Strix Halo requires explicit ROCm vLLM configuration".to_string(),
+            attempts,
+        };
     }
 
     let managed_python = managed_vllm_python(store);
@@ -1864,6 +1964,19 @@ fn missing_vllm_message(discovery: &VllmDiscovery) -> String {
         message.push_str(
             "\n- managed `werk backend install vllm` is intentionally unavailable on DGX Spark",
         );
+    } else if platform == VllmPlatform::StrixHalo {
+        message.push_str(
+            "\n- set WERK_VLLM_PYTHON=/path/to/python-with-rocm-vllm; its PyTorch must report torch.version.hip and gfx1151",
+        );
+        message.push_str(
+            "\n- or start an official ROCm vLLM container and set WERK_VLLM_HOST plus WERK_VLLM_PORT",
+        );
+        message.push_str(
+            "\n- set WERK_VLLM_ACCELERATOR=rocm (or WERK_VLLM_ROCM=1) for a remote ROCm endpoint",
+        );
+        message.push_str(
+            "\n- generic managed `werk backend install vllm` is intentionally unavailable on Strix Halo",
+        );
     } else if managed_vllm_install_rejection_for(platform, env::consts::ARCH)
         == Some(LINUX_ARM64_MANAGED_VLLM_MESSAGE)
     {
@@ -1893,6 +2006,19 @@ fn concise_vllm_unavailable_reason_for_platform(
     }
     if platform == VllmPlatform::DgxSpark {
         return DGX_SPARK_VLLM_MESSAGE.to_string();
+    }
+    if platform == VllmPlatform::StrixHalo {
+        if let Some(attempt) = discovery
+            .attempts
+            .iter()
+            .find(|attempt| attempt.label == "WERK_VLLM_PYTHON" && !attempt.usable)
+        {
+            return format!(
+                "WERK_VLLM_PYTHON is not a verified Strix Halo ROCm runtime: {}",
+                attempt.detail
+            );
+        }
+        return STRIX_HALO_VLLM_MESSAGE.to_string();
     }
     if discovery.attempts.is_empty() {
         return "No vLLM runtime found; run: werk backend install vllm".to_string();
@@ -1943,16 +2069,52 @@ fn python_vllm_status(path: &Path) -> (bool, String) {
     }
 }
 
+fn python_cuda_status(path: &Path) -> (bool, String) {
+    if !path.is_file() {
+        return (false, "Python path does not exist".to_string());
+    }
+    match Command::new(path)
+        .arg("-c")
+        .arg(cuda_python_probe_script())
+        .output()
+    {
+        Ok(output) if output.status.success() => (
+            true,
+            format!(
+                "PyTorch CUDA runtime detected ({})",
+                String::from_utf8_lossy(&output.stdout).trim()
+            ),
+        ),
+        Ok(output) => (
+            false,
+            command_failure_detail("Python does not expose a CUDA PyTorch stack", &output),
+        ),
+        Err(err) => (false, format!("failed to run Python: {err}")),
+    }
+}
+
+fn cuda_python_probe_script() -> &'static str {
+    r#"
+import vllm
+import vllm.entrypoints.openai.api_server
+import torch
+
+hip = getattr(getattr(torch, "version", None), "hip", None)
+assert not hip, f"torch.version.hip is set ({hip}); this is a ROCm runtime, not CUDA"
+cuda = getattr(getattr(torch, "version", None), "cuda", None)
+assert cuda, "torch.version.cuda is not set"
+assert torch.cuda.is_available(), "CUDA PyTorch reports no GPU"
+print(cuda)
+"#
+}
+
 fn python_rocm_status(path: &Path) -> (bool, String) {
     if !path.is_file() {
         return (false, "Python path does not exist".to_string());
     }
     match Command::new(path)
         .arg("-c")
-        .arg(
-            "import torch; hip = getattr(torch.version, 'hip', None); \
-             assert hip, 'torch.version.hip is not set'; print(hip)",
-        )
+        .arg(rocm_python_probe_script())
         .output()
     {
         Ok(output) if output.status.success() => (
@@ -1970,10 +2132,74 @@ fn python_rocm_status(path: &Path) -> (bool, String) {
     }
 }
 
+fn rocm_python_probe_script() -> &'static str {
+    r#"
+import vllm
+import vllm.entrypoints.openai.api_server
+import torch
+
+hip = getattr(getattr(torch, "version", None), "hip", None)
+assert hip, "torch.version.hip is not set"
+assert torch.cuda.is_available(), "ROCm PyTorch reports no visible GPU"
+assert int(torch.cuda.device_count()) > 0, "ROCm PyTorch reports zero logical GPUs"
+print(hip)
+"#
+}
+
+fn python_strix_halo_status(path: &Path) -> (bool, String) {
+    if !path.is_file() {
+        return (false, "Python path does not exist".to_string());
+    }
+    let script = strix_halo_python_probe_script();
+    match Command::new(path).arg("-c").arg(script).output() {
+        Ok(output) if output.status.success() => (
+            true,
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ),
+        Ok(output) => (
+            false,
+            command_failure_detail(
+                "Python is not a verified Strix Halo ROCm vLLM environment",
+                &output,
+            ),
+        ),
+        Err(err) => (false, format!("failed to run Python: {err}")),
+    }
+}
+
+fn strix_halo_python_probe_script() -> &'static str {
+    r#"
+import vllm
+import vllm.entrypoints.openai.api_server
+import torch
+
+hip = getattr(getattr(torch, "version", None), "hip", None)
+assert hip, "torch.version.hip is not set (CUDA PyTorch is not a Strix Halo runtime)"
+assert torch.cuda.is_available(), "ROCm PyTorch reports no GPU"
+assert int(torch.cuda.device_count()) > 0, "ROCm PyTorch reports no logical GPU"
+
+properties = torch.cuda.get_device_properties(0)
+architecture = ""
+for name in ("gcnArchName", "gcn_arch_name"):
+    value = getattr(properties, name, None)
+    if value:
+        architecture = str(value)
+        break
+
+assert "gfx1151" in architecture.lower(), \
+    "selected logical ROCm device 0 is not gfx1151: " + (architecture or "<unknown>")
+print(f"vLLM ROCm/HIP {hip}; gfx1151; FP16 is the validated Strix Halo precision")
+"#
+}
+
 fn vllm_rocm_capability(command: &VllmCommand) -> Result<String> {
     match command {
         VllmCommand::Python(path) => {
-            let (usable, detail) = python_rocm_status(path);
+            let (usable, detail) = if current_selected_rocm_device_is_strix_halo() {
+                python_strix_halo_status(path)
+            } else {
+                python_rocm_status(path)
+            };
             if usable {
                 Ok(detail)
             } else {
@@ -2002,18 +2228,54 @@ fn vllm_rocm_capability(command: &VllmCommand) -> Result<String> {
     }
 }
 
-fn remote_rocm_explicitly_confirmed() -> bool {
-    env::var("WERK_VLLM_ACCELERATOR")
-        .map(|value| value.eq_ignore_ascii_case("rocm") || value.eq_ignore_ascii_case("hip"))
-        .unwrap_or(false)
-        || env::var("WERK_VLLM_ROCM")
-            .map(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on" | "rocm" | "hip"
+fn vllm_cuda_capability(command: &VllmCommand) -> Result<String> {
+    vllm_cuda_capability_for(command, remote_rocm_explicitly_confirmed())
+}
+
+fn vllm_cuda_capability_for(command: &VllmCommand, remote_rocm: bool) -> Result<String> {
+    match command {
+        VllmCommand::Python(path) => {
+            let (usable, detail) = python_cuda_status(path);
+            if usable {
+                Ok(detail)
+            } else {
+                bail!(
+                    "vLLM is installed, but the Python environment is not CUDA-capable: {detail}. Install vLLM with a CUDA PyTorch build or select --backend rocm for a ROCm environment."
                 )
-            })
-            .unwrap_or(false)
+            }
+        }
+        VllmCommand::Remote { host, port } => {
+            if remote_rocm {
+                bail!(
+                    "remote vLLM endpoint at http://{host}:{port} is explicitly marked ROCm-backed and cannot satisfy the CUDA runtime candidate"
+                )
+            }
+            Ok(format!(
+                "remote vLLM endpoint at http://{host}:{port} is not marked ROCm-backed and is treated as CUDA"
+            ))
+        }
+        VllmCommand::Executable(path) => Ok(format!(
+            "vLLM executable {} uses the default CUDA runtime route",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn vllm_rocm_signals(accelerator: Option<&str>, legacy_rocm: Option<&str>) -> bool {
+    accelerator
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "rocm" | "hip"))
+        || legacy_rocm.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "rocm" | "hip"
+            )
+        })
+}
+
+fn remote_rocm_explicitly_confirmed() -> bool {
+    let accelerator = env::var("WERK_VLLM_ACCELERATOR").ok();
+    let legacy_rocm = env::var("WERK_VLLM_ROCM").ok();
+    vllm_rocm_signals(accelerator.as_deref(), legacy_rocm.as_deref())
 }
 
 fn executable_supports_vllm(path: &Path) -> bool {
@@ -2503,30 +2765,6 @@ fn run_command(command: &mut Command, context: &str) -> Result<()> {
     Ok(())
 }
 
-fn command_check(command: &str, args: &[&str], detail: &str) -> BackendDoctorCheck {
-    match Command::new(command).args(args).output() {
-        Ok(output) if output.status.success() => BackendDoctorCheck {
-            name: command.to_string(),
-            ok: true,
-            detail: String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or(detail)
-                .to_string(),
-        },
-        Ok(output) => BackendDoctorCheck {
-            name: command.to_string(),
-            ok: false,
-            detail: format!("{detail}; command exited with {}", output.status),
-        },
-        Err(err) => BackendDoctorCheck {
-            name: command.to_string(),
-            ok: false,
-            detail: format!("{detail}; {err}"),
-        },
-    }
-}
-
 fn find_bootstrap_python() -> Option<PathBuf> {
     env::var_os("WERK_VLLM_PYTHON")
         .map(PathBuf::from)
@@ -2978,6 +3216,7 @@ mod tests {
         assert!(reason.contains("Werk will fall back to Candle CUDA"));
         assert!(reason.contains("remote vLLM server"));
         assert!(local_vllm_platform_rejection(VllmPlatform::NativeLinux).is_none());
+        assert!(local_vllm_platform_rejection(VllmPlatform::StrixHalo).is_none());
     }
 
     #[test]
@@ -3017,6 +3256,13 @@ mod tests {
         assert!(spark.contains("DGX Spark detected"));
         assert!(spark.contains("Spark-compatible vLLM container"));
         assert!(spark.contains("intentionally not offered"));
+
+        let strix = managed_vllm_install_rejection_for(VllmPlatform::StrixHalo, "x86_64").unwrap();
+        assert!(strix.contains("Strix Halo detected"));
+        assert!(strix.contains("ROCm vLLM"));
+        assert!(strix.contains("torch.version.hip"));
+        assert!(strix.contains("gfx1151"));
+        assert!(strix.contains("intentionally not offered"));
 
         let windows =
             managed_vllm_install_rejection_for(VllmPlatform::NativeWindows, "x86_64").unwrap();
@@ -3132,7 +3378,58 @@ mod tests {
     }
 
     #[test]
-    fn vllm_health_timeout_defaults_are_spark_aware_and_overrideable() {
+    fn missing_vllm_on_strix_halo_recommends_explicit_rocm_not_managed_pip() {
+        let discovery = VllmDiscovery {
+            command: None,
+            source: "missing".to_string(),
+            attempts: Vec::new(),
+        };
+        let detail =
+            concise_vllm_unavailable_reason_for_platform(&discovery, VllmPlatform::StrixHalo);
+        assert!(detail.contains("WERK_VLLM_PYTHON"));
+        assert!(detail.contains("WERK_VLLM_HOST"));
+        assert!(detail.contains("WERK_VLLM_ACCELERATOR=rocm"));
+        assert!(detail.contains("gfx1151"));
+        assert!(detail.contains("intentionally not offered"));
+        assert!(!detail.contains("run: werk backend install vllm"));
+
+        let invalid_python = VllmDiscovery {
+            command: None,
+            source: "Strix Halo requires explicit ROCm vLLM configuration".to_string(),
+            attempts: vec![VllmDiscoveryAttempt {
+                label: "WERK_VLLM_PYTHON".to_string(),
+                path: Some(PathBuf::from("/tmp/python")),
+                exists: true,
+                usable: false,
+                detail: "torch.version.hip is not set".to_string(),
+            }],
+        };
+        let detail =
+            concise_vllm_unavailable_reason_for_platform(&invalid_python, VllmPlatform::StrixHalo);
+        assert!(detail.contains("not a verified Strix Halo ROCm runtime"));
+        assert!(detail.contains("torch.version.hip is not set"));
+    }
+
+    #[test]
+    fn rocm_environment_signals_are_normalized_consistently() {
+        for value in ["rocm", "ROCM", " hip "] {
+            assert!(vllm_rocm_signals(Some(value), None));
+        }
+        for value in ["1", "true", "YES", " on ", "rocm", "HIP"] {
+            assert!(vllm_rocm_signals(None, Some(value)));
+        }
+        for (accelerator, legacy) in [
+            (Some("cuda"), None),
+            (Some("1"), None),
+            (None, Some("0")),
+            (None, Some("false")),
+        ] {
+            assert!(!vllm_rocm_signals(accelerator, legacy));
+        }
+    }
+
+    #[test]
+    fn vllm_health_timeout_defaults_are_unified_memory_aware_and_overrideable() {
         let linux = vllm_health_timeout_for(VllmPlatform::NativeLinux, None);
         assert_eq!(linux.duration, Duration::from_secs(300));
         assert!(linux.valid);
@@ -3140,6 +3437,10 @@ mod tests {
         let spark = vllm_health_timeout_for(VllmPlatform::DgxSpark, None);
         assert_eq!(spark.duration, Duration::from_secs(900));
         assert!(spark.detail.contains("DGX Spark cold starts"));
+
+        let strix = vllm_health_timeout_for(VllmPlatform::StrixHalo, None);
+        assert_eq!(strix.duration, Duration::from_secs(900));
+        assert!(strix.detail.contains("Strix Halo ROCm cold starts"));
 
         let overridden = vllm_health_timeout_for(VllmPlatform::DgxSpark, Some("1800"));
         assert_eq!(overridden.duration, Duration::from_secs(1800));
@@ -3282,6 +3583,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn vllm_rocm_capability_accepts_python_with_hip_stack() {
+        let probe = rocm_python_probe_script();
+        assert!(probe.contains("torch.cuda.is_available()"));
+        assert!(probe.contains("torch.cuda.device_count()"));
+
         let python = fake_python("rocm-ok", "printf '6.3.0\\n'\nexit 0\n");
         let detail = vllm_rocm_capability(&VllmCommand::Python(python)).unwrap();
         assert!(detail.contains("PyTorch ROCm/HIP runtime detected"));
@@ -3299,6 +3604,71 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("not ROCm-capable"));
         assert!(message.contains("ROCm/HIP PyTorch"));
+
+        let python = fake_python(
+            "rocm-masked",
+            "printf 'ROCm PyTorch reports no visible GPU\\n' >&2\nexit 1\n",
+        );
+        let (usable, detail) = python_rocm_status(&python);
+        assert!(!usable);
+        assert!(detail.contains("no visible GPU"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vllm_cuda_capability_rejects_hip_python_and_rocm_remote() {
+        let probe = cuda_python_probe_script();
+        assert!(probe.contains("assert not hip"));
+        assert!(probe.contains("torch.version.cuda is not set"));
+
+        let python = fake_python(
+            "cuda-is-hip",
+            "printf 'torch.version.hip is set (6.3); this is a ROCm runtime, not CUDA\\n' >&2\nexit 1\n",
+        );
+        let error = vllm_cuda_capability_for(&VllmCommand::Python(python), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not CUDA-capable"));
+        assert!(error.contains("ROCm runtime, not CUDA"));
+
+        let remote = VllmCommand::Remote {
+            host: "strix-vllm".to_string(),
+            port: 8000,
+        };
+        assert!(vllm_cuda_capability_for(&remote, false).is_ok());
+        let error = vllm_cuda_capability_for(&remote, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicitly marked ROCm-backed"));
+        assert!(error.contains("cannot satisfy the CUDA runtime candidate"));
+    }
+
+    #[test]
+    fn vllm_backend_constructors_preserve_selected_accelerator() {
+        assert_eq!(
+            VllmBackend::new(test_store("vllm-cuda-constructor")).accelerator,
+            VllmAccelerator::Cuda
+        );
+        assert_eq!(
+            VllmBackend::new_rocm(test_store("vllm-rocm-constructor")).accelerator,
+            VllmAccelerator::Rocm
+        );
+    }
+
+    #[test]
+    fn strix_vllm_profile_is_relaxed_only_for_a_confirmed_other_device() {
+        assert!(strix_halo_vllm_profile_selected(
+            true,
+            SelectedRocmDeviceStatus::StrixHalo
+        ));
+        assert!(strix_halo_vllm_profile_selected(
+            true,
+            SelectedRocmDeviceStatus::Unknown
+        ));
+        assert!(!strix_halo_vllm_profile_selected(
+            true,
+            SelectedRocmDeviceStatus::Other
+        ));
     }
 
     #[test]
@@ -3308,6 +3678,35 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("ROCm capability cannot be verified"));
         assert!(message.contains("WERK_VLLM_PYTHON"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strix_halo_python_validation_requires_vllm_hip_and_gfx1151() {
+        let probe = strix_halo_python_probe_script();
+        assert!(probe.contains("get_device_properties(0)"));
+        assert!(probe.contains("selected logical ROCm device 0 is not gfx1151"));
+        assert!(!probe.contains("for index in range"));
+        assert!(!probe.contains("any(\"gfx1151\""));
+
+        let python = fake_python(
+            "strix-ok",
+            "printf 'vLLM ROCm/HIP 7.2.1; gfx1151; FP16 is the validated Strix Halo precision\\n'\nexit 0\n",
+        );
+        let (usable, detail) = python_strix_halo_status(&python);
+        assert!(usable);
+        assert!(detail.contains("ROCm/HIP 7.2.1"));
+        assert!(detail.contains("gfx1151"));
+        assert!(detail.contains("FP16"));
+
+        let python = fake_python(
+            "strix-wrong-arch",
+            "printf 'ROCm PyTorch did not report gfx1151: gfx1100\\n' >&2\nexit 1\n",
+        );
+        let (usable, detail) = python_strix_halo_status(&python);
+        assert!(!usable);
+        assert!(detail.contains("not a verified Strix Halo ROCm vLLM environment"));
+        assert!(detail.contains("gfx1100"));
     }
 
     #[cfg(unix)]

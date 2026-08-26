@@ -15,6 +15,7 @@ matrices and operational behavior belong here.
 | Understand every HTTP route | [HTTP API](api.md) |
 | Install or select a backend | [Backends](backends.md) |
 | Run Werk and Nemotron on NVIDIA DGX Spark | [DGX Spark](integrations/dgx-spark.md) |
+| Run Werk on AMD Strix Halo | [AMD Strix Halo](integrations/strix-halo.md) |
 | Look up tasks, modalities, layouts or formats | [Tasks and formats](reference/tasks-and-formats.md) |
 | Understand manifests and managed model storage | [Models, manifests and the store](concepts/models-manifests-and-store.md) |
 | Look up an environment variable | [Environment variables](reference/environment-variables.md) |
@@ -114,6 +115,7 @@ Client-specific setup and compatibility boundaries are documented separately:
 - [AUTOMATIC1111-compatible clients](integrations/automatic1111.md)
 - [ComfyUI integration choices](integrations/comfyui.md)
 - [NVIDIA DGX Spark and Nemotron](integrations/dgx-spark.md)
+- [AMD Strix Halo, ROCm and Vulkan](integrations/strix-halo.md)
 
 The self-contained [ComfyUI custom-node documentation](../utils/comfyUI/README.md)
 stays beside the package source because it is also the package and Registry
@@ -152,7 +154,8 @@ docs/
 │   ├── open-webui.md
 │   ├── automatic1111.md
 │   ├── comfyui.md
-│   └── dgx-spark.md
+│   ├── dgx-spark.md
+│   └── strix-halo.md
 ├── reference/
 │   ├── cli.md
 │   ├── api.md

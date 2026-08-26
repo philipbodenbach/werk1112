@@ -107,22 +107,23 @@ cargo +stable install --path . --locked --force
 
 ## Target release aliases
 
-Release tooling uses one alias for each configured operating-system and
-architecture pair:
+Release tooling uses one alias for each configured platform profile:
 
 | Alias | Host normally used | Feature bundle | Output |
 | --- | --- | --- | --- |
 | `cargo +stable build-linux` | Native Linux or WSL | `release-linux` | `target/x86_64-unknown-linux-gnu/release/werk` |
+| `cargo +stable build-linux-strix-halo` | Native AMD Ryzen AI Max/Strix Halo | `release-linux-strix-halo` | `target/x86_64-unknown-linux-gnu/release/werk` |
 | `cargo +stable build-linux-aarch64` | Native DGX Spark/GB10 | `release-linux-aarch64` | `target/aarch64-unknown-linux-gnu/release/werk` |
 | `cargo +stable build-windows` | Native Windows Developer PowerShell | `release-windows` | `target/x86_64-pc-windows-msvc/release/werk.exe` |
 | `cargo +stable build-macos-apple-silicon` | Apple Silicon macOS | `release-macos-apple-silicon` | `target/aarch64-apple-darwin/release/werk` |
 
-All four aliases use `--release --locked --no-default-features` and an
+All five aliases use `--release --locked --no-default-features` and an
 explicit target triple. Their bundle definitions in `Cargo.toml` are:
 
 | Bundle | Current expansion | Compiled accelerator path |
 | --- | --- | --- |
 | `release-linux` | `cuda` | Candle CPU and Candle CUDA |
+| `release-linux-strix-halo` | empty | Backend-neutral router; ROCm/Vulkan runtimes remain external |
 | `release-linux-aarch64` | `cuda` | Candle CPU and Candle CUDA, compiled for DGX Spark `sm_121` |
 | `release-windows` | `cuda` | Candle CPU and Candle CUDA |
 | `release-macos-apple-silicon` | `metal` | Candle CPU and Candle Metal |
@@ -142,6 +143,9 @@ The corresponding raw Linux and macOS commands are:
 ~~~bash
 cargo +stable build --release --locked --no-default-features \
   --target x86_64-unknown-linux-gnu --features release-linux
+
+cargo +stable build --release --locked --no-default-features \
+  --target x86_64-unknown-linux-gnu --features release-linux-strix-halo
 
 CUDA_COMPUTE_CAP=121 cargo +stable build \
   --release --locked --no-default-features \
@@ -183,6 +187,7 @@ The feature graph currently exposed by `Cargo.toml` is:
 | `burn-cpu` | Burn runtime with the CPU/flex backend. |
 | `burn-cuda` | Burn runtime with CUDA/fusion and the `cudarc` CUDA 12.8 selector. |
 | `release-linux` | Linux x86_64 release feature bundle; currently `cuda`. |
+| `release-linux-strix-halo` | Backend-neutral Linux x86_64 bundle for AMD Ryzen AI Max/Strix Halo. |
 | `release-linux-aarch64` | DGX Spark/Linux aarch64 release feature bundle; currently `cuda`. |
 | `release-windows` | Windows release feature bundle; currently `cuda`. |
 | `release-macos-apple-silicon` | Apple Silicon release feature bundle; currently `metal`. |
@@ -243,6 +248,36 @@ If Candle reports `fatal error: cuda_fp8.h: No such file or directory`, the
 active toolkit is too old for the selected Candle CUDA code. Verify that the
 intended toolkit's `bin`, `include` and library directories precede an older
 distribution CUDA package.
+
+## AMD Strix Halo / Linux x86_64 release build
+
+The Strix Halo alias uses the same `x86_64-unknown-linux-gnu` Rust target as
+the generic Linux artifact but selects a separate backend-neutral release
+profile:
+
+~~~bash
+rustup target add x86_64-unknown-linux-gnu
+cargo +stable build-linux-strix-halo
+~~~
+
+It deliberately does not compile CUDA, ROCm or Vulkan into the Rust binary.
+Werk discovers compatible llama.cpp, vLLM and media companion processes at
+runtime, so ROCm/PyTorch and model-specific dependencies remain separate. The
+binary path is shared with the generic x86_64 build:
+
+~~~text
+target/x86_64-unknown-linux-gnu/release/werk
+~~~
+
+Do not run the generic and Strix aliases back-to-back and assume the existing
+file identifies which feature bundle produced it; rebuild immediately before
+packaging. The checked-in packager does that and accepts the Strix branch only
+on a native Linux x86_64 host with a specific Ryzen AI Max/Strix Halo CPU, DMI,
+Radeon 8050S/8060S/8040S, or `gfx1151` ROCm signal.
+
+The profile compiles on ordinary x86_64 Linux for CI, but release qualification
+must include real ROCm/Vulkan inference on Strix Halo. See the
+[Strix Halo guide](../integrations/strix-halo.md#hardware-release-smoke-gate).
 
 ## DGX Spark / Linux aarch64 release build
 

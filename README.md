@@ -64,9 +64,10 @@ Installer options, first-model setup and uninstall behavior are documented in
 [Getting started](docs/getting-started.md).
 
 Target-specific source builds use the checked-in Cargo aliases
-`build-linux`, `build-linux-aarch64`, `build-windows`, and
-`build-macos-apple-silicon` on the matching host platform. The Linux aarch64
-artifact is the DGX Spark/GB10 release path. See
+`build-linux`, `build-linux-strix-halo`, `build-linux-aarch64`,
+`build-windows`, and `build-macos-apple-silicon` on the matching host
+platform. The dedicated profiles cover AMD Strix Halo and NVIDIA DGX
+Spark/GB10. See
 [Building from source](docs/development/build.md) for the feature graph,
 platform prerequisites and troubleshooting.
 
@@ -173,6 +174,7 @@ authentication, limits, persistence and known gaps.
 | Media tasks, parameters, jobs and examples | [docs/media-inference.md](docs/media-inference.md) |
 | Building from source | [docs/development/build.md](docs/development/build.md) |
 | Packaging and releases | [docs/development/packaging-releases.md](docs/development/packaging-releases.md) |
+| DGX Spark and AMD Strix Halo | [docs/integrations/dgx-spark.md](docs/integrations/dgx-spark.md) · [docs/integrations/strix-halo.md](docs/integrations/strix-halo.md) |
 | Client integration guides | [docs/README.md#integrations](docs/README.md#integrations) |
 | ComfyUI custom nodes | [utils/comfyUI/README.md](utils/comfyUI/README.md) |
 
@@ -185,6 +187,7 @@ backend contracts.
 Werk's release packaging currently targets:
 
 - Linux x86_64
+- Linux x86_64 AMD Strix Halo (`gfx1151` profile)
 - Linux aarch64 (DGX Spark/GB10 only)
 - Windows x86_64
 - macOS Apple Silicon

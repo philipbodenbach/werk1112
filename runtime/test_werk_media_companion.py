@@ -49,6 +49,94 @@ class Guard:
         self.rejected.append((path, reason))
 
 
+class TorchAcceleratorSelectionTests(unittest.TestCase):
+    @staticmethod
+    def fake_torch(*, hip=None, cuda=None, architecture="gfx1151", available=True):
+        class FakeCuda:
+            @staticmethod
+            def is_available():
+                return available
+
+            @staticmethod
+            def device_count():
+                return 1 if available else 0
+
+            @staticmethod
+            def get_device_name(_index):
+                return "AMD Radeon 8060S" if hip else "NVIDIA GPU"
+
+            @staticmethod
+            def get_device_properties(_index):
+                return types.SimpleNamespace(gcnArchName=architecture)
+
+        return types.SimpleNamespace(
+            __version__="2.9.1",
+            version=types.SimpleNamespace(hip=hip, cuda=cuda),
+            cuda=FakeCuda(),
+            backends=types.SimpleNamespace(mps=None),
+            float16="float16",
+            bfloat16="bfloat16",
+            float32="float32",
+        )
+
+    def test_explicit_rocm_requires_a_hip_pytorch_build(self):
+        torch = self.fake_torch(hip=None, cuda="13.0")
+        with mock.patch.object(COMPANION, "require_module", return_value=torch):
+            with self.assertRaises(COMPANION.CompanionFailure) as failure:
+                COMPANION.torch_runtime({"accelerator": "rocm"})
+
+        self.assertEqual(failure.exception.code, "accelerator_unavailable")
+        self.assertIn("not ROCm-capable", failure.exception.message)
+        self.assertIn("CUDA build", failure.exception.detail)
+
+    def test_explicit_cuda_rejects_a_rocm_pytorch_build(self):
+        torch = self.fake_torch(hip="7.2.1", cuda=None)
+        with mock.patch.object(COMPANION, "require_module", return_value=torch):
+            with self.assertRaises(COMPANION.CompanionFailure) as failure:
+                COMPANION.torch_runtime({"accelerator": "cuda"})
+
+        self.assertEqual(failure.exception.code, "accelerator_unavailable")
+        self.assertIn("use accelerator=rocm", failure.exception.message)
+        self.assertIn("7.2.1", failure.exception.detail)
+
+    def test_strix_halo_rocm_auto_precision_is_fp16(self):
+        torch = self.fake_torch(hip="7.2.1", cuda=None)
+        with mock.patch.object(COMPANION, "require_module", return_value=torch):
+            selected_torch, device, dtype = COMPANION.torch_runtime(
+                {"accelerator": "rocm", "precision": "auto"}
+            )
+
+        self.assertIs(selected_torch, torch)
+        self.assertEqual(device, "cuda")
+        self.assertEqual(dtype, "float16")
+
+    def test_strix_halo_rocm_keeps_explicit_bf16_without_an_artificial_limit(self):
+        torch = self.fake_torch(hip="7.2.1", cuda=None)
+        with mock.patch.object(COMPANION, "require_module", return_value=torch):
+            _selected_torch, device, dtype = COMPANION.torch_runtime(
+                {"accelerator": "rocm", "precision": "bf16"}
+            )
+
+        self.assertEqual(device, "cuda")
+        self.assertEqual(dtype, "bfloat16")
+
+    def test_health_snapshot_identifies_strix_halo_as_rocm_not_cuda(self):
+        torch = self.fake_torch(hip="7.2.1", cuda=None)
+        with mock.patch.object(
+            COMPANION.importlib,
+            "import_module",
+            side_effect=lambda name: torch if name == "torch" else None,
+        ):
+            snapshot = COMPANION.accelerator_snapshot()
+
+        self.assertTrue(snapshot["rocm"]["available"])
+        self.assertFalse(snapshot["cuda"]["available"])
+        self.assertEqual(snapshot["rocm"]["version"], "7.2.1")
+        self.assertIn("gfx1151", snapshot["rocm"]["detail"])
+        self.assertIn("FP16", snapshot["rocm"]["detail"])
+        self.assertIn("uses ROCM, not CUDA", snapshot["cuda"]["detail"])
+
+
 def configure(pipeline, parameters, *, device="cuda", guard=None):
     guard = guard or Guard()
     metadata = COMPANION.configure_diffusers_pipeline(

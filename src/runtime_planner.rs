@@ -322,8 +322,40 @@ fn runtime_candidate_ids_for_plan(
             .any(|availability| availability.runtime_id == RuntimeId::LlamaServerRocm)
         && !candidates.contains(&RuntimeId::LlamaServerRocm)
     {
-        let insert_at = llama_rocm_insert_position(&candidates);
+        let prefer_rocm = available_runtimes
+            .iter()
+            .position(|availability| availability.runtime_id == RuntimeId::LlamaServerRocm)
+            .is_some_and(|rocm| {
+                available_runtimes
+                    .iter()
+                    .position(|availability| availability.runtime_id == RuntimeId::LlamaServerCuda)
+                    .is_none_or(|cuda| rocm < cuda)
+            });
+        let insert_at = if prefer_rocm {
+            0
+        } else {
+            llama_rocm_insert_position(&candidates)
+        };
         candidates.insert(insert_at, RuntimeId::LlamaServerRocm);
+    }
+    if matches!(
+        requested_backend,
+        RequestedBackend::Auto | RequestedBackend::Vllm
+    ) && manifest.format == ModelFormat::SafeTensors
+        && available_runtimes
+            .iter()
+            .any(|availability| availability.runtime_id == RuntimeId::VllmRocm)
+        && !candidates.contains(&RuntimeId::VllmRocm)
+        && runtime_supports_model(
+            runtime_descriptor(RuntimeId::VllmRocm),
+            &manifest.format,
+            manifest.architecture.as_deref(),
+        )
+    {
+        // A verified ROCm endpoint/interpreter must be tried before the
+        // generic CUDA vLLM candidate. This keeps both auto and the
+        // accelerator-neutral explicit `vllm` route correctly labelled.
+        candidates.insert(0, RuntimeId::VllmRocm);
     }
     candidates
 }
@@ -862,6 +894,87 @@ mod tests {
     }
 
     #[test]
+    fn safetensors_auto_prefers_an_available_rocm_vllm_runtime() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("nemotron_h"));
+        let available = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmRocm,
+                available: true,
+                reason: None,
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+
+        let selected = select_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &available,
+        )
+        .unwrap();
+
+        assert_eq!(selected.runtime_id, RuntimeId::VllmRocm);
+
+        let unavailable_rocm = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmRocm,
+                available: false,
+                reason: Some("ROCm runtime unavailable".to_string()),
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+        let fallback = select_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &unavailable_rocm,
+        )
+        .unwrap();
+        assert_eq!(fallback.runtime_id, RuntimeId::VllmCuda);
+        assert!(
+            fallback
+                .fallback_chain
+                .iter()
+                .any(|decision| decision.runtime_id == RuntimeId::VllmRocm)
+        );
+    }
+
+    #[test]
+    fn explicit_vllm_uses_rocm_provenance_when_that_runtime_is_available() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("nemotron_h"));
+        let available = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmRocm,
+                available: true,
+                reason: None,
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+
+        let selected = select_runtime(
+            &manifest,
+            RequestedBackend::Vllm,
+            RequestCapabilities::text(true),
+            &available,
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::VllmRocm);
+        assert_eq!(selected.accelerator, BackendAccelerator::Rocm);
+    }
+
+    #[test]
     fn nemotron_h_safetensors_routes_to_text_only_vllm() {
         for architecture in ["nemotron_h", "nemotron_h_moe"] {
             let nemotron = manifest(ModelFormat::SafeTensors, Some(architecture));
@@ -1013,6 +1126,26 @@ mod tests {
             })
             .unwrap();
         assert!(rocm <= first_lower_priority_llama);
+
+        let preferred = select_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &[
+                RuntimeAvailability {
+                    runtime_id: RuntimeId::LlamaServerRocm,
+                    available: true,
+                    reason: None,
+                },
+                RuntimeAvailability {
+                    runtime_id: RuntimeId::LlamaServerCuda,
+                    available: true,
+                    reason: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(preferred.runtime_id, RuntimeId::LlamaServerRocm);
     }
 
     #[test]

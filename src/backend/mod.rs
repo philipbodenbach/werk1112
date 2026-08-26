@@ -23,6 +23,10 @@ pub use llama_server::{
     backend_doctor_checks, install_managed_llama_server, install_managed_llama_server_with_options,
     llama_server_help_ok, managed_backend_dir,
 };
+pub(crate) use llama_server::{
+    SelectedRocmDeviceStatus, current_host_is_strix_halo,
+    current_selected_rocm_device_is_strix_halo, current_selected_rocm_device_status,
+};
 pub use onnxruntime::{
     OnnxProvisionOptions, OnnxRuntimeAvailability, OnnxRuntimeBackend, OnnxRuntimeMode,
     install_managed_onnx_runtime, managed_runner_path,
@@ -32,6 +36,7 @@ pub use qwen_tts::{
     install_managed_qwen_tts, managed_qwen_tts_dir, managed_qwen_tts_python,
     qwen_tts_python_status, require_qwen_tts_python,
 };
+pub(crate) use vllm::vllm_rocm_signals;
 pub use vllm::{
     VllmBackend, VllmDiscovery, install_managed_vllm, managed_vllm_dir, vllm_doctor_checks,
 };
