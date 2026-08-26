@@ -971,6 +971,7 @@ fn fit_rejects_zero_accelerator_headroom() {
         host_memory_bytes: Some(1_000),
         accelerator_memory_bytes: Some(100),
         accelerator: Some("cuda".to_string()),
+        memory_topology: None,
     };
 
     assert_eq!(
@@ -985,6 +986,7 @@ fn cuda_fit_stays_unknown_without_detected_vram_unless_host_is_already_oom() {
         host_memory_bytes: Some(1_000),
         accelerator_memory_bytes: None,
         accelerator: Some("cuda".to_string()),
+        memory_topology: None,
     };
 
     assert_eq!(
@@ -994,6 +996,54 @@ fn cuda_fit_stays_unknown_without_detected_vram_unless_host_is_already_oom() {
     assert_eq!(
         classify_workload_fit(Some(100), Some(1_000), &resources),
         FitAssessment::LikelyOom
+    );
+}
+
+#[test]
+fn unified_memory_estimate_is_explicit_about_unknown_accelerator_fit() {
+    let manifest = image_manifest();
+    let effective = resolve_request(&manifest, request(), &ResolutionContext::default()).unwrap();
+    let estimate = estimate_workload(
+        &manifest,
+        &effective,
+        &HostResources {
+            host_memory_bytes: Some(128 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: None,
+            accelerator: Some("cuda".to_string()),
+            memory_topology: Some(MemoryTopology::Unified),
+        },
+    );
+
+    assert_eq!(estimate.fit, FitAssessment::Unknown);
+    assert_eq!(estimate.accelerator_memory_limit_bytes, None);
+    assert!(
+        estimate
+            .assumptions
+            .iter()
+            .any(|value| value.contains("shared CPU/GPU unified-memory pool"))
+    );
+    assert!(
+        estimate
+            .warnings
+            .iter()
+            .any(|value| value.contains("no independently reported VRAM capacity"))
+    );
+
+    let cpu_estimate = estimate_workload(
+        &manifest,
+        &effective,
+        &HostResources {
+            host_memory_bytes: Some(128 * 1024 * 1024 * 1024),
+            accelerator_memory_bytes: None,
+            accelerator: Some("cpu".to_string()),
+            memory_topology: Some(MemoryTopology::Unified),
+        },
+    );
+    assert!(
+        !cpu_estimate
+            .warnings
+            .iter()
+            .any(|value| value.contains("no independently reported VRAM capacity"))
     );
 }
 
@@ -1008,6 +1058,7 @@ fn workload_estimate_deserializes_without_memory_limits() {
             host_memory_bytes: Some(64 * 1024 * 1024 * 1024),
             accelerator_memory_bytes: Some(24 * 1024 * 1024 * 1024),
             accelerator: Some("cuda".to_string()),
+            memory_topology: None,
         },
     );
     let mut legacy = serde_json::to_value(estimate).unwrap();
@@ -1392,6 +1443,7 @@ fn planner_scores_fallbacks_and_never_applies_quality_downgrade() {
             host_memory_bytes: Some(16_000_000_000),
             accelerator_memory_bytes: Some(16_000_000_000),
             accelerator: Some("cuda".to_string()),
+            memory_topology: None,
         },
     );
     let candidates = vec![

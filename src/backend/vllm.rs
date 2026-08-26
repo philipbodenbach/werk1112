@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     env, fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -20,9 +20,15 @@ use super::{
 };
 use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
 
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_HEALTH_TIMEOUT_SECONDS: u64 = 300;
+const DGX_SPARK_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HEALTH_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const WSL_VLLM_MESSAGE: &str = "vLLM is a Linux-native runtime. Your environment appears to be WSL, where vLLM can fail because required GPU memory features such as UVA/CUDA IPC are unavailable. Werk will fall back to Candle CUDA. For best vLLM support use native Linux or a remote vLLM server.";
+const DGX_SPARK_VLLM_MESSAGE: &str = "DGX Spark detected (Linux aarch64 / GB10). Use NVIDIA's Spark-compatible vLLM container and expose its OpenAI endpoint, then set WERK_VLLM_HOST, WERK_VLLM_PORT, and, when its served name differs from the Werk model ID, WERK_VLLM_MODEL. A generic managed `pip install vllm` is intentionally not offered on DGX Spark.";
+const LINUX_ARM64_MANAGED_VLLM_MESSAGE: &str = "Linux aarch64 detected without a verified DGX Spark/GB10 signal. Werk does not offer a generic managed `pip install vllm` on ARM64 because the compatible wheel/container depends on the concrete platform. Use a vendor-supported runtime and set WERK_VLLM_PYTHON, or expose an OpenAI-compatible vLLM endpoint and set WERK_VLLM_HOST plus WERK_VLLM_PORT.";
 
 #[derive(Clone)]
 pub struct VllmBackend {
@@ -37,6 +43,8 @@ struct VllmProcess {
     args: Vec<String>,
     model_dir: PathBuf,
     model_name: String,
+    model_name_source: &'static str,
+    is_nemotron: bool,
     url: String,
     pid: Option<u32>,
     log_tail: Arc<Mutex<VecDeque<String>>>,
@@ -80,6 +88,7 @@ pub enum VllmCommand {
 #[derive(Default)]
 struct VllmCompletion {
     text: String,
+    saw_reasoning_content: bool,
     prompt_tokens: usize,
     completion_tokens: usize,
     prompt_seconds: f64,
@@ -106,9 +115,13 @@ impl VllmBackend {
         };
         ensure_vllm_platform_eligible(command)?;
         match command {
-            VllmCommand::Remote { host, port } => {
-                Ok(format!("vLLM OpenAI server at http://{host}:{port}"))
-            }
+            VllmCommand::Remote { host, port } => Ok(if remote_discovery_ready(&discovery) {
+                format!("vLLM OpenAI server at http://{host}:{port}")
+            } else {
+                format!(
+                    "vLLM OpenAI server configured at http://{host}:{port}; not ready yet, execution will wait for /v1/models"
+                )
+            }),
             command => Ok(format!(
                 "vLLM {} ({})",
                 command.display(),
@@ -180,13 +193,17 @@ impl VllmBackend {
             bail!("vLLM backend supports HF safetensors model directories only");
         }
 
-        let model_dir = resolve_vllm_model_dir(&self.store, manifest)?;
-
-        let key = format!(
-            "{}:{}:{}",
-            manifest.id,
-            model_dir.display(),
-            env::var("WERK_VLLM_ARGS").unwrap_or_default()
+        let discovery = discover_vllm(&self.store);
+        // A remote vLLM server owns and loads its weights. The installed Werk
+        // manifest is still required for routing, but its local repository may
+        // intentionally contain metadata only (common when Werk runs beside a
+        // Spark container).
+        let model_dir = resolve_vllm_model_dir_for_discovery(&self.store, manifest, &discovery)?;
+        let key = vllm_server_cache_key(
+            &manifest.id,
+            &model_dir,
+            &discovery,
+            &VllmCacheEnvironment::current(),
         );
         if let Some(server) = self
             .servers
@@ -200,7 +217,12 @@ impl VllmBackend {
         }
 
         let started = Instant::now();
-        let server = Arc::new(VllmProcess::start(&self.store, manifest, &model_dir)?);
+        let server = Arc::new(VllmProcess::start(
+            &self.store,
+            manifest,
+            &model_dir,
+            discovery,
+        )?);
         let load_seconds = started.elapsed().as_secs_f64();
         self.servers
             .lock()
@@ -329,31 +351,50 @@ impl ChatGenerationSession for VllmChatSession {
 }
 
 impl VllmProcess {
-    fn start(store: &ModelStore, manifest: &ModelManifest, model_dir: &Path) -> Result<Self> {
-        let discovery = require_vllm(store)?;
+    fn start(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        model_dir: &Path,
+        discovery: VllmDiscovery,
+    ) -> Result<Self> {
+        let discovery = if discovery.command.is_some() {
+            discovery
+        } else {
+            require_vllm(store)?
+        };
         let command = discovery
             .command
             .clone()
             .context("vLLM discovery had no command")?;
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
-        eprintln!("Using vLLM CUDA backend");
-
         if let VllmCommand::Remote { host, port } = command {
+            eprintln!("Using remote vLLM backend");
+            let url = format!("http://{host}:{port}");
+            let configured_model = configured_vllm_model()?;
+            let timeout = configured_vllm_health_timeout(current_vllm_platform()).duration;
+            let model = wait_for_remote_served_model(
+                &url,
+                &manifest.id,
+                configured_model.as_deref(),
+                timeout,
+            )?;
             let process = Self {
                 child: None,
                 command_label: "remote vLLM OpenAI server".to_string(),
                 discovery_source: discovery.source,
                 args: Vec::new(),
                 model_dir: model_dir.to_path_buf(),
-                model_name: manifest.id.clone(),
-                url: format!("http://{host}:{port}"),
+                model_name: model.name,
+                model_name_source: model.source,
+                is_nemotron: is_nemotron_manifest(manifest),
+                url,
                 pid: None,
                 log_tail,
             };
-            process.wait_until_ready()?;
             return Ok(process);
         }
 
+        eprintln!("Using vLLM CUDA backend");
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         let args = vllm_server_args(&command, model_dir, &manifest.id, port);
@@ -388,6 +429,8 @@ impl VllmProcess {
             args,
             model_dir: model_dir.to_path_buf(),
             model_name: manifest.id.clone(),
+            model_name_source: "Werk model ID / local --served-model-name",
+            is_nemotron: is_nemotron_manifest(manifest),
             url,
             pid: Some(pid),
             log_tail,
@@ -431,12 +474,14 @@ impl VllmProcess {
             })
         })?;
 
+        ensure_vllm_visible_completion(&completion)?;
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
         Ok(completion)
     }
 
     fn wait_until_ready(&self) -> Result<()> {
-        let started = Instant::now();
+        let timeout = configured_vllm_health_timeout(current_vllm_platform()).duration;
+        let deadline = HttpDeadline::new(timeout);
         loop {
             if let Some(status) = self.try_wait_status()? {
                 let reason = format!(
@@ -448,18 +493,38 @@ impl VllmProcess {
                 }
                 bail!("{reason}");
             }
-            if get(&self.url, "/health")
-                .map(|response| response.status == 200)
-                .unwrap_or(false)
-                || get(&self.url, "/v1/models")
-                    .map(|response| response.status == 200)
-                    .unwrap_or(false)
-            {
+            let health_ready = deadline
+                .remaining()
+                .ok()
+                .and_then(|remaining| {
+                    get_with_timeout(
+                        &self.url,
+                        "/health",
+                        remaining.min(HEALTH_REQUEST_IO_TIMEOUT),
+                    )
+                    .ok()
+                })
+                .is_some_and(|response| response.status == 200);
+            let models_ready = !health_ready
+                && deadline
+                    .remaining()
+                    .ok()
+                    .and_then(|remaining| {
+                        get_with_timeout(
+                            &self.url,
+                            "/v1/models",
+                            remaining.min(HEALTH_REQUEST_IO_TIMEOUT),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|response| response.status == 200);
+            if health_ready || models_ready {
                 return Ok(());
             }
-            if started.elapsed() > HEALTH_TIMEOUT {
+            let Ok(remaining) = deadline.remaining() else {
                 let reason = format!(
-                    "timed out waiting for vLLM server at {}{}",
+                    "timed out after {}s waiting for vLLM server at {}{}",
+                    timeout.as_secs(),
                     self.url,
                     self.formatted_log_tail()
                 );
@@ -467,15 +532,15 @@ impl VllmProcess {
                     bail!("{message}");
                 }
                 bail!("{reason}");
-            }
-            thread::sleep(HEALTH_POLL_INTERVAL);
+            };
+            thread::sleep(HEALTH_POLL_INTERVAL.min(remaining));
         }
     }
 
     fn is_running(&self) -> bool {
         if self.child.is_none() {
-            return get(&self.url, "/v1/models")
-                .map(|response| response.status == 200)
+            return remote_vllm_model_ids(&self.url)
+                .map(|models| remote_models_include_served_name(&self.model_name, &models))
                 .unwrap_or(false);
         }
         matches!(self.try_wait_status(), Ok(None))
@@ -525,7 +590,14 @@ impl VllmProcess {
                 .unwrap_or_else(|| "external".to_string())
         );
         eprintln!("server URL: {}", self.url);
+        eprintln!(
+            "served model name: {} ({})",
+            self.model_name, self.model_name_source
+        );
         eprintln!("reused existing server: {reused}");
+        if self.is_nemotron {
+            print_nemotron_reasoning_parser_guidance(&self.args);
+        }
     }
 }
 
@@ -563,6 +635,73 @@ struct HttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
     reader: BufReader<TcpStream>,
+    deadline: Option<HttpDeadline>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HttpDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl HttpDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(self) -> Result<Duration> {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow!("vLLM HTTP probe timed out"))
+    }
+
+    fn remaining_capped(self, cap: Duration) -> Result<Duration> {
+        Ok(self.remaining()?.min(cap))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VllmRemoteConfig {
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteModelResolution {
+    name: String,
+    source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VllmHealthTimeout {
+    duration: Duration,
+    valid: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VllmCacheEnvironment {
+    args: String,
+    served_model: String,
+    host: String,
+    port: String,
+    python: String,
+}
+
+impl VllmCacheEnvironment {
+    fn current() -> Self {
+        Self {
+            args: env::var("WERK_VLLM_ARGS").unwrap_or_default(),
+            served_model: env::var("WERK_VLLM_MODEL").unwrap_or_default(),
+            host: env::var("WERK_VLLM_HOST").unwrap_or_default(),
+            port: env::var("WERK_VLLM_PORT").unwrap_or_default(),
+            python: env::var("WERK_VLLM_PYTHON").unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -622,6 +761,216 @@ fn vllm_server_args(
     args
 }
 
+fn configured_vllm_model() -> Result<Option<String>> {
+    env::var("WERK_VLLM_MODEL")
+        .ok()
+        .map(|value| validate_configured_vllm_model(&value))
+        .transpose()
+}
+
+fn validate_configured_vllm_model(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("WERK_VLLM_MODEL must not be empty");
+    }
+    if value.chars().any(char::is_control) {
+        bail!("WERK_VLLM_MODEL must not contain control characters");
+    }
+    Ok(value.to_string())
+}
+
+fn resolve_remote_served_model_with_timeout(
+    base_url: &str,
+    werk_model_id: &str,
+    configured_model: Option<&str>,
+    timeout: Duration,
+) -> Result<RemoteModelResolution> {
+    let advertised = remote_vllm_model_ids_with_timeout(base_url, timeout).with_context(|| {
+        format!(
+            "could not resolve the served model name from {base_url}/v1/models; set WERK_VLLM_MODEL to the model ID exposed by the remote vLLM server"
+        )
+    })?;
+    if let Some(configured_model) = configured_model {
+        return select_configured_remote_served_model(configured_model, &advertised);
+    }
+    select_remote_served_model(werk_model_id, &advertised)
+}
+
+fn wait_for_remote_served_model(
+    base_url: &str,
+    werk_model_id: &str,
+    configured_model: Option<&str>,
+    timeout: Duration,
+) -> Result<RemoteModelResolution> {
+    wait_for_remote_served_model_with(timeout, HEALTH_POLL_INTERVAL, |remaining| {
+        resolve_remote_served_model_with_timeout(
+            base_url,
+            werk_model_id,
+            configured_model,
+            remaining.min(HEALTH_REQUEST_IO_TIMEOUT),
+        )
+    })
+    .with_context(|| format!("remote vLLM model discovery at {base_url}/v1/models failed"))
+}
+
+fn wait_for_remote_served_model_with<F>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut resolve: F,
+) -> Result<RemoteModelResolution>
+where
+    F: FnMut(Duration) -> Result<RemoteModelResolution>,
+{
+    let deadline = HttpDeadline::new(timeout);
+    let mut last_message = None;
+    loop {
+        let remaining = match deadline.remaining() {
+            Ok(remaining) => remaining,
+            Err(_) => {
+                bail!(
+                    "timed out after {}s waiting for remote vLLM model discovery: {}",
+                    timeout.as_secs(),
+                    last_message.unwrap_or_else(|| "endpoint did not respond".to_string()),
+                )
+            }
+        };
+        let error = match resolve(remaining) {
+            Ok(model) => return Ok(model),
+            Err(error) => error,
+        };
+        let message = compact_error(&error.to_string());
+        let configuration_error = message.contains("serves multiple models")
+            || message.contains("is not advertised by remote vLLM");
+        if configuration_error {
+            return Err(error);
+        }
+        last_message = Some(message);
+        let remaining = deadline.remaining().unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            continue;
+        }
+        thread::sleep(poll_interval.min(remaining));
+    }
+}
+
+fn select_configured_remote_served_model(
+    configured_model: &str,
+    advertised: &[String],
+) -> Result<RemoteModelResolution> {
+    if advertised.iter().any(|model| model == configured_model) {
+        return Ok(RemoteModelResolution {
+            name: configured_model.to_string(),
+            source: "verified WERK_VLLM_MODEL",
+        });
+    }
+    bail!(
+        "WERK_VLLM_MODEL '{}' is not advertised by remote vLLM; available models: {}",
+        configured_model,
+        if advertised.is_empty() {
+            "<none>".to_string()
+        } else {
+            advertised.join(", ")
+        }
+    )
+}
+
+fn remote_models_include_served_name(served_name: &str, advertised: &[String]) -> bool {
+    advertised.iter().any(|model| model == served_name)
+}
+
+fn select_remote_served_model(
+    werk_model_id: &str,
+    advertised: &[String],
+) -> Result<RemoteModelResolution> {
+    if advertised.iter().any(|model| model == werk_model_id) {
+        return Ok(RemoteModelResolution {
+            name: werk_model_id.to_string(),
+            source: "matching /v1/models entry",
+        });
+    }
+    if let [only] = advertised {
+        return Ok(RemoteModelResolution {
+            name: only.clone(),
+            source: "only /v1/models entry",
+        });
+    }
+    if advertised.is_empty() {
+        bail!(
+            "remote vLLM returned no served models; set WERK_VLLM_MODEL after the server has loaded its model"
+        );
+    }
+    bail!(
+        "remote vLLM serves multiple models ({}) and none matches Werk model '{}'; set WERK_VLLM_MODEL to one advertised model ID",
+        advertised.join(", "),
+        werk_model_id
+    )
+}
+
+fn remote_vllm_model_ids(base_url: &str) -> Result<Vec<String>> {
+    remote_vllm_model_ids_with_timeout(base_url, HEALTH_REQUEST_IO_TIMEOUT)
+}
+
+fn remote_vllm_model_ids_with_timeout(base_url: &str, timeout: Duration) -> Result<Vec<String>> {
+    let mut response = get_with_timeout(base_url, "/v1/models", timeout)?;
+    let mut bytes = Vec::new();
+    stream_body(&mut response, |chunk| {
+        bytes.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    parse_remote_vllm_model_ids(&bytes)
+}
+
+fn parse_remote_vllm_model_ids(bytes: &[u8]) -> Result<Vec<String>> {
+    let value: Value =
+        serde_json::from_slice(bytes).context("remote vLLM /v1/models returned invalid JSON")?;
+    let mut models = value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && !id.chars().any(char::is_control))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+fn is_nemotron_manifest(manifest: &ModelManifest) -> bool {
+    manifest
+        .architecture
+        .as_deref()
+        .is_some_and(is_nemotron_architecture_name)
+}
+
+fn is_nemotron_architecture_name(architecture: &str) -> bool {
+    matches!(
+        architecture.to_ascii_lowercase().as_str(),
+        "nemotron_h" | "nemotron_h_moe"
+    )
+}
+
+fn print_nemotron_reasoning_parser_guidance(args: &[String]) {
+    if args.is_empty() {
+        eprintln!(
+            "Nemotron reasoning parser: controlled by the remote vLLM server; configure the parser when starting its Spark/container runtime if the model card requires one"
+        );
+    } else if has_reasoning_parser_arg(args) {
+        eprintln!("Nemotron reasoning parser: configured through WERK_VLLM_ARGS");
+    } else {
+        eprintln!(
+            "Nemotron reasoning parser: not configured; add `--reasoning-parser <parser>` to WERK_VLLM_ARGS only when required by the concrete model card"
+        );
+    }
+}
+
+fn has_reasoning_parser_arg(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--reasoning-parser" || arg.starts_with("--reasoning-parser="))
+}
+
 fn resolve_vllm_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Result<PathBuf> {
     let root = store.model_dir(&manifest.id);
     if !root.is_dir() {
@@ -670,6 +1019,50 @@ fn resolve_vllm_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Resul
     )
 }
 
+fn resolve_vllm_model_dir_for_discovery(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    discovery: &VllmDiscovery,
+) -> Result<PathBuf> {
+    if vllm_uses_remote_weights(discovery) {
+        Ok(store.model_dir(&manifest.id))
+    } else {
+        resolve_vllm_model_dir(store, manifest)
+    }
+}
+
+fn vllm_uses_remote_weights(discovery: &VllmDiscovery) -> bool {
+    matches!(discovery.command, Some(VllmCommand::Remote { .. }))
+}
+
+fn vllm_discovery_cache_identity(discovery: &VllmDiscovery) -> String {
+    match discovery.command.as_ref() {
+        Some(VllmCommand::Python(path)) => format!("python:{}", path.display()),
+        Some(VllmCommand::Executable(path)) => format!("executable:{}", path.display()),
+        Some(VllmCommand::Remote { host, port }) => format!("remote:{host}:{port}"),
+        None => format!("missing:{}", discovery.source),
+    }
+}
+
+fn vllm_server_cache_key(
+    model_id: &str,
+    model_dir: &Path,
+    discovery: &VllmDiscovery,
+    environment: &VllmCacheEnvironment,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        model_id,
+        model_dir.display(),
+        environment.args,
+        environment.served_model,
+        environment.host,
+        environment.port,
+        environment.python,
+        vllm_discovery_cache_identity(discovery),
+    )
+}
+
 fn chat_completion_body(model_name: &str, request: &GenerateRequest) -> Value {
     let messages = if request.messages.is_empty() {
         json!([{
@@ -702,6 +1095,9 @@ fn chat_completion_body(model_name: &str, request: &GenerateRequest) -> Value {
 }
 
 fn update_completion_from_event(completion: &mut VllmCompletion, value: &Value) {
+    if delta_has_reasoning_content(value) {
+        completion.saw_reasoning_content = true;
+    }
     if let Some(choice) = value
         .get("choices")
         .and_then(Value::as_array)
@@ -719,6 +1115,33 @@ fn update_completion_from_event(completion: &mut VllmCompletion, value: &Value) 
             completion.completion_tokens = tokens as usize;
         }
     }
+}
+
+fn delta_has_reasoning_content(value: &Value) -> bool {
+    let Some(delta) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+    else {
+        return false;
+    };
+    ["reasoning", "reasoning_content"].into_iter().any(|key| {
+        delta.get(key).is_some_and(|value| match value {
+            Value::String(text) => !text.is_empty(),
+            Value::Null => false,
+            _ => true,
+        })
+    })
+}
+
+fn ensure_vllm_visible_completion(completion: &VllmCompletion) -> Result<()> {
+    if completion.text.trim().is_empty() && completion.saw_reasoning_content {
+        bail!(
+            "vLLM generated hidden reasoning but no visible answer content; increase max tokens so the model can finish its answer, or disable the configured reasoning parser/mode when hidden reasoning is not wanted"
+        );
+    }
+    Ok(())
 }
 
 fn delta_content(value: &Value) -> Option<String> {
@@ -759,7 +1182,7 @@ fn finalize_completion_stats(
 
 pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
     let platform = current_vllm_platform();
-    if let Some(reason) = managed_vllm_install_rejection(platform) {
+    if let Some(reason) = managed_vllm_install_rejection_for(platform, env::consts::ARCH) {
         bail!("{reason}");
     }
     if platform == VllmPlatform::Wsl {
@@ -807,15 +1230,28 @@ pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
 pub fn vllm_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
     let discovery = discover_vllm(store);
     let health = vllm_health(&discovery);
+    let platform = current_vllm_platform();
+    let health_timeout = configured_vllm_health_timeout(platform);
     let mut checks = Vec::new();
+    checks.push(BackendDoctorCheck {
+        name: "vLLM platform".to_string(),
+        ok: matches!(discovery.command, Some(VllmCommand::Remote { .. }))
+            || local_vllm_platform_rejection(platform).is_none(),
+        detail: vllm_platform_detail(platform).to_string(),
+    });
+    checks.push(BackendDoctorCheck {
+        name: "vLLM health timeout".to_string(),
+        ok: health_timeout.valid,
+        detail: health_timeout.detail,
+    });
     checks.push(BackendDoctorCheck {
         name: "vLLM discovery".to_string(),
         ok: discovery.command.is_some(),
         detail: discovery.source.clone(),
     });
     checks.push(BackendDoctorCheck {
-        name: "vLLM Python path".to_string(),
-        ok: matches!(discovery.command, Some(VllmCommand::Python(_))),
+        name: "vLLM runtime source".to_string(),
+        ok: discovery.command.is_some(),
         detail: match &discovery.command {
             Some(VllmCommand::Python(path)) => path.display().to_string(),
             Some(VllmCommand::Executable(path)) => format!("using executable {}", path.display()),
@@ -839,11 +1275,19 @@ pub fn vllm_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
         ok: health.healthy,
         detail: format!("{}: {}", health.health_label, health.detail),
     });
-    checks.push(command_check(
-        "nvidia-smi",
-        &[],
-        "required to verify CUDA visibility for vLLM",
-    ));
+    if matches!(discovery.command, Some(VllmCommand::Remote { .. })) {
+        checks.push(BackendDoctorCheck {
+            name: "local NVIDIA visibility".to_string(),
+            ok: true,
+            detail: "not required for a remote vLLM endpoint".to_string(),
+        });
+    } else {
+        checks.push(command_check(
+            "nvidia-smi",
+            &[],
+            "required to verify CUDA visibility for local vLLM",
+        ));
+    }
     checks.push(BackendDoctorCheck {
         name: "vLLM version".to_string(),
         ok: discovery.command.is_some(),
@@ -862,14 +1306,23 @@ fn vllm_health(discovery: &VllmDiscovery) -> VllmHealthStatus {
 
 fn vllm_health_for_platform(discovery: &VllmDiscovery, platform: VllmPlatform) -> VllmHealthStatus {
     match discovery.command.as_ref() {
-        Some(VllmCommand::Remote { host, port }) => VllmHealthStatus {
-            installed_label: "remote",
-            health_label: "healthy",
-            healthy: true,
-            detail: format!(
-                "remote OpenAI-compatible vLLM endpoint reachable at http://{host}:{port}"
-            ),
-        },
+        Some(VllmCommand::Remote { host, port }) => {
+            let ready = remote_discovery_ready(discovery);
+            VllmHealthStatus {
+                installed_label: "remote",
+                health_label: if ready { "healthy" } else { "not ready" },
+                healthy: ready,
+                detail: if ready {
+                    format!(
+                        "remote OpenAI-compatible vLLM endpoint reachable at http://{host}:{port}"
+                    )
+                } else {
+                    format!(
+                        "remote vLLM is configured at http://{host}:{port} but is not ready; inference will wait up to the configured health timeout"
+                    )
+                },
+            }
+        }
         Some(command) => match local_vllm_platform_rejection(platform) {
             Some(reason) => VllmHealthStatus {
                 installed_label: "yes",
@@ -904,11 +1357,20 @@ fn vllm_health_for_platform(discovery: &VllmDiscovery, platform: VllmPlatform) -
                     installed_label: "no",
                     health_label: "missing",
                     healthy: false,
-                    detail: concise_vllm_unavailable_reason(discovery),
+                    detail: concise_vllm_unavailable_reason_for_platform(discovery, platform),
                 },
             }
         }
     }
+}
+
+fn remote_discovery_ready(discovery: &VllmDiscovery) -> bool {
+    discovery
+        .attempts
+        .iter()
+        .find(|attempt| attempt.label == "WERK_VLLM_HOST/WERK_VLLM_PORT")
+        .map(|attempt| attempt.usable)
+        .unwrap_or(true)
 }
 
 fn ensure_vllm_platform_eligible(command: &VllmCommand) -> Result<()> {
@@ -924,6 +1386,7 @@ fn ensure_vllm_platform_eligible(command: &VllmCommand) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VllmPlatform {
     NativeLinux,
+    DgxSpark,
     Wsl,
     NativeWindows,
     Macos,
@@ -934,6 +1397,8 @@ fn current_vllm_platform() -> VllmPlatform {
     if cfg!(target_os = "linux") {
         if is_wsl_environment() {
             VllmPlatform::Wsl
+        } else if is_dgx_spark_environment() {
+            VllmPlatform::DgxSpark
         } else {
             VllmPlatform::NativeLinux
         }
@@ -948,7 +1413,7 @@ fn current_vllm_platform() -> VllmPlatform {
 
 fn local_vllm_platform_rejection(platform: VllmPlatform) -> Option<&'static str> {
     match platform {
-        VllmPlatform::NativeLinux => None,
+        VllmPlatform::NativeLinux | VllmPlatform::DgxSpark => None,
         VllmPlatform::Wsl => Some(WSL_VLLM_MESSAGE),
         VllmPlatform::NativeWindows => Some(
             "vLLM is a Linux-native runtime. Native Windows local vLLM is not eligible. Use native Linux or a remote vLLM server.",
@@ -962,8 +1427,15 @@ fn local_vllm_platform_rejection(platform: VllmPlatform) -> Option<&'static str>
     }
 }
 
-fn managed_vllm_install_rejection(platform: VllmPlatform) -> Option<&'static str> {
+fn managed_vllm_install_rejection_for(
+    platform: VllmPlatform,
+    architecture: &str,
+) -> Option<&'static str> {
     match platform {
+        VllmPlatform::DgxSpark => Some(DGX_SPARK_VLLM_MESSAGE),
+        VllmPlatform::NativeLinux | VllmPlatform::Wsl if architecture == "aarch64" => {
+            Some(LINUX_ARM64_MANAGED_VLLM_MESSAGE)
+        }
         VllmPlatform::NativeLinux | VllmPlatform::Wsl => None,
         VllmPlatform::NativeWindows | VllmPlatform::Macos | VllmPlatform::Unsupported => {
             local_vllm_platform_rejection(platform)
@@ -980,18 +1452,11 @@ fn local_vllm_platform_rejection_for_discovery_with_platform(
     platform: VllmPlatform,
 ) -> Option<&'static str> {
     if matches!(discovery.command, Some(VllmCommand::Remote { .. }))
-        || discovery_has_remote_attempt(discovery)
+        || invalid_remote_vllm_config_detail(discovery).is_some()
     {
         return None;
     }
     local_vllm_platform_rejection(platform)
-}
-
-fn discovery_has_remote_attempt(discovery: &VllmDiscovery) -> bool {
-    discovery
-        .attempts
-        .iter()
-        .any(|attempt| attempt.label == "WERK_VLLM_HOST/WERK_VLLM_PORT")
 }
 
 fn is_wsl_environment() -> bool {
@@ -1003,6 +1468,102 @@ fn is_wsl_environment() -> bool {
         || fs::read_to_string("/proc/version")
             .map(|text| linux_release_looks_like_wsl(&text))
             .unwrap_or(false)
+}
+
+fn is_dgx_spark_environment() -> bool {
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        return false;
+    }
+    let device_tree_model = fs::read_to_string("/proc/device-tree/model").ok();
+    let nvidia_smi = Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    dgx_spark_signals(
+        env::consts::ARCH,
+        device_tree_model.as_deref(),
+        nvidia_smi.as_deref(),
+    )
+}
+
+fn dgx_spark_signals(
+    architecture: &str,
+    device_tree_model: Option<&str>,
+    nvidia_smi: Option<&str>,
+) -> bool {
+    if architecture != "aarch64" {
+        return false;
+    }
+    [device_tree_model, nvidia_smi]
+        .into_iter()
+        .flatten()
+        .map(str::to_ascii_lowercase)
+        .any(|signal| {
+            signal.contains("dgx spark")
+                || signal.contains("nvidia spark")
+                || contains_ascii_alphanumeric_token(&signal, "gb10")
+        })
+}
+
+fn contains_ascii_alphanumeric_token(text: &str, expected: &str) -> bool {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(expected))
+}
+
+fn vllm_platform_detail(platform: VllmPlatform) -> &'static str {
+    match platform {
+        VllmPlatform::NativeLinux => "native Linux; local or remote vLLM is eligible",
+        VllmPlatform::DgxSpark => DGX_SPARK_VLLM_MESSAGE,
+        VllmPlatform::Wsl => WSL_VLLM_MESSAGE,
+        VllmPlatform::NativeWindows => "native Windows; use a remote Linux vLLM OpenAI endpoint",
+        VllmPlatform::Macos => "macOS; use a remote Linux vLLM OpenAI endpoint",
+        VllmPlatform::Unsupported => {
+            "unsupported local vLLM platform; use a remote Linux vLLM OpenAI endpoint"
+        }
+    }
+}
+
+fn configured_vllm_health_timeout(platform: VllmPlatform) -> VllmHealthTimeout {
+    let raw = env::var("WERK_VLLM_HEALTH_TIMEOUT_SECONDS").ok();
+    vllm_health_timeout_for(platform, raw.as_deref())
+}
+
+fn vllm_health_timeout_for(platform: VllmPlatform, raw: Option<&str>) -> VllmHealthTimeout {
+    let default_seconds = if platform == VllmPlatform::DgxSpark {
+        DGX_SPARK_HEALTH_TIMEOUT_SECONDS
+    } else {
+        DEFAULT_HEALTH_TIMEOUT_SECONDS
+    };
+    match raw {
+        None => VllmHealthTimeout {
+            duration: Duration::from_secs(default_seconds),
+            valid: true,
+            detail: format!(
+                "{default_seconds}s default{}; override with WERK_VLLM_HEALTH_TIMEOUT_SECONDS",
+                if platform == VllmPlatform::DgxSpark {
+                    " for DGX Spark cold starts"
+                } else {
+                    ""
+                }
+            ),
+        },
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(seconds) if seconds > 0 => VllmHealthTimeout {
+                duration: Duration::from_secs(seconds),
+                valid: true,
+                detail: format!("{seconds}s from WERK_VLLM_HEALTH_TIMEOUT_SECONDS"),
+            },
+            _ => VllmHealthTimeout {
+                duration: Duration::from_secs(default_seconds),
+                valid: false,
+                detail: format!(
+                    "invalid WERK_VLLM_HEALTH_TIMEOUT_SECONDS={raw:?}; expected a positive integer, using {default_seconds}s"
+                ),
+            },
+        },
+    }
 }
 
 fn linux_release_looks_like_wsl(text: &str) -> bool {
@@ -1062,40 +1623,118 @@ fn require_vllm(store: &ModelStore) -> Result<VllmDiscovery> {
     }
 }
 
+fn configured_remote_vllm_from_env() -> Result<Option<VllmRemoteConfig>> {
+    let host = env::var_os("WERK_VLLM_HOST")
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow!("WERK_VLLM_HOST must contain valid UTF-8"))
+        })
+        .transpose()?;
+    let port = env::var_os("WERK_VLLM_PORT")
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow!("WERK_VLLM_PORT must contain valid UTF-8"))
+        })
+        .transpose()?;
+    configured_remote_vllm(host.as_deref(), port.as_deref())
+}
+
+fn configured_remote_vllm(
+    host: Option<&str>,
+    port: Option<&str>,
+) -> Result<Option<VllmRemoteConfig>> {
+    let (Some(host), Some(port)) = (host, port) else {
+        if host.is_some() || port.is_some() {
+            bail!("WERK_VLLM_HOST and WERK_VLLM_PORT must be set together");
+        }
+        return Ok(None);
+    };
+
+    let host = host.trim();
+    if host.is_empty() {
+        bail!("WERK_VLLM_HOST must not be empty");
+    }
+    if host.chars().any(char::is_control) {
+        bail!("WERK_VLLM_HOST must not contain control characters");
+    }
+    if host.contains(':') {
+        bail!(
+            "WERK_VLLM_HOST does not currently accept IPv6 literals; use an IPv4 address or DNS name"
+        );
+    }
+    if !host
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+    {
+        bail!(
+            "WERK_VLLM_HOST contains unsupported characters; use an IPv4 address or ASCII DNS name"
+        );
+    }
+
+    let port_text = port.trim();
+    let port = port_text
+        .parse::<u16>()
+        .with_context(|| format!("invalid WERK_VLLM_PORT value {port_text:?}"))?;
+    if port == 0 {
+        bail!("WERK_VLLM_PORT must be between 1 and 65535");
+    }
+    Ok(Some(VllmRemoteConfig {
+        host: host.to_string(),
+        port,
+    }))
+}
+
 fn discover_vllm(store: &ModelStore) -> VllmDiscovery {
     let mut attempts = Vec::new();
 
-    if let (Ok(host), Ok(port)) = (env::var("WERK_VLLM_HOST"), env::var("WERK_VLLM_PORT")) {
-        match port.parse::<u16>() {
-            Ok(port) => {
-                let usable = remote_supports_vllm(&host, port);
-                attempts.push(VllmDiscoveryAttempt {
-                    label: "WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
-                    path: None,
-                    exists: usable,
-                    usable,
-                    detail: if usable {
-                        format!("remote vLLM server reachable at http://{host}:{port}")
-                    } else {
-                        format!("remote vLLM server is not reachable at http://{host}:{port}")
-                    },
-                });
-                if usable {
-                    let command = VllmCommand::Remote { host, port };
-                    return VllmDiscovery {
-                        command: Some(command),
-                        source: "env WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
-                        attempts,
-                    };
-                }
-            }
-            Err(err) => attempts.push(VllmDiscoveryAttempt {
-                label: "WERK_VLLM_PORT".to_string(),
+    match configured_remote_vllm_from_env() {
+        Ok(Some(config)) => {
+            let usable = remote_supports_vllm(&config.host, config.port);
+            attempts.push(VllmDiscoveryAttempt {
+                label: "WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                path: None,
+                exists: true,
+                usable,
+                detail: if usable {
+                    format!(
+                        "remote vLLM server reachable at http://{}:{}",
+                        config.host, config.port
+                    )
+                } else {
+                    format!(
+                        "remote vLLM server is not ready at http://{}:{}",
+                        config.host, config.port
+                    )
+                },
+            });
+            // Any HOST/PORT configuration is an explicit remote-runtime
+            // choice. Preserve it while a large model is cold-starting instead
+            // of silently loading local weights through another vLLM install.
+            return VllmDiscovery {
+                command: Some(VllmCommand::Remote {
+                    host: config.host,
+                    port: config.port,
+                }),
+                source: "env WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                attempts,
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            attempts.push(VllmDiscoveryAttempt {
+                label: "WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
                 path: None,
                 exists: true,
                 usable: false,
-                detail: format!("invalid port: {err}"),
-            }),
+                detail: compact_error(&error.to_string()),
+            });
+            return VllmDiscovery {
+                command: None,
+                source: "invalid env WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                attempts,
+            };
         }
     }
 
@@ -1192,6 +1831,9 @@ fn discover_vllm(store: &ModelStore) -> VllmDiscovery {
 }
 
 fn missing_vllm_message(discovery: &VllmDiscovery) -> String {
+    if let Some(detail) = invalid_remote_vllm_config_detail(discovery) {
+        return format!("Invalid remote vLLM configuration: {detail}");
+    }
     let mut message = "No vLLM runtime found.\n\nTried:".to_string();
     for attempt in &discovery.attempts {
         let path = attempt
@@ -1211,14 +1853,47 @@ fn missing_vllm_message(discovery: &VllmDiscovery) -> String {
         ));
     }
     message.push_str("\n\nFix:");
-    message.push_str("\n- set WERK_VLLM_PYTHON=/path/to/python-with-vllm");
-    message.push_str("\n- or set WERK_VLLM_HOST=127.0.0.1 and WERK_VLLM_PORT=<port>");
-    message.push_str("\n- or run: werk backend install vllm");
+    let platform = current_vllm_platform();
+    if platform == VllmPlatform::DgxSpark {
+        message
+            .push_str("\n- start NVIDIA's Spark-compatible vLLM container with its OpenAI server");
+        message.push_str("\n- set WERK_VLLM_HOST=127.0.0.1 and WERK_VLLM_PORT=<published-port>");
+        message.push_str(
+            "\n- set WERK_VLLM_MODEL=<served-model-id> when /v1/models uses a different ID",
+        );
+        message.push_str(
+            "\n- managed `werk backend install vllm` is intentionally unavailable on DGX Spark",
+        );
+    } else if managed_vllm_install_rejection_for(platform, env::consts::ARCH)
+        == Some(LINUX_ARM64_MANAGED_VLLM_MESSAGE)
+    {
+        message
+            .push_str("\n- install a vendor-supported ARM64 vLLM runtime and set WERK_VLLM_PYTHON");
+        message.push_str("\n- or set WERK_VLLM_HOST=127.0.0.1 and WERK_VLLM_PORT=<port>");
+        message.push_str("\n- generic managed `werk backend install vllm` is intentionally unavailable on Linux aarch64");
+    } else {
+        message.push_str("\n- set WERK_VLLM_PYTHON=/path/to/python-with-vllm");
+        message.push_str("\n- or set WERK_VLLM_HOST=127.0.0.1 and WERK_VLLM_PORT=<port>");
+        message.push_str("\n- or run: werk backend install vllm");
+    }
     message.push_str("\n- or use: werk --backend candle ...");
     message
 }
 
 fn concise_vllm_unavailable_reason(discovery: &VllmDiscovery) -> String {
+    concise_vllm_unavailable_reason_for_platform(discovery, current_vllm_platform())
+}
+
+fn concise_vllm_unavailable_reason_for_platform(
+    discovery: &VllmDiscovery,
+    platform: VllmPlatform,
+) -> String {
+    if let Some(detail) = invalid_remote_vllm_config_detail(discovery) {
+        return format!("Invalid remote vLLM configuration: {detail}");
+    }
+    if platform == VllmPlatform::DgxSpark {
+        return DGX_SPARK_VLLM_MESSAGE.to_string();
+    }
     if discovery.attempts.is_empty() {
         return "No vLLM runtime found; run: werk backend install vllm".to_string();
     }
@@ -1237,6 +1912,17 @@ fn concise_vllm_unavailable_reason(discovery: &VllmDiscovery) -> String {
     } else {
         "No vLLM runtime found; run: werk backend install vllm".to_string()
     }
+}
+
+fn invalid_remote_vllm_config_detail(discovery: &VllmDiscovery) -> Option<&str> {
+    (discovery.source == "invalid env WERK_VLLM_HOST/WERK_VLLM_PORT")
+        .then(|| {
+            discovery
+                .attempts
+                .first()
+                .map(|attempt| attempt.detail.as_str())
+        })
+        .flatten()
 }
 
 fn python_vllm_status(path: &Path) -> (bool, String) {
@@ -1371,12 +2057,9 @@ fn validate_vllm_python(path: &Path) -> Result<()> {
 
 fn remote_supports_vllm(host: &str, port: u16) -> bool {
     let url = format!("http://{host}:{port}");
-    get(&url, "/v1/models")
+    get_with_timeout(&url, "/v1/models", REMOTE_DISCOVERY_PROBE_TIMEOUT)
         .map(|response| response.status == 200)
         .unwrap_or(false)
-        || get(&url, "/health")
-            .map(|response| response.status == 200)
-            .unwrap_or(false)
 }
 
 fn command_failure_detail(prefix: &str, output: &std::process::Output) -> String {
@@ -1420,25 +2103,34 @@ fn vllm_version(command: &VllmCommand) -> Option<String> {
                     .to_string()
             })
         }
-        VllmCommand::Remote { host, port } => get(&format!("http://{host}:{port}"), "/v1/models")
-            .ok()
-            .filter(|response| response.status == 200)
-            .map(|_| "remote server reachable".to_string()),
+        VllmCommand::Remote { .. } => {
+            Some("remote server; version is not exposed by /v1/models".to_string())
+        }
     }
 }
 
-fn get(base_url: &str, path: &str) -> Result<HttpResponse> {
-    request(base_url, path, "GET", None)
+fn get_with_timeout(base_url: &str, path: &str, timeout: Duration) -> Result<HttpResponse> {
+    request(base_url, path, "GET", None, Some(timeout))
 }
 
 fn post_json(base_url: &str, path: &str, body: &Value) -> Result<HttpResponse> {
-    request(base_url, path, "POST", Some(body))
+    request(base_url, path, "POST", Some(body), None)
 }
 
-fn request(base_url: &str, path: &str, method: &str, body: Option<&Value>) -> Result<HttpResponse> {
+fn request(
+    base_url: &str,
+    path: &str,
+    method: &str,
+    body: Option<&Value>,
+    timeout: Option<Duration>,
+) -> Result<HttpResponse> {
     let (_, host, port) = parse_http_url(base_url)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .with_context(|| format!("failed to connect to vLLM server at {base_url}"))?;
+    let deadline = timeout.map(HttpDeadline::new);
+    let mut stream = match deadline {
+        Some(deadline) => connect_http_with_deadline(&host, port, deadline),
+        None => connect_http(&host, port),
+    }
+    .with_context(|| format!("failed to connect to vLLM server at {base_url}"))?;
     stream.set_nodelay(true).ok();
     let body_text = body.map(serde_json::to_string).transpose()?;
     let mut request = format!(
@@ -1449,15 +2141,17 @@ fn request(base_url: &str, path: &str, method: &str, body: Option<&Value>) -> Re
         request.push_str(&format!("Content-Length: {}\r\n", body_text.len()));
     }
     request.push_str("\r\n");
-    stream.write_all(request.as_bytes())?;
+    write_http_bytes(&mut stream, request.as_bytes(), deadline)?;
     if let Some(body_text) = body_text {
-        stream.write_all(body_text.as_bytes())?;
+        write_http_bytes(&mut stream, body_text.as_bytes(), deadline)?;
+    }
+    if let Some(deadline) = deadline {
+        stream.set_write_timeout(Some(deadline.remaining()?))?;
     }
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
+    let status_line = read_http_line(&mut reader, deadline)?;
     let status = status_line
         .split_whitespace()
         .nth(1)
@@ -1465,8 +2159,7 @@ fn request(base_url: &str, path: &str, method: &str, body: Option<&Value>) -> Re
         .ok_or_else(|| anyhow!("invalid HTTP response from vLLM server: {status_line:?}"))?;
     let mut headers = Vec::new();
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        let line = read_http_line(&mut reader, deadline)?;
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             break;
@@ -1476,15 +2169,147 @@ fn request(base_url: &str, path: &str, method: &str, body: Option<&Value>) -> Re
         }
     }
     if status >= 400 {
-        let mut text = String::new();
-        let _ = reader.read_to_string(&mut text);
-        bail!("vLLM HTTP {status}: {}", text.trim());
+        if deadline.is_some() {
+            bail!("vLLM HTTP {status}");
+        } else {
+            let mut text = String::new();
+            let _ = reader.read_to_string(&mut text);
+            bail!("vLLM HTTP {status}: {}", text.trim());
+        }
     }
     Ok(HttpResponse {
         status,
         headers,
         reader,
+        deadline,
     })
+}
+
+fn write_http_bytes(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Option<HttpDeadline>,
+) -> Result<()> {
+    if deadline.is_none() {
+        stream.write_all(bytes)?;
+        return Ok(());
+    }
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .context("missing vLLM HTTP deadline")?
+            .remaining()?;
+        stream.set_write_timeout(Some(remaining))?;
+        let written = stream.write(bytes)?;
+        if written == 0 {
+            bail!("vLLM HTTP connection closed while writing request");
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+fn read_http_line(
+    reader: &mut BufReader<TcpStream>,
+    deadline: Option<HttpDeadline>,
+) -> Result<String> {
+    let Some(deadline) = deadline else {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        return Ok(line);
+    };
+
+    let mut bytes = Vec::new();
+    loop {
+        reader
+            .get_mut()
+            .set_read_timeout(Some(deadline.remaining()?))?;
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(available.len());
+        let found_newline = available[..count].ends_with(b"\n");
+        bytes.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if found_newline {
+            break;
+        }
+    }
+    String::from_utf8(bytes).context("vLLM returned a non-UTF-8 HTTP header")
+}
+
+fn connect_http(host: &str, port: u16) -> Result<TcpStream> {
+    let addresses = resolve_http_addresses(host, port)?;
+    connect_http_addresses(host, port, &addresses, |_| Ok(HTTP_CONNECT_TIMEOUT))
+}
+
+fn connect_http_with_deadline(host: &str, port: u16, deadline: HttpDeadline) -> Result<TcpStream> {
+    let addresses = resolve_http_addresses_with_deadline(host, port, deadline)?;
+    connect_http_addresses(host, port, &addresses, |_| {
+        deadline.remaining_capped(HTTP_CONNECT_TIMEOUT)
+    })
+}
+
+fn resolve_http_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("could not resolve vLLM host {host}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        bail!("vLLM host {host} resolved to no socket addresses");
+    }
+    Ok(addresses)
+}
+
+fn resolve_http_addresses_with_deadline(
+    host: &str,
+    port: u16,
+    deadline: HttpDeadline,
+) -> Result<Vec<SocketAddr>> {
+    let host_owned = host.to_string();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (host_owned.as_str(), port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect::<Vec<_>>())
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+    let addresses = receiver
+        .recv_timeout(deadline.remaining()?)
+        .map_err(|error| anyhow!("timed out resolving vLLM host {host}: {error}"))?
+        .map_err(|error| anyhow!("could not resolve vLLM host {host}: {error}"))?;
+    if addresses.is_empty() {
+        bail!("vLLM host {host} resolved to no socket addresses");
+    }
+    Ok(addresses)
+}
+
+fn connect_http_addresses<F>(
+    host: &str,
+    port: u16,
+    addresses: &[SocketAddr],
+    mut timeout_for: F,
+) -> Result<TcpStream>
+where
+    F: FnMut(&SocketAddr) -> Result<Duration>,
+{
+    let mut errors = Vec::new();
+    for address in addresses {
+        let timeout = timeout_for(address)?;
+        match TcpStream::connect_timeout(address, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => errors.push(format!("{address}: {error}")),
+        }
+    }
+    Err(anyhow!(
+        "could not connect to {host}:{port}: {}",
+        errors.join("; ")
+    ))
 }
 
 fn stream_body<F>(response: &mut HttpResponse, mut on_bytes: F) -> Result<()>
@@ -1493,8 +2318,7 @@ where
 {
     if header_contains(&response.headers, "transfer-encoding", "chunked") {
         loop {
-            let mut size_line = String::new();
-            response.reader.read_line(&mut size_line)?;
+            let size_line = read_http_line(&mut response.reader, response.deadline)?;
             let size_text = size_line
                 .trim()
                 .split_once(';')
@@ -1506,20 +2330,69 @@ where
                 break;
             }
             let mut chunk = vec![0u8; size];
-            response.reader.read_exact(&mut chunk)?;
+            read_http_exact(&mut response.reader, &mut chunk, response.deadline)?;
             on_bytes(&chunk)?;
             let mut crlf = [0u8; 2];
-            response.reader.read_exact(&mut crlf)?;
+            read_http_exact(&mut response.reader, &mut crlf, response.deadline)?;
+        }
+    } else if let Some(length) = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+    {
+        let mut remaining = length;
+        let mut buffer = [0u8; 8192];
+        while remaining > 0 {
+            let requested = remaining.min(buffer.len());
+            let count = read_http_bytes(
+                &mut response.reader,
+                &mut buffer[..requested],
+                response.deadline,
+            )?;
+            if count == 0 {
+                bail!("vLLM HTTP response ended before Content-Length bytes were received");
+            }
+            on_bytes(&buffer[..count])?;
+            remaining -= count;
         }
     } else {
         let mut buffer = [0u8; 8192];
         loop {
-            let n = response.reader.read(&mut buffer)?;
+            let n = read_http_bytes(&mut response.reader, &mut buffer, response.deadline)?;
             if n == 0 {
                 break;
             }
             on_bytes(&buffer[..n])?;
         }
+    }
+    Ok(())
+}
+
+fn read_http_bytes(
+    reader: &mut BufReader<TcpStream>,
+    bytes: &mut [u8],
+    deadline: Option<HttpDeadline>,
+) -> Result<usize> {
+    if let Some(deadline) = deadline {
+        reader
+            .get_mut()
+            .set_read_timeout(Some(deadline.remaining()?))?;
+    }
+    Ok(reader.read(bytes)?)
+}
+
+fn read_http_exact(
+    reader: &mut BufReader<TcpStream>,
+    mut bytes: &mut [u8],
+    deadline: Option<HttpDeadline>,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        let count = read_http_bytes(reader, bytes, deadline)?;
+        if count == 0 {
+            bail!("vLLM HTTP response ended unexpectedly");
+        }
+        bytes = &mut bytes[count..];
     }
     Ok(())
 }
@@ -1788,6 +2661,44 @@ mod tests {
     }
 
     #[test]
+    fn hidden_reasoning_without_visible_answer_is_not_a_success() {
+        for field in ["reasoning", "reasoning_content"] {
+            let mut completion = VllmCompletion::default();
+            let mut value = json!({
+                "choices": [{"delta": {}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 32}
+            });
+            value["choices"][0]["delta"][field] = json!("internal reasoning");
+            update_completion_from_event(&mut completion, &value);
+            assert!(completion.saw_reasoning_content);
+            let error = ensure_vllm_visible_completion(&completion)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("hidden reasoning but no visible answer"));
+            assert!(error.contains("increase max tokens"));
+
+            completion.text = "visible answer".to_string();
+            ensure_vllm_visible_completion(&completion).unwrap();
+        }
+
+        let mut completion_without_usage = VllmCompletion::default();
+        update_completion_from_event(
+            &mut completion_without_usage,
+            &json!({
+                "choices": [{
+                    "delta": {"reasoning_content": "internal reasoning"},
+                    "finish_reason": "length"
+                }]
+            }),
+        );
+        assert_eq!(completion_without_usage.completion_tokens, 0);
+        let error = ensure_vllm_visible_completion(&completion_without_usage)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hidden reasoning but no visible answer"));
+    }
+
+    #[test]
     fn vllm_model_dir_prefers_manifest_config_parent() {
         let store = test_store("vllm-config-parent");
         let manifest = test_manifest(
@@ -1843,6 +2754,113 @@ mod tests {
     }
 
     #[test]
+    fn remote_vllm_does_not_require_local_config_or_weights() {
+        let store = test_store("vllm-remote-metadata-only");
+        let manifest = test_manifest("nvidia/Nemotron-Super", None, None);
+        let discovery = VllmDiscovery {
+            command: Some(VllmCommand::Remote {
+                host: "127.0.0.1".to_string(),
+                port: 8000,
+            }),
+            source: "test remote".to_string(),
+            attempts: Vec::new(),
+        };
+
+        let resolved = resolve_vllm_model_dir_for_discovery(&store, &manifest, &discovery).unwrap();
+        assert_eq!(resolved, store.model_dir(&manifest.id));
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn failed_remote_attempt_that_falls_back_local_still_requires_local_weights() {
+        let store = test_store("vllm-failed-remote-local-fallback");
+        let manifest = test_manifest("nvidia/Nemotron-Super", None, None);
+        let discovery = VllmDiscovery {
+            command: Some(VllmCommand::Python(PathBuf::from("/usr/bin/python3"))),
+            source: "PATH python3".to_string(),
+            attempts: vec![VllmDiscoveryAttempt {
+                label: "WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                path: None,
+                exists: false,
+                usable: false,
+                detail: "remote endpoint unreachable".to_string(),
+            }],
+        };
+
+        let error = resolve_vllm_model_dir_for_discovery(&store, &manifest, &discovery)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not exist"));
+    }
+
+    #[test]
+    fn vllm_cache_identity_distinguishes_remote_and_python_runtimes() {
+        let remote_a = VllmDiscovery {
+            command: Some(VllmCommand::Remote {
+                host: "spark-a".to_string(),
+                port: 8000,
+            }),
+            source: "env".to_string(),
+            attempts: Vec::new(),
+        };
+        let remote_b = VllmDiscovery {
+            command: Some(VllmCommand::Remote {
+                host: "spark-b".to_string(),
+                port: 9000,
+            }),
+            source: "env".to_string(),
+            attempts: Vec::new(),
+        };
+        let python = VllmDiscovery {
+            command: Some(VllmCommand::Python(PathBuf::from("/opt/vllm/bin/python"))),
+            source: "env".to_string(),
+            attempts: Vec::new(),
+        };
+        assert_ne!(
+            vllm_discovery_cache_identity(&remote_a),
+            vllm_discovery_cache_identity(&remote_b)
+        );
+        assert_ne!(
+            vllm_discovery_cache_identity(&remote_a),
+            vllm_discovery_cache_identity(&python)
+        );
+        assert!(vllm_discovery_cache_identity(&python).contains("/opt/vllm/bin/python"));
+
+        let base = VllmCacheEnvironment {
+            host: "spark-a".to_string(),
+            port: "8000".to_string(),
+            python: "/opt/vllm-a/bin/python".to_string(),
+            ..Default::default()
+        };
+        let base_key =
+            vllm_server_cache_key("nemotron", Path::new("/models/nemotron"), &remote_a, &base);
+        for changed in [
+            VllmCacheEnvironment {
+                host: "spark-b".to_string(),
+                ..base.clone()
+            },
+            VllmCacheEnvironment {
+                port: "9000".to_string(),
+                ..base.clone()
+            },
+            VllmCacheEnvironment {
+                python: "/opt/vllm-b/bin/python".to_string(),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(
+                base_key,
+                vllm_server_cache_key(
+                    "nemotron",
+                    Path::new("/models/nemotron"),
+                    &remote_a,
+                    &changed,
+                )
+            );
+        }
+    }
+
+    #[test]
     fn vllm_args_keep_logical_served_model_name() {
         let model_dir = PathBuf::from("/tmp/werk-model/files");
         let args = vllm_server_args(
@@ -1864,6 +2882,87 @@ mod tests {
     }
 
     #[test]
+    fn remote_served_model_prefers_exact_werk_id() {
+        let models = vec![
+            "remote-alias".to_string(),
+            "nvidia/Nemotron-3-Nano".to_string(),
+        ];
+        let selected = select_remote_served_model("nvidia/Nemotron-3-Nano", &models).unwrap();
+        assert_eq!(selected.name, "nvidia/Nemotron-3-Nano");
+        assert_eq!(selected.source, "matching /v1/models entry");
+    }
+
+    #[test]
+    fn remote_served_model_maps_only_advertised_model_for_spark() {
+        let models = vec!["nemotron-super-nvfp4".to_string()];
+        let selected = select_remote_served_model("local-nemotron", &models).unwrap();
+        assert_eq!(selected.name, "nemotron-super-nvfp4");
+        assert_eq!(selected.source, "only /v1/models entry");
+    }
+
+    #[test]
+    fn remote_served_model_rejects_ambiguous_mapping() {
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let error = select_remote_served_model("local-nemotron", &models).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("multiple models"));
+        assert!(message.contains("WERK_VLLM_MODEL"));
+        assert!(message.contains("model-a, model-b"));
+    }
+
+    #[test]
+    fn configured_remote_model_must_be_advertised() {
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let selected = select_configured_remote_served_model("model-b", &models).unwrap();
+        assert_eq!(selected.name, "model-b");
+        assert_eq!(selected.source, "verified WERK_VLLM_MODEL");
+
+        let error = select_configured_remote_served_model("typo", &models)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("WERK_VLLM_MODEL 'typo' is not advertised"));
+        assert!(error.contains("model-a, model-b"));
+        assert!(remote_models_include_served_name("model-b", &models));
+        assert!(!remote_models_include_served_name("old-model", &models));
+    }
+
+    #[test]
+    fn remote_models_response_is_sanitized_and_deduplicated() {
+        let models = parse_remote_vllm_model_ids(
+            br#"{"data":[{"id":" model-b "},{"id":"model-a"},{"id":"model-b"},{"id":"bad\nmodel"},{"id":""},{"object":"model"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(models, vec!["model-a", "model-b"]);
+    }
+
+    #[test]
+    fn configured_vllm_model_is_trimmed_and_rejects_controls() {
+        assert_eq!(
+            validate_configured_vllm_model("  nemotron-served  ").unwrap(),
+            "nemotron-served"
+        );
+        assert!(validate_configured_vllm_model("  ").is_err());
+        assert!(validate_configured_vllm_model("model\nsecond").is_err());
+    }
+
+    #[test]
+    fn nemotron_architectures_and_reasoning_parser_args_are_explicit() {
+        assert!(is_nemotron_architecture_name("nemotron_h"));
+        assert!(is_nemotron_architecture_name("NEMOTRON_H_MOE"));
+        assert!(!is_nemotron_architecture_name("nemotron_omni"));
+        assert!(has_reasoning_parser_arg(&[
+            "--reasoning-parser".to_string(),
+            "deepseek_r1".to_string(),
+        ]));
+        assert!(has_reasoning_parser_arg(&[
+            "--reasoning-parser=deepseek_r1".to_string(),
+        ]));
+        assert!(!has_reasoning_parser_arg(&[
+            "--trust-remote-code".to_string(),
+        ]));
+    }
+
+    #[test]
     fn linux_release_detection_identifies_wsl() {
         assert!(linux_release_looks_like_wsl(
             "5.15.167.4-microsoft-standard-WSL2"
@@ -1882,15 +2981,181 @@ mod tests {
     }
 
     #[test]
-    fn managed_vllm_install_policy_allows_linux_and_wsl_only() {
-        assert!(managed_vllm_install_rejection(VllmPlatform::NativeLinux).is_none());
-        assert!(managed_vllm_install_rejection(VllmPlatform::Wsl).is_none());
+    fn failed_remote_attempt_does_not_make_local_wsl_vllm_eligible() {
+        let discovery = VllmDiscovery {
+            command: Some(VllmCommand::Python(PathBuf::from("/usr/bin/python3"))),
+            source: "PATH python3".to_string(),
+            attempts: vec![VllmDiscoveryAttempt {
+                label: "WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                path: None,
+                exists: false,
+                usable: false,
+                detail: "unreachable".to_string(),
+            }],
+        };
+        let reason = local_vllm_platform_rejection_for_discovery_with_platform(
+            &discovery,
+            VllmPlatform::Wsl,
+        )
+        .unwrap();
+        assert!(reason.contains("WSL"));
+    }
 
-        let windows = managed_vllm_install_rejection(VllmPlatform::NativeWindows).unwrap();
+    #[test]
+    fn managed_vllm_install_policy_blocks_unverified_linux_arm64() {
+        assert!(managed_vllm_install_rejection_for(VllmPlatform::NativeLinux, "x86_64").is_none());
+        assert!(managed_vllm_install_rejection_for(VllmPlatform::Wsl, "x86_64").is_none());
+
+        for platform in [VllmPlatform::NativeLinux, VllmPlatform::Wsl] {
+            let arm64 = managed_vllm_install_rejection_for(platform, "aarch64").unwrap();
+            assert!(arm64.contains("Linux aarch64 detected"));
+            assert!(arm64.contains("WERK_VLLM_PYTHON"));
+            assert!(arm64.contains("WERK_VLLM_HOST"));
+        }
+
+        let spark = managed_vllm_install_rejection_for(VllmPlatform::DgxSpark, "aarch64").unwrap();
+        assert!(spark.contains("DGX Spark detected"));
+        assert!(spark.contains("Spark-compatible vLLM container"));
+        assert!(spark.contains("intentionally not offered"));
+
+        let windows =
+            managed_vllm_install_rejection_for(VllmPlatform::NativeWindows, "x86_64").unwrap();
         assert!(windows.contains("Native Windows local vLLM is not eligible"));
 
-        let macos = managed_vllm_install_rejection(VllmPlatform::Macos).unwrap();
+        let macos = managed_vllm_install_rejection_for(VllmPlatform::Macos, "aarch64").unwrap();
         assert!(macos.contains("not eligible on macOS"));
+    }
+
+    #[test]
+    fn remote_vllm_configuration_is_strict_and_header_safe() {
+        assert_eq!(configured_remote_vllm(None, None).unwrap(), None);
+        assert_eq!(
+            configured_remote_vllm(Some(" spark.local "), Some(" 8000 ")).unwrap(),
+            Some(VllmRemoteConfig {
+                host: "spark.local".to_string(),
+                port: 8000,
+            })
+        );
+
+        for (host, port, expected) in [
+            (Some("spark.local"), None, "must be set together"),
+            (None, Some("8000"), "must be set together"),
+            (Some(""), Some("8000"), "must not be empty"),
+            (
+                Some("spark.local\r\nX-Injected: true"),
+                Some("8000"),
+                "control characters",
+            ),
+            (Some("::1"), Some("8000"), "IPv6 literals"),
+            (
+                Some("spark.local/path"),
+                Some("8000"),
+                "unsupported characters",
+            ),
+            (Some("spark.local"), Some("0"), "between 1 and 65535"),
+            (
+                Some("spark.local"),
+                Some("invalid"),
+                "invalid WERK_VLLM_PORT",
+            ),
+        ] {
+            let error = configured_remote_vllm(host, port).unwrap_err().to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn invalid_remote_intent_is_actionable_and_never_treated_as_local() {
+        let discovery = VllmDiscovery {
+            command: None,
+            source: "invalid env WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+            attempts: vec![VllmDiscoveryAttempt {
+                label: "WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                path: None,
+                exists: true,
+                usable: false,
+                detail: "WERK_VLLM_HOST and WERK_VLLM_PORT must be set together".to_string(),
+            }],
+        };
+        assert!(invalid_remote_vllm_config_detail(&discovery).is_some());
+        assert!(
+            local_vllm_platform_rejection_for_discovery_with_platform(
+                &discovery,
+                VllmPlatform::Wsl,
+            )
+            .is_none()
+        );
+        let message = missing_vllm_message(&discovery);
+        assert!(message.starts_with("Invalid remote vLLM configuration:"));
+        assert!(message.contains("must be set together"));
+        assert!(!message.contains("werk backend install vllm"));
+    }
+
+    #[test]
+    fn dgx_spark_detection_requires_aarch64_and_a_spark_or_gb10_signal() {
+        assert!(dgx_spark_signals(
+            "aarch64",
+            Some("NVIDIA DGX Spark\0"),
+            None,
+        ));
+        assert!(dgx_spark_signals("aarch64", None, Some("NVIDIA GB10"),));
+        assert!(!dgx_spark_signals(
+            "x86_64",
+            Some("NVIDIA DGX Spark"),
+            Some("NVIDIA GB10"),
+        ));
+        assert!(!dgx_spark_signals(
+            "aarch64",
+            Some("Generic ARM server"),
+            Some("NVIDIA H100"),
+        ));
+        assert!(!dgx_spark_signals(
+            "aarch64",
+            Some("Generic ARM server"),
+            Some("NVIDIA GB100"),
+        ));
+    }
+
+    #[test]
+    fn missing_vllm_on_spark_recommends_remote_container_not_managed_pip() {
+        let discovery = VllmDiscovery {
+            command: None,
+            source: "missing".to_string(),
+            attempts: Vec::new(),
+        };
+        let detail =
+            concise_vllm_unavailable_reason_for_platform(&discovery, VllmPlatform::DgxSpark);
+        assert!(detail.contains("WERK_VLLM_HOST"));
+        assert!(detail.contains("WERK_VLLM_MODEL"));
+        assert!(detail.contains("intentionally not offered"));
+        assert!(!detail.contains("run: werk backend install vllm"));
+    }
+
+    #[test]
+    fn vllm_health_timeout_defaults_are_spark_aware_and_overrideable() {
+        let linux = vllm_health_timeout_for(VllmPlatform::NativeLinux, None);
+        assert_eq!(linux.duration, Duration::from_secs(300));
+        assert!(linux.valid);
+
+        let spark = vllm_health_timeout_for(VllmPlatform::DgxSpark, None);
+        assert_eq!(spark.duration, Duration::from_secs(900));
+        assert!(spark.detail.contains("DGX Spark cold starts"));
+
+        let overridden = vllm_health_timeout_for(VllmPlatform::DgxSpark, Some("1800"));
+        assert_eq!(overridden.duration, Duration::from_secs(1800));
+        assert!(overridden.valid);
+        assert!(
+            overridden
+                .detail
+                .contains("WERK_VLLM_HEALTH_TIMEOUT_SECONDS")
+        );
+
+        for invalid in ["0", "-1", "not-a-number", ""] {
+            let fallback = vllm_health_timeout_for(VllmPlatform::DgxSpark, Some(invalid));
+            assert_eq!(fallback.duration, Duration::from_secs(900));
+            assert!(!fallback.valid);
+            assert!(fallback.detail.contains("positive integer"));
+        }
     }
 
     #[test]
@@ -1917,6 +3182,75 @@ mod tests {
         assert_eq!(health.installed_label, "remote");
         assert_eq!(health.health_label, "healthy");
         assert!(health.healthy);
+    }
+
+    #[test]
+    fn configured_but_unready_remote_is_not_reported_healthy() {
+        let remote = VllmDiscovery {
+            command: Some(VllmCommand::Remote {
+                host: "spark.local".to_string(),
+                port: 8000,
+            }),
+            source: "env".to_string(),
+            attempts: vec![VllmDiscoveryAttempt {
+                label: "WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                path: None,
+                exists: false,
+                usable: false,
+                detail: "cold starting".to_string(),
+            }],
+        };
+        let health = vllm_health_for_platform(&remote, VllmPlatform::DgxSpark);
+        assert_eq!(health.installed_label, "remote");
+        assert_eq!(health.health_label, "not ready");
+        assert!(!health.healthy);
+        assert!(health.detail.contains("will wait"));
+    }
+
+    #[test]
+    fn remote_model_resolution_waits_through_cold_start() {
+        let mut attempts = 0;
+        let resolution =
+            wait_for_remote_served_model_with(Duration::from_secs(2), Duration::ZERO, |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    bail!("remote endpoint is still loading");
+                }
+                Ok(RemoteModelResolution {
+                    name: "nemotron-spark".to_string(),
+                    source: "only /v1/models entry",
+                })
+            })
+            .unwrap();
+        assert_eq!(resolution.name, "nemotron-spark");
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn remote_model_wait_has_a_hard_bound_when_http_server_stalls() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+
+        let started = Instant::now();
+        let error = wait_for_remote_served_model(
+            &format!("http://127.0.0.1:{port}"),
+            "nvidia/Nemotron-Super",
+            None,
+            Duration::from_millis(100),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("remote vLLM model discovery"));
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "stalled HTTP probe exceeded its health deadline: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

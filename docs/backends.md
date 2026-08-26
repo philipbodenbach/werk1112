@@ -197,7 +197,7 @@ There is currently no <code>werk backend uninstall</code> command. See
 | <code>onnx-cuda</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
 | <code>onnx-rocm</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
 | <code>onnx-cpu</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
-| <code>vllm</code> | Creates an isolated virtual environment and installs vLLM with pip. | Native Linux, Python/venv, pip, compatible PyTorch and accelerator stack. | Import/version and runtime health checks. |
+| <code>vllm</code> | Creates an isolated virtual environment and installs vLLM with pip. On DGX Spark this target stops with container/remote-endpoint guidance instead of installing an unverified generic wheel. | Native Linux x86_64, Python/venv, pip, compatible PyTorch and accelerator stack. | Import/version and runtime health checks. |
 | <code>qwen-tts</code> | Creates an isolated virtual environment and installs exactly qwen-tts 0.1.1. | Python 3.9+, venv, pip and platform-compatible PyTorch/audio dependencies. | Exact package version and Qwen3TTSModel import. |
 
 Important limitations:
@@ -216,22 +216,38 @@ Important limitations:
 The table distinguishes practical primary support from best-effort or
 upstream-unconfirmed paths.
 
-| Target | Native Linux | WSL2 | Native Windows | macOS Apple Silicon |
-| --- | --- | --- | --- | --- |
-| Werk release binary | x86_64 artifact | Linux artifact | x86_64 artifact | arm64 artifact |
-| llama CPU | Supported build path | Supported build path | Supported build path | Supported build path |
-| llama CUDA | Primary NVIDIA path | Best-effort Linux/CUDA path | Build path with CUDA toolchain | Not applicable |
-| llama ROCm | Primary practical ROCm path | Not recommended | Not practically supported | Not applicable |
-| llama Vulkan | Build path with Vulkan SDK | Best effort | Build path with Vulkan SDK | Not a primary path |
-| llama Metal | Rejected | Rejected | Rejected | Supported build path |
-| local vLLM | Eligible | Installer allowed, local execution currently rejected/cautioned | Rejected | Rejected |
-| remote vLLM | Supported | Supported | Supported | Supported |
-| Qwen-TTS | CUDA is the primary documented path; CPU possible | Experimental/upstream-unconfirmed | Experimental/upstream-unconfirmed | CPU/MPS experimental and upstream-unconfirmed |
-| ONNX targets | Requires matching runner bundle | Requires matching Linux bundle | Requires matching Windows bundle | Requires matching macOS bundle |
+| Target | Native Linux x86_64 | Linux aarch64 / DGX Spark | WSL2 | Native Windows | macOS Apple Silicon |
+| --- | --- | --- | --- | --- | --- |
+| Werk release binary | x86_64 artifact | Spark-only arm64 `sm_121` artifact | Linux x86_64 artifact | x86_64 artifact | arm64 artifact |
+| llama CPU | Supported build path | Supported build path | Supported build path | Supported build path | Supported build path |
+| llama CUDA | Primary NVIDIA path | Primary GB10 path; build upstream natively | Best-effort Linux/CUDA path | Build path with CUDA toolchain | Not applicable |
+| llama ROCm | Primary practical ROCm path | Not applicable to GB10 | Not recommended | Not practically supported | Not applicable |
+| llama Vulkan | Build path with Vulkan SDK | Not a primary Spark path | Best effort | Build path with Vulkan SDK | Not a primary path |
+| llama Metal | Rejected | Rejected | Rejected | Rejected | Supported build path |
+| local vLLM | Eligible | Native-Linux eligible; ARM64 package/model support remains upstream-dependent | Installer allowed, local execution currently rejected/cautioned | Rejected | Rejected |
+| remote vLLM | Supported | Supported | Supported | Supported | Supported |
+| Qwen-TTS | CUDA is the primary documented path; CPU possible | Experimental/upstream-dependent | Experimental/upstream-unconfirmed | Experimental/upstream-unconfirmed | CPU/MPS experimental and upstream-unconfirmed |
+| ONNX targets | Requires matching runner bundle | Requires matching Linux aarch64 runner bundle | Requires matching Linux bundle | Requires matching Windows bundle | Requires matching macOS bundle |
 
-Werk currently publishes normal end-user artifacts for Linux x86_64, Windows
-x86_64 and macOS arm64. Linux arm64, Windows arm64 and macOS x86_64 are not
-current release targets.
+Werk's release tooling produces artifacts for Linux x86_64, Linux aarch64/DGX
+Spark, Windows x86_64 and macOS arm64. The Spark artifact must be built and
+smoke-tested natively with a CUDA 13+ toolchain and targets GB10 compute
+capability 12.1 (`sm_121`). Windows arm64 and macOS x86_64 are not current
+release targets.
+
+### DGX Spark and Nemotron
+
+Werk recognizes text-only Nemotron-H safetensors architectures and can route
+them to vLLM. On Spark the recommended deployment is NVIDIA's compatible vLLM
+container with Werk attached to its OpenAI endpoint. A separately provisioned
+local vLLM interpreter can also be selected explicitly, but the managed generic
+pip installer is deliberately disabled on Spark.
+
+GGUF checkpoints can use a compatible llama.cpp server; the managed CUDA build
+detects GB10 and selects the architecture-specific CMake target. Werk's vLLM
+adapter remains text-only, so recognizing Nemotron-H does not imply support for
+Nemotron Omni image, audio or video inputs. See the complete
+[DGX Spark guide](integrations/dgx-spark.md).
 
 ### WSL and vLLM
 
@@ -325,7 +341,7 @@ Managed installation is optional. Relevant explicit overrides include:
 | --- | --- |
 | llama.cpp | <code>WERK_LLAMA_SERVER_CUDA</code>, <code>WERK_LLAMA_SERVER_ROCM</code>, <code>WERK_LLAMA_SERVER_VULKAN</code>, <code>WERK_LLAMA_SERVER_METAL</code>, <code>WERK_LLAMA_SERVER_CPU</code> |
 | ONNX | <code>WERK_ONNX_RUNTIME_*</code> for execution and <code>WERK_ONNX_RUNTIME_BUNDLE_*</code> for provisioning bundles |
-| vLLM | <code>WERK_VLLM_PYTHON</code>, or remote <code>WERK_VLLM_HOST</code> and <code>WERK_VLLM_PORT</code> |
+| vLLM | <code>WERK_VLLM_PYTHON</code>, or remote <code>WERK_VLLM_HOST</code>, <code>WERK_VLLM_PORT</code> and optional <code>WERK_VLLM_MODEL</code> |
 | Qwen-TTS | <code>WERK_QWEN_TTS_PYTHON</code> |
 | general media companion | <code>WERK_MEDIA_PYTHON</code> or <code>WERK_MEDIA_COMPANION</code> |
 

@@ -12,6 +12,13 @@ Linux and macOS:
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/philipbodenbach/werk1112/main/scripts/install.sh)"
 ```
 
+The shell installer selects `linux-x86_64`, `linux-aarch64-dgx-spark`, or
+`macos-aarch64` from the current host. The ARM64 artifact is accepted only
+when `/proc/device-tree/model` or `nvidia-smi` identifies DGX Spark/GB10;
+other Linux ARM64 hosts must build from source. The installer verifies the
+published `.sha256` file before extracting any release archive. Models and
+CUDA-backed runtimes remain separate from the Werk binary.
+
 The default destination is `$HOME/.local/bin`. Select a release or destination
 with environment variables:
 
@@ -187,4 +194,3 @@ scripts ask separately before deleting it. The default answer keeps user data.
 Managed backend environments have a separate lifecycle. The current cleanup
 procedure and the absence of a `werk backend uninstall` command are documented
 under [Backend uninstall and cleanup](backends.md#uninstall-and-cleanup).
-

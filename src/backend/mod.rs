@@ -269,7 +269,17 @@ const MEDIA_FORMATS: &[ModelFormat] = &[ModelFormat::SafeTensors, ModelFormat::P
 
 const ANY_ARCH: &[&str] = &[];
 const VLLM_ARCHES: &[&str] = &[
-    "llama", "qwen2", "qwen3", "mistral", "mixtral", "phi3", "gemma", "gemma2", "gemma3",
+    "llama",
+    "qwen2",
+    "qwen3",
+    "mistral",
+    "mixtral",
+    "phi3",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "nemotron_h",
+    "nemotron_h_moe",
 ];
 const TRANSFORMERS_COMPAT_ARCHES: &[&str] = &["chatglm"];
 const MLX_VLM_ARCHES: &[&str] = &["gemma4_unified"];
@@ -1200,6 +1210,21 @@ mod tests {
         assert!(mlx_vlm.supports_task(InferenceTask::ImageUnderstanding));
         assert!(mlx_vlm.supports_layout(RepositoryLayout::Mlx));
         assert!(!mlx_vlm.supports_task(InferenceTask::ImageGeneration));
+    }
+
+    #[test]
+    fn vllm_registry_accepts_text_only_nemotron_h_architectures() {
+        let vllm = runtime_descriptor(RuntimeId::VllmCuda);
+        for architecture in ["nemotron_h", "nemotron_h_moe", "NEMOTRON_H"] {
+            assert!(runtime_supports_model(
+                vllm,
+                &ModelFormat::SafeTensors,
+                Some(architecture),
+            ));
+        }
+        assert!(vllm.capabilities.text_generation);
+        assert!(!vllm.capabilities.vision_language);
+        assert!(!vllm.supports_task(InferenceTask::ImageUnderstanding));
     }
 
     #[test]

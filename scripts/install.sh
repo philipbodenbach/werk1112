@@ -16,6 +16,49 @@ detect_downloader() {
     fi
 }
 
+detect_checksum_tool() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        CHECKSUM_TOOL="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        CHECKSUM_TOOL="shasum"
+    else
+        die "sha256sum or shasum is required to verify the Werk1112 release"
+    fi
+}
+
+is_dgx_spark_signal() {
+    signal=$1
+    normalized=$(printf '%s\n' "$signal" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' ' ')
+
+    case " $normalized " in
+        *" NVIDIA DGX SPARK "*|*" GB10 "*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_dgx_spark_host() {
+    if [ -r /proc/device-tree/model ]; then
+        device_model=$(tr '\000' ' ' </proc/device-tree/model)
+        if is_dgx_spark_signal "$device_model"; then
+            return 0
+        fi
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null); then
+            if is_dgx_spark_signal "$gpu_names"; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
 download_to_file() {
     url=$1
     output=$2
@@ -35,6 +78,37 @@ download_to_stdout() {
     else
         wget -qO- "$url"
     fi
+}
+
+verify_checksum() {
+    directory=$1
+    checksum_name=$2
+
+    if [ "$CHECKSUM_TOOL" = "sha256sum" ]; then
+        (cd "$directory" && sha256sum -c "$checksum_name")
+    else
+        (cd "$directory" && shasum -a 256 -c "$checksum_name")
+    fi
+}
+
+validate_archive_listing() {
+    archive=$1
+
+    if ! archive_entries=$(tar -tzf "$archive"); then
+        die "could not read downloaded release archive"
+    fi
+    sorted_entries=$(printf '%s\n' "$archive_entries" | LC_ALL=C sort)
+    expected_entries=$(printf '%s\n' LICENSE README.md werk)
+    [ "$sorted_entries" = "$expected_entries" ] || die "release archive contains unexpected entries"
+}
+
+validate_extracted_archive() {
+    directory=$1
+
+    for name in werk README.md LICENSE; do
+        [ -f "$directory/$name" ] || die "release archive did not contain regular file: $name"
+        [ ! -L "$directory/$name" ] || die "release archive contained a symbolic link: $name"
+    done
 }
 
 normalize_version() {
@@ -60,6 +134,10 @@ detect_platform() {
         Linux:x86_64)
             WERK_PLATFORM="linux-x86_64"
             ;;
+        Linux:arm64|Linux:aarch64)
+            is_dgx_spark_host || die "unsupported Linux aarch64 host: the prebuilt arm64 release is limited to NVIDIA DGX Spark/GB10; build Werk from source on other ARM64 systems"
+            WERK_PLATFORM="linux-aarch64-dgx-spark"
+            ;;
         Darwin:arm64|Darwin:aarch64)
             WERK_PLATFORM="macos-aarch64"
             ;;
@@ -70,6 +148,7 @@ detect_platform() {
 }
 
 detect_downloader
+detect_checksum_tool
 detect_platform
 
 WERK_REPO=${WERK_REPO:-philipbodenbach/werk1112}
@@ -93,19 +172,28 @@ fi
 
 artifact_name="werk1112-v${WERK_VERSION_NUMBER}-${WERK_PLATFORM}.tar.gz"
 download_url="https://github.com/${WERK_REPO}/releases/download/${WERK_TAG}/${artifact_name}"
+checksum_name="$artifact_name.sha256"
+checksum_url="$download_url.sha256"
 
 tmp_root=${TMPDIR:-/tmp}
 tmp_dir="$tmp_root/werk1112-install-$$"
 archive_path="$tmp_dir/$artifact_name"
+checksum_path="$tmp_dir/$checksum_name"
 
 mkdir "$tmp_dir" || die "could not create temporary directory: $tmp_dir"
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 
 printf 'Downloading %s\n' "$download_url"
 download_to_file "$download_url" "$archive_path"
+printf 'Downloading %s\n' "$checksum_url"
+download_to_file "$checksum_url" "$checksum_path"
+
+printf 'Verifying %s\n' "$artifact_name"
+verify_checksum "$tmp_dir" "$checksum_name" || die "checksum verification failed for $artifact_name"
+validate_archive_listing "$archive_path"
 
 tar -xzf "$archive_path" -C "$tmp_dir"
-[ -f "$tmp_dir/werk" ] || die "downloaded artifact did not contain werk"
+validate_extracted_archive "$tmp_dir"
 
 mkdir -p "$install_dir"
 cp "$tmp_dir/werk" "$install_dir/werk"

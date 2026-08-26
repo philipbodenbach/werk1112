@@ -1528,6 +1528,12 @@ fn cuda_architecture() -> Option<String> {
     {
         return Some(value.trim().to_string());
     }
+    if current_host_is_dgx_spark() {
+        // llama.cpp's CMake build accepts the architecture-specific GB10
+        // target documented by NVIDIA. Candle's CUDA_COMPUTE_CAP uses the
+        // separate numeric `121` spelling and is configured in Cargo.
+        return Some("121a-real".to_string());
+    }
     let output = Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
@@ -1540,6 +1546,45 @@ fn cuda_architecture() -> Option<String> {
         .find_map(|line| {
             let arch = line.trim().replace('.', "");
             (!arch.is_empty() && arch.chars().all(|ch| ch.is_ascii_digit())).then_some(arch)
+        })
+}
+
+fn current_host_is_dgx_spark() -> bool {
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        return false;
+    }
+    let device_tree_model = fs::read_to_string("/proc/device-tree/model").ok();
+    let gpu_names = Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    dgx_spark_host_signals(
+        env::consts::ARCH,
+        device_tree_model.as_deref(),
+        gpu_names.as_deref(),
+    )
+}
+
+fn dgx_spark_host_signals(
+    architecture: &str,
+    device_tree_model: Option<&str>,
+    gpu_names: Option<&str>,
+) -> bool {
+    if architecture != "aarch64" {
+        return false;
+    }
+    [device_tree_model, gpu_names]
+        .into_iter()
+        .flatten()
+        .map(str::to_ascii_lowercase)
+        .any(|signal| {
+            signal.contains("dgx spark")
+                || signal.contains("nvidia spark")
+                || signal
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|token| token == "gb10")
         })
 }
 
@@ -1911,6 +1956,35 @@ mod tests {
             managed_backend_dir(&store, LlamaCppMode::Cpu),
             root.join("backends").join("llama-cpu")
         );
+    }
+
+    #[test]
+    fn dgx_spark_selects_the_architecture_specific_llama_cmake_target() {
+        assert!(dgx_spark_host_signals(
+            "aarch64",
+            Some("NVIDIA DGX Spark\0"),
+            None
+        ));
+        assert!(dgx_spark_host_signals(
+            "aarch64",
+            None,
+            Some("NVIDIA GB10\n")
+        ));
+        assert!(!dgx_spark_host_signals(
+            "x86_64",
+            Some("NVIDIA DGX Spark"),
+            Some("NVIDIA GB10")
+        ));
+        assert!(!dgx_spark_host_signals(
+            "aarch64",
+            Some("generic arm server"),
+            Some("NVIDIA H100")
+        ));
+        assert!(!dgx_spark_host_signals(
+            "aarch64",
+            None,
+            Some("NVIDIA GB100")
+        ));
     }
 
     #[test]

@@ -26,11 +26,21 @@ pub enum FitAssessment {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryTopology {
+    Discrete,
+    Unified,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HostResources {
     pub host_memory_bytes: Option<u64>,
     pub accelerator_memory_bytes: Option<u64>,
     pub accelerator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_topology: Option<MemoryTopology>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,6 +282,31 @@ pub fn estimate_workload(
 
     let mut warnings = Vec::new();
     let mut recommendations = Vec::new();
+    if resources.memory_topology == Some(MemoryTopology::Unified) {
+        assumptions.push(
+            "host MemAvailable is the conservative available capacity of the shared CPU/GPU unified-memory pool"
+                .to_string(),
+        );
+        let uses_accelerator = resources.accelerator.as_deref().is_some_and(|accelerator| {
+            matches!(
+                accelerator.to_ascii_lowercase().as_str(),
+                "cuda" | "rocm" | "hip" | "mps" | "metal" | "mlx"
+            )
+        });
+        if uses_accelerator {
+            if resources.accelerator_memory_bytes.is_none() {
+                warnings.push(
+                    "DGX Spark unified memory has no independently reported VRAM capacity; accelerator fit remains unknown and CPU offload does not create a separate memory pool"
+                        .to_string(),
+                );
+            } else {
+                warnings.push(
+                    "the configured accelerator-memory limit is part of DGX Spark's shared unified-memory pool, not additional discrete VRAM"
+                        .to_string(),
+                );
+            }
+        }
+    }
     let fit = classify_workload_fit(Some(accelerator_peak), Some(host_peak), resources);
     if let Some(limit) = resources.accelerator_memory_bytes {
         assumptions.push(format!(

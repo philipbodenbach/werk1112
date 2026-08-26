@@ -88,6 +88,7 @@ vulkan = ["llama-legacy-vulkan"]
 # platform accelerator path into that artifact. External/server backends
 # remain runtime-discovered and are not gated by these feature bundles.
 release-linux = ["cuda"]
+release-linux-aarch64 = ["cuda"]
 release-windows = ["cuda"]
 release-macos-apple-silicon = ["metal"]
 

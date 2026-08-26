@@ -862,6 +862,43 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_h_safetensors_routes_to_text_only_vllm() {
+        for architecture in ["nemotron_h", "nemotron_h_moe"] {
+            let nemotron = manifest(ModelFormat::SafeTensors, Some(architecture));
+            let candidates = runtime_candidate_ids(&nemotron, RequestedBackend::Vllm);
+            assert_eq!(candidates, vec![RuntimeId::VllmCuda]);
+
+            let available = [RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: true,
+                reason: None,
+            }];
+            let selected = select_runtime(
+                &nemotron,
+                RequestedBackend::Vllm,
+                RequestCapabilities::text(true),
+                &available,
+            )
+            .unwrap();
+            assert_eq!(selected.runtime_id, RuntimeId::VllmCuda);
+
+            let image_plan = plan_runtime(
+                &nemotron,
+                RequestedBackend::Vllm,
+                RequestCapabilities::text_with_images(true, true),
+                &available,
+            );
+            assert!(image_plan.selected.is_none());
+            assert!(
+                image_plan
+                    .candidates
+                    .iter()
+                    .any(|decision| decision.reason.contains("VLM"))
+            );
+        }
+    }
+
+    #[test]
     fn safetensors_auto_omits_burn_and_keeps_cpu_only_as_auto_fallback() {
         let unknown = manifest(ModelFormat::SafeTensors, Some("unknown"));
         let candidates = runtime_candidate_ids(&unknown, RequestedBackend::Auto);

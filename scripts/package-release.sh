@@ -13,7 +13,7 @@ die() {
 
 usage() {
     cat >&2 <<'USAGE'
-Usage: ./scripts/package-release.sh <linux|windows|macos|all>
+Usage: ./scripts/package-release.sh <linux|linux-aarch64|windows|macos|all>
 
 Builds release artifacts into releases/.
 Artifacts are universal runtime-router binaries, one per supported OS/architecture,
@@ -23,6 +23,39 @@ USAGE
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+is_dgx_spark_signal() {
+    local signal="$1"
+    local normalized
+
+    normalized="$(printf '%s\n' "$signal" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' ' ')"
+    case " $normalized " in
+        *" NVIDIA DGX SPARK "*|*" GB10 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_dgx_spark_host() {
+    local os
+    local arch
+    local signal
+
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    [[ "$os" == "Linux" ]] || return 1
+    [[ "$arch" == "aarch64" || "$arch" == "arm64" ]] || return 1
+
+    if [[ -r /proc/device-tree/model ]]; then
+        signal="$(tr '\000' ' ' </proc/device-tree/model)"
+        is_dgx_spark_signal "$signal" && return 0
+    fi
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if signal="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"; then
+            is_dgx_spark_signal "$signal" && return 0
+        fi
+    fi
+    return 1
 }
 
 package_version() {
@@ -64,6 +97,12 @@ package_target() {
             cargo_alias="build-linux"
             binary_path="target/x86_64-unknown-linux-gnu/release/werk"
             artifact_name="werk1112-v${VERSION}-linux-x86_64.tar.gz"
+            ;;
+        linux-aarch64)
+            is_dgx_spark_host || die "linux-aarch64 release packaging must run natively on NVIDIA DGX Spark/GB10"
+            cargo_alias="build-linux-aarch64"
+            binary_path="target/aarch64-unknown-linux-gnu/release/werk"
+            artifact_name="werk1112-v${VERSION}-linux-aarch64-dgx-spark.tar.gz"
             ;;
         windows)
             cargo_alias="build-windows"
@@ -108,7 +147,7 @@ package_target() {
             require_command zip
             (cd "$staging_dir" && zip -q "$artifact" "$binary_name" README.md LICENSE)
             ;;
-        linux|macos)
+        linux|linux-aarch64|macos)
             require_command tar
             tar -czf "$artifact" -C "$staging_dir" "$binary_name" README.md LICENSE
             ;;
@@ -131,11 +170,12 @@ VERSION="$(package_version)"
 mkdir -p "$REPO_ROOT/releases" "$REPO_ROOT/target/package"
 
 case "$1" in
-    linux|windows|macos)
+    linux|linux-aarch64|windows|macos)
         package_target "$1"
         ;;
     all)
         package_target linux
+        package_target linux-aarch64
         package_target windows
         package_target macos
         ;;

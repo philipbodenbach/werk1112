@@ -64,9 +64,11 @@ Installer options, first-model setup and uninstall behavior are documented in
 [Getting started](docs/getting-started.md).
 
 Target-specific source builds use the checked-in Cargo aliases
-`build-linux`, `build-windows`, and `build-macos-apple-silicon` on the matching
-host platform. See [Building from source](docs/development/build.md) for the
-feature graph, platform prerequisites and troubleshooting.
+`build-linux`, `build-linux-aarch64`, `build-windows`, and
+`build-macos-apple-silicon` on the matching host platform. The Linux aarch64
+artifact is the DGX Spark/GB10 release path. See
+[Building from source](docs/development/build.md) for the feature graph,
+platform prerequisites and troubleshooting.
 
 ## Quick start
 
@@ -180,9 +182,10 @@ backend contracts.
 
 ## Platform overview
 
-Prebuilt Werk artifacts currently target:
+Werk's release packaging currently targets:
 
 - Linux x86_64
+- Linux aarch64 (DGX Spark/GB10 only)
 - Windows x86_64
 - macOS Apple Silicon
 

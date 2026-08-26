@@ -69,9 +69,11 @@ Managed CUDA builds additionally read `WERK_LLAMA_CUDA_COMPILER`,
 
 | Variable | Meaning |
 | --- | --- |
-| `WERK_VLLM_HOST` + `WERK_VLLM_PORT` | Together select an already-running remote vLLM endpoint before local discovery. |
+| `WERK_VLLM_HOST` + `WERK_VLLM_PORT` | Together explicitly select a remote vLLM endpoint before local discovery. Werk waits for its `/v1/models` readiness within the health timeout. |
+| `WERK_VLLM_MODEL` | Served model ID for a remote vLLM endpoint. When omitted, Werk accepts an exact Werk-model-ID match or the endpoint's only advertised model; ambiguous endpoints fail instead of guessing. |
 | `WERK_VLLM_PYTHON` | Python interpreter for a local vLLM installation. |
 | `WERK_VLLM_ARGS` | Additional whitespace-split local vLLM arguments. |
+| `WERK_VLLM_HEALTH_TIMEOUT_SECONDS` | Positive cold-start readiness timeout for a Werk-supervised local server or explicitly configured remote endpoint. The default is 300 seconds, or 900 seconds on detected DGX Spark; this does not change request/inference timeouts. |
 | `WERK_VLLM_LOG` | Truthy value enables child-runtime logging. |
 | `WERK_VLLM_ACCELERATOR=rocm` or `WERK_VLLM_ROCM=1` | Declares that a remote vLLM endpoint is ROCm-backed. This does not verify the remote server. |
 | `WERK_ONNX_RUNTIME_CUDA`, `WERK_ONNX_RUNTIME_ROCM`, `WERK_ONNX_RUNTIME_CPU` | Mode-specific `werk-onnx-runner` executable. |
@@ -134,8 +136,10 @@ building managed backends:
   checks;
 - `WSL_DISTRO_NAME` and `WSL_INTEROP` for WSL detection.
 
-`CUDA_COMPUTE_CAP` and the checked-in target-specific `CC_*`/`CXX_*` settings
-belong to legacy/custom source builds; see the [build guide](../development/build.md).
+`CUDA_COMPUTE_CAP` is also set by target release aliases where required; the
+DGX Spark alias forces `121`. Custom source builds and the checked-in
+target-specific `CC_*`/`CXX_*` settings are documented in the
+[build guide](../development/build.md).
 
 ## Source of truth
 

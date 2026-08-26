@@ -13,7 +13,8 @@ mod types;
 
 pub use conversation::{ConversationContent, MediaContent, ToolCallContent, ToolResultContent};
 pub use estimate::{
-    EstimateConfidence, FitAssessment, HostResources, WorkloadEstimate, estimate_workload,
+    EstimateConfidence, FitAssessment, HostResources, MemoryTopology, WorkloadEstimate,
+    estimate_workload,
 };
 pub use planner::{
     DependencyRoute, ExecutionDegradation, ExecutionPlan, InferenceRuntimeCandidate,

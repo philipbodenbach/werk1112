@@ -1,7 +1,8 @@
 # Packaging and releasing Werk1112
 
-Werk1112 publishes one router artifact for each supported operating-system and
-architecture pair. It does not publish a separate archive for every backend.
+Werk1112's release tooling produces one router artifact for each configured
+operating-system and architecture pair. It does not produce a separate archive
+for every backend.
 Runtime availability is determined later from compiled Werk features, managed
 backend installations, host-installed runtimes and configured remote services.
 
@@ -20,16 +21,17 @@ See [Building from source](build.md) for toolchain setup and feature details,
 and [Backend support](../backends.md) for runtime provisioning after release
 installation.
 
-## Published target matrix
+## Configured target matrix
 
 | Platform | Cargo alias | Binary | Release archive |
 | --- | --- | --- | --- |
 | Linux x86_64 | `cargo +stable build-linux` | `target/x86_64-unknown-linux-gnu/release/werk` | `werk1112-v<VERSION>-linux-x86_64.tar.gz` |
+| Linux aarch64 / DGX Spark | `cargo +stable build-linux-aarch64` | `target/aarch64-unknown-linux-gnu/release/werk` | `werk1112-v<VERSION>-linux-aarch64-dgx-spark.tar.gz` |
 | Windows 10/11 x64 | `cargo +stable build-windows` or `scripts/build-windows.ps1` | `target/x86_64-pc-windows-msvc/release/werk.exe` | `werk1112-v<VERSION>-windows-x86_64.zip` |
 | macOS Apple Silicon | `cargo +stable build-macos-apple-silicon` | `target/aarch64-apple-darwin/release/werk` | `werk1112-v<VERSION>-macos-aarch64.tar.gz` |
 
-Linux arm64, Windows arm64, macOS x86_64 and other target combinations are not
-currently produced by the checked-in release scripts.
+Windows arm64, macOS x86_64 and other target combinations are not currently
+produced by the checked-in release scripts.
 
 The version embedded in each archive name is read from the `[package]` version
 in `Cargo.toml`. The scripts write archives under `releases/` and a sibling
@@ -65,7 +67,8 @@ Each packaging command invokes its target build before creating the archive.
 The configured Rust target alone does not provide a foreign linker, SDK or
 accelerator toolchain. Unless a complete cross-compilation environment exists:
 
-- package Linux from native Linux or WSL;
+- package Linux x86_64 from native x86_64 Linux or WSL;
+- package Linux aarch64 natively on DGX Spark/GB10;
 - package Windows from native Windows Developer PowerShell;
 - package macOS from Apple Silicon macOS.
 
@@ -93,6 +96,31 @@ The shell script:
    `sha256sum` is unavailable.
 
 It requires `tar` in addition to the build prerequisites.
+
+## DGX Spark / Linux aarch64 package
+
+Run the aarch64 packaging branch natively on the DGX Spark release builder:
+
+~~~bash
+./scripts/package-release.sh linux-aarch64
+~~~
+
+It invokes `cargo build-linux-aarch64`, which selects
+`aarch64-unknown-linux-gnu`, the `release-linux-aarch64` CUDA bundle and compute
+capability 12.1 (`sm_121`). It then stages the same three files as the x86_64
+Linux package and writes:
+
+~~~text
+releases/werk1112-v<VERSION>-linux-aarch64-dgx-spark.tar.gz
+releases/werk1112-v<VERSION>-linux-aarch64-dgx-spark.tar.gz.sha256
+~~~
+
+The checked-in packaging command intentionally requires a native Spark/GB10
+build host. Before invoking Cargo, the packager requires Linux aarch64 plus a
+DGX Spark/GB10 signal from `/proc/device-tree/model` or `nvidia-smi`. It does
+not attempt to synthesize an ARM64 sysroot or CUDA cross-toolchain on x86_64.
+The resulting archive still requires a separate native smoke test before
+release.
 
 ## macOS package
 
@@ -142,11 +170,12 @@ The shell script accepts:
 ./scripts/package-release.sh all
 ~~~
 
-This means “run the Linux, Windows and macOS packaging branches in sequence.”
+This means “run the Linux x86_64, Linux aarch64, Windows and macOS packaging
+branches in sequence.”
 It does not install cross-compilers or bypass native SDK requirements. On an
 ordinary single-platform host it will normally stop when the first foreign
 target cannot build. Use it only in an environment deliberately configured for
-all three targets; otherwise package each artifact on its matching host.
+all four targets; otherwise package each artifact on its matching host.
 
 ## Local output layout
 
@@ -156,6 +185,8 @@ For package version `1.3.3`, the generated tree is:
 releases/
 ├── werk1112-v1.3.3-linux-x86_64.tar.gz
 ├── werk1112-v1.3.3-linux-x86_64.tar.gz.sha256
+├── werk1112-v1.3.3-linux-aarch64-dgx-spark.tar.gz
+├── werk1112-v1.3.3-linux-aarch64-dgx-spark.tar.gz.sha256
 ├── werk1112-v1.3.3-windows-x86_64.zip
 ├── werk1112-v1.3.3-windows-x86_64.zip.sha256
 ├── werk1112-v1.3.3-macos-aarch64.tar.gz
@@ -172,6 +203,7 @@ Inspect Unix archive contents:
 
 ~~~bash
 tar -tzf releases/werk1112-v<VERSION>-linux-x86_64.tar.gz
+tar -tzf releases/werk1112-v<VERSION>-linux-aarch64-dgx-spark.tar.gz
 tar -tzf releases/werk1112-v<VERSION>-macos-aarch64.tar.gz
 ~~~
 
@@ -216,12 +248,15 @@ whose tag is `v<VERSION>`:
 
 | Installer | Supported downloads |
 | --- | --- |
-| `scripts/install.sh` | `linux-x86_64` on Linux x86_64; `macos-aarch64` on Apple Silicon macOS |
+| `scripts/install.sh` | `linux-x86_64` on Linux x86_64; `linux-aarch64-dgx-spark` only when Linux arm64 identifies DGX Spark/GB10; `macos-aarch64` on Apple Silicon macOS |
 | `scripts/install.ps1` | `windows-x86_64` on native Windows |
 
 Both installers accept `WERK_VERSION` with or without a leading `v`. When it is
 unset they query the latest GitHub release. `WERK_REPO` can select a different
 GitHub repository, and `WERK_INSTALL_DIR` changes the binary destination.
+The POSIX installer downloads the archive's sibling `.sha256`, requires
+`sha256sum` or `shasum`, verifies it before extraction, and rejects archives
+whose entries are not exactly `werk`, `README.md`, and `LICENSE`.
 
 The packaging scripts only create local files. They do not create a Git tag,
 create a GitHub release or upload artifacts.
@@ -235,7 +270,7 @@ create a GitHub release or upload artifacts.
 4. Inspect archive contents and verify every checksum.
 5. Smoke-test the extracted binary on the target operating system.
 6. Create the matching `v<VERSION>` release tag.
-7. Upload all three archives and their three checksum files to the GitHub
+7. Upload all four archives and their four checksum files to the GitHub
    release.
 8. Test each public installer against that release.
 

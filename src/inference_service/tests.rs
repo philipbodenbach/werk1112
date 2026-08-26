@@ -601,6 +601,7 @@ fn preflight_vram_rejection_never_calls_execute_or_creates_an_attempt() {
             host_memory_bytes: Some(64 * 1024 * 1024 * 1024),
             accelerator_memory_bytes: Some(12 * 1024 * 1024 * 1024),
             accelerator: Some("cuda".to_string()),
+            memory_topology: None,
         },
     );
     let output_entries_before = fs::read_dir(service.output_store().root())
@@ -828,6 +829,7 @@ fn backend_fit_is_derived_from_its_own_peaks() {
         host_memory_bytes: Some(100),
         accelerator_memory_bytes: Some(100),
         accelerator: Some("cuda".to_string()),
+        memory_topology: None,
     };
     let mut backend = WorkloadEstimate {
         task: InferenceTask::ImageGeneration,
@@ -859,6 +861,7 @@ fn detected_accelerator_limit_overrides_optimistic_backend_fit() {
         host_memory_bytes: Some(1_000),
         accelerator_memory_bytes: Some(100),
         accelerator: Some("cuda".to_string()),
+        memory_topology: None,
     };
     let mut backend = WorkloadEstimate {
         task: InferenceTask::ImageGeneration,
@@ -896,6 +899,7 @@ fn explicit_cpu_route_does_not_inherit_cuda_memory_limit() {
             host_memory_bytes: Some(64 * 1024 * 1024 * 1024),
             accelerator_memory_bytes: Some(24 * 1024 * 1024 * 1024),
             accelerator: Some("cuda".to_string()),
+            memory_topology: None,
         },
         &effective,
     );
@@ -919,6 +923,7 @@ fn explicit_cpu_device_takes_precedence_over_cuda_accelerator_for_resources() {
             host_memory_bytes: Some(64 * 1024 * 1024 * 1024),
             accelerator_memory_bytes: Some(24 * 1024 * 1024 * 1024),
             accelerator: Some("cuda".to_string()),
+            memory_topology: None,
         },
         &effective,
     );

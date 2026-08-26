@@ -45,6 +45,7 @@ and these release targets:
 ~~~text
 x86_64-unknown-linux-gnu
 x86_64-pc-windows-msvc
+aarch64-unknown-linux-gnu
 aarch64-apple-darwin
 ~~~
 
@@ -106,21 +107,23 @@ cargo +stable install --path . --locked --force
 
 ## Target release aliases
 
-Release artifacts use one alias for each published operating-system and
+Release tooling uses one alias for each configured operating-system and
 architecture pair:
 
 | Alias | Host normally used | Feature bundle | Output |
 | --- | --- | --- | --- |
 | `cargo +stable build-linux` | Native Linux or WSL | `release-linux` | `target/x86_64-unknown-linux-gnu/release/werk` |
+| `cargo +stable build-linux-aarch64` | Native DGX Spark/GB10 | `release-linux-aarch64` | `target/aarch64-unknown-linux-gnu/release/werk` |
 | `cargo +stable build-windows` | Native Windows Developer PowerShell | `release-windows` | `target/x86_64-pc-windows-msvc/release/werk.exe` |
 | `cargo +stable build-macos-apple-silicon` | Apple Silicon macOS | `release-macos-apple-silicon` | `target/aarch64-apple-darwin/release/werk` |
 
-All three aliases use `--release --locked --no-default-features` and an
+All four aliases use `--release --locked --no-default-features` and an
 explicit target triple. Their bundle definitions in `Cargo.toml` are:
 
 | Bundle | Current expansion | Compiled accelerator path |
 | --- | --- | --- |
 | `release-linux` | `cuda` | Candle CPU and Candle CUDA |
+| `release-linux-aarch64` | `cuda` | Candle CPU and Candle CUDA, compiled for DGX Spark `sm_121` |
 | `release-windows` | `cuda` | Candle CPU and Candle CUDA |
 | `release-macos-apple-silicon` | `metal` | Candle CPU and Candle Metal |
 
@@ -139,6 +142,10 @@ The corresponding raw Linux and macOS commands are:
 ~~~bash
 cargo +stable build --release --locked --no-default-features \
   --target x86_64-unknown-linux-gnu --features release-linux
+
+CUDA_COMPUTE_CAP=121 cargo +stable build \
+  --release --locked --no-default-features \
+  --target aarch64-unknown-linux-gnu --features release-linux-aarch64
 
 cargo +stable build --release --locked --no-default-features \
   --target aarch64-apple-darwin --features release-macos-apple-silicon
@@ -175,9 +182,10 @@ The feature graph currently exposed by `Cargo.toml` is:
 | `burn-runtime` | Burn runtime and model-store dependencies. |
 | `burn-cpu` | Burn runtime with the CPU/flex backend. |
 | `burn-cuda` | Burn runtime with CUDA/fusion and the `cudarc` CUDA 12.8 selector. |
-| `release-linux` | Published Linux feature bundle; currently `cuda`. |
-| `release-windows` | Published Windows feature bundle; currently `cuda`. |
-| `release-macos-apple-silicon` | Published Apple Silicon bundle; currently `metal`. |
+| `release-linux` | Linux x86_64 release feature bundle; currently `cuda`. |
+| `release-linux-aarch64` | DGX Spark/Linux aarch64 release feature bundle; currently `cuda`. |
+| `release-windows` | Windows release feature bundle; currently `cuda`. |
+| `release-macos-apple-silicon` | Apple Silicon release feature bundle; currently `metal`. |
 
 The persistent llama.cpp server route is preferred over the legacy in-process
 FFI features. Build those legacy features only for development or regression
@@ -185,7 +193,7 @@ testing.
 
 ## Linux x86_64 release build
 
-`release-linux` currently includes Candle CUDA, so producing the published
+`release-linux` currently includes Candle CUDA, so producing the configured
 Linux artifact requires a working CUDA build environment even though the final
 Werk router can later use CPU or external runtimes.
 
@@ -235,6 +243,41 @@ If Candle reports `fatal error: cuda_fp8.h: No such file or directory`, the
 active toolkit is too old for the selected Candle CUDA code. Verify that the
 intended toolkit's `bin`, `include` and library directories precede an older
 distribution CUDA package.
+
+## DGX Spark / Linux aarch64 release build
+
+Werk's configured Linux aarch64 target is built for the NVIDIA DGX Spark GB10.
+GB10 is an arm64 system with CUDA compute capability 12.1 (`sm_121`). The
+checked-in alias therefore overrides the repository's x86/Ampere default and
+sets `CUDA_COMPUTE_CAP=121` for this command only:
+
+~~~bash
+rustup target add aarch64-unknown-linux-gnu
+nvcc --version
+cargo +stable build-linux-aarch64
+~~~
+
+Produce and smoke-test the release artifact natively on a DGX Spark (or an
+equivalent native Linux aarch64/GB10 release builder). The repository does not
+ship an aarch64 CUDA cross-toolchain, sysroot, or containerized cross-build.
+Specifying the Rust target alone on an x86_64 host is not a supported release
+build.
+
+The Spark build requires a CUDA toolkit capable of compiling `sm_121`; use
+CUDA 13 or newer and ensure its `nvcc`, headers and libraries are selected.
+DGX OS already provides an arm64 NVIDIA software base, but optional runtimes
+such as llama.cpp, vLLM, TensorRT-LLM and model-specific containers remain
+separate installations. Building Werk does not install them.
+
+The resulting binary is:
+
+~~~text
+target/aarch64-unknown-linux-gnu/release/werk
+~~~
+
+The compute-capability value follows NVIDIA's
+[CUDA GPU table](https://developer.nvidia.com/cuda-gpus) and
+[DGX Spark porting guide](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/).
 
 ## Native Windows x64 release build
 
@@ -353,6 +396,7 @@ Install the target for the active stable toolchain:
 
 ~~~bash
 rustup target add x86_64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
 rustup target add x86_64-pc-windows-msvc
 rustup target add aarch64-apple-darwin
 ~~~

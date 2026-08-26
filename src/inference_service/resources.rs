@@ -4,7 +4,7 @@ use std::{env, fs};
 #[cfg(not(target_os = "macos"))]
 use std::{path::Path, process::Command, sync::OnceLock};
 
-use crate::inference::{HostResources, RuntimeAccelerator};
+use crate::inference::{HostResources, MemoryTopology, RuntimeAccelerator};
 
 #[cfg(any(not(target_os = "macos"), test))]
 const CUDA_DEVICE_PATHS: [&str; 3] = ["/dev/nvidiactl", "/dev/nvidia0", "/dev/dxg"];
@@ -15,6 +15,9 @@ const MEBIBYTE_BYTES: u64 = 1024 * 1024;
 #[cfg(not(target_os = "macos"))]
 static NVIDIA_MEMORY_BYTES: OnceLock<Option<u64>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
+static DGX_SPARK: OnceLock<bool> = OnceLock::new();
+
 pub fn detect_host_resources() -> HostResources {
     let host_memory_bytes = fs::read_to_string("/proc/meminfo").ok().and_then(|data| {
         data.lines()
@@ -24,19 +27,114 @@ pub fn detect_host_resources() -> HostResources {
             .map(|kib| kib.saturating_mul(1024))
     });
     let accelerator = detected_accelerator();
-    let accelerator_memory_bytes = if accelerator == RuntimeAccelerator::Cpu {
-        None
-    } else {
-        env::var("WERK_ACCELERATOR_MEMORY_BYTES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .or_else(|| detected_accelerator_memory_bytes(accelerator))
-    };
+    let memory_topology = detected_memory_topology();
+    let configured_accelerator_memory_bytes = env::var("WERK_ACCELERATOR_MEMORY_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let accelerator_memory_bytes = select_accelerator_memory_bytes(
+        accelerator,
+        configured_accelerator_memory_bytes,
+        memory_topology,
+        || detected_accelerator_memory_bytes(accelerator),
+    );
     HostResources {
         host_memory_bytes,
         accelerator_memory_bytes,
         accelerator: Some(format!("{accelerator:?}").to_ascii_lowercase()),
+        memory_topology,
     }
+}
+
+fn select_accelerator_memory_bytes<F>(
+    accelerator: RuntimeAccelerator,
+    configured: Option<u64>,
+    memory_topology: Option<MemoryTopology>,
+    detect: F,
+) -> Option<u64>
+where
+    F: FnOnce() -> Option<u64>,
+{
+    if accelerator == RuntimeAccelerator::Cpu {
+        return None;
+    }
+    configured.or_else(|| {
+        (memory_topology != Some(MemoryTopology::Unified))
+            .then(detect)
+            .flatten()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn detected_memory_topology() -> Option<MemoryTopology> {
+    is_dgx_spark_environment().then_some(MemoryTopology::Unified)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detected_memory_topology() -> Option<MemoryTopology> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn is_dgx_spark_environment() -> bool {
+    *DGX_SPARK.get_or_init(probe_dgx_spark_environment)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_dgx_spark_environment() -> bool {
+    if !matches!(env::consts::ARCH, "aarch64" | "arm64") {
+        return false;
+    }
+
+    let device_tree_model = [
+        "/proc/device-tree/model",
+        "/sys/firmware/devicetree/base/model",
+    ]
+    .into_iter()
+    .find_map(|path| {
+        fs::read(path)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    });
+    if dgx_spark_signals(env::consts::ARCH, device_tree_model.as_deref(), None) {
+        return true;
+    }
+
+    let nvidia_smi = Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    dgx_spark_signals(
+        env::consts::ARCH,
+        device_tree_model.as_deref(),
+        nvidia_smi.as_deref(),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn dgx_spark_signals(
+    architecture: &str,
+    device_tree_model: Option<&str>,
+    nvidia_smi: Option<&str>,
+) -> bool {
+    if !matches!(architecture, "aarch64" | "arm64") {
+        return false;
+    }
+    [device_tree_model, nvidia_smi]
+        .into_iter()
+        .flatten()
+        .any(signal_identifies_dgx_spark)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn signal_identifies_dgx_spark(signal: &str) -> bool {
+    let lower = signal.to_ascii_lowercase();
+    lower.contains("dgx spark")
+        || lower.contains("nvidia spark")
+        || lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| token == "gb10")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -255,6 +353,68 @@ fn accelerator_from_hardware_signals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_detection_requires_arm64_and_an_exact_spark_or_gb10_signal() {
+        assert!(dgx_spark_signals(
+            "aarch64",
+            Some("NVIDIA DGX Spark\0"),
+            None,
+        ));
+        assert!(dgx_spark_signals("arm64", None, Some("NVIDIA GB10\n"),));
+        assert!(!dgx_spark_signals(
+            "x86_64",
+            Some("NVIDIA DGX Spark"),
+            Some("NVIDIA GB10"),
+        ));
+        assert!(!dgx_spark_signals("aarch64", None, Some("NVIDIA GB100"),));
+    }
+
+    #[test]
+    fn unified_memory_skips_automatic_vram_but_keeps_explicit_override() {
+        let probe_called = std::cell::Cell::new(false);
+        let automatic = select_accelerator_memory_bytes(
+            RuntimeAccelerator::Cuda,
+            None,
+            Some(MemoryTopology::Unified),
+            || {
+                probe_called.set(true);
+                Some(128 * 1024 * 1024 * 1024)
+            },
+        );
+        assert_eq!(automatic, None);
+        assert!(!probe_called.get());
+
+        let configured = select_accelerator_memory_bytes(
+            RuntimeAccelerator::Cuda,
+            Some(96 * 1024 * 1024 * 1024),
+            Some(MemoryTopology::Unified),
+            || panic!("explicit override must skip automatic probing"),
+        );
+        assert_eq!(configured, Some(96 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn non_unified_accelerators_keep_existing_memory_probe_behavior() {
+        assert_eq!(
+            select_accelerator_memory_bytes(
+                RuntimeAccelerator::Cuda,
+                None,
+                Some(MemoryTopology::Discrete),
+                || Some(24 * 1024 * 1024 * 1024),
+            ),
+            Some(24 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            select_accelerator_memory_bytes(
+                RuntimeAccelerator::Cpu,
+                Some(24 * 1024 * 1024 * 1024),
+                None,
+                || panic!("CPU resources must not probe accelerator memory"),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn wsl_dxg_cuda_signal_selects_cuda() {

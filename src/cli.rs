@@ -6759,8 +6759,27 @@ fn print_backend_list(store: &ModelStore) {
                 .collect::<Vec<_>>()
                 .join("/"),
             yes_no(runtime.capabilities.vision_language),
-            runtime.install_target.unwrap_or("-")
+            runtime_install_target_for_current_host(runtime.install_target).unwrap_or("-")
         );
+    }
+}
+
+fn runtime_install_target_for_current_host(target: Option<&'static str>) -> Option<&'static str> {
+    runtime_install_target_for_platform(target, env::consts::OS, env::consts::ARCH)
+}
+
+fn runtime_install_target_for_platform<'a>(
+    target: Option<&'a str>,
+    operating_system: &str,
+    architecture: &str,
+) -> Option<&'a str> {
+    match target {
+        // The managed vLLM installer is intentionally unavailable outside
+        // Linux and on every Linux ARM64 host, including DGX Spark. Rendering
+        // the static registry target there would contradict the actionable
+        // runtime rejection printed beside it.
+        Some("vllm") if operating_system != "linux" || architecture == "aarch64" => None,
+        target => target,
     }
 }
 
@@ -8278,7 +8297,7 @@ fn print_routing_debug(
             decision.display_name, decision.reason
         );
         if decision.status == RuntimeDecisionStatus::Rejected
-            && let Some(target) = descriptor.install_target
+            && let Some(target) = runtime_install_target_for_current_host(descriptor.install_target)
         {
             eprintln!("  install hint: werk backend install {target}");
         }
@@ -10305,6 +10324,28 @@ mod tests {
         assert_eq!(onnx.display_name, "ONNX Runtime CUDA");
         assert!(onnx.implemented);
         assert_eq!(onnx.install_target, None);
+    }
+
+    #[test]
+    fn vllm_install_hint_is_hidden_where_managed_install_is_unavailable() {
+        assert_eq!(
+            runtime_install_target_for_platform(Some("vllm"), "linux", "x86_64"),
+            Some("vllm")
+        );
+        for (operating_system, architecture) in [
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            assert_eq!(
+                runtime_install_target_for_platform(Some("vllm"), operating_system, architecture,),
+                None
+            );
+        }
+        assert_eq!(
+            runtime_install_target_for_platform(Some("llama-cuda"), "linux", "aarch64"),
+            Some("llama-cuda")
+        );
     }
 
     #[test]
