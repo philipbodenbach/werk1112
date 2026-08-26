@@ -415,6 +415,15 @@ that case planning rejects it with the recorded reason. It distinguishes:
 - execution degradation: offload, tiling/windowing, or a slower attention path;
 - model/quality downgrade: a recommendation that is never silently executed.
 
+The model/task probe also reports `task_readiness`. This keeps five different
+conditions separate: a ready adapter, a verified fallback, a known managed
+backend that can be installed, a task for which no execution adapter has been
+implemented, and an unavailable environment or model layout. Missing generic
+Python dependencies are reported as mandatory packages plus explicit
+`any_of`/`all_of` alternative groups without synthesizing an unsafe install
+command. These facts are diagnostic only: Werk still executes the explicitly
+named model and never substitutes another model automatically.
+
 For CUDA, Werk obtains the accelerator-memory limit from `nvidia-smi`, with
 `WERK_ACCELERATOR_MEMORY_BYTES` as an explicit override. Heterogeneous
 multi-GPU configurations without a stable GPU UUID intentionally report the

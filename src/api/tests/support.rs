@@ -24,7 +24,7 @@ pub(super) use crate::{
     capabilities::{OutputModality, RepositoryLayout},
     inference::{
         EffectiveInferenceRequest, InferenceRuntimeCandidate, ParameterSupportStatus,
-        RuntimeAccelerator,
+        RuntimeAccelerator, TaskReadiness, TaskReadinessStatus,
     },
     inference_service::{BackendExecution, BackendOutput, BackendProbe, MediaInferenceBackend},
     model_store::{ModelFormat, ModelMetadata, ModelSource},
@@ -179,6 +179,16 @@ impl MediaInferenceBackend for MockMediaBackend {
                 priority: 1_000,
             }],
             parameter_support,
+            readiness: Some(TaskReadiness {
+                status: TaskReadinessStatus::Available,
+                detail: "mock media backend is ready".to_string(),
+                adapter: Some("mock-media".to_string()),
+                required_backend: None,
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            }),
         }
     }
 

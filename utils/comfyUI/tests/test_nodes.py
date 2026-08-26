@@ -114,6 +114,45 @@ def test_models_parsing_distinguishes_installed_declared_and_available():
     assert result["available"] == ["image-ready"]
 
 
+def test_model_classifiers_preserve_per_task_readiness_metadata():
+    image_statuses = {
+        "image_generation": {
+            "status": "installable",
+            "detail": "managed backend is missing",
+            "install_command": "werk backend install image-runtime",
+        }
+    }
+    video_statuses = {
+        "video-generation": {
+            "status": "unavailable",
+            "detail": "codec probe failed",
+            "missing_dependencies": ["ffmpeg"],
+        }
+    }
+    capabilities = {
+        "models": [
+            {
+                "id": "image",
+                "tasks": ["image_generation"],
+                "available_tasks": [],
+                "task_statuses": image_statuses,
+            },
+            {
+                "id": "video",
+                "tasks": ["video_generation"],
+                "available_tasks": [],
+                "task_statuses": video_statuses,
+            },
+        ]
+    }
+
+    images = classify_image_models(models_payload("image"), capabilities)
+    videos = classify_video_models(models_payload("video"), capabilities)
+
+    assert images["models"][0]["task_statuses"] == image_statuses
+    assert videos["models"][0]["task_statuses"] == video_statuses
+
+
 def test_older_models_payload_tasks_are_used_without_capabilities():
     payload = {"data": [{"id": "legacy", "tasks": ["image-generation"], "available_tasks": ["image-generation"]}]}
     result = classify_image_models(payload, {})
@@ -687,6 +726,43 @@ def test_multiple_image_models_require_explicit_preference(fake_client):
         WerkImageModelsNode().select(WerkConnection("http://werk"), 0, "", True)
 
 
+def test_image_model_does_not_replace_unavailable_preference_and_shows_server_install_command(
+    fake_client,
+):
+    fake_client.responses = {
+        "/v1/models": models_payload("ready", "preferred"),
+        "/v1/capabilities": {
+            "models": [
+                {
+                    "id": "ready",
+                    "tasks": ["image-generation"],
+                    "available_tasks": ["image-generation"],
+                },
+                {
+                    "id": "preferred",
+                    "tasks": ["image-generation"],
+                    "available_tasks": [],
+                    "task_statuses": {
+                        "image_generation": {
+                            "status": "installable",
+                            "detail": "backend is missing",
+                            "install_command": "werk backend install exact-image-backend",
+                        }
+                    },
+                },
+            ]
+        },
+    }
+
+    with pytest.raises(ValueError) as error:
+        WerkImageModelsNode().select(
+            WerkConnection("http://werk"), 0, "preferred", True
+        )
+
+    assert "werk backend install exact-image-backend" in str(error.value)
+    assert "ready" not in str(error.value)
+
+
 def test_video_model_selection_filters_the_requested_task(fake_client):
     fake_client.responses = {
         "/v1/models": models_payload("text-video", "wan-ti2v"),
@@ -715,6 +791,35 @@ def test_video_model_selection_filters_the_requested_task(fake_client):
     with pytest.raises(ValueError, match="task must be"):
         WerkVideoModelsNode().select(
             WerkConnection("http://werk"), "video-upscaling", 0, "", True
+        )
+
+
+def test_unavailable_video_model_recommends_model_specific_doctor_command(fake_client):
+    fake_client.responses = {
+        "/v1/models": models_payload("wan"),
+        "/v1/capabilities": {
+            "models": [
+                {
+                    "id": "wan",
+                    "tasks": ["video_generation"],
+                    "available_tasks": [],
+                    "task_statuses": {
+                        "video_generation": {
+                            "status": "unavailable",
+                            "detail": "runtime probe failed",
+                        }
+                    },
+                }
+            ]
+        },
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"werk doctor --model wan --task video-generation",
+    ):
+        WerkVideoModelsNode().select(
+            WerkConnection("http://werk"), "video-generation", 0, "", True
         )
 
 

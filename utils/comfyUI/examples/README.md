@@ -25,7 +25,10 @@ submitting it.
 The audio API prompts exercise each native path:
 
 - `werk_music_generation_api.json` uses Audio Models, Audio Config, Audio
-  Generate, and ComfyUI's native `PreviewAudio`;
+  Generate, and ComfyUI's native `PreviewAudio`. It automatically selects the
+  model when exactly one executable `music-generation` model is installed and
+  uses an explicit CUDA/FP16 route, fixed seed 1112, and an empty negative
+  prompt compatible with the Transformers MusicGen adapter;
 - `werk_text_to_speech_api.json` mirrors the documented Qwen3-TTS VoiceDesign
   CUDA smoke test: explicit BF16 routing, fixed seed 1112, German language,
   first-class speaking-style instruction, and WAV output;
@@ -38,9 +41,11 @@ The audio API prompts exercise each native path:
   a compatible external media backend before it can execute.
 
 Upload/change `example.wav`, `source.wav`, and `reference.wav` before submitting
-the input-audio prompts. Replace the illustrative preferred aliases
-`music-model`, `audio-understanding-model`, and `voice-conversion-model` with
-installed aliases that declare the selected task. The TTS prompt names the
+the input-audio prompts. The music example leaves `preferred_model` empty and
+therefore requires exactly one executable music model; set an installed alias
+when multiple candidates exist. Replace the illustrative preferred aliases
+`audio-understanding-model` and `voice-conversion-model` with installed aliases
+that declare the selected task. The TTS prompt names the
 installed Qwen3-TTS VoiceDesign repository directly; replace it with its local
 alias if one was assigned during `werk pull`. Analysis is itself an output
 node, so its text/JSON values and metadata are returned in ComfyUI history

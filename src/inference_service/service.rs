@@ -11,12 +11,13 @@ use super::{
     types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome, RuntimeAttemptTiming},
 };
 use crate::{
+    backend::validated_backend_install_command,
     inference::{
         EffectiveInferenceRequest, ExecutionDegradation, ExecutionPlan, HostResources,
         InferenceRequest, ParameterSource, ParameterValue, PlanCandidateStatus, ResolutionContext,
-        ResolvedParameter, RuntimeAccelerator, WorkloadEstimate, classify_workload_fit,
-        estimate_workload, parameter_schema, parameter_schema_for_manifest, plan_execution,
-        resolve_request,
+        ResolvedParameter, RuntimeAccelerator, TaskReadiness, TaskReadinessStatus,
+        WorkloadEstimate, classify_workload_fit, estimate_workload, parameter_schema,
+        parameter_schema_for_manifest, plan_execution, resolve_request,
     },
     media_companion::CompanionProtocolError,
     model_store::{ModelManifest, ModelStore, unix_ts},
@@ -83,9 +84,11 @@ impl InferenceService {
             .into_iter()
             .map(|descriptor| descriptor.path)
             .collect::<Vec<_>>();
-        Ok(self
+        let mut probe = self
             .backend
-            .probe(&self.store, manifest, task, &schema_paths))
+            .probe(&self.store, manifest, task, &schema_paths);
+        normalize_probe_readiness(&mut probe);
+        Ok(probe)
     }
 
     pub fn resolve(&self, request: InferenceRequest) -> Result<EffectiveInferenceRequest> {
@@ -127,7 +130,8 @@ impl InferenceService {
         let probe = self
             .backend
             .probe(&self.store, &manifest, effective.task, &schema_paths);
-        let plan = plan_execution(&manifest, &effective, &estimate, &probe.candidates);
+        let mut plan = plan_execution(&manifest, &effective, &estimate, &probe.candidates);
+        attach_probe_readiness(&mut plan, &probe);
         apply_plan_adjustments(&mut effective, &plan);
         Ok((effective, estimate, plan))
     }
@@ -221,6 +225,7 @@ impl InferenceService {
             .backend
             .probe(&self.store, &manifest, effective.task, &schema_paths);
         let mut plan = plan_execution(&manifest, &effective, &estimate, &probe.candidates);
+        attach_probe_readiness(&mut plan, &probe);
         timings.planning_seconds = planning_started.elapsed().as_secs_f64();
 
         plan_observer(&effective, &estimate, &plan);
@@ -229,7 +234,7 @@ impl InferenceService {
             anyhow!(
                 "no executable runtime for {}: {}",
                 effective.task,
-                format_plan_rejections(&plan)
+                format_plan_rejections(&plan, &manifest.id)
             )
         })?;
 
@@ -314,9 +319,11 @@ impl InferenceService {
         let Some(execution) = execution else {
             let _ = remove_output_dir(&self.outputs.root, &output_dir);
             bail!(
-                "all accepted runtimes failed for {}: {}",
+                "all accepted runtimes failed for {}: {}. Recommendation: inspect this exact model/task with `werk doctor --model {} --task {}`; Werk will not silently switch models",
                 effective.task,
-                execution_errors.join("; ")
+                execution_errors.join("; "),
+                manifest.id,
+                effective.task,
             );
         };
 
@@ -399,32 +406,68 @@ impl InferenceService {
             .list()?
             .into_iter()
             .map(|manifest| {
-                let available_tasks = manifest
+                let task_probes = manifest
                     .metadata
                     .tasks
                     .iter()
                     .copied()
-                    .filter(|task| {
-                        let paths = parameter_schema_for_manifest(*task, &manifest)
-                            .unwrap_or_else(|_| parameter_schema(*task))
+                    .map(|task| {
+                        let paths = parameter_schema_for_manifest(task, &manifest)
+                            .unwrap_or_else(|_| parameter_schema(task))
                             .into_iter()
                             .map(|descriptor| descriptor.path)
                             .collect::<Vec<_>>();
-                        self.backend
-                            .probe(&self.store, &manifest, *task, &paths)
-                            .candidates
-                            .iter()
-                            .any(|candidate| {
-                                candidate.available && candidate.supported_tasks.contains(task)
-                            })
+                        let probe = self.backend.probe(&self.store, &manifest, task, &paths);
+                        (task, probe)
                     })
                     .collect::<Vec<_>>();
+                let available_tasks = task_probes
+                    .iter()
+                    .filter(|(task, probe)| {
+                        probe.candidates.iter().any(|candidate| {
+                            candidate.available && candidate.supported_tasks.contains(task)
+                        })
+                    })
+                    .map(|(task, _)| *task)
+                    .collect::<Vec<_>>();
+                let task_statuses = task_probes
+                    .into_iter()
+                    .map(|(task, probe)| {
+                        let mut readiness = probe.readiness.unwrap_or_else(|| {
+                            let available = probe.candidates.iter().any(|candidate| {
+                                candidate.available && candidate.supported_tasks.contains(&task)
+                            });
+                            TaskReadiness {
+                                status: if available {
+                                    TaskReadinessStatus::Available
+                                } else {
+                                    TaskReadinessStatus::Unavailable
+                                },
+                                detail: probe.detail,
+                                adapter: None,
+                                required_backend: None,
+                                install_command: None,
+                                fallback_backend: None,
+                                missing_dependencies: Vec::new(),
+                                missing_dependency_groups: Vec::new(),
+                            }
+                        });
+                        normalize_task_readiness(&mut readiness);
+                        readiness.detail = sanitize_capability_detail(&readiness.detail);
+                        let task_key = serde_json::to_value(task)
+                            .ok()
+                            .and_then(|value| value.as_str().map(ToString::to_string))
+                            .unwrap_or_else(|| task.to_string());
+                        (task_key, readiness)
+                    })
+                    .collect::<BTreeMap<_, _>>();
                 json!({
                     "id": manifest.id,
                     "family": manifest.metadata.family,
                     "layout": manifest.metadata.repository_layout,
                     "tasks": manifest.metadata.tasks,
                     "available_tasks": available_tasks,
+                    "task_statuses": task_statuses,
                     "input_modalities": manifest.metadata.input_modalities,
                     "output_modalities": manifest.metadata.output_modalities
                 })
@@ -678,10 +721,233 @@ fn runtime_accelerator_label(accelerator: RuntimeAccelerator) -> Option<&'static
     }
 }
 
-fn format_plan_rejections(plan: &ExecutionPlan) -> String {
-    plan.candidates
+fn format_plan_rejections(plan: &ExecutionPlan, model: &str) -> String {
+    let rejections = plan
+        .candidates
         .iter()
         .map(|candidate| format!("{}: {}", candidate.runtime_id, candidate.reasons.join(", ")))
         .collect::<Vec<_>>()
-        .join("; ")
+        .join("; ");
+    match plan
+        .task_readiness
+        .as_ref()
+        .and_then(|readiness| task_readiness_recommendation(readiness, model, plan))
+    {
+        Some(recommendation) => format!("{rejections}. {recommendation}"),
+        None => rejections,
+    }
+}
+
+fn attach_probe_readiness(plan: &mut ExecutionPlan, probe: &BackendProbe) {
+    plan.task_readiness = probe.readiness.clone();
+    if let Some(readiness) = plan.task_readiness.as_mut() {
+        normalize_task_readiness(readiness);
+    }
+    if plan.selected_runtime.is_some() {
+        return;
+    }
+
+    let constrained_fallback = plan.candidates.iter().find_map(|decision| {
+        let constraints = explicit_routing_constraints(&decision.reasons)?;
+        let candidate_was_available = probe
+            .candidates
+            .iter()
+            .any(|candidate| candidate.id == decision.runtime_id && candidate.available);
+        candidate_was_available.then_some((decision.runtime_id.clone(), constraints))
+    });
+    let Some((fallback_runtime, constraints)) = constrained_fallback else {
+        return;
+    };
+
+    let constraint_label = match constraints {
+        ExplicitRoutingConstraints {
+            backend: true,
+            accelerator: true,
+        } => "explicit backend and accelerator/device constraints",
+        ExplicitRoutingConstraints { backend: true, .. } => "the explicit backend constraint",
+        ExplicitRoutingConstraints {
+            accelerator: true, ..
+        } => "the explicit accelerator/device constraint",
+        _ => return,
+    };
+    let detail = format!(
+        "runtime '{fallback_runtime}' passed its backend probe but was rejected only by {constraint_label}"
+    );
+    let readiness = plan.task_readiness.get_or_insert_with(|| TaskReadiness {
+        status: TaskReadinessStatus::FallbackAvailable,
+        detail: detail.clone(),
+        adapter: None,
+        required_backend: None,
+        install_command: None,
+        fallback_backend: Some(fallback_runtime.clone()),
+        missing_dependencies: Vec::new(),
+        missing_dependency_groups: Vec::new(),
+    });
+    readiness.status = TaskReadinessStatus::FallbackAvailable;
+    readiness.detail = detail;
+    readiness.install_command = None;
+    readiness.fallback_backend = Some(fallback_runtime);
+}
+
+fn task_readiness_recommendation(
+    readiness: &TaskReadiness,
+    model: &str,
+    plan: &ExecutionPlan,
+) -> Option<String> {
+    match readiness.status {
+        TaskReadinessStatus::Available => None,
+        TaskReadinessStatus::Installable => readiness
+            .install_command
+            .as_deref()
+            .and_then(validated_backend_install_command)
+            .map(|command| {
+                format!("Recommendation: run `{command}`; no compatible fallback was verified")
+            })
+            .or_else(|| {
+                Some(format!(
+                    "Recommendation: inspect this exact model/task with `werk doctor --model {model} --task {}`",
+                    plan.task
+                ))
+            }),
+        TaskReadinessStatus::NotImplemented => Some(format!(
+            "No Werk execution adapter is implemented for model '{model}' and task {}; installing an unrelated package will not enable it",
+            plan.task
+        )),
+        TaskReadinessStatus::FallbackAvailable => {
+            let constraints = readiness
+                .fallback_backend
+                .as_deref()
+                .and_then(|runtime| {
+                    plan.candidates
+                        .iter()
+                        .find(|candidate| candidate.runtime_id == runtime)
+                })
+                .and_then(|candidate| explicit_routing_constraints(&candidate.reasons));
+            let action = match constraints {
+                Some(ExplicitRoutingConstraints {
+                    backend: true,
+                    accelerator: true,
+                }) => {
+                    "change or remove the explicit accelerator/device constraint and change the explicit backend or allow backend fallback"
+                }
+                Some(ExplicitRoutingConstraints { backend: true, .. }) => {
+                    "change the explicit backend or use a fallback policy that permits backend fallback"
+                }
+                Some(ExplicitRoutingConstraints {
+                    accelerator: true, ..
+                }) => "change or remove the explicit accelerator/device constraint",
+                _ => "change the explicit routing constraints",
+            };
+            Some(format!(
+                "A verified fallback runtime{} exists but the current routing constraints rejected it; {action}",
+                readiness
+                    .fallback_backend
+                    .as_deref()
+                    .map(|backend| format!(" '{backend}'"))
+                    .unwrap_or_default()
+            ))
+        }
+        TaskReadinessStatus::Unavailable => Some(format!(
+            "Recommendation: inspect this exact model/task with `werk doctor --model {model} --task {}`",
+            plan.task
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExplicitRoutingConstraints {
+    backend: bool,
+    accelerator: bool,
+}
+
+fn explicit_routing_constraints(reasons: &[String]) -> Option<ExplicitRoutingConstraints> {
+    if reasons.is_empty() {
+        return None;
+    }
+    let mut constraints = ExplicitRoutingConstraints {
+        backend: false,
+        accelerator: false,
+    };
+    for reason in reasons {
+        if reason.starts_with("explicit backend '") && reason.ends_with("' was requested") {
+            constraints.backend = true;
+        } else if reason.starts_with("accelerator '") && reason.ends_with("' was requested") {
+            constraints.accelerator = true;
+        } else {
+            return None;
+        }
+    }
+    (constraints.backend || constraints.accelerator).then_some(constraints)
+}
+
+fn normalize_probe_readiness(probe: &mut BackendProbe) {
+    if let Some(readiness) = probe.readiness.as_mut() {
+        normalize_task_readiness(readiness);
+    }
+}
+
+fn normalize_task_readiness(readiness: &mut TaskReadiness) {
+    readiness.install_command = if readiness.status == TaskReadinessStatus::Installable {
+        readiness
+            .install_command
+            .as_deref()
+            .and_then(validated_backend_install_command)
+    } else {
+        None
+    };
+}
+
+fn sanitize_capability_detail(detail: &str) -> String {
+    let without_controls = detail
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    without_controls
+        .split_whitespace()
+        .map(|part| {
+            let candidate = part.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
+            });
+            if candidate.contains("http://") || candidate.contains("https://") {
+                "<url>".to_string()
+            } else if contains_absolute_path(candidate) {
+                "<path>".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| {
+        (*byte == b'/'
+            && (index == 0
+                || matches!(
+                    bytes[index - 1],
+                    b'=' | b':' | b'\'' | b'"' | b'(' | b'[' | b'{'
+                )))
+            || (*byte == b'\\'
+                && (index == 0
+                    || matches!(
+                        bytes[index - 1],
+                        b'=' | b':' | b'\'' | b'"' | b'(' | b'[' | b'{'
+                    )))
+            || (byte.is_ascii_alphabetic()
+                && bytes.get(index + 1) == Some(&b':')
+                && bytes
+                    .get(index + 2)
+                    .is_some_and(|separator| matches!(separator, b'/' | b'\\')))
+    })
 }

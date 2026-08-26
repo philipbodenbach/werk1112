@@ -28,7 +28,8 @@ use crate::{
         EffectiveInferenceRequest, EstimateConfidence, FitAssessment, HostResources,
         InferenceRequest, InferenceRuntimeCandidate, ParameterPolicy, ParameterSource,
         ParameterSupportStatus, ParameterValue, ResolutionContext, RoutingOverrides,
-        RuntimeAccelerator, WorkloadEstimate, classify_workload_fit, resolve_request,
+        RuntimeAccelerator, TaskReadiness, TaskReadinessStatus, WorkloadEstimate,
+        classify_workload_fit, resolve_request,
     },
     model_store::{ModelManifest, ModelStore, unix_ts},
 };
@@ -73,6 +74,7 @@ impl MediaInferenceBackend for MockMediaBackend {
                 .cloned()
                 .map(|path| (path, ParameterSupportStatus::Native))
                 .collect(),
+            readiness: None,
         }
     }
 
@@ -102,6 +104,137 @@ impl MediaInferenceBackend for MockMediaBackend {
                 "device": "cpu",
             }),
         })
+    }
+}
+
+#[derive(Clone)]
+struct InstallableMediaBackend;
+
+impl MediaInferenceBackend for InstallableMediaBackend {
+    fn probe(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        task: InferenceTask,
+        schema_paths: &[String],
+    ) -> BackendProbe {
+        let parameter_support = schema_paths
+            .iter()
+            .cloned()
+            .map(|path| (path, ParameterSupportStatus::ModelDependent))
+            .collect::<BTreeMap<_, _>>();
+        BackendProbe {
+            available: false,
+            detail: "managed fixture backend is missing".to_string(),
+            candidates: vec![InferenceRuntimeCandidate {
+                id: "fixture-cuda".to_string(),
+                backend: "fixture".to_string(),
+                accelerator: RuntimeAccelerator::Cuda,
+                available: false,
+                availability_reason: Some("managed fixture backend is missing".to_string()),
+                supported_tasks: vec![task],
+                supported_layouts: vec![RepositoryLayout::Diffusers],
+                supported_formats: Vec::new(),
+                supported_families: Vec::new(),
+                supported_architectures: Vec::new(),
+                parameter_support: parameter_support.clone(),
+                supports_offloading: false,
+                supports_compile: false,
+                supports_batching: false,
+                priority: 1_000,
+            }],
+            parameter_support,
+            readiness: Some(TaskReadiness {
+                status: TaskReadinessStatus::Installable,
+                detail: "managed fixture backend is missing".to_string(),
+                adapter: Some("fixture-adapter".to_string()),
+                required_backend: Some("qwen-tts".to_string()),
+                install_command: Some("werk backend install qwen-tts".to_string()),
+                fallback_backend: None,
+                missing_dependencies: vec!["fixture_runtime".to_string()],
+                missing_dependency_groups: Vec::new(),
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        _request: &EffectiveInferenceRequest,
+        _output_dir: &Path,
+        _runtime: &str,
+    ) -> Result<BackendExecution> {
+        bail!("installable backend must not execute")
+    }
+}
+
+#[derive(Clone)]
+struct HardRejectedFallbackBackend;
+
+impl MediaInferenceBackend for HardRejectedFallbackBackend {
+    fn probe(
+        &self,
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+        schema_paths: &[String],
+    ) -> BackendProbe {
+        let mut probe = MockMediaBackend.probe(store, manifest, task, schema_paths);
+        probe.candidates[0].supported_layouts = vec![RepositoryLayout::Custom];
+        probe
+    }
+
+    fn execute(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        _request: &EffectiveInferenceRequest,
+        _output_dir: &Path,
+        _runtime: &str,
+    ) -> Result<BackendExecution> {
+        bail!("hard-rejected backend must not execute")
+    }
+}
+
+#[derive(Clone)]
+struct UnsafeReadinessBackend;
+
+impl MediaInferenceBackend for UnsafeReadinessBackend {
+    fn probe(
+        &self,
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+        schema_paths: &[String],
+    ) -> BackendProbe {
+        let mut probe = MockMediaBackend.probe(store, manifest, task, schema_paths);
+        probe.available = false;
+        probe.detail = "runtime failed at /private/model\nC:\\private\\python".to_string();
+        probe.candidates[0].available = false;
+        probe.candidates[0].availability_reason = Some(probe.detail.clone());
+        probe.readiness = Some(TaskReadiness {
+            status: TaskReadinessStatus::Unavailable,
+            detail: probe.detail.clone(),
+            adapter: Some("unsafe-fixture".to_string()),
+            required_backend: None,
+            install_command: Some("werk backend install qwen-tts".to_string()),
+            fallback_backend: None,
+            missing_dependencies: Vec::new(),
+            missing_dependency_groups: Vec::new(),
+        });
+        probe
+    }
+
+    fn execute(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        _request: &EffectiveInferenceRequest,
+        _output_dir: &Path,
+        _runtime: &str,
+    ) -> Result<BackendExecution> {
+        bail!("unsafe readiness backend must not execute")
     }
 }
 
@@ -144,6 +277,7 @@ impl MediaInferenceBackend for PreflightOomBackend {
                 priority: 100,
             }],
             parameter_support,
+            readiness: None,
         }
     }
 
@@ -224,6 +358,7 @@ impl MediaInferenceBackend for FallbackMediaBackend {
                 candidate("mock-cpu", RuntimeAccelerator::Cpu, 500),
             ],
             parameter_support: support,
+            readiness: None,
         }
     }
 
@@ -340,6 +475,116 @@ fn service_resolves_plans_executes_and_persists_output_metadata() {
         persisted.timings.runtime_attempts,
         result.timings.runtime_attempts
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn installable_backend_readiness_reaches_plan_and_failure_recommendation() {
+    let (root, store) = image_store("installable-readiness");
+    let service = InferenceService::with_backend(store, Arc::new(InstallableMediaBackend));
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("readiness fixture".to_string());
+
+    let (_, _, plan) = service.plan(request.clone()).unwrap();
+    let readiness = plan.task_readiness.as_ref().unwrap();
+    assert_eq!(readiness.status, TaskReadinessStatus::Installable);
+    assert_eq!(
+        readiness.install_command.as_deref(),
+        Some("werk backend install qwen-tts")
+    );
+    assert_eq!(plan.selected_runtime, None);
+
+    let error = format!("{:#}", service.execute(request).unwrap_err());
+    assert!(error.contains("Recommendation: run `werk backend install qwen-tts`"));
+    assert_eq!(error.matches("werk backend install qwen-tts").count(), 1);
+    assert!(error.contains("no compatible fallback was verified"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_accelerator_reports_a_verified_same_model_fallback() {
+    let (root, store) = image_store("constrained-fallback-readiness");
+    let service = InferenceService::with_backend(store, Arc::new(MockMediaBackend));
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("routing constraint fixture".to_string());
+    request.routing.accelerator = Some("cuda".to_string());
+
+    let (_, _, plan) = service.plan(request.clone()).unwrap();
+    let readiness = plan.task_readiness.as_ref().unwrap();
+    assert_eq!(readiness.status, TaskReadinessStatus::FallbackAvailable);
+    assert_eq!(readiness.fallback_backend.as_deref(), Some("mock-cpu"));
+    assert_eq!(plan.selected_runtime, None);
+
+    let error = format!("{:#}", service.execute(request).unwrap_err());
+    assert!(error.contains("verified fallback runtime 'mock-cpu'"));
+    assert!(error.contains("change or remove the explicit accelerator/device constraint"));
+    assert!(!error.contains("fallback policy"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_backend_fallback_recommendation_mentions_backend_policy_only() {
+    let (root, store) = image_store("backend-fallback-readiness");
+    let service = InferenceService::with_backend(store, Arc::new(MockMediaBackend));
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("backend constraint fixture".to_string());
+    request.routing.backend = Some("different-backend".to_string());
+    request.routing.fallback_policy = Some("none".to_string());
+
+    let error = format!("{:#}", service.execute(request).unwrap_err());
+    assert!(error.contains("verified fallback runtime 'mock-cpu'"));
+    assert!(error.contains("fallback policy that permits backend fallback"));
+    assert!(!error.contains("accelerator/device constraint"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn routing_constraint_plus_hard_rejection_is_not_a_verified_fallback() {
+    let (root, store) = image_store("hard-rejected-fallback-readiness");
+    let service = InferenceService::with_backend(store, Arc::new(HardRejectedFallbackBackend));
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("mixed rejection fixture".to_string());
+    request.routing.accelerator = Some("cuda".to_string());
+
+    let (_, _, plan) = service.plan(request.clone()).unwrap();
+    assert_ne!(
+        plan.task_readiness
+            .as_ref()
+            .map(|readiness| readiness.status),
+        Some(TaskReadinessStatus::FallbackAvailable)
+    );
+    let error = format!("{:#}", service.execute(request).unwrap_err());
+    assert!(!error.contains("verified fallback"));
+    assert!(error.contains("repository layout"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn capabilities_redact_readiness_paths_and_drop_non_installable_commands() {
+    let (root, store) = image_store("sanitized-capability-readiness");
+    let service = InferenceService::with_backend(store, Arc::new(UnsafeReadinessBackend));
+
+    let capabilities = service.capabilities().unwrap();
+    let readiness = &capabilities["models"][0]["task_statuses"]["image_generation"];
+    assert_eq!(readiness["status"], "unavailable");
+    assert_eq!(readiness["detail"], "runtime failed at <path> <path>");
+    assert!(readiness.get("install_command").is_none());
+    let encoded = serde_json::to_string(&capabilities).unwrap();
+    assert!(!encoded.contains("/private/model"));
+    assert!(!encoded.contains("C:\\\\private"));
+    assert!(!encoded.contains("\\n"));
+
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("unsafe readiness fixture".to_string());
+    let (_, _, plan) = service.plan(request.clone()).unwrap();
+    assert!(
+        plan.task_readiness
+            .as_ref()
+            .is_some_and(|readiness| readiness.install_command.is_none())
+    );
+    let error = format!("{:#}", service.execute(request).unwrap_err());
+    assert!(!error.contains("werk backend install"));
+    assert!(error.contains("werk doctor --model flux --task image-generation"));
     let _ = fs::remove_dir_all(root);
 }
 

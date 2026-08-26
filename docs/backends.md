@@ -99,6 +99,51 @@ An unavailable architecture-specific runtime should produce:
 - an installation or configuration hint when Werk knows one;
 - another accepted route only when policy and accelerator constraints permit it.
 
+Media probes expose the same decision as a structured `task_readiness` value:
+`available`, `fallback_available`, `installable`, `not_implemented`, or
+`unavailable`. A concrete install command is shown only when the registered
+adapter supplied that command. For example, a supported Qwen3-TTS VoiceDesign
+model can recommend `werk backend install qwen-tts`; a task or model variant
+without an implemented adapter explicitly says so and does not invent a pip or
+Werk install command. `werk doctor --model MODEL --task TASK`, `--debug`,
+`werk parameters MODEL --json`, and the HTTP discovery routes expose this same
+status.
+
+### Missing-backend negative smoke test
+
+The repository includes a non-destructive test for the `installable` case:
+
+~~~bash
+./scripts/test-missing-media-backend.sh
+~~~
+
+It creates a metadata-only Qwen3-TTS VoiceDesign fixture and a temporary,
+isolated model store, disables automatic backend provisioning, and verifies
+both discovery and execution preflight. It never removes or changes the real
+model store or an installed Qwen backend. To test a binary built from the
+current checkout instead of the `werk` on `PATH`, select it explicitly:
+
+~~~bash
+WERK_BIN=./target/debug/werk ./scripts/test-missing-media-backend.sh
+~~~
+
+The relevant output is:
+
+~~~text
+Task readiness: installable
+  Adapter: qwen3_tts_voice_design
+  Required backend: qwen-tts
+  Recommendation: werk backend install qwen-tts
+...
+Recommendation: run `werk backend install qwen-tts`; no compatible fallback was verified
+PASS: missing managed backend was detected before inference and no output was created.
+~~~
+
+A missing required backend is a preflight failure, not a warning attached to a
+successful inference. Werk reports `fallback_available` instead only when a
+different runtime for the same model and task actually passed its probe and
+the request policy permits that route.
+
 ## Parameter policy
 
 The parameter policy is independent of backend fallback:

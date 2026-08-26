@@ -20,7 +20,8 @@ use crate::{
     capabilities::{InferenceTask, RepositoryLayout},
     inference::{
         EffectiveInferenceRequest, InferenceRuntimeCandidate, ParameterSource,
-        ParameterSupportStatus, ParameterValue, RuntimeAccelerator, WorkloadEstimate,
+        ParameterSupportStatus, ParameterValue, RuntimeAccelerator, TaskReadiness,
+        TaskReadinessStatus, WorkloadEstimate,
     },
     media_companion::{CompanionClient, CompanionExecution, CompanionHealth, CompanionOutput},
     model_store::{ModelManifest, ModelStore},
@@ -30,7 +31,7 @@ use crate::{
 pub struct CompanionMediaBackend {
     client: std::result::Result<CompanionClient, String>,
     health_cache: Arc<OnceLock<CompanionHealth>>,
-    qwen_client_cache: Arc<OnceLock<std::result::Result<CompanionClient, String>>>,
+    qwen_client_cache: Arc<OnceLock<CompanionClient>>,
     qwen_health_cache: Arc<OnceLock<CompanionHealth>>,
 }
 
@@ -63,13 +64,17 @@ impl CompanionMediaBackend {
         if !is_qwen3_tts_manifest(manifest) {
             return self.client.clone().map(|client| (client, false));
         }
-        self.qwen_client_cache
-            .get_or_init(|| {
-                let python = require_qwen_tts_python(store).map_err(|error| error.to_string())?;
-                CompanionClient::from_python(python).map_err(|error| error.to_string())
-            })
-            .clone()
-            .map(|client| (client, true))
+        if let Some(client) = self.qwen_client_cache.get() {
+            return Ok((client.clone(), true));
+        }
+
+        // Cache only a usable client. A failed lookup commonly means the user
+        // has not installed the managed backend yet; keeping that error in a
+        // OnceLock would make `werk backend install qwen-tts` ineffective until
+        // the Werk process is restarted.
+        let python = require_qwen_tts_python(store).map_err(|error| error.to_string())?;
+        let client = CompanionClient::from_python(python).map_err(|error| error.to_string())?;
+        Ok((self.qwen_client_cache.get_or_init(|| client).clone(), true))
     }
 
     fn health(
@@ -113,6 +118,74 @@ fn is_qwen3_tts_manifest(manifest: &ModelManifest) -> bool {
             .is_some_and(|family| family.starts_with("qwen3-tts"))
 }
 
+fn unavailable_task_readiness(detail: String) -> TaskReadiness {
+    TaskReadiness {
+        status: TaskReadinessStatus::Unavailable,
+        detail,
+        adapter: None,
+        required_backend: None,
+        install_command: None,
+        fallback_backend: None,
+        missing_dependencies: Vec::new(),
+        missing_dependency_groups: Vec::new(),
+    }
+}
+
+fn normalize_task_readiness(mut readiness: TaskReadiness) -> TaskReadiness {
+    // The install command is an executable recommendation, not descriptive
+    // metadata. Old companions exposed it as a top-level field even when the
+    // task was unavailable; never let that become an installation suggestion.
+    if readiness.status != TaskReadinessStatus::Installable {
+        readiness.install_command = None;
+    }
+    readiness
+}
+
+fn task_readiness_from_model_probe(value: &Value, available: bool, detail: &str) -> TaskReadiness {
+    let readiness = value
+        .get("readiness")
+        .cloned()
+        .and_then(|readiness| serde_json::from_value(readiness).ok())
+        .unwrap_or_else(|| TaskReadiness {
+            status: if available {
+                TaskReadinessStatus::Available
+            } else {
+                TaskReadinessStatus::Unavailable
+            },
+            detail: detail.to_string(),
+            adapter: value
+                .get("adapter")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            required_backend: value
+                .get("required_backend")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            install_command: value
+                .get("install_command")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            fallback_backend: None,
+            missing_dependencies: value
+                .get("missing_dependencies")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect(),
+            missing_dependency_groups: Vec::new(),
+        });
+    normalize_task_readiness(readiness)
+}
+
+fn confirms_installable_qwen_voice_design(readiness: &TaskReadiness) -> bool {
+    readiness.status == TaskReadinessStatus::Installable
+        && readiness.adapter.as_deref() == Some("qwen3_tts_voice_design")
+        && readiness.required_backend.as_deref() == Some("qwen-tts")
+        && readiness.install_command.as_deref() == Some("werk backend install qwen-tts")
+}
+
 impl MediaInferenceBackend for CompanionMediaBackend {
     fn probe(
         &self,
@@ -121,21 +194,47 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         task: InferenceTask,
         schema_paths: &[String],
     ) -> BackendProbe {
-        let (client, qwen_tts) = match self.client_for_manifest(store, manifest) {
-            Ok(client) => client,
+        let (client, qwen_tts, qwen_runtime_error) = match self.client_for_manifest(store, manifest)
+        {
+            Ok((client, qwen_tts)) => (client, qwen_tts, None),
+            Err(error) if is_qwen3_tts_manifest(manifest) => match self.client.clone() {
+                // The general companion can inspect config.json without
+                // loading Qwen weights. This distinguishes an installable
+                // VoiceDesign model from a recognized but unsupported
+                // CustomVoice/Base variant even when the isolated backend
+                // is absent.
+                Ok(client) => (client, false, Some(error)),
+                Err(_) => {
+                    return BackendProbe {
+                        available: false,
+                        detail: error.clone(),
+                        candidates: companion_candidates_for_model(
+                            false,
+                            Some(error.clone()),
+                            schema_paths,
+                            task,
+                            manifest.metadata.repository_layout,
+                            None,
+                        ),
+                        parameter_support: default_companion_parameter_support(schema_paths),
+                        readiness: Some(unavailable_task_readiness(error)),
+                    };
+                }
+            },
             Err(error) => {
                 return BackendProbe {
                     available: false,
                     detail: error.clone(),
                     candidates: companion_candidates_for_model(
                         false,
-                        Some(error),
+                        Some(error.clone()),
                         schema_paths,
                         task,
                         manifest.metadata.repository_layout,
                         None,
                     ),
                     parameter_support: default_companion_parameter_support(schema_paths),
+                    readiness: Some(unavailable_task_readiness(error)),
                 };
             }
         };
@@ -147,13 +246,14 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                     detail: error.clone(),
                     candidates: companion_candidates_for_model(
                         false,
-                        Some(error),
+                        Some(error.clone()),
                         schema_paths,
                         task,
                         manifest.metadata.repository_layout,
                         None,
                     ),
                     parameter_support: default_companion_parameter_support(schema_paths),
+                    readiness: Some(unavailable_task_readiness(error)),
                 };
             }
         };
@@ -168,20 +268,40 @@ impl MediaInferenceBackend for CompanionMediaBackend {
             .clone()
             .without_resident_worker()
             .probe_model(&probe_request);
-        let (available, detail) = match model_probe {
-            Ok(value) => (
-                value
+        let (mut available, mut detail, mut readiness) = match model_probe {
+            Ok(value) => {
+                let available = value
                     .get("supported")
                     .and_then(Value::as_bool)
-                    .unwrap_or(true),
-                value
+                    .unwrap_or(true);
+                let detail = value
                     .get("detail")
                     .and_then(Value::as_str)
                     .unwrap_or("companion model probe succeeded")
-                    .to_string(),
-            ),
-            Err(error) => (false, error.to_string()),
+                    .to_string();
+                let readiness = task_readiness_from_model_probe(&value, available, &detail);
+                (available, detail, readiness)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                (false, detail.clone(), unavailable_task_readiness(detail))
+            }
         };
+        if let Some(error) = qwen_runtime_error {
+            available = false;
+            if confirms_installable_qwen_voice_design(&readiness) {
+                detail = error.clone();
+                readiness.detail = error;
+            } else if readiness.status == TaskReadinessStatus::Available {
+                detail = error.clone();
+                readiness = unavailable_task_readiness(error);
+            } else {
+                // Preserve a concrete model-probe rejection (broken layout,
+                // unsupported variant, or unavailable dependencies) instead
+                // of replacing it with an unrelated install recommendation.
+                detail = readiness.detail.clone();
+            }
+        }
         let parameter_support = companion_parameter_support(schema_paths, Some(&health));
         BackendProbe {
             available,
@@ -195,6 +315,7 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                 Some(&health),
             ),
             parameter_support,
+            readiness: Some(readiness),
         }
     }
 
@@ -904,7 +1025,110 @@ pub(super) fn companion_execution_parameters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media_companion::CompanionAccelerator;
+    use crate::{
+        backend::managed_qwen_tts_python,
+        media_companion::CompanionAccelerator,
+        model_store::{ModelFormat, ModelMetadata, ModelSource},
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct CompanionTestDirectory(PathBuf);
+
+    impl CompanionTestDirectory {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "werk-companion-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create companion test directory");
+            Self(path)
+        }
+
+        fn store(&self) -> ModelStore {
+            ModelStore::resolve(Some(self.0.join("store"))).expect("resolve test model store")
+        }
+    }
+
+    impl Drop for CompanionTestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn qwen_voice_design_manifest() -> ModelManifest {
+        ModelManifest {
+            id: "qwen-voice-design".to_string(),
+            source: ModelSource::LocalPath {
+                path: "qwen-voice-design".to_string(),
+            },
+            format: ModelFormat::SafeTensors,
+            architecture: Some("qwen3_tts".to_string()),
+            tokenizer_path: None,
+            config_path: Some("files/config.json".to_string()),
+            model_path: None,
+            backend: "media-companion".to_string(),
+            created_unix: 1,
+            files: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: ModelMetadata {
+                family: Some("qwen3-tts-voice-design".to_string()),
+                repository_layout: RepositoryLayout::Transformers,
+                tasks: vec![InferenceTask::TextToSpeech],
+                ..ModelMetadata::default()
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create executable parent");
+        }
+        fs::write(path, contents).expect("write test executable");
+        let mut permissions = fs::metadata(path)
+            .expect("test executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make test executable executable");
+    }
+
+    #[cfg(unix)]
+    fn static_probe_client(directory: &Path, name: &str, probe: &Value) -> CompanionClient {
+        let path = directory.join(name);
+        let health = json!({
+            "ok": true,
+            "status": "ok",
+            "protocol_version": 1,
+            "companion_version": "test",
+            "python_version": "test",
+            "dependencies": {},
+            "accelerators": {
+                "cpu": {
+                    "available": true,
+                    "version": null,
+                    "detail": "test CPU"
+                }
+            }
+        });
+        let health = serde_json::to_string(&health).expect("serialize health response");
+        let probe = serde_json::to_string(probe).expect("serialize probe response");
+        let quote = |value: &str| value.replace('\'', "'\"'\"'");
+        write_executable(
+            &path,
+            &format!(
+                "#!/bin/sh\ncat >/dev/null\ncase \"$1\" in\n  health) printf '%s\\n' '{}' ;;\n  probe-model) printf '%s\\n' '{}' ;;\n  *) exit 64 ;;\nesac\n",
+                quote(&health),
+                quote(&probe),
+            ),
+        );
+        CompanionClient::from_command(path, Vec::<std::ffi::OsString>::new())
+    }
 
     fn health_with_accelerators(
         accelerators: impl IntoIterator<Item = (&'static str, bool, &'static str)>,
@@ -930,6 +1154,195 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn legacy_unavailable_readiness_drops_install_command() {
+        let value = json!({
+            "supported": false,
+            "detail": "the repository config is incomplete",
+            "adapter": "qwen3_tts_voice_design",
+            "required_backend": "qwen-tts",
+            "install_command": "werk backend install qwen-tts",
+            "missing_dependencies": ["qwen_tts"]
+        });
+
+        let readiness =
+            task_readiness_from_model_probe(&value, false, "the repository config is incomplete");
+
+        assert_eq!(readiness.status, TaskReadinessStatus::Unavailable);
+        assert_eq!(readiness.required_backend.as_deref(), Some("qwen-tts"));
+        assert_eq!(readiness.install_command, None);
+    }
+
+    #[test]
+    fn structured_non_installable_readiness_drops_install_command() {
+        let value = json!({
+            "supported": false,
+            "detail": "the repository layout is broken",
+            "readiness": {
+                "status": "unavailable",
+                "detail": "the repository layout is broken",
+                "adapter": null,
+                "required_backend": null,
+                "install_command": "werk backend install qwen-tts",
+                "fallback_backend": null,
+                "missing_dependencies": []
+            }
+        });
+
+        let readiness =
+            task_readiness_from_model_probe(&value, false, "the repository layout is broken");
+
+        assert_eq!(readiness.status, TaskReadinessStatus::Unavailable);
+        assert_eq!(readiness.install_command, None);
+    }
+
+    #[test]
+    fn structured_readiness_preserves_alternative_dependency_routes() {
+        let value = json!({
+            "supported": false,
+            "detail": "an audio generation framework is missing",
+            "readiness": {
+                "status": "unavailable",
+                "detail": "an audio generation framework is missing",
+                "missing_dependencies": ["torch", "numpy"],
+                "missing_dependency_groups": [{
+                    "purpose": "audio_generation_framework",
+                    "any_of": [
+                        {"all_of": ["diffusers"]},
+                        {"all_of": ["transformers"]}
+                    ]
+                }]
+            }
+        });
+
+        let readiness = task_readiness_from_model_probe(
+            &value,
+            false,
+            "an audio generation framework is missing",
+        );
+
+        assert_eq!(readiness.missing_dependencies, ["torch", "numpy"]);
+        assert_eq!(readiness.missing_dependency_groups.len(), 1);
+        assert_eq!(
+            readiness.missing_dependency_groups[0].purpose,
+            "audio_generation_framework"
+        );
+        assert_eq!(
+            readiness.missing_dependency_groups[0].any_of[1].all_of,
+            ["transformers"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qwen_client_discovery_retries_after_backend_appears() {
+        let directory = CompanionTestDirectory::new("qwen-retry");
+        let store = directory.store();
+        let manifest = qwen_voice_design_manifest();
+        let general_client = static_probe_client(
+            &directory.0,
+            "general-companion",
+            &json!({"ok": true, "supported": false}),
+        );
+        let backend = CompanionMediaBackend::with_client(general_client);
+
+        let first = backend.client_for_manifest(&store, &manifest);
+        assert!(first.is_err());
+        assert!(backend.qwen_client_cache.get().is_none());
+
+        let managed_python = managed_qwen_tts_python(&store);
+        write_executable(&managed_python, "#!/bin/sh\nprintf '%s\\n' '0.1.1'\n");
+
+        let (_client, isolated) = backend
+            .client_for_manifest(&store, &manifest)
+            .expect("newly installed Qwen backend must be discovered");
+        assert!(isolated);
+        assert!(backend.qwen_client_cache.get().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_qwen_model_is_not_reclassified_as_installable() {
+        let directory = CompanionTestDirectory::new("qwen-broken-model");
+        let store = directory.store();
+        let manifest = qwen_voice_design_manifest();
+        let files = store.model_dir(&manifest.id).join("files");
+        fs::create_dir_all(&files).expect("create model files directory");
+        fs::write(files.join("config.json"), "{broken-json").expect("write broken model config");
+        let client = static_probe_client(
+            &directory.0,
+            "broken-model-companion",
+            &json!({
+                "ok": true,
+                "supported": false,
+                "detail": "the repository config/layout is broken",
+                "readiness": {
+                    "status": "unavailable",
+                    "detail": "the repository config/layout is broken",
+                    "adapter": null,
+                    "required_backend": null,
+                    "install_command": "werk backend install qwen-tts",
+                    "fallback_backend": null,
+                    "missing_dependencies": []
+                }
+            }),
+        );
+        let backend = CompanionMediaBackend::with_client(client);
+
+        let probe = backend.probe(&store, &manifest, InferenceTask::TextToSpeech, &[]);
+        let readiness = probe.readiness.expect("probe readiness");
+
+        assert!(!probe.available);
+        assert_eq!(readiness.status, TaskReadinessStatus::Unavailable);
+        assert_eq!(readiness.detail, "the repository config/layout is broken");
+        assert_eq!(readiness.install_command, None);
+        assert!(probe.detail.contains("config/layout is broken"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_qwen_runtime_is_installable_only_after_voice_design_confirmation() {
+        let directory = CompanionTestDirectory::new("qwen-installable");
+        let store = directory.store();
+        let manifest = qwen_voice_design_manifest();
+        let files = store.model_dir(&manifest.id).join("files");
+        fs::create_dir_all(&files).expect("create model files directory");
+        fs::write(
+            files.join("config.json"),
+            r#"{"model_type":"qwen3_tts","tts_model_type":"voice_design"}"#,
+        )
+        .expect("write model config");
+        let client = static_probe_client(
+            &directory.0,
+            "installable-model-companion",
+            &json!({
+                "ok": true,
+                "supported": false,
+                "detail": "Qwen VoiceDesign backend is missing",
+                "readiness": {
+                    "status": "installable",
+                    "detail": "Qwen VoiceDesign backend is missing",
+                    "adapter": "qwen3_tts_voice_design",
+                    "required_backend": "qwen-tts",
+                    "install_command": "werk backend install qwen-tts",
+                    "fallback_backend": null,
+                    "missing_dependencies": ["qwen_tts"]
+                }
+            }),
+        );
+        let backend = CompanionMediaBackend::with_client(client);
+
+        let probe = backend.probe(&store, &manifest, InferenceTask::TextToSpeech, &[]);
+        let readiness = probe.readiness.expect("probe readiness");
+
+        assert!(!probe.available);
+        assert_eq!(readiness.status, TaskReadinessStatus::Installable);
+        assert_eq!(
+            readiness.install_command.as_deref(),
+            Some("werk backend install qwen-tts")
+        );
     }
 
     #[test]

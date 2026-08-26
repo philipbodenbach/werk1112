@@ -47,14 +47,14 @@ use crate::{
         install_managed_onnx_runtime, install_managed_qwen_tts, install_managed_vllm,
         llama_server_help_ok, managed_backend_dir, managed_runner_path as managed_onnx_runner_path,
         managed_vllm_dir, probe_device, runtime_descriptor, runtime_registry,
-        runtime_supports_model, vllm_doctor_checks,
+        runtime_supports_model, validated_backend_install_command, vllm_doctor_checks,
     },
     banner::print_banner,
     capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
     inference::{
         InferenceInput, InferenceInputSource, InferenceRequest, OverrideBool, ParameterPolicy,
-        ParameterValue, RoutingOverrides, WorkloadEstimate, parameter_schema,
-        parameter_schema_for_manifest,
+        ParameterValue, RoutingOverrides, TaskReadiness, TaskReadinessStatus, WorkloadEstimate,
+        parameter_schema, parameter_schema_for_manifest,
     },
     inference_service::{InferenceResult, InferenceService, OutputStore, RuntimeAttemptTiming},
     media_cli::{
@@ -3389,15 +3389,13 @@ fn print_parameters(
         Some(manifest) => parameter_schema_for_manifest(task, manifest)?,
         None => parameter_schema(task),
     };
-    let mut runtime_candidates = manifest
-        .as_ref()
-        .map(|manifest| {
-            InferenceService::new(store.clone())
-                .parameter_probe(manifest, task)
-                .map(|probe| probe.candidates)
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let (mut runtime_candidates, task_readiness) = match manifest.as_ref() {
+        Some(manifest) => {
+            let probe = InferenceService::new(store.clone()).parameter_probe(manifest, task)?;
+            (probe.candidates, probe.readiness)
+        }
+        None => (Vec::new(), None),
+    };
     if backend != BackendArg::Auto {
         let filter = requested_backend_label(backend);
         runtime_candidates.retain(|candidate| {
@@ -3450,6 +3448,7 @@ fn print_parameters(
             "parameters": descriptors,
             "parameter_support": parameter_support,
             "runtime_candidates": runtime_candidates,
+            "task_readiness": task_readiness,
             "model_constraints": manifest
                 .as_ref()
                 .map(|manifest| &manifest.metadata.parameter_constraints),
@@ -3484,7 +3483,62 @@ fn print_parameters(
                 .unwrap_or_else(|| "-".to_string())
         );
     }
+    if let Some(readiness) = task_readiness.as_ref() {
+        print_task_readiness(readiness);
+    }
     Ok(())
+}
+
+fn print_task_readiness(readiness: &TaskReadiness) {
+    println!(
+        "Task readiness: {}",
+        task_readiness_status_label(readiness.status)
+    );
+    println!("  {}", readiness.detail);
+    if let Some(adapter) = readiness.adapter.as_deref() {
+        println!("  Adapter: {adapter}");
+    }
+    if let Some(backend) = readiness.required_backend.as_deref() {
+        println!("  Required backend: {backend}");
+    }
+    if !readiness.missing_dependencies.is_empty() {
+        println!(
+            "  Missing dependencies: {}",
+            readiness.missing_dependencies.join(", ")
+        );
+    }
+    for group in &readiness.missing_dependency_groups {
+        let alternatives = group
+            .any_of
+            .iter()
+            .map(|route| route.all_of.join(" + "))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        println!(
+            "  Missing dependency choice ({}): {alternatives}",
+            group.purpose
+        );
+    }
+    if readiness.status == TaskReadinessStatus::Installable
+        && let Some(command) = readiness
+            .install_command
+            .as_deref()
+            .and_then(validated_backend_install_command)
+    {
+        println!("  Recommendation: {command}");
+    } else if readiness.status == TaskReadinessStatus::NotImplemented {
+        println!("  Recommendation: choose a supported task/model or add a dedicated adapter");
+    }
+}
+
+fn task_readiness_status_label(status: TaskReadinessStatus) -> &'static str {
+    match status {
+        TaskReadinessStatus::Available => "available",
+        TaskReadinessStatus::FallbackAvailable => "fallback_available",
+        TaskReadinessStatus::Installable => "installable",
+        TaskReadinessStatus::NotImplemented => "not_implemented",
+        TaskReadinessStatus::Unavailable => "unavailable",
+    }
 }
 
 fn print_inference_doctor(
@@ -3572,6 +3626,9 @@ fn print_inference_doctor(
                     estimate.fit,
                     plan.selected_runtime.as_deref().unwrap_or("none")
                 );
+                if let Some(readiness) = plan.task_readiness.as_ref() {
+                    print_task_readiness(readiness);
+                }
                 for candidate in plan.candidates {
                     println!(
                         "  {:<24} {:?}: {}",
@@ -11834,6 +11891,7 @@ mod tests {
                 backend_fallback: false,
                 degradations: Vec::new(),
                 model_or_quality_downgrades: Vec::new(),
+                task_readiness: None,
             },
             backend_metadata: Value::Null,
             timings: Default::default(),

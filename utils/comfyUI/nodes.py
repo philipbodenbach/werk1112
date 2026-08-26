@@ -283,6 +283,86 @@ def _normalized_tasks(value: Any) -> list[str]:
     return tasks
 
 
+def _task_name(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower().replace("_", "-")
+
+
+def _task_statuses(capability: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
+    """Keep the server's structured readiness metadata intact for consumers."""
+
+    statuses = capability.get("task_statuses", model.get("task_statuses", {}))
+    return statuses if isinstance(statuses, dict) else {}
+
+
+def _task_status_for_model(model: dict[str, Any], task: str) -> dict[str, Any]:
+    statuses = model.get("task_statuses", {})
+    if not isinstance(statuses, dict):
+        return {}
+    for status_task, status in statuses.items():
+        if _task_name(status_task) == task and isinstance(status, dict):
+            return status
+    return {}
+
+
+def _unavailable_task_message(
+    task: str,
+    model_ids: list[str],
+    metadata: list[dict[str, Any]],
+) -> str:
+    """Render only authoritative readiness actions returned by Werk.
+
+    Install commands are never inferred from backend or dependency names. A
+    missing generic adapter is materially different from a missing package and
+    must not be presented as something pip/cargo can fix.
+    """
+
+    models_by_id = {model["id"]: model for model in metadata}
+    statuses = [
+        (model_id, _task_status_for_model(models_by_id.get(model_id, {}), task))
+        for model_id in model_ids
+    ]
+    base = (
+        f"Werk models declare {task}, but none is currently runtime "
+        f"probe-eligible: {', '.join(model_ids)}."
+    )
+
+    install_actions: list[tuple[str, str]] = []
+    for model_id, status in statuses:
+        command = status.get("install_command")
+        if (
+            _task_name(status.get("status")) == "installable"
+            and isinstance(command, str)
+            and command.strip()
+        ):
+            action = (model_id, command.strip())
+            if action not in install_actions:
+                install_actions.append(action)
+    if install_actions:
+        rendered = "; ".join(
+            f"{model_id}: {command}" for model_id, command in install_actions
+        )
+        return f"{base} Install the required backend: {rendered}"
+
+    not_implemented = [
+        model_id
+        for model_id, status in statuses
+        if _task_name(status.get("status")) == "not-implemented"
+    ]
+    if not_implemented:
+        return (
+            f"{base} No registered Werk adapter exists for {task} on: "
+            f"{', '.join(not_implemented)}. Installing a package alone will not "
+            "add support; a compatible adapter must be implemented or configured."
+        )
+
+    doctor_commands = "; ".join(
+        f"werk doctor --model {model_id} --task {task}" for model_id in model_ids
+    )
+    return f"{base} Diagnose the runtime with: {doctor_commands}"
+
+
 def classify_image_models(
     models_payload: Any, capabilities_payload: Any
 ) -> dict[str, Any]:
@@ -301,6 +381,7 @@ def classify_image_models(
         available_tasks = _normalized_tasks(
             capability.get("available_tasks", model.get("available_tasks", []))
         )
+        task_statuses = _task_statuses(capability, model)
         if IMAGE_TASK in tasks:
             declared.append(model_id)
         if IMAGE_TASK in available_tasks:
@@ -312,6 +393,7 @@ def classify_image_models(
                 "image_generation_probe_eligible": IMAGE_TASK in available_tasks,
                 "tasks": tasks,
                 "available_tasks": available_tasks,
+                "task_statuses": task_statuses,
             }
         )
     return {
@@ -345,6 +427,7 @@ def classify_video_models(
         available_tasks = _normalized_tasks(
             capability.get("available_tasks", model.get("available_tasks", []))
         )
+        task_statuses = _task_statuses(capability, model)
         for task in VIDEO_TASKS:
             if task in tasks:
                 by_task[task]["declared"].append(model_id)
@@ -365,6 +448,7 @@ def classify_video_models(
                 "image_to_video_probe_eligible": IMAGE_TO_VIDEO_TASK in available_tasks,
                 "tasks": tasks,
                 "available_tasks": available_tasks,
+                "task_statuses": task_statuses,
             }
         )
     return {
@@ -397,6 +481,7 @@ def classify_audio_models(
         available_tasks = _normalized_tasks(
             capability.get("available_tasks", model.get("available_tasks", []))
         )
+        task_statuses = _task_statuses(capability, model)
         for task in AUDIO_TASKS:
             if task in tasks:
                 by_task[task]["declared"].append(model_id)
@@ -421,6 +506,7 @@ def classify_audio_models(
                 "text_to_speech_probe_eligible": TEXT_TO_SPEECH_TASK in available_tasks,
                 "tasks": tasks,
                 "available_tasks": available_tasks,
+                "task_statuses": task_statuses,
             }
         )
     return {
@@ -1911,8 +1997,23 @@ class WerkImageModelsNode:
             classified["available"] if require_available else classified["declared"]
         )
         preferred = preferred_model.strip()
-        if preferred and preferred in candidates:
-            selected = preferred
+        if preferred:
+            if preferred in candidates:
+                selected = preferred
+            elif preferred in classified["declared"] and require_available:
+                raise ValueError(
+                    _unavailable_task_message(
+                        IMAGE_TASK,
+                        [preferred],
+                        classified["models"],
+                    )
+                )
+            elif preferred in classified["installed"]:
+                raise ValueError(
+                    f"preferred Werk model {preferred!r} does not declare {IMAGE_TASK}"
+                )
+            else:
+                raise ValueError(f"preferred Werk model {preferred!r} is not installed")
         elif len(candidates) == 1:
             selected = candidates[0]
         elif len(candidates) > 1:
@@ -1922,8 +2023,11 @@ class WerkImageModelsNode:
             )
         elif classified["declared"] and require_available:
             raise ValueError(
-                "Werk models declare image-generation, but none is currently runtime probe-eligible: "
-                + ", ".join(classified["declared"])
+                _unavailable_task_message(
+                    IMAGE_TASK,
+                    classified["declared"],
+                    classified["models"],
+                )
             )
         else:
             raise ValueError("no installed Werk model declares image-generation")
@@ -1975,8 +2079,23 @@ class WerkVideoModelsNode:
             else task_models["declared"]
         )
         preferred = preferred_model.strip()
-        if preferred and preferred in candidates:
-            selected = preferred
+        if preferred:
+            if preferred in candidates:
+                selected = preferred
+            elif preferred in task_models["declared"] and require_available:
+                raise ValueError(
+                    _unavailable_task_message(
+                        selected_task,
+                        [preferred],
+                        classified["models"],
+                    )
+                )
+            elif preferred in classified["installed"]:
+                raise ValueError(
+                    f"preferred Werk model {preferred!r} does not declare {selected_task}"
+                )
+            else:
+                raise ValueError(f"preferred Werk model {preferred!r} is not installed")
         elif len(candidates) == 1:
             selected = candidates[0]
         elif len(candidates) > 1:
@@ -1986,8 +2105,11 @@ class WerkVideoModelsNode:
             )
         elif task_models["declared"] and require_available:
             raise ValueError(
-                f"Werk models declare {selected_task}, but none is currently "
-                "runtime probe-eligible: " + ", ".join(task_models["declared"])
+                _unavailable_task_message(
+                    selected_task,
+                    task_models["declared"],
+                    classified["models"],
+                )
             )
         else:
             raise ValueError(
@@ -2043,8 +2165,23 @@ class WerkAudioModelsNode:
             else task_models["declared"]
         )
         preferred = preferred_model.strip()
-        if preferred and preferred in candidates:
-            selected = preferred
+        if preferred:
+            if preferred in candidates:
+                selected = preferred
+            elif preferred in task_models["declared"] and require_available:
+                raise ValueError(
+                    _unavailable_task_message(
+                        selected_task,
+                        [preferred],
+                        classified["models"],
+                    )
+                )
+            elif preferred in classified["installed"]:
+                raise ValueError(
+                    f"preferred Werk model {preferred!r} does not declare {selected_task}"
+                )
+            else:
+                raise ValueError(f"preferred Werk model {preferred!r} is not installed")
         elif len(candidates) == 1:
             selected = candidates[0]
         elif len(candidates) > 1:
@@ -2054,8 +2191,11 @@ class WerkAudioModelsNode:
             )
         elif task_models["declared"] and require_available:
             raise ValueError(
-                f"Werk models declare {selected_task}, but none is currently "
-                "runtime probe-eligible: " + ", ".join(task_models["declared"])
+                _unavailable_task_message(
+                    selected_task,
+                    task_models["declared"],
+                    classified["models"],
+                )
             )
         else:
             raise ValueError(f"no installed Werk model declares {selected_task}")

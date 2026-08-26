@@ -2536,6 +2536,19 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
         self.assertFalse(missing["fallback_possible"])
         self.assertTrue(missing["architecture_adapter_supported"])
         self.assertEqual(missing["missing_dependencies"], ["qwen_tts"])
+        self.assertEqual(
+            missing["readiness"],
+            {
+                "status": "installable",
+                "detail": missing["detail"],
+                "adapter": COMPANION.QWEN3_TTS_ADAPTER,
+                "required_backend": "qwen-tts",
+                "install_command": "werk backend install qwen-tts",
+                "fallback_backend": None,
+                "missing_dependencies": ["qwen_tts"],
+                "missing_dependency_groups": [],
+            },
+        )
         self.assertTrue(ready["supported"])
         self.assertEqual(ready["required_backend"], "qwen-tts")
         self.assertIsNone(ready["install_command"])
@@ -2546,6 +2559,19 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
         self.assertIn("text_to_speech", ready["probe"]["tasks"])
         self.assertIn("speech_tokenizer", ready["probe"]["components"])
         self.assertEqual(ready["probe"]["model_variant"], "voice_design")
+        self.assertEqual(
+            ready["readiness"],
+            {
+                "status": "available",
+                "detail": ready["detail"],
+                "adapter": COMPANION.QWEN3_TTS_ADAPTER,
+                "required_backend": "qwen-tts",
+                "install_command": None,
+                "fallback_backend": None,
+                "missing_dependencies": [],
+                "missing_dependency_groups": [],
+            },
+        )
 
     def test_other_qwen_tts_variants_do_not_fall_through_to_transformers(self):
         for variant in ("custom_voice", "base"):
@@ -2575,6 +2601,22 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
             self.assertFalse(result["fallback_possible"])
             self.assertFalse(result["architecture_adapter_supported"])
             self.assertIsNone(result["install_command"])
+            self.assertEqual(result["readiness"]["status"], "not_implemented")
+            self.assertIsNone(result["readiness"]["adapter"])
+            self.assertEqual(
+                result["readiness"]["required_backend"],
+                "qwen-tts",
+            )
+            self.assertIsNone(result["readiness"]["install_command"])
+            self.assertIsNone(result["readiness"]["fallback_backend"])
+            self.assertEqual(
+                result["readiness"]["missing_dependencies"],
+                ["qwen_tts"],
+            )
+            self.assertEqual(
+                result["readiness"]["missing_dependency_groups"],
+                [],
+            )
 
     def test_generic_transformers_probe_has_no_architecture_install_claim(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2605,6 +2647,199 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
         self.assertIsNone(result["fallback_possible"])
         self.assertIsNone(result["architecture_adapter_supported"])
         self.assertEqual(result["missing_dependencies"], [])
+        self.assertEqual(result["readiness"]["status"], "available")
+        self.assertEqual(result["readiness"]["adapter"], "transformers_tts")
+        self.assertIsNone(result["readiness"]["required_backend"])
+        self.assertIsNone(result["readiness"]["install_command"])
+        self.assertIsNone(result["readiness"]["fallback_backend"])
+        self.assertEqual(result["readiness"]["missing_dependencies"], [])
+        self.assertEqual(result["readiness"]["missing_dependency_groups"], [])
+
+    def test_generic_missing_dependencies_are_unavailable_not_installable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "speecht5",
+                        "architectures": ["SpeechT5ForTextToSpeech"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            dependencies = self.dependencies(qwen_tts=False)
+            dependencies["transformers"]["available"] = False
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=dependencies,
+            ):
+                result = COMPANION.command_probe_model(
+                    {"model_path": str(model), "task": "text_to_speech"}
+                )
+
+        self.assertFalse(result["supported"])
+        self.assertEqual(result["adapter"], "transformers_tts")
+        self.assertEqual(result["readiness"]["status"], "unavailable")
+        self.assertEqual(
+            result["readiness"]["missing_dependencies"],
+            ["transformers"],
+        )
+        self.assertIsNone(result["readiness"]["required_backend"])
+        self.assertIsNone(result["readiness"]["install_command"])
+        self.assertIsNone(result["readiness"]["fallback_backend"])
+        self.assertEqual(result["readiness"]["missing_dependency_groups"], [])
+
+    def test_generic_alternative_dependencies_preserve_any_of_semantics(self):
+        dependencies = self.dependencies(qwen_tts=False)
+        dependencies["transformers"]["available"] = False
+
+        mandatory, groups = COMPANION.generic_dependency_readiness(
+            "audio_generation",
+            dependencies,
+        )
+
+        self.assertEqual(mandatory, [])
+        self.assertEqual(
+            groups,
+            [
+                {
+                    "purpose": "audio_generation_framework",
+                    "any_of": [
+                        {"all_of": ["diffusers"]},
+                        {"all_of": ["transformers"]},
+                    ],
+                }
+            ],
+        )
+
+        mandatory, groups = COMPANION.generic_dependency_readiness(
+            "speech_to_text",
+            dependencies,
+        )
+        self.assertEqual(mandatory, ["transformers"])
+        self.assertEqual(
+            groups,
+            [
+                {
+                    "purpose": "audio_decoder",
+                    "any_of": [
+                        {"all_of": ["soundfile"]},
+                        {"all_of": ["ffmpeg"]},
+                    ],
+                }
+            ],
+        )
+
+    def test_audio_model_readiness_requires_its_selected_framework(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "musicgen",
+                        "architectures": ["MusicgenForConditionalGeneration"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            dependencies = self.dependencies(qwen_tts=False)
+            dependencies["diffusers"]["available"] = True
+            dependencies["transformers"]["available"] = False
+            with mock.patch.object(
+                COMPANION,
+                "dependency_snapshot",
+                return_value=dependencies,
+            ):
+                result = COMPANION.command_probe_model(
+                    {"model_path": str(model), "task": "music_generation"}
+                )
+
+        self.assertEqual(result["adapter"], "transformers_audio")
+        self.assertFalse(result["supported"])
+        self.assertEqual(result["readiness"]["status"], "unavailable")
+        self.assertEqual(
+            result["readiness"]["missing_dependencies"],
+            ["transformers"],
+        )
+        self.assertEqual(result["readiness"]["missing_dependency_groups"], [])
+
+    def test_video_decoder_represents_compound_alternative_routes(self):
+        dependencies = self.dependencies(qwen_tts=False)
+        dependencies["diffusers"]["available"] = True
+        dependencies["PIL"]["available"] = True
+
+        mandatory, groups = COMPANION.generic_dependency_readiness(
+            "video_to_video",
+            dependencies,
+        )
+
+        self.assertEqual(mandatory, [])
+        self.assertEqual(
+            groups,
+            [
+                {
+                    "purpose": "video_encoder",
+                    "any_of": [
+                        {"all_of": ["av"]},
+                        {"all_of": ["ffmpeg"]},
+                        {"all_of": ["imageio_ffmpeg"]},
+                    ],
+                },
+                {
+                    "purpose": "video_decoder",
+                    "any_of": [
+                        {"all_of": ["av"]},
+                        {"all_of": ["imageio", "imageio_ffmpeg"]},
+                    ],
+                },
+            ],
+        )
+
+        dependencies["imageio"]["available"] = True
+        dependencies["imageio_ffmpeg"]["available"] = True
+        mandatory, groups = COMPANION.generic_dependency_readiness(
+            "video_to_video",
+            dependencies,
+        )
+        self.assertEqual(mandatory, [])
+        self.assertEqual(groups, [])
+
+    def test_declared_unsupported_tasks_are_not_implemented(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps({"model_type": "fixture"}),
+                encoding="utf-8",
+            )
+            dependencies = self.dependencies(qwen_tts=False)
+            for task in sorted(COMPANION.DECLARED_UNSUPPORTED_TASKS):
+                with self.subTest(task=task), mock.patch.object(
+                    COMPANION,
+                    "dependency_snapshot",
+                    return_value=dependencies,
+                ):
+                    result = COMPANION.command_probe_model(
+                        {"model_path": str(model), "task": task}
+                    )
+
+                self.assertFalse(result["supported"])
+                self.assertEqual(
+                    result["readiness"]["status"],
+                    "not_implemented",
+                )
+                self.assertIsNone(result["readiness"]["adapter"])
+                self.assertIsNone(result["readiness"]["required_backend"])
+                self.assertIsNone(result["readiness"]["install_command"])
+                self.assertIsNone(result["readiness"]["fallback_backend"])
+                self.assertEqual(
+                    result["readiness"]["missing_dependencies"],
+                    [],
+                )
+                self.assertEqual(
+                    result["readiness"]["missing_dependency_groups"],
+                    [],
+                )
 
     def test_estimate_remains_available_but_reports_missing_runtime(self):
         with tempfile.TemporaryDirectory() as directory:

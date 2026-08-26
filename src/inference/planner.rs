@@ -13,6 +13,56 @@ use super::{
     types::{EffectiveInferenceRequest, ParameterPolicy, ParameterSupportStatus},
 };
 
+/// Model/task readiness reported by a concrete inference backend.
+///
+/// This is deliberately separate from runtime candidate scoring. A task can be
+/// installable or known-but-not-implemented without making any runtime
+/// executable, and a recommendation must never silently select another model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskReadinessStatus {
+    Available,
+    FallbackAvailable,
+    Installable,
+    NotImplemented,
+    Unavailable,
+}
+
+/// One alternative dependency route. Every package in `all_of` is required
+/// for this route, while sibling routes in a group are alternatives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyRoute {
+    #[serde(default)]
+    pub all_of: Vec<String>,
+}
+
+/// A machine-readable dependency choice such as PyAV OR
+/// imageio+imageio-ffmpeg for video decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingDependencyGroup {
+    pub purpose: String,
+    #[serde(default)]
+    pub any_of: Vec<DependencyRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskReadiness {
+    pub status: TaskReadinessStatus,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_dependency_groups: Vec<MissingDependencyGroup>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeAccelerator {
@@ -85,6 +135,8 @@ pub struct ExecutionPlan {
     pub backend_fallback: bool,
     pub degradations: Vec<ExecutionDegradation>,
     pub model_or_quality_downgrades: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_readiness: Option<TaskReadiness>,
 }
 
 pub fn plan_execution(
@@ -309,6 +361,7 @@ pub fn plan_execution(
             .map(|decision| decision.degradations)
             .unwrap_or_default(),
         model_or_quality_downgrades,
+        task_readiness: None,
     }
 }
 

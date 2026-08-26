@@ -14,22 +14,22 @@
       "connection": ["1", 0],
       "task": "music-generation",
       "refresh_token": 0,
-      "preferred_model": "music-model",
+      "preferred_model": "",
       "require_available": true
     }
   },
   "3": {
     "class_type": "WerkRoutingConfig",
     "inputs": {
-      "backend": "",
-      "accelerator": "",
+      "backend": "auto",
+      "accelerator": "cuda",
       "device": "",
-      "precision": "",
+      "precision": "fp16",
       "quantization": "",
       "profile": "",
       "quality": "inherit",
       "performance_preference": "inherit",
-      "fallback_policy": "inherit",
+      "fallback_policy": "none",
       "parameter_policy": "inherit",
       "allow_cpu_offload": "inherit",
       "allow_sequential_offload": "inherit",
@@ -48,7 +48,7 @@
       "task": "music-generation",
       "duration": 10.0,
       "variations": 1,
-      "seed": 0,
+      "seed": 1112,
       "sample_rate": 0,
       "channels": 0,
       "output_format": "wav",
@@ -64,8 +64,8 @@
       "connection": ["1", 0],
       "model": ["2", 0],
       "task": "music-generation",
-      "prompt": "Warm analogue ambient music with a slow pulse and no abrupt ending",
-      "negative_prompt": "clipping, distortion",
+      "prompt": "Ten-second instrumental cinematic synthwave, warm analogue pulse, no vocals, clean ending",
+      "negative_prompt": "",
       "config": ["4", 0]
     }
   },

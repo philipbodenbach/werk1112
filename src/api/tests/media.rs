@@ -691,6 +691,14 @@ async fn capability_and_parameter_routes_are_authenticated() {
             .as_array()
             .is_some_and(|tasks| tasks.contains(&json!("image_generation")))
     );
+    assert_eq!(
+        capabilities["models"][0]["task_statuses"]["image_generation"]["status"],
+        "available"
+    );
+    assert_eq!(
+        capabilities["models"][0]["task_statuses"]["image_generation"]["adapter"],
+        "mock-media"
+    );
 
     let response = app
         .clone()
@@ -709,6 +717,8 @@ async fn capability_and_parameter_routes_are_authenticated() {
     assert_eq!(parameters["task"], "image_generation");
     assert_eq!(parameters["parameter_support"]["image.width"], "native");
     assert_eq!(parameters["runtime_candidates"][0]["id"], "mock-media-cpu");
+    assert_eq!(parameters["task_readiness"]["status"], "available");
+    assert_eq!(parameters["task_readiness"]["adapter"], "mock-media");
     assert!(
         parameters["parameters"]
             .as_array()

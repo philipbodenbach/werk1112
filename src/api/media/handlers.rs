@@ -284,11 +284,11 @@ pub(in crate::api) async fn parameters_handler(
         },
         None => parameter_schema(task),
     };
-    let mut runtimes = if let Some(manifest) = manifest.as_ref() {
+    let (mut runtimes, task_readiness) = if let Some(manifest) = manifest.as_ref() {
         let service = state.inference_service.clone();
         let manifest = manifest.clone();
         match tokio::task::spawn_blocking(move || service.parameter_probe(&manifest, task)).await {
-            Ok(Ok(probe)) => probe.candidates,
+            Ok(Ok(probe)) => (probe.candidates, probe.readiness),
             Ok(Err(error)) => {
                 return api_error(StatusCode::BAD_REQUEST, error.to_string(), None);
             }
@@ -301,7 +301,7 @@ pub(in crate::api) async fn parameters_handler(
             }
         }
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     if let Some(filter) = query
         .backend
@@ -340,6 +340,7 @@ pub(in crate::api) async fn parameters_handler(
         "parameters": parameters,
         "parameter_support": selected_support,
         "runtime_candidates": runtimes,
+        "task_readiness": task_readiness,
         "model_constraints": manifest
             .as_ref()
             .map(|manifest| &manifest.metadata.parameter_constraints)

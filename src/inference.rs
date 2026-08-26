@@ -16,8 +16,9 @@ pub use estimate::{
     EstimateConfidence, FitAssessment, HostResources, WorkloadEstimate, estimate_workload,
 };
 pub use planner::{
-    ExecutionDegradation, ExecutionPlan, InferenceRuntimeCandidate, PlanCandidateDecision,
-    PlanCandidateStatus, RuntimeAccelerator, plan_execution,
+    DependencyRoute, ExecutionDegradation, ExecutionPlan, InferenceRuntimeCandidate,
+    MissingDependencyGroup, PlanCandidateDecision, PlanCandidateStatus, RuntimeAccelerator,
+    TaskReadiness, TaskReadinessStatus, plan_execution,
 };
 pub use resolution::resolve_request;
 pub use schema::{parameter_schema, parameter_schema_for_manifest};

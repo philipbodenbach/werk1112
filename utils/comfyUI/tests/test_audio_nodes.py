@@ -195,6 +195,74 @@ def test_audio_model_classification_and_selection_are_task_specific(fake_client)
     assert json.loads(metadata)["selected_task"] == "stem-separation"
 
 
+def test_audio_model_readiness_is_preserved_and_install_command_is_authoritative(
+    fake_client,
+):
+    readiness = {
+        "text_to_speech": {
+            "status": "installable",
+            "detail": "Qwen TTS backend is missing",
+            "required_backend": "qwen-tts",
+            "install_command": "werk backend install qwen-tts",
+        }
+    }
+    capabilities = {
+        "models": [
+            {
+                "id": "qwen-voice",
+                "tasks": ["text_to_speech"],
+                "available_tasks": [],
+                "task_statuses": readiness,
+            }
+        ]
+    }
+    classified = classify_audio_models(models_payload("qwen-voice"), capabilities)
+    assert classified["models"][0]["task_statuses"] == readiness
+
+    fake_client.responses = {
+        "/v1/models": models_payload("qwen-voice"),
+        "/v1/capabilities": capabilities,
+    }
+    with pytest.raises(ValueError) as error:
+        WerkAudioModelsNode().select(
+            WerkConnection("http://werk"), "text-to-speech", 0, "", True
+        )
+    assert "werk backend install qwen-tts" in str(error.value)
+
+
+def test_audio_model_reports_missing_adapter_without_inventing_install_command(
+    fake_client,
+):
+    fake_client.responses = {
+        "/v1/models": models_payload("separator"),
+        "/v1/capabilities": {
+            "models": [
+                {
+                    "id": "separator",
+                    "tasks": ["stem_separation"],
+                    "available_tasks": [],
+                    "task_statuses": {
+                        "stem_separation": {
+                            "status": "not_implemented",
+                            "detail": "no generic adapter",
+                            "missing_dependencies": [],
+                        }
+                    },
+                }
+            ]
+        },
+    }
+
+    with pytest.raises(ValueError) as error:
+        WerkAudioModelsNode().select(
+            WerkConnection("http://werk"), "stem-separation", 0, "", True
+        )
+    message = str(error.value)
+    assert "No registered Werk adapter exists" in message
+    assert "Installing a package alone will not add support" in message
+    assert "werk backend install" not in message
+
+
 def test_audio_parameters_forwards_every_selected_task(fake_client):
     seen = {}
 
@@ -604,8 +672,20 @@ def test_audio_api_prompt_examples_are_valid_and_keep_task_links_explicit():
     conversion = json.loads((examples / "werk_voice_conversion_api.json").read_text())
 
     assert music["2"]["inputs"]["task"] == "music-generation"
+    assert music["2"]["inputs"]["preferred_model"] == ""
+    assert {
+        field: music["3"]["inputs"][field]
+        for field in ("backend", "accelerator", "precision", "fallback_policy")
+    } == {
+        "backend": "auto",
+        "accelerator": "cuda",
+        "precision": "fp16",
+        "fallback_policy": "none",
+    }
     assert music["4"]["class_type"] == "WerkAudioConfig"
+    assert music["4"]["inputs"]["seed"] == 1112
     assert music["5"]["inputs"]["model"] == ["2", 0]
+    assert music["5"]["inputs"]["negative_prompt"] == ""
     assert music["6"]["class_type"] == "PreviewAudio"
     assert tts["3"]["class_type"] == "WerkRoutingConfig"
     assert {

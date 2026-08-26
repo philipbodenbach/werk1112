@@ -4,11 +4,12 @@ use std::io::{self, Write};
 
 use super::{format_bytes, format_duration, trim_float, yes_no};
 use crate::{
+    backend::validated_backend_install_command,
     capabilities::{InferenceTask, OutputModality},
     inference::{
         EffectiveInferenceRequest, ExecutionDegradation, ExecutionPlan, InferenceInputSource,
-        ParameterSource, ParameterValue, PlanCandidateStatus, WorkloadEstimate,
-        projected_host_peak_with_offload,
+        ParameterSource, ParameterValue, PlanCandidateStatus, TaskReadinessStatus,
+        WorkloadEstimate, projected_host_peak_with_offload,
     },
     inference_service::{InferenceResult, RuntimeAttemptTiming},
 };
@@ -402,6 +403,67 @@ pub(super) fn write_media_routing_debug<W: Write>(
                 .map(|parameter| serialized_enum_label(&parameter.source))
                 .unwrap_or_else(|| "unknown".to_string());
             write_media_stat(writer, label, &format!("{value} ({source})"))?;
+        }
+    }
+    if let Some(readiness) = plan.task_readiness.as_ref() {
+        write_media_stat(
+            writer,
+            "task readiness:",
+            &serialized_enum_label(&readiness.status),
+        )?;
+        write_media_stat(
+            writer,
+            "readiness detail:",
+            &media_sanitize_debug_text(&readiness.detail),
+        )?;
+        if let Some(adapter) = readiness.adapter.as_deref() {
+            write_media_stat(
+                writer,
+                "required adapter:",
+                &media_sanitize_debug_text(adapter),
+            )?;
+        }
+        if let Some(backend) = readiness.required_backend.as_deref() {
+            write_media_stat(
+                writer,
+                "required backend:",
+                &media_sanitize_debug_text(backend),
+            )?;
+        }
+        if !readiness.missing_dependencies.is_empty() {
+            write_media_stat(
+                writer,
+                "missing dependencies:",
+                &media_sanitize_debug_text(&readiness.missing_dependencies.join(", ")),
+            )?;
+        }
+        for group in &readiness.missing_dependency_groups {
+            let alternatives = group
+                .any_of
+                .iter()
+                .map(|route| route.all_of.join(" + "))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            write_media_stat(
+                writer,
+                &format!(
+                    "missing dependency choice ({}):",
+                    media_sanitize_debug_text(&group.purpose)
+                ),
+                &media_sanitize_debug_text(&alternatives),
+            )?;
+        }
+        if readiness.status == TaskReadinessStatus::Installable
+            && let Some(command) = readiness
+                .install_command
+                .as_deref()
+                .and_then(validated_backend_install_command)
+        {
+            write_media_stat(
+                writer,
+                "recommendation:",
+                &media_sanitize_debug_text(&command),
+            )?;
         }
     }
     write_media_stat(
@@ -968,7 +1030,8 @@ mod tests {
         inference::{
             EffectiveInferenceRequest, EstimateConfidence, ExecutionPlan, FitAssessment,
             InferenceInput, InferenceInputSource, ParameterPolicy, ParameterSource, ParameterValue,
-            PlanCandidateDecision, PlanCandidateStatus, ResolvedParameter, WorkloadEstimate,
+            PlanCandidateDecision, PlanCandidateStatus, ResolvedParameter, TaskReadiness,
+            TaskReadinessStatus, WorkloadEstimate,
         },
         inference_service::{
             InferenceResult, OutputMetadata, RuntimeAttemptOutcome, RuntimeAttemptTiming,
@@ -1251,6 +1314,16 @@ mod tests {
             },
         ];
         result.plan.selected_runtime = Some("media-companion-cpu".to_string());
+        result.plan.task_readiness = Some(TaskReadiness {
+            status: TaskReadinessStatus::Installable,
+            detail: "runtime missing at /private/READINESS_SECRET".to_string(),
+            adapter: Some("qwen3_tts_voice_design".to_string()),
+            required_backend: Some("qwen-tts".to_string()),
+            install_command: Some("werk backend install qwen-tts".to_string()),
+            fallback_backend: None,
+            missing_dependencies: vec!["qwen_tts".to_string()],
+            missing_dependency_groups: Vec::new(),
+        });
         result.backend_metadata = json!({
             "model_path": "/private/model/SECRET_MODEL",
             "effective_parameters": {"prompt": "BACKEND_PROMPT_SECRET"},
@@ -1289,6 +1362,9 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.contains("candidate runtimes:"));
+        assert!(output.contains("task readiness:         installable"));
+        assert!(output.contains("required backend:       qwen-tts"));
+        assert!(output.contains("recommendation:         werk backend install qwen-tts"));
         assert!(output.contains("status=rejected"));
         assert!(output.contains("routing backend:        media-companion (task_default)"));
         assert!(output.contains("resolved parameters:"));
@@ -1317,6 +1393,7 @@ mod tests {
             "EMBEDDED_URL_SECRET",
             "WINDOWS_PATH_SECRET",
             "QUOTED_PATH_SECRET",
+            "READINESS_SECRET",
         ] {
             assert!(!output.contains(secret), "debug output leaked {secret}");
         }
@@ -1496,6 +1573,7 @@ mod tests {
                 backend_fallback: false,
                 degradations: Vec::new(),
                 model_or_quality_downgrades: Vec::new(),
+                task_readiness: None,
             },
             backend_metadata: Value::Null,
             timings: Default::default(),

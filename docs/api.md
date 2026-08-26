@@ -565,6 +565,17 @@ construction.
 Returns installed declarations and runtime probe information. Declared tasks
 must be distinguished from available/executable tasks.
 
+Each model includes a `task_statuses` object keyed like the serialized task
+enum (for example `music_generation`). Every value is a structured readiness
+record with `status`, `detail`, optional `adapter`, `required_backend`,
+`install_command`, `fallback_backend`, `missing_dependencies`, and
+`missing_dependency_groups` fields. Dependency groups use `any_of` routes
+whose individual `all_of` lists distinguish alternatives from packages that
+must all be installed.
+Only a probe-supplied install command is returned. `available_tasks` and the
+dynamic tools list continue to include only tasks with a genuinely executable
+runtime candidate.
+
 ### GET /v1/parameters
 
 Query parameters:
@@ -589,6 +600,7 @@ The response includes:
 - canonical parameter descriptors;
 - selected parameter-support information;
 - runtime candidates;
+- structured `task_readiness` for a model-specific probe;
 - model-specific parameter constraints.
 
 ## Generic jobs

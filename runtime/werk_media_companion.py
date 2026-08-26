@@ -1621,7 +1621,159 @@ def adapter_dependency_ready(task, adapter, deps):
     if registration is not None:
         ready = not missing_adapter_dependencies(registration, deps)
         return ready, registration["dependency_reason"]
+    if adapter == "diffusers_audio":
+        return (
+            deps["torch"]["available"]
+            and deps["numpy"]["available"]
+            and deps["diffusers"]["available"]
+        ), "requires torch, numpy and diffusers for this Diffusers repository"
+    if adapter == "transformers_audio":
+        return (
+            deps["torch"]["available"]
+            and deps["numpy"]["available"]
+            and deps["transformers"]["available"]
+        ), "requires torch, numpy and transformers for this Transformers repository"
     return task_dependency_ready(task, deps)
+
+
+def generic_dependency_readiness(task, dependencies, adapter=None):
+    """Return mandatory dependencies and unsatisfied alternative groups.
+
+    ``missing_dependencies`` remains the backward-compatible flat field, but
+    now contains only packages which are individually mandatory for the task.
+    Alternative execution routes are represented separately.  Each ``any_of``
+    entry is one viable route, whose ``all_of`` packages must be available
+    together.  This can express both simple choices such as
+    diffusers-or-transformers and compound routes such as
+    PyAV-or-(imageio-and-imageio-ffmpeg) without implying that every listed
+    package must be installed.
+    """
+
+    def available(name):
+        return bool(dependencies.get(name, {}).get("available", False))
+
+    missing = []
+    missing_groups = []
+
+    def require(*names):
+        missing.extend(name for name in names if not available(name))
+
+    def require_any_of(purpose, *routes):
+        normalized_routes = [tuple(route) for route in routes]
+        if any(all(available(name) for name in route) for route in normalized_routes):
+            return
+        missing_groups.append(
+            {
+                "purpose": purpose,
+                "any_of": [
+                    {"all_of": list(route)} for route in normalized_routes
+                ],
+            }
+        )
+
+    if task in IMAGE_TASKS:
+        require("torch", "diffusers", "PIL")
+    elif task in VIDEO_TASKS:
+        require("torch", "diffusers", "PIL")
+        require_any_of(
+            "video_encoder",
+            ("av",),
+            ("ffmpeg",),
+            ("imageio_ffmpeg",),
+        )
+        if task in VIDEO_INPUT_TASKS:
+            require_any_of(
+                "video_decoder",
+                ("av",),
+                ("imageio", "imageio_ffmpeg"),
+            )
+    elif task in AUDIO_GENERATION_TASKS:
+        require("torch", "numpy")
+        if adapter == "diffusers_audio":
+            require("diffusers")
+        elif adapter == "transformers_audio":
+            require("transformers")
+        else:
+            require_any_of(
+                "audio_generation_framework",
+                ("diffusers",),
+                ("transformers",),
+            )
+    elif task in TTS_TASKS:
+        require("torch", "transformers", "numpy")
+    elif task in AUDIO_SOURCE_TASKS:
+        require("torch", "transformers", "numpy")
+        require_any_of(
+            "audio_decoder",
+            ("soundfile",),
+            ("ffmpeg",),
+        )
+
+    return list(dict.fromkeys(missing)), missing_groups
+
+
+def model_probe_readiness(
+    requested_task,
+    supported,
+    adapter,
+    detail,
+    backend_hint,
+    dependencies,
+):
+    """Build the additive, machine-readable readiness result for a probe."""
+
+    architecture_not_implemented = bool(
+        backend_hint is not None
+        and backend_hint.get("architecture_adapter_supported") is False
+    )
+    task_not_implemented = requested_task in DECLARED_UNSUPPORTED_TASKS
+
+    if supported is True:
+        status = "available"
+    elif task_not_implemented or architecture_not_implemented:
+        status = "not_implemented"
+    elif backend_hint and backend_hint.get("install_command"):
+        status = "installable"
+    else:
+        status = "unavailable"
+
+    if backend_hint is not None:
+        required_backend = backend_hint.get("required_backend")
+        missing_dependencies = list(
+            backend_hint.get("missing_dependencies") or []
+        )
+        missing_dependency_groups = []
+    else:
+        required_backend = None
+        (
+            missing_dependencies,
+            missing_dependency_groups,
+        ) = generic_dependency_readiness(
+            requested_task,
+            dependencies,
+            adapter,
+        )
+
+    # An installation command is authoritative only when it came from the
+    # existing explicit architecture-backend hint and that adapter is actually
+    # implemented.  Generic dependency failures and unimplemented variants
+    # must never manufacture or repeat one.
+    install_command = (
+        backend_hint.get("install_command")
+        if status == "installable" and backend_hint is not None
+        else None
+    )
+
+    return {
+        "status": status,
+        "detail": detail,
+        "adapter": adapter,
+        "required_backend": required_backend,
+        "install_command": install_command,
+        "fallback_backend": None,
+        "missing_dependencies": missing_dependencies,
+        "missing_dependency_groups": missing_dependency_groups,
+    }
 
 
 def command_probe_model(payload):
@@ -1709,6 +1861,14 @@ def command_probe_model(payload):
             "architecture_adapter_supported": None,
             "missing_dependencies": [],
         }
+    )
+    result["readiness"] = model_probe_readiness(
+        requested_task,
+        supported,
+        adapter,
+        detail,
+        backend_hint,
+        dependencies,
     )
     return result
 

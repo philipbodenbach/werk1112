@@ -36,6 +36,36 @@ pub use vllm::{
     VllmBackend, VllmDiscovery, install_managed_vllm, managed_vllm_dir, vllm_doctor_checks,
 };
 
+/// Exact targets accepted by `werk backend install`.
+///
+/// Readiness data may originate in an external media companion, so consumers
+/// must not render an arbitrary string as a trusted shell recommendation.
+pub const BACKEND_INSTALL_TARGETS: &[&str] = &[
+    "llama-cuda",
+    "llama-rocm",
+    "llama-vulkan",
+    "llama-metal",
+    "llama-cpu",
+    "onnx-cuda",
+    "onnx-rocm",
+    "onnx-cpu",
+    "vllm",
+    "qwen-tts",
+];
+
+pub fn validated_backend_install_command(command: &str) -> Option<String> {
+    if command.chars().any(char::is_control) {
+        return None;
+    }
+    let parts = command.split_ascii_whitespace().collect::<Vec<_>>();
+    let ["werk", "backend", "install", target] = parts.as_slice() else {
+        return None;
+    };
+    BACKEND_INSTALL_TARGETS
+        .contains(target)
+        .then(|| format!("werk backend install {target}"))
+}
+
 use crate::{
     capabilities::{InferenceTask, RepositoryLayout},
     inference::ParameterSupportStatus,
@@ -1088,6 +1118,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backend_install_recommendations_accept_only_exact_known_targets() {
+        assert_eq!(
+            validated_backend_install_command("werk backend install qwen-tts"),
+            Some("werk backend install qwen-tts".to_string())
+        );
+        assert_eq!(
+            validated_backend_install_command("werk backend install onnx-rocm"),
+            Some("werk backend install onnx-rocm".to_string())
+        );
+        assert_eq!(
+            validated_backend_install_command("werk backend install invented"),
+            None
+        );
+        assert_eq!(
+            validated_backend_install_command("werk backend install qwen-tts --force"),
+            None
+        );
+        assert_eq!(
+            validated_backend_install_command("werk backend install qwen-tts\nrm -rf /"),
+            None
+        );
+    }
+
+    #[test]
     fn media_companion_registry_covers_media_tasks_and_layouts() {
         let companions = runtime_registry()
             .iter()
@@ -1106,6 +1160,22 @@ mod tests {
                 assert!(
                     descriptor.supports_task(*task),
                     "{} is missing task {task}",
+                    descriptor.display_name
+                );
+            }
+            for task in [
+                InferenceTask::SongContinuation,
+                InferenceTask::SongVariation,
+                InferenceTask::SpeakerDiarization,
+                InferenceTask::VoiceConversion,
+                InferenceTask::StemGeneration,
+                InferenceTask::StemSeparation,
+                InferenceTask::AudioEnhancement,
+                InferenceTask::AudioEditing,
+            ] {
+                assert!(
+                    !descriptor.supports_task(task),
+                    "{} must not advertise unimplemented task {task}",
                     descriptor.display_name
                 );
             }

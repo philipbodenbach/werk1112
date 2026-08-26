@@ -10,7 +10,7 @@ use crate::{
     capabilities::InferenceTask,
     inference::{
         EffectiveInferenceRequest, InferenceRuntimeCandidate, ParameterSupportStatus,
-        WorkloadEstimate,
+        TaskReadiness, WorkloadEstimate,
     },
     model_store::{ModelManifest, ModelStore},
 };
@@ -22,6 +22,8 @@ pub struct BackendProbe {
     pub candidates: Vec<InferenceRuntimeCandidate>,
     #[serde(default)]
     pub parameter_support: BTreeMap<String, ParameterSupportStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<TaskReadiness>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
