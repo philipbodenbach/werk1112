@@ -1,0 +1,80 @@
+{
+  "1": {
+    "class_type": "WerkConnection",
+    "inputs": {
+      "server_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout_seconds": 1800,
+      "verify_tls": true
+    }
+  },
+  "2": {
+    "class_type": "WerkAudioModels",
+    "inputs": {
+      "connection": ["1", 0],
+      "task": "text-to-speech",
+      "refresh_token": 0,
+      "preferred_model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+      "require_available": true
+    }
+  },
+  "3": {
+    "class_type": "WerkRoutingConfig",
+    "inputs": {
+      "backend": "auto",
+      "accelerator": "cuda",
+      "device": "",
+      "precision": "bf16",
+      "quantization": "",
+      "profile": "",
+      "quality": "inherit",
+      "performance_preference": "inherit",
+      "fallback_policy": "none",
+      "parameter_policy": "inherit",
+      "allow_cpu_offload": "inherit",
+      "allow_sequential_offload": "inherit",
+      "allow_component_offload": "inherit",
+      "allow_disk_offload": "inherit",
+      "attention_backend": "",
+      "compile": "inherit",
+      "inference_timeout_seconds": 0,
+      "additional_routing_parameters_json": "{}"
+    }
+  },
+  "4": {
+    "class_type": "WerkAudioConfig",
+    "inputs": {
+      "routing": ["3", 0],
+      "task": "text-to-speech",
+      "duration": 30.0,
+      "variations": 1,
+      "seed": 1112,
+      "sample_rate": 0,
+      "channels": 0,
+      "output_format": "wav",
+      "instrumental": "inherit",
+      "voice": "",
+      "speed": 1.0,
+      "language": "German",
+      "speaking_style": "Young adult female voice, unmistakably feminine, around 25 years old. Light, warm timbre with a subtle Japanese accent while speaking clear Standard German. Cheerful, calm and confident. Natural pace, precise articulation, dry close-miked studio recording.",
+      "additional_audio_parameters_json": "{}"
+    }
+  },
+  "5": {
+    "class_type": "WerkAudioGenerate",
+    "inputs": {
+      "connection": ["1", 0],
+      "model": ["2", 0],
+      "task": "text-to-speech",
+      "prompt": "Willkommen bei WERK elf zwölf. Lokale Inferenz, intelligent geroutet – schnell, präzise und vollständig unter deiner Kontrolle. Aus einem einfachen Satz entsteht eine natürliche Stimme mit Charakter.",
+      "negative_prompt": "",
+      "config": ["4", 0]
+    }
+  },
+  "6": {
+    "class_type": "PreviewAudio",
+    "inputs": {
+      "audio": ["5", 0]
+    }
+  }
+}

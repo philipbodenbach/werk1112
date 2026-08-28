@@ -1,26 +1,38 @@
-use anyhow::{Result, anyhow, bail};
+mod media_diagnostics;
+mod terminal_activity;
+
+use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-#[cfg(unix)]
-use std::{io::Read, os::fd::AsRawFd};
 use tokio_stream::StreamExt;
 
+use self::media_diagnostics::{
+    MediaCliTimings, write_media_backend_debug, write_media_failed_attempts,
+    write_media_routing_debug, write_media_verbose_stats,
+};
+use self::terminal_activity::{
+    ActivityKind, ActivitySpec, generation_activity_enabled, with_activity,
+};
 #[cfg(feature = "burn-experimental")]
 use crate::backend::burn_doctor_checks;
 use crate::{
-    api::{ApiState, serve},
+    api::{ApiState, CorsOrigin, serve},
     api_keys,
     backend::{
         BackendAccelerator, BackendRuntime, BurnBackend, BurnMode, CandleBackend, CandleDeviceMode,
@@ -32,20 +44,37 @@ use crate::{
         TransformersCompatBackend, VllmBackend, backend_doctor_checks,
         backend_supports_accelerator, backend_supports_format,
         backend_supports_images as runtime_supports_images, candle_gguf_tokenizer_rejection,
-        install_managed_llama_server, install_managed_llama_server_with_options,
-        install_managed_onnx_runtime, install_managed_vllm, llama_server_help_ok,
-        managed_backend_dir, managed_runner_path as managed_onnx_runner_path, managed_vllm_dir,
-        probe_device, runtime_descriptor, runtime_registry, runtime_supports_model,
-        vllm_doctor_checks,
+        current_host_is_strix_halo, install_managed_llama_server,
+        install_managed_llama_server_with_options, install_managed_onnx_runtime,
+        install_managed_qwen_tts, install_managed_vllm, llama_server_help_ok, managed_backend_dir,
+        managed_runner_path as managed_onnx_runner_path, managed_vllm_dir, probe_device,
+        runtime_descriptor, runtime_registry, runtime_supports_model,
+        validated_backend_install_command, vllm_architecture_supports_images, vllm_doctor_checks,
+        vllm_rocm_signals,
     },
     banner::print_banner,
+    capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
+    inference::{
+        InferenceInput, InferenceInputSource, InferenceRequest, OverrideBool, ParameterPolicy,
+        ParameterValue, RoutingOverrides, TaskReadiness, TaskReadinessStatus, WorkloadEstimate,
+        parameter_schema, parameter_schema_for_manifest,
+    },
+    inference_service::{InferenceResult, InferenceService, OutputStore, RuntimeAttemptTiming},
+    media_cli::{
+        AudioAnalyzeCommands, AudioCommands, AudioDetectCommands, AudioGenerateCommands,
+        AudioGenerationOptions, AudioInputTaskArgs, AudioSeparateArgs, AudioSpeakArgs,
+        AudioTranscribeArgs, AudioTransformCommands, AudioVoiceTransformArgs, ImageCommands,
+        RoutingArgs, SpeechToTextTask, VideoCommands, collect_raw_overrides, parse_set_overrides,
+    },
+    media_companion::CompanionClient,
     model_store::{
         ArtifactStatus, ModelArtifact, ModelFormat, ModelManifest, ModelSource, ModelStore,
         PullProgress,
     },
     openai::{
-        ChatMessage, ChatTemplateOptions, ChatTemplateSource, MessageContent, PromptSpec,
-        messages_to_prompt_for_model, messages_to_prompt_for_model_with_template,
+        ChatMessage, ChatTemplateOptions, ChatTemplateSource, ContentPart, ImageUrlSpec,
+        MessageContent, PromptSpec, image_urls_from_messages, messages_to_prompt_for_model,
+        messages_to_prompt_for_model_with_template,
     },
     runtime_planner::{
         RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
@@ -54,6 +83,9 @@ use crate::{
 };
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
+const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
+const CHAT_CONTEXT_SAFETY_TOKENS: usize = 64;
+const DEFAULT_MAX_VISION_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 #[cfg(test)]
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -121,6 +153,22 @@ pub enum DeviceArg {
     Cpu,
     Cuda,
     Metal,
+}
+
+fn parse_inference_task(value: &str) -> std::result::Result<InferenceTask, String> {
+    value.parse()
+}
+
+fn parse_input_modality(value: &str) -> std::result::Result<InputModality, String> {
+    value.parse()
+}
+
+fn parse_output_modality(value: &str) -> std::result::Result<OutputModality, String> {
+    value.parse()
+}
+
+fn parse_repository_layout(value: &str) -> std::result::Result<RepositoryLayout, String> {
+    value.parse()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -209,7 +257,7 @@ pub struct LlamaRuntimeArgs {
         env = "WERK_LLAMA_BATCH",
         help = "llama.cpp logical prompt batch size"
     )]
-    pub batch_size: Option<usize>,
+    pub batch_size: Option<u32>,
 
     #[arg(
         long,
@@ -295,7 +343,7 @@ impl LlamaRuntimeArgs {
     fn to_options(&self) -> LlamaRuntimeOptions {
         LlamaRuntimeOptions {
             ctx_size: self.ctx_size,
-            batch_size: self.batch_size,
+            batch_size: self.batch_size.map(|value| value as usize),
             ubatch_size: self.ubatch_size,
             gpu_layers: self.gpu_layers,
             main_gpu: self.main_gpu,
@@ -327,6 +375,8 @@ pub enum BackendInstallArg {
     OnnxCpu,
     #[value(name = "vllm")]
     Vllm,
+    #[value(name = "qwen-tts")]
+    QwenTts,
 }
 
 impl BackendInstallArg {
@@ -337,7 +387,7 @@ impl BackendInstallArg {
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaMetal => Some(LlamaCppMode::Metal),
             Self::LlamaCpu => Some(LlamaCppMode::Cpu),
-            Self::OnnxCuda | Self::OnnxRocm | Self::OnnxCpu | Self::Vllm => None,
+            Self::OnnxCuda | Self::OnnxRocm | Self::OnnxCpu | Self::Vllm | Self::QwenTts => None,
         }
     }
 
@@ -371,6 +421,7 @@ impl From<DeviceArg> for CandleDeviceMode {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
     #[command(about = "Start the OpenAI-compatible HTTP server")]
@@ -381,8 +432,14 @@ pub enum Commands {
         #[arg(long, default_value_t = 11434, help = "Port to bind")]
         port: u16,
 
-        #[arg(long, help = "Default model for API requests that omit model")]
+        #[arg(long, help = "Default chat model for API requests that omit model")]
         model: Option<String>,
+
+        #[arg(
+            long,
+            help = "Default image model for compatible clients that omit model or use an OpenAI image alias"
+        )]
+        image_model: Option<String>,
 
         #[arg(
             long,
@@ -409,11 +466,22 @@ pub enum Commands {
         )]
         allow_unauthenticated: bool,
 
+        #[arg(
+            long = "cors-origin",
+            value_name = "ORIGIN",
+            action = ArgAction::Append,
+            help = "Allow an exact browser origin; repeat for multiple origins (wildcard and null are rejected)"
+        )]
+        cors_origins: Vec<CorsOrigin>,
+
         #[arg(long, help = "Print HTTP request and generation logs")]
         verbose: bool,
     },
 
-    #[command(about = "Run one prompt against an installed model and print the response")]
+    #[command(
+        about = "Run one prompt against an installed model and print the response",
+        hide = true
+    )]
     Run {
         #[arg(help = "Installed model id")]
         model: String,
@@ -511,10 +579,59 @@ pub enum Commands {
         debug: bool,
     },
 
+    #[command(about = "Generate, edit, or upscale images")]
+    Image {
+        #[command(subcommand)]
+        command: ImageCommands,
+    },
+
+    #[command(about = "Generate, animate, transform, or upscale video")]
+    Video {
+        #[command(subcommand)]
+        command: VideoCommands,
+    },
+
+    #[command(about = "Generate, understand, analyze, and transform audio")]
+    Audio {
+        #[command(subcommand)]
+        command: AudioCommands,
+    },
+
     #[command(about = "Estimate whether a local or Hugging Face model is likely to fit in memory")]
     Estimate {
         #[arg(help = "Installed model id or Hugging Face repo id")]
         model: String,
+
+        #[arg(
+            long,
+            value_parser = parse_inference_task,
+            help = "Estimate an inference task using the canonical media request pipeline"
+        )]
+        task: Option<InferenceTask>,
+
+        #[arg(long, help = "Requested output width")]
+        width: Option<u32>,
+
+        #[arg(long, help = "Requested output height")]
+        height: Option<u32>,
+
+        #[arg(long, help = "Requested video frame count")]
+        frames: Option<u32>,
+
+        #[arg(long, value_name = "SECONDS", help = "Requested output duration")]
+        duration: Option<f64>,
+
+        #[arg(long, help = "Requested batch size")]
+        batch_size: Option<u32>,
+
+        #[arg(long, help = "Requested audio sample rate")]
+        sample_rate: Option<u32>,
+
+        #[arg(long, help = "Requested audio channel count")]
+        channels: Option<u16>,
+
+        #[arg(long, help = "Requested diffusion or sampling step count")]
+        steps: Option<u32>,
 
         #[arg(
             long,
@@ -580,7 +697,20 @@ pub enum Commands {
     #[command(about = "Inspect Werk runtime diagnostics")]
     Doctor {
         #[command(subcommand)]
-        command: DoctorCommands,
+        command: Option<DoctorCommands>,
+
+        #[arg(
+            long,
+            value_parser = parse_inference_task,
+            help = "Limit media diagnostics to an inference task"
+        )]
+        task: Option<InferenceTask>,
+
+        #[arg(long, help = "Limit diagnostics to a runtime name")]
+        runtime: Option<String>,
+
+        #[arg(long, help = "Inspect routing for an installed model")]
+        model: Option<String>,
     },
 
     #[command(about = "Manage local runtime backends")]
@@ -636,7 +766,55 @@ pub enum Commands {
     },
 
     #[command(about = "List installed models")]
-    List,
+    List {
+        #[arg(long, value_parser = parse_inference_task, help = "Filter by supported task")]
+        task: Option<InferenceTask>,
+
+        #[arg(
+            long = "input-modality",
+            value_parser = parse_input_modality,
+            help = "Filter by input modality"
+        )]
+        input: Option<InputModality>,
+
+        #[arg(
+            long = "output-modality",
+            value_parser = parse_output_modality,
+            help = "Filter by output modality"
+        )]
+        output: Option<OutputModality>,
+
+        #[arg(long, help = "Filter by model family")]
+        family: Option<String>,
+
+        #[arg(long, value_parser = parse_repository_layout, help = "Filter by repository layout")]
+        layout: Option<RepositoryLayout>,
+
+        #[arg(long, help = "Print manifests as JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Describe task parameters, defaults, and resolution sources")]
+    Parameters {
+        #[arg(value_name = "MODEL", help = "Installed model id")]
+        model: Option<String>,
+
+        #[arg(
+            long,
+            value_parser = parse_inference_task,
+            help = "Inference task whose parameter contract should be shown"
+        )]
+        task: Option<InferenceTask>,
+
+        #[arg(long, help = "Print machine-readable parameter information")]
+        json: bool,
+
+        #[arg(long, help = "Print a canonical request example")]
+        example: bool,
+
+        #[arg(long, help = "Resolve and include parameter provenance")]
+        sources: bool,
+    },
 
     #[command(about = "Print a model manifest as JSON")]
     Inspect {
@@ -665,20 +843,20 @@ pub enum DoctorCommands {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackendCommands {
-    #[command(about = "Install a managed llama.cpp server backend")]
+    #[command(about = "Install a managed runtime backend")]
     Install {
         #[arg(
             value_enum,
             value_name = "BACKEND",
-            help = "Backend to install, for example llama-cuda, onnx-cuda, or onnx-cpu"
+            help = "Backend to install, for example llama-cuda, onnx-cuda, vllm, or qwen-tts"
         )]
         target: BackendInstallArg,
     },
 
-    #[command(about = "List discovered llama-server backends")]
+    #[command(about = "List discovered runtime backends")]
     List,
 
-    #[command(about = "Check tools required for managed backend builds")]
+    #[command(about = "Check runtime discovery and managed backend prerequisites")]
     Doctor {
         #[arg(
             long,
@@ -791,9 +969,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         host: "127.0.0.1".to_string(),
         port: 11434,
         model: None,
+        image_model: None,
         api_key: None,
         api_keys: None,
         allow_unauthenticated: false,
+        cors_origins: Vec::new(),
         verbose: false,
     });
     let selection_options =
@@ -808,9 +988,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             host,
             port,
             model,
+            image_model,
             api_key,
             api_keys,
             allow_unauthenticated,
+            cors_origins,
             verbose,
         } => {
             let store = ModelStore::resolve(model_home)?;
@@ -826,8 +1008,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 selection_options,
             )?;
             let prompt_options_resolver = {
-                let backend_choice = backend_choice;
-                let selection_options = selection_options;
                 Arc::new(
                     move |store: &ModelStore, manifest: &ModelManifest, has_images: bool| {
                         let selected_backend = selected_backend_for_request(
@@ -861,6 +1041,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 )?;
                 println!("Default model available: {model}");
             }
+            if let Some(image_model) = image_model.as_deref() {
+                let manifest = store.get(image_model)?;
+                if !manifest.supports_task(InferenceTask::ImageGeneration) {
+                    bail!(
+                        "default image model '{}' does not declare image-generation",
+                        manifest.id
+                    );
+                }
+                println!("Default image model available: {image_model}");
+            }
             let api_state = ApiState::new_with_default_model_prompt_options_and_verbose(
                 store,
                 backend,
@@ -868,7 +1058,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(prompt_options_resolver),
                 verbose,
             )
-            .with_api_keys(api_keys);
+            .with_default_image_model(image_model)
+            .with_chat_context_size(llama_options.ctx_size)
+            .with_api_keys(api_keys)
+            .with_cors_origins(cors_origins);
             serve(addr, api_state).await
         }
         Commands::Run {
@@ -884,6 +1077,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             debug,
         } => {
             let prompt = prompt.join(" ");
+            let images = normalize_cli_image_sources(&images)?;
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
@@ -919,18 +1113,19 @@ pub async fn run(cli: Cli) -> Result<()> {
                 llama_options.clone(),
                 selection_options,
             )?;
-            let messages = vec![ChatMessage {
-                role: "user".to_string(),
-                content: Some(MessageContent::Text(prompt)),
-                name: None,
-            }];
+            let messages = vec![vision_user_message(&prompt, &images)];
             let prompt = prompt_for_backend(&manifest, &messages, selected_backend, chat_template);
             let prompt_diagnostics = prompt_diagnostics(&prompt, messages.len(), None);
             let request_messages = generation_request_messages(&prompt, &messages);
+            let request_image_urls = if request_messages.is_empty() {
+                images
+            } else {
+                image_urls_from_messages(&request_messages)
+            };
             let request = GenerateRequest {
                 prompt: prompt.prompt,
                 messages: request_messages,
-                image_urls: images,
+                image_urls: request_image_urls,
                 max_tokens,
                 temperature,
                 top_p,
@@ -940,9 +1135,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 verbose,
                 debug,
             };
-            let response = with_terminal_spinner(
-                terminal_spinner_enabled(debug),
-                format!("Running model '{}'...", manifest.id),
+            let activity = ActivitySpec::chat();
+            let response = with_activity(
+                generation_activity_enabled(debug),
+                activity.kind(),
+                activity.message(&manifest.id),
                 || backend.generate(&manifest, request),
             )?;
             println!("{}", response.text.trim());
@@ -975,6 +1172,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             verbose,
             debug,
         } => {
+            let images = normalize_cli_image_sources(&images)?;
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
@@ -1010,10 +1208,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 llama_options.clone(),
                 selection_options,
             )?;
+            let chat_context_size =
+                chat_context_size(selected_backend, &manifest, llama_options.ctx_size);
             chat_loop(
                 backend,
                 manifest,
                 selected_backend,
+                chat_context_size,
                 max_tokens,
                 temperature,
                 top_p,
@@ -1028,23 +1229,74 @@ pub async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Commands::Image { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            run_image_command(&store, backend_override, device_override, command)
+        }
+        Commands::Video { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            run_video_command(&store, backend_override, device_override, command)
+        }
+        Commands::Audio { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            run_audio_command(&store, backend_override, device_override, command)
+        }
         Commands::Estimate {
             model,
+            task,
+            width,
+            height,
+            frames,
+            duration,
+            batch_size,
+            sample_rate,
+            channels,
+            steps,
             file,
             json,
             verbose,
         } => {
             let store = ModelStore::resolve(model_home)?;
-            let report = estimate_model_or_huggingface(
-                &store,
-                &model,
-                file.as_deref(),
-                detect_system_memory(),
-            )?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+            if let Some(task) = task {
+                if file.is_some() {
+                    bail!("--file cannot be combined with --task workload estimates");
+                }
+                let service = InferenceService::new(store);
+                let request = workload_estimate_request(
+                    model,
+                    task,
+                    backend_override,
+                    device_override,
+                    WorkloadEstimateArgs {
+                        width,
+                        height,
+                        frames,
+                        duration,
+                        batch_size,
+                        sample_rate,
+                        channels,
+                        steps,
+                    },
+                );
+                let _effective = service.resolve(request.clone())?;
+                let report = service.estimate(request)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_workload_estimate(&report, verbose);
+                }
             } else {
-                print_estimate_report(&report, verbose);
+                let report = estimate_model_or_huggingface(
+                    &store,
+                    &model,
+                    file.as_deref(),
+                    detect_system_memory(),
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_estimate_report(&report, verbose);
+                }
             }
             Ok(())
         }
@@ -1088,20 +1340,35 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Commands::Doctor { command } => match command {
-            DoctorCommands::Perf { model } => {
-                let store = ModelStore::resolve(model_home)?;
-                let backend_choice = resolve_backend(backend_override, device_override)?;
-                let manifest = store.get(&model)?;
-                print_perf_doctor(
+        Commands::Doctor {
+            command,
+            task,
+            runtime,
+            model,
+        } => {
+            let store = ModelStore::resolve(model_home)?;
+            match command {
+                Some(DoctorCommands::Perf { model }) => {
+                    let backend_choice = resolve_backend(backend_override, device_override)?;
+                    let manifest = store.get(&model)?;
+                    print_perf_doctor(
+                        &store,
+                        &manifest,
+                        backend_choice,
+                        &llama_options,
+                        selection_options,
+                    )
+                }
+                None => print_inference_doctor(
                     &store,
-                    &manifest,
-                    backend_choice,
-                    &llama_options,
-                    selection_options,
-                )
+                    backend_override,
+                    device_override,
+                    task,
+                    runtime.as_deref(),
+                    model.as_deref(),
+                ),
             }
-        },
+        }
         Commands::Backend { command } => {
             let store = ModelStore::resolve(model_home)?;
             match command {
@@ -1123,6 +1390,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     } else if target == BackendInstallArg::Vllm {
                         let python = install_managed_vllm(&store)?;
                         println!("Installed vLLM backend: {}", python.display());
+                    } else if target == BackendInstallArg::QwenTts {
+                        let python = install_managed_qwen_tts(&store)?;
+                        println!("Installed Qwen-TTS backend: {}", python.display());
                     }
                     Ok(())
                 }
@@ -1241,32 +1511,86 @@ pub async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Commands::List => {
+        Commands::List {
+            task,
+            input,
+            output,
+            family,
+            layout,
+            json,
+        } => {
             let store = ModelStore::resolve(model_home)?;
-            let manifests = store.list()?;
+            let backend_filter = (backend_override != BackendArg::Auto)
+                .then(|| requested_backend_label(backend_override));
+            let manifests = store
+                .list()?
+                .into_iter()
+                .filter(|manifest| {
+                    manifest_matches_list_filters(
+                        manifest,
+                        task,
+                        input,
+                        output,
+                        family.as_deref(),
+                        layout,
+                        backend_filter,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&manifests)?);
+                return Ok(());
+            }
             if manifests.is_empty() {
-                println!("No models installed in {}", store.home().display());
+                println!("No matching models installed in {}", store.home().display());
             } else {
                 println!(
-                    "{:<32} {:<14} {:<18} PATH",
-                    "MODEL", "FORMAT", "ARCHITECTURE"
+                    "{:<26} {:<14} {:<14} {:<18} TASKS",
+                    "MODEL", "LAYOUT", "FAMILY", "ARCHITECTURE"
                 );
                 for manifest in manifests {
                     println!(
-                        "{:<32} {:<14} {:<18} {}",
+                        "{:<26} {:<14} {:<14} {:<18} {}",
                         manifest.id,
-                        format!("{:?}", manifest.format).to_lowercase(),
+                        manifest.metadata.repository_layout,
+                        manifest.metadata.family.as_deref().unwrap_or("-"),
                         manifest.architecture.unwrap_or_else(|| "-".to_string()),
-                        store.model_dir(&manifest.id).display()
+                        join_display(&manifest.metadata.tasks)
                     );
                 }
             }
             Ok(())
         }
+        Commands::Parameters {
+            model,
+            task,
+            json,
+            example,
+            sources,
+        } => {
+            let store = ModelStore::resolve(model_home)?;
+            print_parameters(
+                &store,
+                backend_override,
+                device_override,
+                model.as_deref(),
+                task,
+                json,
+                example,
+                sources,
+            )
+        }
         Commands::Inspect { id } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.get(&id)?;
-            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            let mut value = serde_json::to_value(&manifest)?;
+            if let Some(fields) = value.as_object_mut() {
+                fields.insert(
+                    "host_resources".to_string(),
+                    serde_json::to_value(crate::inference_service::detect_host_resources())?,
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         Commands::SelectFile { id, file } => {
@@ -1280,6 +1604,2175 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkloadEstimateArgs {
+    width: Option<u32>,
+    height: Option<u32>,
+    frames: Option<u32>,
+    duration: Option<f64>,
+    batch_size: Option<u32>,
+    sample_rate: Option<u32>,
+    channels: Option<u16>,
+    steps: Option<u32>,
+}
+
+fn run_image_command(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    command: ImageCommands,
+) -> Result<()> {
+    match command {
+        ImageCommands::Generate(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            if args.conditioning.mask.is_some() && args.conditioning.init_image.is_none() {
+                bail!("--mask requires --init-image for image generation");
+            }
+            let task = if args.conditioning.mask.is_some() {
+                InferenceTask::ImageInpainting
+            } else if args.conditioning.init_image.is_some() {
+                InferenceTask::ImageEditing
+            } else {
+                InferenceTask::ImageGeneration
+            };
+            let mut inputs = Vec::new();
+            if let Some(initial_image) = args.conditioning.init_image.as_deref() {
+                inputs.push(string_input(InputModality::Image, "image", initial_image));
+            }
+            if let Some(mask) = args.conditioning.mask.as_deref() {
+                inputs.push(path_input(InputModality::Image, "mask_image", mask));
+            }
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                task,
+                prompt,
+                negative_prompt,
+                inputs,
+                &args.routing,
+                &args,
+            )
+        }
+        ImageCommands::Edit(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            let task = if args.conditioning.mask.is_some() {
+                InferenceTask::ImageInpainting
+            } else {
+                InferenceTask::ImageEditing
+            };
+            let mut inputs = vec![path_input(InputModality::Image, "image", &args.image)];
+            if let Some(mask) = args.conditioning.mask.as_deref() {
+                inputs.push(path_input(InputModality::Image, "mask_image", mask));
+            }
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                task,
+                prompt,
+                negative_prompt,
+                inputs,
+                &args.routing,
+                &args,
+            )
+        }
+        ImageCommands::Upscale(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                false,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                InferenceTask::ImageUpscaling,
+                prompt,
+                negative_prompt,
+                vec![path_input(InputModality::Image, "image", &args.image)],
+                &args.routing,
+                &args,
+            )
+        }
+    }
+}
+
+fn run_video_command(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    command: VideoCommands,
+) -> Result<()> {
+    match command {
+        VideoCommands::Generate(args) => {
+            let task = if args.initial_image.is_some() {
+                InferenceTask::ImageToVideo
+            } else {
+                InferenceTask::VideoGeneration
+            };
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            let inputs = args
+                .initial_image
+                .as_deref()
+                .map(|path| vec![path_input(InputModality::Image, "initial_image", path)])
+                .unwrap_or_default();
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                task,
+                prompt,
+                negative_prompt,
+                inputs,
+                &args.routing,
+                &args,
+            )
+        }
+        VideoCommands::Animate(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                InferenceTask::ImageToVideo,
+                prompt,
+                negative_prompt,
+                vec![path_input(
+                    InputModality::Image,
+                    "initial_image",
+                    &args.image,
+                )],
+                &args.routing,
+                &args,
+            )
+        }
+        VideoCommands::Transform(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                InferenceTask::VideoToVideo,
+                prompt,
+                negative_prompt,
+                vec![path_input(
+                    InputModality::Video,
+                    "source_video",
+                    &args.video,
+                )],
+                &args.routing,
+                &args,
+            )
+        }
+        VideoCommands::Upscale(args) => execute_media_args(
+            store,
+            backend,
+            device,
+            &args.model,
+            InferenceTask::VideoUpscaling,
+            None,
+            None,
+            vec![path_input(
+                InputModality::Video,
+                "source_video",
+                &args.video,
+            )],
+            &args.routing,
+            &args,
+        ),
+    }
+}
+
+fn run_audio_command(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    command: AudioCommands,
+) -> Result<()> {
+    match command {
+        AudioCommands::Generate(mut args) => match args.command.take() {
+            Some(AudioGenerateCommands::Speech(args)) => {
+                run_audio_speech(store, backend, device, args)
+            }
+            Some(AudioGenerateCommands::Music(mut variant)) => {
+                let (prompt, negative_prompt, inputs) =
+                    prepare_audio_generation(&mut variant.options, InferenceTask::MusicGeneration)?;
+                execute_media_args(
+                    store,
+                    backend,
+                    device,
+                    &variant.model,
+                    InferenceTask::MusicGeneration,
+                    prompt,
+                    negative_prompt,
+                    inputs,
+                    &variant.options.routing,
+                    &variant,
+                )
+            }
+            Some(AudioGenerateCommands::Sound(mut variant)) => {
+                let (prompt, negative_prompt, inputs) =
+                    prepare_audio_generation(&mut variant.options, InferenceTask::AudioGeneration)?;
+                execute_media_args(
+                    store,
+                    backend,
+                    device,
+                    &variant.model,
+                    InferenceTask::AudioGeneration,
+                    prompt,
+                    negative_prompt,
+                    inputs,
+                    &variant.options.routing,
+                    &variant,
+                )
+            }
+            None => {
+                let model = args.model.clone().ok_or_else(|| {
+                    anyhow!(
+                        "audio generate requires speech, music, sound, or a legacy MODEL argument"
+                    )
+                })?;
+                let task = legacy_audio_generation_task(store, &model, &args.options);
+                let (prompt, negative_prompt, inputs) =
+                    prepare_audio_generation(&mut args.options, task)?;
+                execute_media_args(
+                    store,
+                    backend,
+                    device,
+                    &model,
+                    task,
+                    prompt,
+                    negative_prompt,
+                    inputs,
+                    &args.options.routing,
+                    &args,
+                )
+            }
+        },
+        AudioCommands::Speak(args) => run_audio_speech(store, backend, device, args),
+        AudioCommands::Transcribe(args) => {
+            run_audio_transcription(store, backend, device, args, false)
+        }
+        AudioCommands::Translate(args) => {
+            run_audio_transcription(store, backend, device, args, true)
+        }
+        AudioCommands::Detect(args) => match args.command {
+            AudioDetectCommands::Event(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::AudioEventDetection,
+            ),
+            AudioDetectCommands::Voice(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::VoiceActivityDetection,
+            ),
+            AudioDetectCommands::Speaker(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::SpeakerIdentification,
+            ),
+            AudioDetectCommands::Language(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::LanguageIdentification,
+            ),
+            AudioDetectCommands::Emotion(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::SpeechEmotionRecognition,
+            ),
+        },
+        AudioCommands::Analyze(args) => match args.command {
+            AudioAnalyzeCommands::Caption(args) => {
+                run_audio_input_task(store, backend, device, args, InferenceTask::AudioCaptioning)
+            }
+            AudioAnalyzeCommands::Diarize(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::SpeakerDiarization,
+            ),
+            AudioAnalyzeCommands::Classify(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::AudioClassification,
+            ),
+            AudioAnalyzeCommands::Understand(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::AudioUnderstanding,
+            ),
+        },
+        AudioCommands::Transform(args) => match args.command {
+            AudioTransformCommands::Voice(args) => {
+                run_audio_voice_transform(store, backend, device, args)
+            }
+            AudioTransformCommands::Separate(args) => {
+                run_audio_separation(store, backend, device, args)
+            }
+            AudioTransformCommands::Enhance(args) => run_audio_input_task(
+                store,
+                backend,
+                device,
+                args,
+                InferenceTask::AudioEnhancement,
+            ),
+            AudioTransformCommands::Edit(args) => {
+                run_audio_input_task(store, backend, device, args, InferenceTask::AudioEditing)
+            }
+        },
+        AudioCommands::Embed(args) => {
+            run_audio_input_task(store, backend, device, args, InferenceTask::AudioEmbedding)
+        }
+        AudioCommands::Separate(args) => run_audio_separation(store, backend, device, args),
+    }
+}
+
+fn legacy_audio_generation_task(
+    store: &ModelStore,
+    model: &str,
+    options: &AudioGenerationOptions,
+) -> InferenceTask {
+    store
+        .get(model)
+        .map(|manifest| {
+            if options.conditioning.source_audio.is_some()
+                && (options.conditioning.continuation_start.is_some()
+                    || options.conditioning.continuation_duration.is_some())
+                && manifest.supports_task(InferenceTask::SongContinuation)
+            {
+                InferenceTask::SongContinuation
+            } else if options.conditioning.source_audio.is_some()
+                && manifest.supports_task(InferenceTask::SongVariation)
+            {
+                InferenceTask::SongVariation
+            } else if options.conditioning.source_audio.is_some()
+                && manifest.supports_task(InferenceTask::SongContinuation)
+            {
+                InferenceTask::SongContinuation
+            } else if manifest.supports_task(InferenceTask::MusicGeneration) {
+                InferenceTask::MusicGeneration
+            } else {
+                InferenceTask::AudioGeneration
+            }
+        })
+        .unwrap_or(InferenceTask::AudioGeneration)
+}
+
+fn prepare_audio_generation(
+    options: &mut AudioGenerationOptions,
+    task: InferenceTask,
+) -> Result<(Option<String>, Option<String>, Vec<InferenceInput>)> {
+    let lyrics = resolve_optional_text(
+        options.lyrics.lyrics.as_deref(),
+        options.lyrics.lyrics_file.as_deref(),
+    )?;
+    let prompt = if lyrics.is_some() {
+        resolve_optional_text(
+            options.prompt.prompt.as_deref(),
+            options.prompt.prompt_file.as_deref(),
+        )?
+    } else {
+        resolve_primary_text(
+            options.prompt.prompt.as_deref(),
+            options.prompt.prompt_file.as_deref(),
+            false,
+            "prompt",
+        )?
+    };
+    options.lyrics.lyrics = lyrics.clone();
+    options.lyrics.lyrics_file = None;
+    let prompt = match (prompt, lyrics.as_deref()) {
+        (Some(prompt), _) => Some(prompt),
+        // Keep the canonical lyrics value as `audio.lyrics` while also using
+        // it as the required generative prompt when no prose prompt exists.
+        (None, Some(lyrics)) => Some(lyrics.to_string()),
+        (None, None) if task.requires_prompt() => resolve_primary_text(None, None, true, "prompt")?,
+        (None, None) => None,
+    };
+    let negative_prompt = resolve_optional_text(
+        options.prompt.negative_prompt.as_deref(),
+        options.prompt.negative_prompt_file.as_deref(),
+    )?;
+    let mut inputs = Vec::new();
+    for (role, path) in [
+        ("input_audio", options.conditioning.source_audio.as_deref()),
+        (
+            "reference_audio",
+            options.conditioning.reference_audio.as_deref(),
+        ),
+        (
+            "instrumental_audio",
+            options.conditioning.instrumental_audio.as_deref(),
+        ),
+        ("vocal_audio", options.conditioning.vocal_audio.as_deref()),
+        ("melody_audio", options.conditioning.melody_audio.as_deref()),
+        ("rhythm_audio", options.conditioning.rhythm_audio.as_deref()),
+        ("chord_audio", options.conditioning.chord_audio.as_deref()),
+    ] {
+        if let Some(path) = path {
+            inputs.push(path_input(InputModality::Audio, role, path));
+        }
+    }
+    Ok((prompt, negative_prompt, inputs))
+}
+
+fn run_audio_speech(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: AudioSpeakArgs,
+) -> Result<()> {
+    let text = resolve_primary_text(
+        args.text.text.as_deref(),
+        args.text.text_file.as_deref(),
+        true,
+        "text",
+    )?;
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        InferenceTask::TextToSpeech,
+        text,
+        None,
+        Vec::new(),
+        &args.routing,
+        &args,
+    )
+}
+
+fn run_audio_transcription(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    mut args: AudioTranscribeArgs,
+    translate: bool,
+) -> Result<()> {
+    let task = prepare_audio_transcription_task(&mut args, translate)?;
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        task,
+        None,
+        None,
+        vec![path_input(
+            InputModality::Audio,
+            "input_audio",
+            &args.input_audio,
+        )],
+        &args.routing,
+        &args,
+    )
+}
+
+fn prepare_audio_transcription_task(
+    args: &mut AudioTranscribeArgs,
+    translate: bool,
+) -> Result<InferenceTask> {
+    if translate {
+        if args.transcription.task == Some(SpeechToTextTask::Transcribe) {
+            bail!("audio translate conflicts with --task transcribe");
+        }
+        args.transcription.task = Some(SpeechToTextTask::Translate);
+        Ok(InferenceTask::SpeechTranslation)
+    } else if args.transcription.task == Some(SpeechToTextTask::Translate) {
+        Ok(InferenceTask::SpeechTranslation)
+    } else {
+        Ok(InferenceTask::SpeechToText)
+    }
+}
+
+fn run_audio_input_task(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: AudioInputTaskArgs,
+    task: InferenceTask,
+) -> Result<()> {
+    let prompt = resolve_primary_text(
+        args.prompt.prompt.as_deref(),
+        args.prompt.prompt_file.as_deref(),
+        task.requires_prompt(),
+        "prompt",
+    )?;
+    let negative_prompt = resolve_optional_text(
+        args.prompt.negative_prompt.as_deref(),
+        args.prompt.negative_prompt_file.as_deref(),
+    )?;
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        task,
+        prompt,
+        negative_prompt,
+        vec![path_input(
+            InputModality::Audio,
+            "input_audio",
+            &args.input_audio,
+        )],
+        &args.routing,
+        &args,
+    )
+}
+
+fn run_audio_voice_transform(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: AudioVoiceTransformArgs,
+) -> Result<()> {
+    let mut inputs = vec![path_input(
+        InputModality::Audio,
+        "input_audio",
+        &args.input_audio,
+    )];
+    if let Some(reference) = args.reference_audio.as_deref() {
+        inputs.push(path_input(
+            InputModality::Audio,
+            "reference_audio",
+            reference,
+        ));
+    }
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        InferenceTask::VoiceConversion,
+        None,
+        None,
+        inputs,
+        &args.routing,
+        &args,
+    )
+}
+
+fn run_audio_separation(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: AudioSeparateArgs,
+) -> Result<()> {
+    execute_media_args(
+        store,
+        backend,
+        device,
+        &args.model,
+        InferenceTask::StemSeparation,
+        None,
+        None,
+        vec![path_input(
+            InputModality::Audio,
+            "input_audio",
+            &args.input_audio,
+        )],
+        &args.routing,
+        &args,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_media_args<T: Serialize>(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    model: &str,
+    task: InferenceTask,
+    prompt: Option<String>,
+    negative_prompt: Option<String>,
+    inputs: Vec<InferenceInput>,
+    routing_args: &RoutingArgs,
+    args: &T,
+) -> Result<()> {
+    let requested_output = requested_media_output(args)?;
+    let mut request = InferenceRequest::new(model, task);
+    request.prompt = prompt;
+    request.negative_prompt = negative_prompt;
+    request.inputs = inputs;
+    request.parameters = media_parameters(args, routing_args, task)?;
+    request.routing = media_routing(routing_args, backend, device)?;
+
+    let service = InferenceService::new(store.clone());
+    let activity = ActivitySpec::for_task(task);
+    let total_started = Instant::now();
+    let service_started = Instant::now();
+    let attempts = RefCell::new(Vec::<RuntimeAttemptTiming>::new());
+    let execution = with_activity(
+        generation_activity_enabled(routing_args.debug),
+        activity.kind(),
+        activity.message(model),
+        || {
+            service.execute_with_observers(
+                request,
+                |effective, estimate, plan| {
+                    if routing_args.debug {
+                        let mut stderr = io::stderr().lock();
+                        let _ = write_media_routing_debug(&mut stderr, effective, estimate, plan);
+                    }
+                },
+                |attempt| attempts.borrow_mut().push(attempt.clone()),
+            )
+        },
+    );
+    let service_seconds = service_started.elapsed().as_secs_f64();
+    let mut result = match execution {
+        Ok(result) => result,
+        Err(error) => {
+            if routing_args.verbose || routing_args.debug {
+                let attempts = attempts.borrow();
+                if !attempts.is_empty() {
+                    let mut stderr = io::stderr().lock();
+                    let _ = write_media_failed_attempts(&mut stderr, &attempts, service_seconds);
+                }
+            }
+            return Err(error);
+        }
+    };
+    let publication_started = Instant::now();
+    if let Some(destination) = requested_output {
+        publish_and_release_cli_outputs(
+            service.output_store(),
+            &mut result,
+            destination.as_path(),
+        )?;
+    } else {
+        publish_default_cli_outputs(service.output_store(), &mut result)?;
+    }
+    let timings = MediaCliTimings {
+        total_seconds: total_started.elapsed().as_secs_f64(),
+        service_seconds,
+        publication_seconds: publication_started.elapsed().as_secs_f64(),
+    };
+    print_inference_result(&result, false);
+    if routing_args.verbose {
+        let mut stderr = io::stderr().lock();
+        write_media_verbose_stats(&mut stderr, &result, timings)?;
+    }
+    if routing_args.debug {
+        let mut stderr = io::stderr().lock();
+        write_media_backend_debug(&mut stderr, &result)?;
+    }
+    Ok(())
+}
+
+fn requested_media_output<T: Serialize>(args: &T) -> Result<Option<PathBuf>> {
+    let raw = collect_raw_overrides(args)?;
+    Ok(raw.get("output").and_then(Value::as_str).map(PathBuf::from))
+}
+
+fn publish_and_release_cli_outputs(
+    output_store: &OutputStore,
+    result: &mut InferenceResult,
+    destination: &Path,
+) -> Result<()> {
+    ensure_cli_publication_paths(output_store, result, destination)?;
+    let published = publish_cli_outputs(result, destination)?;
+    for (output, path) in result.outputs.iter_mut().zip(published) {
+        output.path = path.display().to_string();
+    }
+    if let Err(error) = output_store.remove_result(&result.id) {
+        result.warnings.push(format!(
+            "outputs were published, but the redundant managed copy could not be removed: {error:#}"
+        ));
+    }
+    Ok(())
+}
+
+fn publish_default_cli_outputs(
+    output_store: &OutputStore,
+    result: &mut InferenceResult,
+) -> Result<()> {
+    ensure_managed_cli_sources(output_store, result)?;
+    output_store.ensure()?;
+    let targets = result
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            let source = PathBuf::from(&output.path);
+            let file_name = default_cli_output_file_name(result, index, &source);
+            (source, output_store.root().join(file_name))
+        })
+        .collect::<Vec<_>>();
+    let published = move_managed_cli_outputs(&targets)?;
+    for (output, path) in result.outputs.iter_mut().zip(published) {
+        output.path = path.display().to_string();
+    }
+    if let Err(error) = output_store.remove_result(&result.id) {
+        result.warnings.push(format!(
+            "outputs were saved, but temporary result metadata could not be removed: {error:#}"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_cli_publication_paths(
+    output_store: &OutputStore,
+    result: &InferenceResult,
+    destination: &Path,
+) -> Result<()> {
+    let output_root = output_store
+        .root()
+        .canonicalize()
+        .context("failed to resolve the managed output store")?;
+    ensure_managed_cli_sources(output_store, result)?;
+
+    let destination = resolve_existing_ancestor(destination)?;
+    if destination.starts_with(&output_root) {
+        bail!(
+            "--output must be outside the managed output store: {}",
+            output_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_managed_cli_sources(output_store: &OutputStore, result: &InferenceResult) -> Result<()> {
+    let result_root = output_store
+        .root()
+        .join(&result.id)
+        .canonicalize()
+        .with_context(|| format!("managed result '{}' was not found", result.id))?;
+    for output in &result.outputs {
+        let source = Path::new(&output.path)
+            .canonicalize()
+            .with_context(|| format!("managed output does not exist: {}", output.path))?;
+        if !source.starts_with(&result_root) {
+            bail!(
+                "managed output escaped result '{}': {}",
+                result.id,
+                source.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn default_cli_output_file_name(result: &InferenceResult, index: usize, source: &Path) -> String {
+    let model = cli_output_slug(&result.model, 48);
+    let identifier = result.id.strip_prefix("out-").unwrap_or(&result.id);
+    let identifier = cli_output_slug(identifier, 48);
+    let ordinal = (result.outputs.len() > 1).then(|| format!("-{:02}", index + 1));
+    let extension = cli_output_extension(source, &result.outputs[index].mime_type);
+    format!(
+        "{model}-{}-{identifier}{}.{}",
+        result.task,
+        ordinal.as_deref().unwrap_or_default(),
+        extension
+    )
+}
+
+fn cli_output_slug(value: &str, max_len: usize) -> String {
+    let mut slug = String::with_capacity(value.len().min(max_len));
+    let mut separator = false;
+    for character in value.chars() {
+        if slug.len() >= max_len {
+            break;
+        }
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            separator = false;
+        } else if !slug.is_empty() && !separator {
+            slug.push('-');
+            separator = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "model".to_string()
+    } else {
+        slug
+    }
+}
+
+fn cli_output_extension(source: &Path, mime_type: &str) -> String {
+    if let Some(extension) = source.extension().and_then(|value| value.to_str())
+        && !extension.is_empty()
+        && extension.len() <= 16
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return extension.to_ascii_lowercase();
+    }
+    match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "audio/wav" => "wav",
+        "audio/flac" => "flac",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "application/json" => "json",
+        "text/plain" => "txt",
+        _ => "bin",
+    }
+    .to_string()
+}
+
+fn move_managed_cli_outputs(targets: &[(PathBuf, PathBuf)]) -> Result<Vec<PathBuf>> {
+    if targets.is_empty() {
+        bail!("inference completed without producing an output file");
+    }
+    let mut unique_targets = HashSet::with_capacity(targets.len());
+    for (source, target) in targets {
+        let metadata = fs::symlink_metadata(source)
+            .with_context(|| format!("managed output does not exist: {}", source.display()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("managed output is not a regular file: {}", source.display());
+        }
+        if !unique_targets.insert(target.clone()) {
+            bail!(
+                "multiple outputs resolve to the same destination {}",
+                target.display()
+            );
+        }
+        if target.exists() {
+            bail!(
+                "refusing to overwrite existing default output {}; remove it or use --output",
+                target.display()
+            );
+        }
+    }
+
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(targets.len());
+    for (source, target) in targets {
+        if let Err(error) = fs::rename(source, target) {
+            let mut rollback_errors = Vec::new();
+            for (original, published) in moved.iter().rev() {
+                if let Err(rollback_error) = fs::rename(published, original) {
+                    rollback_errors.push(format!(
+                        "{} -> {}: {rollback_error}",
+                        published.display(),
+                        original.display()
+                    ));
+                }
+            }
+            let rollback = if rollback_errors.is_empty() {
+                "previous outputs were restored to the managed result".to_string()
+            } else {
+                format!("rollback also failed: {}", rollback_errors.join("; "))
+            };
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to move managed output {} to {}; {rollback}",
+                    source.display(),
+                    target.display()
+                )
+            });
+        }
+        moved.push((source.clone(), target.clone()));
+    }
+    Ok(moved.into_iter().map(|(_, target)| target).collect())
+}
+
+fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut cursor = absolute.as_path();
+    let mut suffix = Vec::new();
+    while !cursor.exists() {
+        let name = cursor
+            .file_name()
+            .ok_or_else(|| anyhow!("cannot resolve output path {}", path.display()))?;
+        suffix.push(name.to_os_string());
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| anyhow!("cannot resolve output path {}", path.display()))?;
+    }
+    let mut resolved = cursor.canonicalize()?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn publish_cli_outputs(result: &InferenceResult, destination: &Path) -> Result<Vec<PathBuf>> {
+    let outputs = result.outputs.iter().collect::<Vec<_>>();
+    if outputs.is_empty() {
+        bail!("inference completed without outputs to publish");
+    }
+    let destination_is_directory = destination.is_dir()
+        || outputs.len() > 1
+        || (!destination.exists() && destination.extension().is_none());
+    if outputs.len() > 1 && destination.exists() && !destination.is_dir() {
+        bail!(
+            "multiple outputs require a destination directory, but {} is a file",
+            destination.display()
+        );
+    }
+    let mut targets = Vec::with_capacity(outputs.len());
+    let mut unique_targets = HashSet::with_capacity(outputs.len());
+    for output in outputs {
+        let source = Path::new(&output.path);
+        let target = if destination_is_directory {
+            let filename = source
+                .file_name()
+                .ok_or_else(|| anyhow!("output has no filename: {}", source.display()))?;
+            destination.join(filename)
+        } else {
+            destination.to_path_buf()
+        };
+        if !source.is_file() {
+            bail!("managed output does not exist: {}", source.display());
+        }
+        if !unique_targets.insert(target.clone()) {
+            bail!(
+                "multiple outputs resolve to the same destination {}",
+                target.display()
+            );
+        }
+        if target.exists() {
+            bail!(
+                "refusing to overwrite existing output {}; choose another --output path",
+                target.display()
+            );
+        }
+        targets.push((source.to_path_buf(), target));
+    }
+
+    if destination_is_directory {
+        fs::create_dir_all(destination).with_context(|| {
+            format!(
+                "failed to create output directory {}",
+                destination.display()
+            )
+        })?;
+    } else if let Some(parent) = destination.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+
+    let mut published = Vec::with_capacity(targets.len());
+    for (source, target) in targets {
+        if let Err(error) = fs::copy(&source, &target) {
+            let _ = fs::remove_file(&target);
+            for path in &published {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to copy managed output {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            });
+        }
+        published.push(target);
+    }
+    Ok(published)
+}
+
+fn resolve_primary_text(
+    explicit: Option<&str>,
+    file: Option<&Path>,
+    required: bool,
+    label: &str,
+) -> Result<Option<String>> {
+    if let Some(value) = explicit {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    if let Some(path) = file {
+        let value = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {} file {}", label, path.display()))?;
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    if !io::stdin().is_terminal() {
+        let mut value = String::new();
+        io::stdin().lock().read_to_string(&mut value)?;
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(Some(value.to_string()));
+        }
+    } else if required {
+        print!("{label}> ");
+        io::stdout().flush()?;
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    if required {
+        bail!(
+            "{} is required; pass --{}, --{}-file, pipe stdin, or enter it interactively",
+            label,
+            label,
+            label
+        );
+    }
+    Ok(None)
+}
+
+fn resolve_optional_text(explicit: Option<&str>, file: Option<&Path>) -> Result<Option<String>> {
+    if let Some(value) = explicit {
+        return Ok((!value.trim().is_empty()).then(|| value.trim().to_string()));
+    }
+    let Some(path) = file else {
+        return Ok(None);
+    };
+    let value = fs::read_to_string(path)
+        .with_context(|| format!("failed to read text file {}", path.display()))?;
+    Ok((!value.trim().is_empty()).then(|| value.trim().to_string()))
+}
+
+fn path_input(modality: InputModality, role: &str, path: &Path) -> InferenceInput {
+    string_input(modality, role, &path.to_string_lossy())
+}
+
+fn vision_user_message(text: &str, image_urls: &[String]) -> ChatMessage {
+    let content = if image_urls.is_empty() {
+        MessageContent::Text(text.to_string())
+    } else {
+        let mut parts = Vec::with_capacity(image_urls.len() + 1);
+        parts.push(ContentPart {
+            kind: "text".to_string(),
+            text: Some(text.to_string()),
+            image_url: None,
+        });
+        parts.extend(image_urls.iter().map(|url| ContentPart {
+            kind: "image_url".to_string(),
+            text: None,
+            image_url: Some(ImageUrlSpec::Url(url.clone())),
+        }));
+        MessageContent::Parts(parts)
+    };
+    ChatMessage {
+        role: "user".to_string(),
+        content: Some(content),
+        name: None,
+    }
+}
+
+fn normalize_cli_image_sources(values: &[String]) -> Result<Vec<String>> {
+    let max_bytes = env::var("WERK_MAX_VISION_INPUT_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_VISION_INPUT_BYTES);
+    let mut total_bytes = 0usize;
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            bail!("--image value must not be empty");
+        }
+        if value.starts_with("http://") || value.starts_with("https://") {
+            normalized.push(value.to_string());
+            continue;
+        }
+        if value.starts_with("data:") {
+            if !value.starts_with("data:image/") || !value.contains(";base64,") {
+                bail!("--image data URL must contain a base64-encoded image MIME type");
+            }
+            total_bytes = total_bytes
+                .checked_add(value.len())
+                .context("vision input byte count overflowed")?;
+            if total_bytes > max_bytes.saturating_mul(4).div_ceil(3) {
+                bail!("vision image inputs exceed WERK_MAX_VISION_INPUT_BYTES ({max_bytes} bytes)");
+            }
+            normalized.push(value.to_string());
+            continue;
+        }
+
+        let path = cli_image_path(value);
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read --image {}", path.display()))?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .context("vision input byte count overflowed")?;
+        if total_bytes > max_bytes {
+            bail!("vision image inputs exceed WERK_MAX_VISION_INPUT_BYTES ({max_bytes} bytes)");
+        }
+        let mime = image_mime_type(&path, &bytes)?;
+        normalized.push(format!(
+            "data:{mime};base64,{}",
+            BASE64_STANDARD.encode(bytes)
+        ));
+    }
+    Ok(normalized)
+}
+
+fn cli_image_path(value: &str) -> PathBuf {
+    let Some(path) = value.strip_prefix("file://") else {
+        return PathBuf::from(value);
+    };
+    #[cfg(windows)]
+    let path = path
+        .strip_prefix('/')
+        .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+        .unwrap_or(path);
+    PathBuf::from(path)
+}
+
+fn image_mime_type(path: &Path, bytes: &[u8]) -> Result<&'static str> {
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("png") => Some("image/png"),
+            Some("jpg" | "jpeg") => Some("image/jpeg"),
+            Some("gif") => Some("image/gif"),
+            Some("webp") => Some("image/webp"),
+            Some("bmp") => Some("image/bmp"),
+            _ => None,
+        }
+    };
+    mime.ok_or_else(|| {
+        anyhow!(
+            "unsupported --image format for {}; use PNG, JPEG, GIF, WebP, or BMP",
+            path.display()
+        )
+    })
+}
+
+fn string_input(modality: InputModality, role: &str, value: &str) -> InferenceInput {
+    let value = value.to_string();
+    let (source, mime_type) = if value.starts_with("http://") || value.starts_with("https://") {
+        (InferenceInputSource::Url { url: value }, None)
+    } else if let Some((header, data)) = value.split_once(";base64,")
+        && value.starts_with("data:")
+    {
+        (
+            InferenceInputSource::Base64 {
+                data: data.to_string(),
+            },
+            header.strip_prefix("data:").map(str::to_string),
+        )
+    } else {
+        (InferenceInputSource::Path { path: value }, None)
+    };
+    InferenceInput {
+        modality,
+        role: role.to_string(),
+        source,
+        mime_type,
+    }
+}
+
+fn media_routing(
+    args: &RoutingArgs,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+) -> Result<RoutingOverrides> {
+    let backend_accelerator = match backend {
+        BackendArg::Cpu => Some("cpu"),
+        BackendArg::Cuda => Some("cuda"),
+        BackendArg::Rocm => Some("rocm"),
+        BackendArg::Metal => Some("metal"),
+        _ => None,
+    };
+    let device_accelerator = device
+        .filter(|device| *device != DeviceArg::Auto)
+        .map(device_arg_label);
+    if let (Some(accelerator), Some(device)) = (args.accelerator.as_deref(), device_accelerator)
+        && !accelerator.eq_ignore_ascii_case(device)
+    {
+        bail!(
+            "conflicting media accelerator selections: --accelerator {accelerator} and --device {device}"
+        );
+    }
+    let accelerator = args
+        .accelerator
+        .clone()
+        .or_else(|| device_accelerator.map(str::to_string))
+        .or_else(|| backend_accelerator.map(str::to_string));
+    let backend = if backend == BackendArg::Auto || backend_accelerator.is_some() {
+        None
+    } else {
+        Some(requested_backend_label(backend).to_string())
+    };
+    Ok(RoutingOverrides {
+        backend,
+        accelerator,
+        device: device.map(device_arg_label).map(str::to_string),
+        precision: args.precision.clone(),
+        quantization: args.quantization.clone(),
+        profile: args.profile.clone(),
+        quality: args.quality.clone(),
+        performance_preference: args.performance_preference.clone(),
+        fallback_policy: args.fallback_policy.clone(),
+        parameter_policy: args
+            .parameter_policy
+            .as_deref()
+            .unwrap_or("strict")
+            .parse::<ParameterPolicy>()
+            .map_err(anyhow::Error::msg)?,
+        allow_cpu_offload: canonical_bool(args.allow_cpu_offload, args.no_allow_cpu_offload),
+        allow_sequential_offload: canonical_bool(
+            args.allow_sequential_offload,
+            args.no_allow_sequential_offload,
+        ),
+        allow_component_offload: canonical_bool(
+            args.allow_component_offload,
+            args.no_allow_component_offload,
+        ),
+        allow_disk_offload: canonical_bool(args.allow_disk_offload, args.no_allow_disk_offload),
+        attention_backend: args.attention_backend.clone(),
+        compile: canonical_bool(args.compile, args.no_compile),
+        timeout_seconds: args.timeout,
+    })
+}
+
+fn canonical_bool(enabled: bool, disabled: bool) -> OverrideBool {
+    match (enabled, disabled) {
+        (true, false) => OverrideBool::Enabled,
+        (false, true) => OverrideBool::Disabled,
+        _ => OverrideBool::Inherit,
+    }
+}
+
+fn device_arg_label(device: DeviceArg) -> &'static str {
+    match device {
+        DeviceArg::Auto => "auto",
+        DeviceArg::Cpu => "cpu",
+        DeviceArg::Cuda => "cuda",
+        DeviceArg::Metal => "metal",
+    }
+}
+
+fn media_parameters<T: Serialize>(
+    args: &T,
+    routing: &RoutingArgs,
+    task: InferenceTask,
+) -> Result<BTreeMap<String, ParameterValue>> {
+    let mut raw = collect_raw_overrides(args)?;
+    for path in MEDIA_TRANSPORT_FIELDS
+        .iter()
+        .chain(MEDIA_ROUTING_FIELDS.iter())
+    {
+        raw.remove(*path);
+    }
+    expand_structured_media_values(&mut raw)?;
+    for (path, value) in parse_set_overrides(&routing.set).map_err(anyhow::Error::msg)? {
+        raw.insert(path, value);
+    }
+    normalize_negative_bool_pairs(&mut raw);
+
+    raw.into_iter()
+        .map(|(path, value)| {
+            let path = normalize_media_parameter_path(task, &path);
+            Ok((path, ParameterValue::from_json(value)?))
+        })
+        .collect()
+}
+
+const MEDIA_TRANSPORT_FIELDS: &[&str] = &[
+    "model",
+    "prompt",
+    "prompt_file",
+    "negative_prompt",
+    "negative_prompt_file",
+    "text",
+    "text_file",
+    "lyrics_file",
+    "image",
+    "init_image",
+    "mask",
+    "video",
+    "input_audio",
+    "source_audio",
+    "reference_audio",
+    "instrumental_audio",
+    "vocal_audio",
+    "melody_audio",
+    "rhythm_audio",
+    "chord_audio",
+    "initial_image",
+    "output",
+    "output_path",
+];
+
+const MEDIA_ROUTING_FIELDS: &[&str] = &[
+    "accelerator",
+    "precision",
+    "quantization",
+    "profile",
+    "quality",
+    "performance_preference",
+    "fallback_policy",
+    "parameter_policy",
+    "allow_cpu_offload",
+    "no_allow_cpu_offload",
+    "allow_sequential_offload",
+    "no_allow_sequential_offload",
+    "allow_component_offload",
+    "no_allow_component_offload",
+    "allow_disk_offload",
+    "no_allow_disk_offload",
+    "attention_backend",
+    "compile",
+    "no_compile",
+    "timeout",
+    "set",
+];
+
+fn expand_structured_media_values(raw: &mut BTreeMap<String, Value>) -> Result<()> {
+    for path in [
+        "controls",
+        "loras",
+        "adapters",
+        "camera_keyframes",
+        "prompt_keyframes",
+        "guidance_schedule",
+        "denoise_schedule",
+        "adapter_schedule",
+        "instruments",
+        "mix_controls",
+        "mastering_controls",
+    ] {
+        let Some(Value::Array(values)) = raw.get_mut(path) else {
+            continue;
+        };
+        for value in values.iter_mut() {
+            let Value::String(spec) = value else {
+                continue;
+            };
+            if !spec.contains('=') {
+                continue;
+            }
+            *value = parse_structured_spec(spec)
+                .with_context(|| format!("invalid structured value for {path}"))?;
+        }
+    }
+
+    let structured = raw
+        .keys()
+        .filter(|path| path.ends_with("_json") || path.ends_with("_file"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in structured {
+        let Some(source) = raw.remove(&path) else {
+            continue;
+        };
+        let (target, value) = if let Some(target) = path.strip_suffix("_json") {
+            let encoded = source
+                .as_str()
+                .ok_or_else(|| anyhow!("{path} must contain JSON text"))?;
+            let value = serde_json::from_str(encoded)
+                .with_context(|| format!("invalid JSON supplied for {path}"))?;
+            (target.to_string(), value)
+        } else {
+            let target = path.trim_end_matches("_file").to_string();
+            let file = source
+                .as_str()
+                .ok_or_else(|| anyhow!("{path} must contain a file path"))?;
+            let encoded = fs::read_to_string(file)
+                .with_context(|| format!("failed to read structured override file {file}"))?;
+            let value = serde_json::from_str(&encoded)
+                .with_context(|| format!("invalid JSON in structured override file {file}"))?;
+            (target, value)
+        };
+        merge_media_value(raw, target, value);
+    }
+    Ok(())
+}
+
+fn parse_structured_spec(spec: &str) -> Result<Value> {
+    let mut object = serde_json::Map::new();
+    for field in spec.split(',') {
+        let (name, raw_value) = field
+            .split_once('=')
+            .ok_or_else(|| anyhow!("expected comma-separated key=value fields"))?;
+        let name = name.trim().replace('-', "_");
+        if name.is_empty() {
+            bail!("structured field name must not be empty");
+        }
+        if object.contains_key(&name) {
+            bail!("structured field '{name}' is repeated");
+        }
+        let raw_value = raw_value.trim();
+        if raw_value.is_empty() {
+            bail!("structured field '{name}' has an empty value");
+        }
+        let value = serde_json::from_str(raw_value)
+            .unwrap_or_else(|_| Value::String(raw_value.to_string()));
+        object.insert(name, value);
+    }
+    if object.is_empty() {
+        bail!("structured value must contain at least one key=value field");
+    }
+    Ok(Value::Object(object))
+}
+
+fn merge_media_value(raw: &mut BTreeMap<String, Value>, path: String, value: Value) {
+    match (raw.remove(&path), value) {
+        (Some(Value::Array(mut current)), Value::Array(additional)) => {
+            current.extend(additional);
+            raw.insert(path, Value::Array(current));
+        }
+        (_, value) => {
+            raw.insert(path, value);
+        }
+    }
+}
+
+fn normalize_negative_bool_pairs(raw: &mut BTreeMap<String, Value>) {
+    if raw.remove("exclude_audio") == Some(Value::Bool(true)) {
+        raw.insert("include_audio".to_string(), Value::Bool(false));
+    }
+    let negative_paths = raw
+        .iter()
+        .filter(|(path, value)| {
+            *value == &Value::Bool(true)
+                && path
+                    .rsplit_once('.')
+                    .map(|(_, name)| name.starts_with("no_"))
+                    .unwrap_or_else(|| path.starts_with("no_"))
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    for negative_path in negative_paths {
+        raw.remove(&negative_path);
+        let positive_path = match negative_path.rsplit_once('.') {
+            Some((prefix, name)) => format!("{prefix}.{}", name.trim_start_matches("no_")),
+            None => negative_path.trim_start_matches("no_").to_string(),
+        };
+        raw.insert(positive_path, Value::Bool(false));
+    }
+}
+
+fn normalize_media_parameter_path(task: InferenceTask, path: &str) -> String {
+    let path = path.replace('-', "_");
+    if path.contains('.') {
+        return path;
+    }
+    let normalized = match (task, path.as_str()) {
+        (
+            InferenceTask::ImageGeneration
+            | InferenceTask::ImageEditing
+            | InferenceTask::ImageVariation
+            | InferenceTask::ImageInpainting
+            | InferenceTask::ImageOutpainting
+            | InferenceTask::ImageUpscaling,
+            "image_vae_tiling",
+        ) => "vae_tiling",
+        (
+            InferenceTask::ImageGeneration
+            | InferenceTask::ImageEditing
+            | InferenceTask::ImageVariation
+            | InferenceTask::ImageInpainting
+            | InferenceTask::ImageOutpainting
+            | InferenceTask::ImageUpscaling,
+            "image_vae_slicing",
+        ) => "vae_slicing",
+        (
+            InferenceTask::ImageGeneration
+            | InferenceTask::ImageEditing
+            | InferenceTask::ImageVariation
+            | InferenceTask::ImageInpainting
+            | InferenceTask::ImageOutpainting
+            | InferenceTask::ImageUpscaling,
+            "post_upscale",
+        ) => "post_upscaling",
+        (
+            InferenceTask::VideoGeneration
+            | InferenceTask::ImageToVideo
+            | InferenceTask::VideoToVideo
+            | InferenceTask::VideoInpainting
+            | InferenceTask::VideoExtension
+            | InferenceTask::VideoUpscaling
+            | InferenceTask::FrameInterpolation,
+            "loop",
+        ) => "looping",
+        (InferenceTask::SpeechToText | InferenceTask::SpeechTranslation, "task") => "operation",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "num_variations",
+        ) => "variations",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "bpm_min",
+        ) => "tempo_min",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "bpm_max",
+        ) => "tempo_max",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_register",
+        ) => "register",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_range",
+        ) => "range",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_language",
+        ) => "language",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_accent",
+        ) => "accent",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_delivery",
+        ) => "delivery",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_emotion",
+        ) => "emotion",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_power",
+        ) => "power",
+        (InferenceTask::TextToSpeech, "loudness_lufs") => "loudness",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation
+            | InferenceTask::TextToSpeech
+            | InferenceTask::StemSeparation,
+            "format",
+        ) => "output_format",
+        _ => path.as_str(),
+    };
+    format!("{}.{}", task.parameter_namespace(), normalized)
+}
+
+fn print_inference_result(result: &InferenceResult, managed: bool) {
+    if managed {
+        println!(
+            "{} {} via {} ({})",
+            result.task, result.model, result.runtime, result.id
+        );
+    } else {
+        println!("{} {} via {}", result.task, result.model, result.runtime);
+    }
+    for output in &result.outputs {
+        println!("output> {}", output.path);
+        let details = format!(
+            "mime={} size={}{}{}{}",
+            output.mime_type,
+            format_bytes(output.size_bytes),
+            output
+                .width
+                .map(|width| format!(" width={width}"))
+                .unwrap_or_default(),
+            output
+                .height
+                .map(|height| format!(" height={height}"))
+                .unwrap_or_default(),
+            output
+                .duration
+                .map(|duration| format!(" duration={duration:.2}s"))
+                .unwrap_or_default(),
+        );
+        if managed {
+            println!("  id={} {details}", output.id);
+        } else {
+            println!("  {details}");
+        }
+    }
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn workload_estimate_request(
+    model: String,
+    task: InferenceTask,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: WorkloadEstimateArgs,
+) -> InferenceRequest {
+    let mut request = InferenceRequest::new(model, task);
+    if task.requires_prompt() {
+        request.prompt = Some("<estimate>".to_string());
+    }
+    request.inputs = estimate_inputs_for_task(task);
+    let namespace = task.parameter_namespace();
+    let mut insert = |name: &str, value: ParameterValue| {
+        request
+            .parameters
+            .insert(format!("{namespace}.{name}"), value);
+    };
+    if let Some(value) = args.width {
+        insert("width", value.into());
+    }
+    if let Some(value) = args.height {
+        insert("height", value.into());
+    }
+    if let Some(value) = args.frames {
+        insert("frames", value.into());
+    }
+    if let Some(value) = args.duration {
+        insert("duration", value.into());
+    }
+    if let Some(value) = args.batch_size {
+        insert("batch_size", value.into());
+    }
+    if let Some(value) = args.sample_rate {
+        insert("sample_rate", value.into());
+    }
+    if let Some(value) = args.channels {
+        insert("channels", ParameterValue::Integer(i64::from(value)));
+    }
+    if let Some(value) = args.steps {
+        insert("steps", value.into());
+    }
+    request.routing.backend = Some(requested_backend_label(backend).to_string());
+    request.routing.device = device.map(device_arg_label).map(str::to_string);
+    request
+}
+
+fn estimate_inputs_for_task(task: InferenceTask) -> Vec<InferenceInput> {
+    let placeholder = |modality, role: &str| InferenceInput {
+        modality,
+        role: role.to_string(),
+        source: InferenceInputSource::Path {
+            path: "<estimate-input>".to_string(),
+        },
+        mime_type: None,
+    };
+    use InferenceTask::*;
+    match task {
+        ImageUnderstanding | ImageEditing | ImageVariation | ImageUpscaling => {
+            vec![placeholder(InputModality::Image, "image")]
+        }
+        ImageInpainting | ImageOutpainting => vec![
+            placeholder(InputModality::Image, "image"),
+            placeholder(InputModality::Image, "mask_image"),
+        ],
+        ImageToVideo => vec![placeholder(InputModality::Image, "initial_image")],
+        VideoToVideo | VideoExtension | VideoUpscaling | FrameInterpolation => {
+            vec![placeholder(InputModality::Video, "source_video")]
+        }
+        VideoInpainting => vec![
+            placeholder(InputModality::Video, "source_video"),
+            placeholder(InputModality::Video, "mask_video"),
+        ],
+        SongContinuation
+        | SongVariation
+        | SpeechToText
+        | SpeechTranslation
+        | AudioEventDetection
+        | VoiceActivityDetection
+        | SpeakerIdentification
+        | LanguageIdentification
+        | SpeechEmotionRecognition
+        | AudioCaptioning
+        | SpeakerDiarization
+        | AudioClassification
+        | AudioUnderstanding
+        | AudioEmbedding
+        | StemGeneration
+        | StemSeparation
+        | AudioEnhancement
+        | AudioEditing => vec![placeholder(InputModality::Audio, "input_audio")],
+        VoiceConversion => vec![placeholder(InputModality::Audio, "input_audio")],
+        TextGeneration | TextEmbedding | ImageGeneration | VideoGeneration | AudioGeneration
+        | MusicGeneration | TextToSpeech => Vec::new(),
+    }
+}
+
+fn print_workload_estimate(report: &WorkloadEstimate, verbose: bool) {
+    println!("Task: {}", report.task);
+    println!(
+        "Fit: {} (confidence: {})",
+        format!("{:?}", report.fit).to_ascii_lowercase(),
+        format!("{:?}", report.confidence).to_ascii_lowercase()
+    );
+    for (label, value) in [
+        ("Download", report.download_size_bytes),
+        ("Weights", report.weight_payload_bytes),
+        ("Accelerator peak", report.accelerator_peak_bytes),
+        ("Host peak", report.host_peak_bytes),
+        ("Output", report.output_size_bytes),
+    ] {
+        println!(
+            "{label}: {}",
+            value
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+    for warning in &report.warnings {
+        println!("Warning: {warning}");
+    }
+    for recommendation in &report.recommendations {
+        println!("Recommendation: {recommendation}");
+    }
+    if verbose {
+        for assumption in &report.assumptions {
+            println!("Assumption: {assumption}");
+        }
+    }
+}
+
+fn manifest_matches_list_filters(
+    manifest: &ModelManifest,
+    task: Option<InferenceTask>,
+    input: Option<InputModality>,
+    output: Option<OutputModality>,
+    family: Option<&str>,
+    layout: Option<RepositoryLayout>,
+    backend: Option<&str>,
+) -> bool {
+    task.is_none_or(|task| manifest.metadata.tasks.contains(&task))
+        && input.is_none_or(|input| manifest.metadata.input_modalities.contains(&input))
+        && output.is_none_or(|output| manifest.metadata.output_modalities.contains(&output))
+        && family.is_none_or(|family| {
+            manifest
+                .metadata
+                .family
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(family))
+        })
+        && layout.is_none_or(|layout| manifest.metadata.repository_layout == layout)
+        && backend.is_none_or(|backend| {
+            manifest.backend.eq_ignore_ascii_case(backend)
+                || manifest.metadata.compatible_runtimes.iter().any(|runtime| {
+                    runtime
+                        .to_ascii_lowercase()
+                        .contains(&backend.to_ascii_lowercase())
+                })
+        })
+}
+
+fn join_display<T: std::fmt::Display>(values: &[T]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_parameters(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    model: Option<&str>,
+    task: Option<InferenceTask>,
+    json_output: bool,
+    example: bool,
+    sources: bool,
+) -> Result<()> {
+    let manifest = model.map(|model| store.get(model)).transpose()?;
+    let task = task
+        .or_else(|| {
+            manifest
+                .as_ref()
+                .and_then(|manifest| manifest.metadata.tasks.first().copied())
+        })
+        .ok_or_else(|| anyhow!("provide --task or an installed MODEL with declared tasks"))?;
+    if let Some(manifest) = &manifest
+        && !manifest.supports_task(task)
+    {
+        bail!(
+            "model '{}' does not declare support for task {task}",
+            manifest.id
+        );
+    }
+
+    let descriptors = match manifest.as_ref() {
+        Some(manifest) => parameter_schema_for_manifest(task, manifest)?,
+        None => parameter_schema(task),
+    };
+    let (mut runtime_candidates, task_readiness) = match manifest.as_ref() {
+        Some(manifest) => {
+            let probe = InferenceService::new(store.clone()).parameter_probe(manifest, task)?;
+            (probe.candidates, probe.readiness)
+        }
+        None => (Vec::new(), None),
+    };
+    if backend != BackendArg::Auto {
+        let filter = requested_backend_label(backend);
+        runtime_candidates.retain(|candidate| {
+            candidate.id.eq_ignore_ascii_case(filter)
+                || candidate.backend.eq_ignore_ascii_case(filter)
+                || format!("{:?}", candidate.accelerator).eq_ignore_ascii_case(filter)
+                || (filter == "metal"
+                    && format!("{:?}", candidate.accelerator).eq_ignore_ascii_case("mps"))
+        });
+        if manifest.is_some() && runtime_candidates.is_empty() {
+            bail!("no runtime matching backend '{filter}' supports model/task");
+        }
+    }
+    let parameter_support = runtime_candidates
+        .iter()
+        .filter(|candidate| candidate.available)
+        .max_by_key(|candidate| candidate.priority)
+        .or_else(|| {
+            runtime_candidates
+                .iter()
+                .max_by_key(|candidate| candidate.priority)
+        })
+        .map(|candidate| candidate.parameter_support.clone());
+    let example_request = workload_estimate_request(
+        manifest
+            .as_ref()
+            .map(|manifest| manifest.id.clone())
+            .unwrap_or_else(|| "MODEL".to_string()),
+        task,
+        backend,
+        device,
+        WorkloadEstimateArgs::default(),
+    );
+    let resolved = if sources {
+        let manifest = manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("--sources requires an installed MODEL"))?;
+        let mut request = example_request.clone();
+        request.model = manifest.id.clone();
+        Some(InferenceService::new(store.clone()).resolve(request)?)
+    } else {
+        None
+    };
+
+    if json_output || example || sources {
+        let payload = json!({
+            "model": manifest.as_ref().map(|manifest| manifest.id.as_str()),
+            "task": task,
+            "backend": requested_backend_label(backend),
+            "parameters": descriptors,
+            "parameter_support": parameter_support,
+            "runtime_candidates": runtime_candidates,
+            "task_readiness": task_readiness,
+            "model_constraints": manifest
+                .as_ref()
+                .map(|manifest| &manifest.metadata.parameter_constraints),
+            "example": example.then_some(&example_request),
+            "sources": resolved.as_ref().map(|request| &request.parameters),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    println!("Parameters for {task}");
+    println!(
+        "{:<34} {:<12} {:<16} {:<18} {:<15} DEFAULT",
+        "PATH", "TYPE", "CATEGORY", "CLI FLAG", "SUPPORT"
+    );
+    for descriptor in descriptors {
+        println!(
+            "{:<34} {:<12} {:<16} {:<18} {:<15} {}",
+            descriptor.path,
+            format!("{:?}", descriptor.value_type).to_ascii_lowercase(),
+            descriptor.category,
+            descriptor.cli_flag,
+            parameter_support
+                .as_ref()
+                .and_then(|support| support.get(&descriptor.path))
+                .map(|status| format!("{status:?}").to_ascii_lowercase())
+                .unwrap_or_else(|| "-".to_string()),
+            descriptor
+                .default
+                .as_ref()
+                .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "-".to_string()))
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+    if let Some(readiness) = task_readiness.as_ref() {
+        print_task_readiness(readiness);
+    }
+    Ok(())
+}
+
+fn print_task_readiness(readiness: &TaskReadiness) {
+    println!(
+        "Task readiness: {}",
+        task_readiness_status_label(readiness.status)
+    );
+    println!("  {}", readiness.detail);
+    if let Some(adapter) = readiness.adapter.as_deref() {
+        println!("  Adapter: {adapter}");
+    }
+    if let Some(backend) = readiness.required_backend.as_deref() {
+        println!("  Required backend: {backend}");
+    }
+    if !readiness.missing_dependencies.is_empty() {
+        println!(
+            "  Missing dependencies: {}",
+            readiness.missing_dependencies.join(", ")
+        );
+    }
+    for group in &readiness.missing_dependency_groups {
+        let alternatives = group
+            .any_of
+            .iter()
+            .map(|route| route.all_of.join(" + "))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        println!(
+            "  Missing dependency choice ({}): {alternatives}",
+            group.purpose
+        );
+    }
+    if readiness.status == TaskReadinessStatus::Installable
+        && let Some(command) = readiness
+            .install_command
+            .as_deref()
+            .and_then(validated_backend_install_command)
+    {
+        println!("  Recommendation: {command}");
+    } else if readiness.status == TaskReadinessStatus::NotImplemented {
+        println!("  Recommendation: choose a supported task/model or add a dedicated adapter");
+    }
+}
+
+fn task_readiness_status_label(status: TaskReadinessStatus) -> &'static str {
+    match status {
+        TaskReadinessStatus::Available => "available",
+        TaskReadinessStatus::FallbackAvailable => "fallback_available",
+        TaskReadinessStatus::Installable => "installable",
+        TaskReadinessStatus::NotImplemented => "not_implemented",
+        TaskReadinessStatus::Unavailable => "unavailable",
+    }
+}
+
+fn print_inference_doctor(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    task: Option<InferenceTask>,
+    runtime: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    println!("Werk runtime diagnostics");
+    print_backend_doctor(store, false);
+
+    let report = CompanionClient::discover_doctor_report();
+    println!(
+        "Media companion: {} ({})",
+        if report.available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        report.summary
+    );
+    if let Some(launcher) = report.launcher.as_deref() {
+        println!("Companion launcher: {launcher}");
+    }
+    let runtime_lower = runtime.map(str::to_ascii_lowercase);
+    for check in report.checks.iter().filter(|check| {
+        runtime_lower.as_ref().is_none_or(|runtime| {
+            check.name.to_ascii_lowercase().contains(runtime)
+                || check.detail.to_ascii_lowercase().contains(runtime)
+        })
+    }) {
+        let status = if check.available {
+            "ok"
+        } else if check.required {
+            "missing"
+        } else {
+            "optional"
+        };
+        println!("{:<12} {:<24} {}", status, check.name, check.detail);
+    }
+
+    if let Some(task) = task {
+        let compatible = store
+            .list()?
+            .into_iter()
+            .filter(|manifest| manifest.supports_task(task))
+            .map(|manifest| manifest.id)
+            .collect::<Vec<_>>();
+        println!(
+            "Task {task}: {} installed model(s){}",
+            compatible.len(),
+            if compatible.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", compatible.join(", "))
+            }
+        );
+    }
+
+    if let Some(model) = model {
+        let manifest = store.get(model)?;
+        let selected_task = task
+            .or_else(|| manifest.metadata.tasks.first().copied())
+            .ok_or_else(|| anyhow!("model '{model}' does not declare an inference task"))?;
+        let mut request = workload_estimate_request(
+            manifest.id.clone(),
+            selected_task,
+            backend,
+            device,
+            WorkloadEstimateArgs::default(),
+        );
+        if let Some(runtime) = runtime {
+            request.routing.backend = Some(runtime.to_string());
+            request.routing.fallback_policy = Some("none".to_string());
+        }
+        match InferenceService::new(store.clone()).plan(request) {
+            Ok((_, estimate, plan)) => {
+                println!(
+                    "Model {}: task={}, layout={}, fit={:?}, runtime={}",
+                    manifest.id,
+                    selected_task,
+                    manifest.metadata.repository_layout,
+                    estimate.fit,
+                    plan.selected_runtime.as_deref().unwrap_or("none")
+                );
+                if let Some(readiness) = plan.task_readiness.as_ref() {
+                    print_task_readiness(readiness);
+                }
+                for candidate in plan.candidates {
+                    println!(
+                        "  {:<24} {:?}: {}",
+                        candidate.runtime_id,
+                        candidate.status,
+                        if candidate.reasons.is_empty() {
+                            "eligible".to_string()
+                        } else {
+                            candidate.reasons.join("; ")
+                        }
+                    );
+                }
+            }
+            Err(error) => println!("Model {}: diagnostic warning: {error:#}", manifest.id),
+        }
+    }
+    Ok(())
 }
 
 fn should_print_startup_banner(command: &Commands) -> bool {
@@ -1343,7 +3836,11 @@ fn should_print_startup_banner_for(
     }
 
     match command {
-        Commands::Serve { .. } | Commands::Run { .. } => true,
+        Commands::Serve { .. }
+        | Commands::Run { .. }
+        | Commands::Image { .. }
+        | Commands::Video { .. }
+        | Commands::Audio { .. } => true,
         Commands::Chat { .. } => stdin_is_terminal,
         Commands::Import { .. }
         | Commands::Pull { .. }
@@ -1354,7 +3851,8 @@ fn should_print_startup_banner_for(
         | Commands::Backend { .. }
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
-        | Commands::List
+        | Commands::List { .. }
+        | Commands::Parameters { .. }
         | Commands::Inspect { .. }
         | Commands::SelectFile { .. } => false,
     }
@@ -1366,6 +3864,9 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         Commands::Run { verbose, debug, .. } | Commands::Chat { verbose, debug, .. } => {
             *verbose || *debug
         }
+        Commands::Image { command } => command.routing().verbose || command.routing().debug,
+        Commands::Video { command } => command.routing().verbose || command.routing().debug,
+        Commands::Audio { command } => command.routing().verbose || command.routing().debug,
         Commands::Bench { debug, .. } => *debug,
         Commands::Import { .. }
         | Commands::Pull { .. }
@@ -1375,7 +3876,8 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         | Commands::Backend { .. }
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
-        | Commands::List
+        | Commands::List { .. }
+        | Commands::Parameters { .. }
         | Commands::Inspect { .. }
         | Commands::SelectFile { .. } => false,
     }
@@ -1944,6 +4446,7 @@ fn remote_hf_manifest(remote: &RemoteHfModel, include_file: Option<&str>) -> Res
         created_unix: 0,
         files,
         artifacts: Vec::new(),
+        metadata: Default::default(),
     })
 }
 
@@ -2291,13 +4794,12 @@ fn estimate_model_files_bytes(manifest: &ModelManifest) -> u64 {
 }
 
 fn estimate_weight_accounting(store: &ModelStore, manifest: &ModelManifest) -> WeightAccounting {
-    if manifest.format == ModelFormat::SafeTensors
-        || manifest.format == ModelFormat::Mlx
-        || manifest.format == ModelFormat::PyTorch
+    if matches!(
+        manifest.format,
+        ModelFormat::SafeTensors | ModelFormat::Mlx | ModelFormat::PyTorch
+    ) && let Some(accounting) = safetensors_index_weight_accounting(store, manifest)
     {
-        if let Some(accounting) = safetensors_index_weight_accounting(store, manifest) {
-            return accounting;
-        }
+        return accounting;
     }
     estimate_weight_accounting_without_store(manifest)
 }
@@ -2621,7 +5123,7 @@ fn kv_cache_from_config(config: &EstimateConfig) -> Option<KvCacheEstimate> {
             4096
         }
     };
-    let effective_context = model_context.min(4096);
+    let effective_context = model_context;
     Some(KvCacheEstimate {
         bytes: layers
             .saturating_mul(kv_heads)
@@ -2968,19 +5470,7 @@ fn with_terminal_spinner<T>(
     message: impl Into<String>,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let spinner = enabled.then(|| {
-        let progress = ProgressBar::new_spinner();
-        progress.enable_steady_tick(Duration::from_millis(120));
-        progress.set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
-        progress.set_message(message.into());
-        progress
-    });
-
-    let result = operation();
-    if let Some(progress) = spinner {
-        progress.finish_and_clear();
-    }
-    result
+    with_activity(enabled, ActivityKind::Spinner, message, operation)
 }
 
 enum ChatInputReader {
@@ -3529,13 +6019,12 @@ impl AssistantPendingSpinner {
             return Ok(());
         }
 
-        const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
-        let frame = FRAMES[self.frame_index % FRAMES.len()];
+        let frame = ActivityKind::Chat.frame(self.frame_index);
         self.frame_index += 1;
         self.visible = true;
 
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\r\x1b[2Kassistant> {frame}")?;
+        write!(stdout, "\r\x1b[2Kassistant> {frame} Werk is thinking...")?;
         stdout.flush()?;
         Ok(())
     }
@@ -3553,10 +6042,12 @@ impl AssistantPendingSpinner {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn chat_loop(
     backend: Arc<dyn GenerationBackend>,
     manifest: ModelManifest,
     selected_backend: BackendChoice,
+    context_size: Option<usize>,
     max_tokens: usize,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -3569,8 +6060,14 @@ async fn chat_loop(
     debug: bool,
     show_loading_spinner: bool,
 ) -> Result<()> {
-    let chat_session =
-        prepare_backend_for_chat(backend.as_ref(), &manifest, seed, show_loading_spinner)?;
+    // Session selection predates multimodal request capabilities. Keep image
+    // chats on the request-aware backend path so a llama.cpp server is started
+    // with its projector and no cached text-only session can pin the route.
+    let chat_session = if images.is_empty() {
+        prepare_backend_for_chat(backend.as_ref(), &manifest, seed, show_loading_spinner)?
+    } else {
+        None
+    };
 
     println!(
         "Chatting with {}. Type /exit or /quit to stop.",
@@ -3592,14 +6089,27 @@ async fn chat_loop(
             break;
         }
 
-        let user_message = ChatMessage {
-            role: "user".to_string(),
-            content: Some(MessageContent::Text(input.to_string())),
-            name: None,
-        };
+        let user_message = vision_user_message(input, &images);
 
-        let request_messages =
+        let mut request_messages =
             request_messages_for_turn(&mut messages, user_message, history_enabled);
+        let removed_messages = trim_chat_history_to_context(
+            &manifest,
+            selected_backend,
+            chat_template,
+            &mut request_messages,
+            context_size,
+            max_tokens,
+        )?;
+        if history_enabled {
+            messages.clone_from(&request_messages);
+        }
+        if removed_messages > 0 {
+            eprintln!(
+                "[werk chat] context window: removed {removed_messages} old message(s) to fit {} tokens",
+                context_size.unwrap_or_default()
+            );
+        }
         let prompt = prompt_for_backend(
             &manifest,
             &request_messages,
@@ -3609,10 +6119,15 @@ async fn chat_loop(
         let prompt_diagnostics =
             prompt_diagnostics(&prompt, request_messages.len(), Some(history_enabled));
         let generation_messages = generation_request_messages(&prompt, &request_messages);
+        let request_image_urls = if generation_messages.is_empty() {
+            images.clone()
+        } else {
+            image_urls_from_messages(&generation_messages)
+        };
         let request = GenerateRequest {
             prompt: prompt.prompt,
             messages: generation_messages,
-            image_urls: images.clone(),
+            image_urls: request_image_urls,
             max_tokens,
             temperature,
             top_p,
@@ -3735,6 +6250,130 @@ fn request_messages_for_turn(
         history.clone()
     } else {
         vec![user_message]
+    }
+}
+
+fn chat_context_size(
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    configured: Option<usize>,
+) -> Option<usize> {
+    if !matches!(backend, BackendChoice::LlamaServer(_)) {
+        return None;
+    }
+    match configured {
+        Some(0) => manifest
+            .metadata
+            .parameter_constraints
+            .get("max_position_embeddings")
+            .or_else(|| {
+                manifest
+                    .metadata
+                    .parameter_constraints
+                    .get("model_max_length")
+            })
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .or(Some(DEFAULT_LLAMA_CONTEXT_SIZE)),
+        Some(size) => Some(size),
+        None => Some(DEFAULT_LLAMA_CONTEXT_SIZE),
+    }
+}
+
+fn trim_chat_history_to_context(
+    manifest: &ModelManifest,
+    backend: BackendChoice,
+    chat_template: Option<ChatTemplateArg>,
+    messages: &mut Vec<ChatMessage>,
+    context_size: Option<usize>,
+    max_tokens: usize,
+) -> Result<usize> {
+    let Some(context_size) = context_size else {
+        return Ok(0);
+    };
+    let reserved = max_tokens
+        .checked_add(CHAT_CONTEXT_SAFETY_TOKENS)
+        .context("chat response token reserve overflowed")?;
+    if reserved >= context_size {
+        bail!(
+            "chat response budget ({max_tokens} tokens) leaves no prompt space in the {context_size}-token context; reduce --max-tokens or increase --ctx-size"
+        );
+    }
+    let prompt_budget = context_size - reserved;
+    let mut removed = 0;
+
+    loop {
+        let prompt = prompt_for_backend(manifest, messages, backend, chat_template);
+        let estimated_tokens = estimate_chat_prompt_tokens(&prompt, messages);
+        if estimated_tokens <= prompt_budget {
+            return Ok(removed);
+        }
+
+        let Some(start) = messages
+            .iter()
+            .position(|message| !message.role.eq_ignore_ascii_case("system"))
+        else {
+            bail!(
+                "system prompt is too large for the {context_size}-token context; increase --ctx-size"
+            );
+        };
+        if start + 1 >= messages.len() {
+            bail!(
+                "current message is too large for the {context_size}-token context after reserving {max_tokens} response tokens; shorten it, reduce --max-tokens, or increase --ctx-size"
+            );
+        }
+
+        let remove_count = if messages
+            .get(start + 1)
+            .is_some_and(|message| message.role.eq_ignore_ascii_case("assistant"))
+        {
+            2
+        } else {
+            1
+        };
+        messages.drain(start..start + remove_count);
+        removed += remove_count;
+    }
+}
+
+fn estimate_chat_prompt_tokens(prompt: &PromptSpec, messages: &[ChatMessage]) -> usize {
+    let rendered = prompt.prompt.len().div_ceil(3).max(1);
+    let structured = messages
+        .iter()
+        .map(|message| {
+            let content_tokens = message
+                .content
+                .as_ref()
+                .map(cli_message_content_tokens)
+                .unwrap_or_default();
+            content_tokens + 16
+        })
+        .sum::<usize>()
+        + 16;
+    rendered.max(structured)
+}
+
+fn cli_message_content_tokens(content: &MessageContent) -> usize {
+    match content {
+        MessageContent::Text(text) => text.len().div_ceil(3),
+        MessageContent::Parts(parts) => parts.iter().fold(0usize, |tokens, part| {
+            let part_tokens = match part.kind.as_str() {
+                "text" => part.text.as_deref().unwrap_or_default().len().div_ceil(3),
+                "image_url" | "input_image" => {
+                    let detail = part.image_url.as_ref().and_then(|image| match image {
+                        ImageUrlSpec::Object(image) => image.detail.as_deref(),
+                        ImageUrlSpec::Url(_) => None,
+                    });
+                    match detail {
+                        Some("low") => 256,
+                        Some("high") => 2048,
+                        _ => 1024,
+                    }
+                }
+                _ => 0,
+            };
+            tokens.saturating_add(part_tokens)
+        }),
     }
 }
 
@@ -3911,6 +6550,7 @@ struct BenchSample {
     eval_tokens_per_second: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_model(
     store: ModelStore,
     manifest: ModelManifest,
@@ -4009,6 +6649,7 @@ fn bench_model(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_benchmark_choice(
     store: ModelStore,
     manifest: &ModelManifest,
@@ -4244,8 +6885,8 @@ fn print_backend_list(store: &ModelStore) {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| managed_vllm_dir(store).join("venv").display().to_string());
     println!(
-        "{:<8} {:<16} {:<10} {:<18} {}",
-        "BACKEND", "SOURCE", "INSTALLED", "HEALTH", "PATH"
+        "{:<8} {:<16} {:<10} {:<18} PATH",
+        "BACKEND", "SOURCE", "INSTALLED", "HEALTH"
     );
     println!(
         "{:<8} {:<16} {:<10} {:<18} {}",
@@ -4275,8 +6916,35 @@ fn print_backend_list(store: &ModelStore) {
                 .collect::<Vec<_>>()
                 .join("/"),
             yes_no(runtime.capabilities.vision_language),
-            runtime.install_target.unwrap_or("-")
+            runtime_install_target_for_current_host(runtime.install_target).unwrap_or("-")
         );
+    }
+}
+
+fn runtime_install_target_for_current_host(target: Option<&'static str>) -> Option<&'static str> {
+    runtime_install_target_for_platform(
+        target,
+        env::consts::OS,
+        env::consts::ARCH,
+        current_host_is_strix_halo(),
+    )
+}
+
+fn runtime_install_target_for_platform<'a>(
+    target: Option<&'a str>,
+    operating_system: &str,
+    architecture: &str,
+    strix_halo: bool,
+) -> Option<&'a str> {
+    match target {
+        // The managed vLLM installer is intentionally unavailable outside
+        // Linux and on every Linux ARM64 host, including DGX Spark. Rendering
+        // the static registry target there would contradict the actionable
+        // runtime rejection printed beside it.
+        Some("vllm") if operating_system != "linux" || architecture == "aarch64" || strix_halo => {
+            None
+        }
+        target => target,
     }
 }
 
@@ -4525,7 +7193,7 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
     }
     values.sort_by(|left, right| left.total_cmp(right));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         Some((values[mid - 1] + values[mid]) / 2.0)
     } else {
         Some(values[mid])
@@ -4680,7 +7348,7 @@ enum BackendChoice {
     VllmRocm,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct SelectionOptions {
     provision_missing_backends: bool,
     verbose_backend_installs: bool,
@@ -4703,15 +7371,6 @@ impl SelectionOptions {
     }
 }
 
-impl Default for SelectionOptions {
-    fn default() -> Self {
-        Self {
-            provision_missing_backends: false,
-            verbose_backend_installs: false,
-        }
-    }
-}
-
 struct AutoBackend {
     store: ModelStore,
     runtime_options: LlamaRuntimeOptions,
@@ -4726,6 +7385,19 @@ struct GgufPreferredBackend {
     runtime_options: LlamaRuntimeOptions,
     selection_options: SelectionOptions,
     backends: Mutex<HashMap<&'static str, Arc<dyn GenerationBackend>>>,
+}
+
+struct MlxPreferredBackend {
+    text_backend: Arc<dyn GenerationBackend>,
+    vision_backend: Arc<dyn GenerationBackend>,
+}
+
+struct VllmPreferredBackend {
+    store: ModelStore,
+    selection_options: SelectionOptions,
+    backends: Mutex<HashMap<&'static str, Arc<dyn GenerationBackend>>>,
+    #[cfg(test)]
+    selection_override: Option<Arc<dyn Fn(bool) -> BackendChoice + Send + Sync>>,
 }
 
 impl AutoBackend {
@@ -4799,6 +7471,16 @@ impl GenerationBackend for AutoBackend {
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         self.backend_for(manifest)?
             .start_chat_session(manifest, seed)
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        (task == InferenceTask::ImageUnderstanding).then(|| {
+            generation_backend_task_readiness(&self.store, BackendChoice::Auto, manifest, task)
+        })
     }
 
     fn generate(
@@ -4903,6 +7585,265 @@ impl GenerationBackend for GgufPreferredBackend {
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         self.backend_for(manifest)?
             .start_chat_session(manifest, seed)
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task != InferenceTask::ImageUnderstanding {
+            return None;
+        }
+        let requested = match (self.gguf_backend, self.fallback_backend) {
+            (BackendChoice::LlamaServer(llama), BackendChoice::Candle(candle)) => {
+                BackendChoice::GgufPreferred { llama, candle }
+            }
+            _ => self.gguf_backend,
+        };
+        Some(generation_backend_task_readiness(
+            &self.store,
+            requested,
+            manifest,
+            task,
+        ))
+    }
+
+    fn generate(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::GenerateResponse> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .generate(manifest, request)
+    }
+
+    fn generate_stream(
+        &self,
+        manifest: ModelManifest,
+        request: GenerateRequest,
+    ) -> crate::backend::GenerateStream {
+        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+            Ok(backend) => backend.generate_stream(manifest, request),
+            Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
+        }
+    }
+}
+
+impl MlxPreferredBackend {
+    fn new(store: ModelStore) -> Self {
+        Self {
+            text_backend: Arc::new(MlxBackend::new(store.clone())),
+            vision_backend: Arc::new(MlxVlmBackend::new(store)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backends(
+        text_backend: Arc<dyn GenerationBackend>,
+        vision_backend: Arc<dyn GenerationBackend>,
+    ) -> Self {
+        Self {
+            text_backend,
+            vision_backend,
+        }
+    }
+
+    fn backend_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Arc<dyn GenerationBackend> {
+        if has_images || manifest_requires_mlx_vlm(manifest) {
+            self.vision_backend.clone()
+        } else {
+            self.text_backend.clone()
+        }
+    }
+}
+
+fn manifest_requires_mlx_vlm(manifest: &ModelManifest) -> bool {
+    manifest.supports_task(InferenceTask::ImageUnderstanding)
+        && manifest
+            .architecture
+            .as_deref()
+            .is_some_and(|architecture| architecture.eq_ignore_ascii_case("gemma4_unified"))
+}
+
+impl GenerationBackend for MlxPreferredBackend {
+    fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
+        self.backend_for_request(manifest, false).prepare(manifest)
+    }
+
+    fn start_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for_request(manifest, false)
+            .start_chat_session(manifest, seed)
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task == InferenceTask::ImageUnderstanding {
+            self.vision_backend.task_readiness(manifest, task)
+        } else {
+            self.text_backend.task_readiness(manifest, task)
+        }
+    }
+
+    fn generate(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::GenerateResponse> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())
+            .generate(manifest, request)
+    }
+
+    fn generate_stream(
+        &self,
+        manifest: ModelManifest,
+        request: GenerateRequest,
+    ) -> crate::backend::GenerateStream {
+        self.backend_for_request(&manifest, !request.image_urls.is_empty())
+            .generate_stream(manifest, request)
+    }
+}
+
+impl VllmPreferredBackend {
+    fn new(store: ModelStore, selection_options: SelectionOptions) -> Self {
+        Self {
+            store,
+            selection_options,
+            backends: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            selection_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backends(
+        store: ModelStore,
+        selection_options: SelectionOptions,
+        cuda_backend: Arc<dyn GenerationBackend>,
+        rocm_backend: Arc<dyn GenerationBackend>,
+        selection_override: impl Fn(bool) -> BackendChoice + Send + Sync + 'static,
+    ) -> Self {
+        let mut backends = HashMap::new();
+        backends.insert(backend_label(BackendChoice::Vllm), cuda_backend);
+        backends.insert(backend_label(BackendChoice::VllmRocm), rocm_backend);
+        Self {
+            store,
+            selection_options,
+            backends: Mutex::new(backends),
+            selection_override: Some(Arc::new(selection_override)),
+        }
+    }
+
+    fn backend_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        let selected =
+            self.select_backend_for_request(manifest, has_images, self.selection_options)?;
+        self.cached_backend(selected)
+    }
+
+    fn select_backend_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        selection_options: SelectionOptions,
+    ) -> Result<BackendChoice> {
+        #[cfg(test)]
+        if let Some(select) = &self.selection_override {
+            return Ok(select(has_images));
+        }
+
+        selected_backend_for_request(
+            &self.store,
+            BackendChoice::Vllm,
+            manifest,
+            has_images,
+            selection_options,
+        )
+    }
+
+    fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
+        if !matches!(backend, BackendChoice::Vllm | BackendChoice::VllmRocm) {
+            bail!(
+                "explicit vLLM routing selected incompatible backend {}",
+                backend_label(backend)
+            );
+        }
+        let key = backend_label(backend);
+        if let Some(backend) = self
+            .backends
+            .lock()
+            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?
+            .get(key)
+            .cloned()
+        {
+            return Ok(backend);
+        }
+
+        let concrete: Arc<dyn GenerationBackend> = match backend {
+            BackendChoice::Vllm => Arc::new(VllmBackend::new(self.store.clone())),
+            BackendChoice::VllmRocm => Arc::new(VllmBackend::new_rocm(self.store.clone())),
+            _ => unreachable!("validated above"),
+        };
+        self.backends
+            .lock()
+            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?
+            .insert(key, concrete.clone());
+        Ok(concrete)
+    }
+}
+
+impl GenerationBackend for VllmPreferredBackend {
+    fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
+        self.backend_for_request(manifest, false)?.prepare(manifest)
+    }
+
+    fn start_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for_request(manifest, false)?
+            .start_chat_session(manifest, seed)
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task != InferenceTask::ImageUnderstanding {
+            return None;
+        }
+        let readiness = self
+            .select_backend_for_request(manifest, true, SelectionOptions::default())
+            .and_then(|selected| self.cached_backend(selected));
+        match readiness {
+            Ok(backend) => backend.task_readiness(manifest, task),
+            Err(error) => Some(TaskReadiness {
+                status: TaskReadinessStatus::Unavailable,
+                detail: compact_reason(&error.to_string()),
+                adapter: None,
+                required_backend: None,
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            }),
+        }
     }
 
     fn generate(
@@ -5013,6 +7954,11 @@ fn build_generation_backend(
             runtime_options,
             selection_options,
         ))),
+        BackendChoice::Mlx => Ok(Arc::new(MlxPreferredBackend::new(store))),
+        BackendChoice::Vllm => Ok(Arc::new(VllmPreferredBackend::new(
+            store,
+            selection_options,
+        ))),
         backend => build_concrete_backend(store, backend, runtime_options, selection_options),
     }
 }
@@ -5049,7 +7995,8 @@ fn build_concrete_backend(
         BackendChoice::MlxVlm => Ok(Arc::new(MlxVlmBackend::new(store))),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
         BackendChoice::TransformersCompat => Ok(Arc::new(TransformersCompatBackend::new(store))),
-        BackendChoice::Vllm | BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new(store))),
+        BackendChoice::Vllm => Ok(Arc::new(VllmBackend::new(store))),
+        BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new_rocm(store))),
     }
 }
 
@@ -5087,6 +8034,10 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::TransformersCompat => Some(BackendChoice::TransformersCompat),
         RuntimeId::VllmCuda => Some(BackendChoice::Vllm),
         RuntimeId::VllmRocm => Some(BackendChoice::VllmRocm),
+        RuntimeId::MediaCompanionCuda
+        | RuntimeId::MediaCompanionRocm
+        | RuntimeId::MediaCompanionMetal
+        | RuntimeId::MediaCompanionCpu => None,
     }
 }
 
@@ -5174,6 +8125,16 @@ fn select_backend_from_runtime_candidates(
             ));
             continue;
         }
+        if capabilities.image_input
+            && descriptor.runtime == BackendRuntime::Vllm
+            && !vllm_architecture_supports_images(manifest.architecture.as_deref())
+        {
+            rejected.push(format!(
+                "{}: vLLM does not support image input for this architecture",
+                descriptor.display_name
+            ));
+            continue;
+        }
         if capabilities.image_input && !descriptor.capabilities.vision_language {
             rejected.push(format!(
                 "{}: runtime is not VLM-capable",
@@ -5188,10 +8149,14 @@ fn select_backend_from_runtime_candidates(
             ));
             continue;
         };
-        if let Some(reason) =
-            backend_unavailability_reason(store, backend, manifest, selection_options)
-        {
-            let reason = if candidates.len() == 1 {
+        if let Some(reason) = backend_unavailability_reason_for_request(
+            store,
+            backend,
+            manifest,
+            capabilities.image_input,
+            selection_options,
+        ) {
+            let reason = if candidates.len() == 1 && !capabilities.image_input {
                 unavailable_backend_message(store, backend, manifest)
             } else {
                 reason
@@ -5341,7 +8306,7 @@ fn backend_unavailability_reason(
         }
         BackendChoice::Vllm => VllmBackend::probe(store)
             .err()
-            .map(|_| VllmBackend::unavailable_reason(store)),
+            .map(|_| VllmBackend::cuda_unavailable_reason(store)),
         BackendChoice::VllmRocm => VllmBackend::probe_rocm(store)
             .err()
             .map(|_| VllmBackend::rocm_unavailable_reason(store)),
@@ -5374,6 +8339,44 @@ fn backend_unavailability_reason(
     }
 }
 
+fn backend_unavailability_reason_for_request(
+    store: &ModelStore,
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    has_images: bool,
+    selection_options: SelectionOptions,
+) -> Option<String> {
+    if has_images
+        && matches!(backend, BackendChoice::LlamaServer(_))
+        && let Err(error) = LlamaServerBackend::validate_image_model(store, manifest)
+    {
+        // Reject unusable model assets before optional runtime provisioning.
+        return Some(compact_reason(&error.to_string()));
+    }
+
+    let unavailable = backend_unavailability_reason(store, backend, manifest, selection_options);
+    if unavailable.is_some() || !has_images {
+        return unavailable;
+    }
+
+    match backend {
+        BackendChoice::LlamaServer(mode) => {
+            LlamaServerBackend::probe_image_input(store, manifest, mode)
+                .err()
+                .map(|error| compact_reason(&error.to_string()))
+        }
+        BackendChoice::Vllm | BackendChoice::VllmRocm
+            if !vllm_architecture_supports_images(manifest.architecture.as_deref()) =>
+        {
+            Some(format!(
+                "vLLM does not support image input for architecture '{}'",
+                manifest.architecture.as_deref().unwrap_or("unknown")
+            ))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 fn selected_backend_for_manifest(
     store: &ModelStore,
@@ -5383,6 +8386,60 @@ fn selected_backend_for_manifest(
     selected_backend_for_request(store, backend, manifest, false, SelectionOptions::default())
 }
 
+fn generation_backend_task_readiness(
+    store: &ModelStore,
+    requested_backend: BackendChoice,
+    manifest: &ModelManifest,
+    task: InferenceTask,
+) -> TaskReadiness {
+    debug_assert_eq!(task, InferenceTask::ImageUnderstanding);
+    if !manifest.supports_task(task) {
+        return TaskReadiness {
+            status: TaskReadinessStatus::Unavailable,
+            detail: format!(
+                "model '{}' does not advertise image-understanding",
+                manifest.id
+            ),
+            adapter: None,
+            required_backend: None,
+            install_command: None,
+            fallback_backend: None,
+            missing_dependencies: Vec::new(),
+            missing_dependency_groups: Vec::new(),
+        };
+    }
+
+    // Capability discovery must be read-only: explicitly ignore the serve
+    // command's auto-install policy while reusing the real request router.
+    let readiness_options = SelectionOptions::default();
+    match selected_backend_for_request(store, requested_backend, manifest, true, readiness_options)
+    {
+        Ok(selected) => TaskReadiness {
+            status: TaskReadinessStatus::Available,
+            detail: format!(
+                "image understanding is routable through {} without loading model weights during capability discovery",
+                verbose_backend_label(selected)
+            ),
+            adapter: Some(backend_label(selected).to_string()),
+            required_backend: None,
+            install_command: None,
+            fallback_backend: None,
+            missing_dependencies: Vec::new(),
+            missing_dependency_groups: Vec::new(),
+        },
+        Err(error) => TaskReadiness {
+            status: TaskReadinessStatus::Unavailable,
+            detail: compact_reason(&error.to_string()),
+            adapter: None,
+            required_backend: None,
+            install_command: None,
+            fallback_backend: None,
+            missing_dependencies: Vec::new(),
+            missing_dependency_groups: Vec::new(),
+        },
+    }
+}
+
 fn selected_backend_for_request(
     store: &ModelStore,
     backend: BackendChoice,
@@ -5390,11 +8447,18 @@ fn selected_backend_for_request(
     has_images: bool,
     selection_options: SelectionOptions,
 ) -> Result<BackendChoice> {
+    if has_images && !manifest.supports_task(InferenceTask::ImageUnderstanding) {
+        bail!(
+            "model '{}' does not advertise image-understanding; select a vision-language model",
+            manifest.id
+        );
+    }
     let capabilities = request_capabilities(has_images);
     match backend {
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
-        | BackendChoice::Candle(CandleDeviceMode::Auto) => {
+        | BackendChoice::Candle(CandleDeviceMode::Auto)
+        | BackendChoice::Vllm => {
             select_backend_with_planner(store, backend, manifest, capabilities, selection_options)
         }
         BackendChoice::Candle(mode) => {
@@ -5416,7 +8480,6 @@ fn selected_backend_for_request(
         | BackendChoice::MlxVlm
         | BackendChoice::OnnxRuntime(_)
         | BackendChoice::TransformersCompat
-        | BackendChoice::Vllm
         | BackendChoice::VllmRocm => {
             let candidates = if matches!(backend, BackendChoice::Mlx) && has_images {
                 vec![RuntimeId::MlxVlm, RuntimeId::Mlx]
@@ -5461,8 +8524,13 @@ fn select_backend_with_planner(
     selection_options: SelectionOptions,
 ) -> Result<BackendChoice> {
     let requested = requested_backend_for_choice(backend);
-    let availability =
-        runtime_availabilities_for_request(store, manifest, requested, selection_options);
+    let availability = runtime_availabilities_for_request(
+        store,
+        manifest,
+        requested,
+        capabilities,
+        selection_options,
+    );
     let selected = select_runtime(manifest, requested, capabilities, &availability)
         .map_err(|err| anyhow!("{}", format_runtime_plan_error(manifest, &err)))?;
     runtime_id_to_backend_for_request(selected.runtime_id, requested).ok_or_else(|| {
@@ -5510,6 +8578,7 @@ fn runtime_availabilities_for_request(
     store: &ModelStore,
     manifest: &ModelManifest,
     requested: RequestedBackend,
+    capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
 ) -> Vec<RuntimeAvailability> {
     runtime_candidate_ids_for_selection(store, manifest, requested)
@@ -5521,6 +8590,7 @@ fn runtime_availabilities_for_request(
                     runtime_id,
                     backend,
                     manifest,
+                    capabilities,
                     selection_options,
                 );
                 RuntimeAvailability {
@@ -5553,13 +8623,41 @@ fn runtime_candidate_ids_for_selection(
     requested: RequestedBackend,
 ) -> Vec<RuntimeId> {
     let mut candidates = runtime_candidate_ids(manifest, requested);
+    if requested == RequestedBackend::Vllm
+        && manifest.format == ModelFormat::SafeTensors
+        && vllm_rocm_auto_probeable()
+        && !candidates.contains(&RuntimeId::VllmRocm)
+        && runtime_supports_model(
+            runtime_descriptor(RuntimeId::VllmRocm),
+            &manifest.format,
+            manifest.architecture.as_deref(),
+        )
+    {
+        candidates.insert(0, RuntimeId::VllmRocm);
+    }
     if requested == RequestedBackend::Auto
         && manifest.format == ModelFormat::Gguf
         && llama_rocm_auto_probeable(store)
         && !candidates.contains(&RuntimeId::LlamaServerRocm)
     {
-        let insert_at = llama_rocm_insert_position(&candidates);
+        let insert_at = if current_host_is_strix_halo() {
+            0
+        } else {
+            llama_rocm_insert_position(&candidates)
+        };
         candidates.insert(insert_at, RuntimeId::LlamaServerRocm);
+    }
+    if requested == RequestedBackend::Auto
+        && manifest.format == ModelFormat::SafeTensors
+        && vllm_rocm_auto_probeable()
+        && !candidates.contains(&RuntimeId::VllmRocm)
+        && runtime_supports_model(
+            runtime_descriptor(RuntimeId::VllmRocm),
+            &manifest.format,
+            manifest.architecture.as_deref(),
+        )
+    {
+        candidates.insert(0, RuntimeId::VllmRocm);
     }
     candidates
 }
@@ -5579,8 +8677,16 @@ fn llama_rocm_insert_position(candidates: &[RuntimeId]) -> usize {
 }
 
 fn llama_rocm_auto_probeable(store: &ModelStore) -> bool {
-    env::var_os("WERK_LLAMA_SERVER_ROCM").is_some()
+    current_host_is_strix_halo()
+        || env::var_os("WERK_LLAMA_SERVER_ROCM").is_some()
         || managed_backend_dir(store, LlamaCppMode::Rocm).exists()
+}
+
+fn vllm_rocm_auto_probeable() -> bool {
+    let accelerator = env::var("WERK_VLLM_ACCELERATOR").ok();
+    let legacy_rocm = env::var("WERK_VLLM_ROCM").ok();
+    current_host_is_strix_halo()
+        || vllm_rocm_signals(accelerator.as_deref(), legacy_rocm.as_deref())
 }
 
 fn should_auto_install_llama_server(mode: LlamaCppMode) -> bool {
@@ -5592,13 +8698,23 @@ fn runtime_unavailability_reason(
     runtime_id: RuntimeId,
     backend: BackendChoice,
     manifest: &ModelManifest,
+    capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
 ) -> Option<String> {
     match runtime_id {
+        RuntimeId::VllmCuda => VllmBackend::probe(store)
+            .err()
+            .map(|_| VllmBackend::cuda_unavailable_reason(store)),
         RuntimeId::VllmRocm => VllmBackend::probe_rocm(store)
             .err()
             .map(|_| VllmBackend::rocm_unavailable_reason(store)),
-        _ => backend_unavailability_reason(store, backend, manifest, selection_options),
+        _ => backend_unavailability_reason_for_request(
+            store,
+            backend,
+            manifest,
+            capabilities.image_input,
+            selection_options,
+        ),
     }
 }
 
@@ -5761,6 +8877,7 @@ fn print_routing_debug(
         store,
         manifest,
         requested_backend,
+        capabilities,
         SelectionOptions::default(),
     );
     let plan = plan_runtime(manifest, requested_backend, capabilities, &availability);
@@ -5799,7 +8916,7 @@ fn print_routing_debug(
             decision.display_name, decision.reason
         );
         if decision.status == RuntimeDecisionStatus::Rejected
-            && let Some(target) = descriptor.install_target
+            && let Some(target) = runtime_install_target_for_current_host(descriptor.install_target)
         {
             eprintln!("  install hint: werk backend install {target}");
         }
@@ -6188,6 +9305,33 @@ fn print_manifest_summary(action: &str, manifest: &ModelManifest) {
         manifest.format,
         manifest.architecture.as_deref().unwrap_or("unknown")
     );
+    println!(
+        "  family={} layout={} tasks={}",
+        manifest.metadata.family.as_deref().unwrap_or("unknown"),
+        manifest.metadata.repository_layout,
+        join_display(&manifest.metadata.tasks)
+    );
+    println!(
+        "  components={} size={} precision={} quantization={}",
+        manifest.metadata.components.len(),
+        format_bytes(
+            manifest
+                .files
+                .iter()
+                .map(|file| file.size)
+                .fold(0_u64, u64::saturating_add)
+        ),
+        manifest.metadata.precision.as_deref().unwrap_or("unknown"),
+        manifest.metadata.quantization.as_deref().unwrap_or("none")
+    );
+    println!(
+        "  compatible runtimes={}",
+        if manifest.metadata.compatible_runtimes.is_empty() {
+            "unknown".to_string()
+        } else {
+            manifest.metadata.compatible_runtimes.join(",")
+        }
+    );
 }
 
 fn print_artifact_result(action: &str, model: &str, artifact: &ModelArtifact) {
@@ -6353,6 +9497,11 @@ fn format_bytes_f64(bytes: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::{
+        EffectiveInferenceRequest, EstimateConfidence as WorkloadEstimateConfidence, ExecutionPlan,
+        FitAssessment,
+    };
+    use crate::inference_service::OutputMetadata;
     use crate::model_store::{ModelFile, ModelSource};
     use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
@@ -6420,8 +9569,18 @@ mod tests {
     #[test]
     fn parses_cli_commands() {
         let cli = Cli::try_parse_from([
-            "werk", "--device", "cuda", "serve", "--host", "0.0.0.0", "--port", "8080", "--model",
+            "werk",
+            "--device",
+            "cuda",
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "--model",
             "m",
+            "--image-model",
+            "image-m",
         ])
         .unwrap();
         assert_eq!(cli.device, Some(DeviceArg::Cuda));
@@ -6430,17 +9589,21 @@ mod tests {
                 host,
                 port,
                 model,
+                image_model,
                 api_key,
                 api_keys,
                 allow_unauthenticated,
+                cors_origins,
                 verbose,
             } => {
                 assert_eq!(host, "0.0.0.0");
                 assert_eq!(port, 8080);
                 assert_eq!(model.as_deref(), Some("m"));
+                assert_eq!(image_model.as_deref(), Some("image-m"));
                 assert!(api_key.is_none());
                 assert!(api_keys.is_none());
                 assert!(!allow_unauthenticated);
+                assert!(cors_origins.is_empty());
                 assert!(!verbose);
             }
             command => panic!("unexpected command: {command:?}"),
@@ -6476,6 +9639,33 @@ mod tests {
                 ..
             } => assert!(allow_unauthenticated),
             command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "serve",
+            "--cors-origin",
+            "http://127.0.0.1:3000",
+            "--cors-origin",
+            "tauri://localhost",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Serve { cors_origins, .. } => assert_eq!(
+                cors_origins
+                    .iter()
+                    .map(CorsOrigin::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["http://127.0.0.1:3000", "tauri://localhost"]
+            ),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        for origin in ["*", "null", "file:///tmp/app.html"] {
+            assert!(
+                Cli::try_parse_from(["werk", "serve", "--cors-origin", origin]).is_err(),
+                "unexpectedly accepted CORS origin {origin}"
+            );
         }
 
         assert!(
@@ -6668,6 +9858,14 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "qwen-tts"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Backend {
+                command: BackendCommands::Install { target },
+            } => assert_eq!(target, BackendInstallArg::QwenTts),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
         let cli = Cli::try_parse_from(["werk", "backend", "install", "onnx-rocm"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
@@ -6731,6 +9929,10 @@ mod tests {
             Commands::Chat { max_tokens, .. } => assert_eq!(max_tokens, 64),
             command => panic!("unexpected command: {command:?}"),
         }
+
+        let cli = Cli::try_parse_from(["werk", "chat", "tiny", "--batch-size", "128"]).unwrap();
+        assert_eq!(cli.llama.batch_size, Some(128));
+        assert!(matches!(cli.command, Some(Commands::Chat { .. })));
 
         let cli = Cli::try_parse_from(["werk", "chat", "tiny", "--single-turn"]).unwrap();
         match cli.command.unwrap() {
@@ -6857,6 +10059,554 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn parses_media_command_families() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "image",
+            "generate",
+            "flux",
+            "--prompt",
+            "orbital station",
+            "--width",
+            "1024",
+            "--batch-size",
+            "2",
+            "--no-compile",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Image {
+                command: ImageCommands::Generate(args),
+            } => {
+                assert_eq!(args.model, "flux");
+                assert_eq!(args.prompt.prompt.as_deref(), Some("orbital station"));
+                assert_eq!(args.dimensions.width, Some(1024));
+                assert_eq!(args.dimensions.batch_size, Some(2));
+                assert!(args.routing.no_compile);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "image",
+            "edit",
+            "inpaint",
+            "--image",
+            "source.png",
+            "--prompt",
+            "remove the sign",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Image {
+                command: ImageCommands::Edit(_)
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "video",
+            "animate",
+            "wan",
+            "--image",
+            "first.png",
+            "--prompt",
+            "camera moves forward",
+            "--frames",
+            "81",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Video {
+                command: VideoCommands::Animate(args),
+            } => {
+                assert_eq!(args.model, "wan");
+                assert_eq!(args.image, PathBuf::from("first.png"));
+                assert_eq!(args.core.frames, Some(81));
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        for argv in [
+            vec!["werk", "video", "generate", "wan", "--prompt", "clouds"],
+            vec!["werk", "video", "transform", "wan", "--video", "source.mp4"],
+            vec!["werk", "video", "upscale", "wan", "--video", "source.mp4"],
+            vec![
+                "werk",
+                "audio",
+                "generate",
+                "musicgen",
+                "--prompt",
+                "ambient score",
+            ],
+            vec!["werk", "audio", "speak", "kokoro", "--text", "hello"],
+            vec![
+                "werk",
+                "audio",
+                "transcribe",
+                "whisper",
+                "--input",
+                "speech.wav",
+            ],
+            vec!["werk", "audio", "separate", "demucs", "--input", "song.wav"],
+        ] {
+            Cli::try_parse_from(argv).unwrap();
+        }
+    }
+
+    #[test]
+    fn parses_media_horizontal_commands_and_filters() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "estimate",
+            "flux",
+            "--task",
+            "image-generation",
+            "--width",
+            "1024",
+            "--height",
+            "768",
+            "--steps",
+            "30",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Estimate {
+                task,
+                width,
+                height,
+                steps,
+                json,
+                ..
+            } => {
+                assert_eq!(task, Some(InferenceTask::ImageGeneration));
+                assert_eq!(width, Some(1024));
+                assert_eq!(height, Some(768));
+                assert_eq!(steps, Some(30));
+                assert!(json);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "list",
+            "--task",
+            "image-generation",
+            "--input-modality",
+            "text",
+            "--output-modality",
+            "image",
+            "--family",
+            "flux",
+            "--layout",
+            "diffusers",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::List {
+                task,
+                input,
+                output,
+                family,
+                layout,
+                json,
+            } => {
+                assert_eq!(task, Some(InferenceTask::ImageGeneration));
+                assert_eq!(input, Some(InputModality::Text));
+                assert_eq!(output, Some(OutputModality::Image));
+                assert_eq!(family.as_deref(), Some("flux"));
+                assert_eq!(layout, Some(RepositoryLayout::Diffusers));
+                assert!(json);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "--backend",
+            "cuda",
+            "parameters",
+            "flux",
+            "--task",
+            "image-generation",
+            "--sources",
+        ])
+        .unwrap();
+        assert_eq!(cli.backend, BackendArg::Cuda);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Parameters {
+                task: Some(InferenceTask::ImageGeneration),
+                sources: true,
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "doctor",
+            "--task",
+            "music-generation",
+            "--runtime",
+            "diffusers-cuda",
+            "--model",
+            "musicgen",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                command: None,
+                task: Some(InferenceTask::MusicGeneration),
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["werk", "doctor", "perf", "tiny"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                command: Some(DoctorCommands::Perf { .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn media_arguments_become_canonical_typed_overrides() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "image",
+            "generate",
+            "flux",
+            "--prompt",
+            "test",
+            "--width",
+            "640",
+            "--no-image-vae-tiling",
+            "--image-control-json",
+            r#"[{"type":"depth","weight":0.8}]"#,
+            "--set",
+            "image.seed=17",
+            "--no-allow-cpu-offload",
+            "--verbose",
+            "--debug",
+        ])
+        .unwrap();
+        let Commands::Image {
+            command: ImageCommands::Generate(args),
+        } = cli.command.unwrap()
+        else {
+            panic!("image command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::ImageGeneration).unwrap();
+        assert_eq!(
+            parameters.get("image.width"),
+            Some(&ParameterValue::Integer(640))
+        );
+        assert_eq!(
+            parameters.get("image.vae_tiling"),
+            Some(&ParameterValue::Boolean(false))
+        );
+        assert!(matches!(
+            parameters.get("image.controls"),
+            Some(ParameterValue::List(values)) if matches!(
+                values.first(),
+                Some(ParameterValue::Object(_))
+            )
+        ));
+        assert_eq!(
+            parameters.get("image.seed"),
+            Some(&ParameterValue::Integer(17))
+        );
+        assert!(!parameters.contains_key("image.prompt"));
+
+        let routing =
+            media_routing(&args.routing, BackendArg::Cuda, Some(DeviceArg::Cuda)).unwrap();
+        assert_eq!(routing.backend, None);
+        assert_eq!(routing.accelerator.as_deref(), Some("cuda"));
+        assert_eq!(routing.device.as_deref(), Some("cuda"));
+        assert_eq!(routing.allow_cpu_offload, OverrideBool::Disabled);
+        assert!(args.routing.verbose);
+        assert!(args.routing.debug);
+        assert!(!parameters.contains_key("image.verbose"));
+        assert!(!parameters.contains_key("image.debug"));
+
+        let mlx = media_routing(&args.routing, BackendArg::Mlx, None).unwrap();
+        assert_eq!(mlx.backend.as_deref(), Some("mlx"));
+        assert_eq!(mlx.accelerator, None);
+    }
+
+    #[test]
+    fn audio_lyrics_remain_a_canonical_parameter_override() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "generate",
+            "music-model",
+            "--prompt",
+            "slow synthwave",
+            "--lyrics",
+            "we cross the night",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Generate(args),
+        } = cli.command.unwrap()
+        else {
+            panic!("audio generate command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.options.routing, InferenceTask::MusicGeneration).unwrap();
+        assert_eq!(
+            parameters.get("audio.lyrics"),
+            Some(&ParameterValue::String("we cross the night".to_string()))
+        );
+        assert!(!parameters.contains_key("audio.prompt"));
+    }
+
+    #[test]
+    fn qwen3_tts_cli_controls_become_canonical_tts_parameters() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "speak",
+            "qwen3-tts",
+            "--text",
+            "Hallo Welt",
+            "--language",
+            "de",
+            "--speaking-style",
+            "Warm, ruhig und natürlich",
+            "--seed",
+            "17",
+            "--format",
+            "wav",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Speak(args),
+        } = cli.command.unwrap()
+        else {
+            panic!("audio speak command expected");
+        };
+
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::TextToSpeech).unwrap();
+        assert_eq!(
+            parameters.get("tts.language"),
+            Some(&ParameterValue::String("de".to_string()))
+        );
+        assert_eq!(
+            parameters.get("tts.speaking_style"),
+            Some(&ParameterValue::String(
+                "Warm, ruhig und natürlich".to_string()
+            ))
+        );
+        assert_eq!(
+            parameters.get("tts.seed"),
+            Some(&ParameterValue::Integer(17))
+        );
+        assert_eq!(
+            parameters.get("tts.output_format"),
+            Some(&ParameterValue::String("wav".to_string()))
+        );
+        assert!(!parameters.contains_key("tts.text"));
+    }
+
+    #[test]
+    fn audio_translation_and_classification_build_canonical_parameters() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "translate",
+            "whisper",
+            "--input",
+            "speech.wav",
+            "--language",
+            "de",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Translate(mut args),
+        } = cli.command.unwrap()
+        else {
+            panic!("audio translate command expected");
+        };
+        assert_eq!(
+            prepare_audio_transcription_task(&mut args, true).unwrap(),
+            InferenceTask::SpeechTranslation
+        );
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::SpeechTranslation).unwrap();
+        assert_eq!(
+            parameters.get("stt.operation"),
+            Some(&ParameterValue::String("translate".to_string()))
+        );
+        assert_eq!(
+            parameters.get("stt.language"),
+            Some(&ParameterValue::String("de".to_string()))
+        );
+
+        let conflict = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "translate",
+            "whisper",
+            "--input",
+            "speech.wav",
+            "--task",
+            "transcribe",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Translate(mut args),
+        } = conflict.command.unwrap()
+        else {
+            panic!("audio translate command expected");
+        };
+        assert!(prepare_audio_transcription_task(&mut args, true).is_err());
+
+        let legacy_translate = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "transcribe",
+            "whisper",
+            "--input",
+            "speech.wav",
+            "--task",
+            "translate",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Transcribe(mut args),
+        } = legacy_translate.command.unwrap()
+        else {
+            panic!("audio transcribe command expected");
+        };
+        assert_eq!(
+            prepare_audio_transcription_task(&mut args, false).unwrap(),
+            InferenceTask::SpeechTranslation
+        );
+
+        let classifier = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "detect",
+            "event",
+            "classifier",
+            "--input",
+            "clip.wav",
+            "--top-k",
+            "5",
+            "--output-format",
+            "json",
+            "--accelerator",
+            "cuda",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command:
+                AudioCommands::Detect(crate::media_cli::AudioDetectArgs {
+                    command: AudioDetectCommands::Event(args),
+                }),
+        } = classifier.command.unwrap()
+        else {
+            panic!("audio event detection command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::AudioEventDetection).unwrap();
+        assert_eq!(
+            parameters.get("audio.top_k"),
+            Some(&ParameterValue::Integer(5))
+        );
+        assert_eq!(
+            parameters.get("audio.output_format"),
+            Some(&ParameterValue::String("json".to_string()))
+        );
+        let routing = media_routing(&args.routing, BackendArg::Auto, None).unwrap();
+        assert_eq!(routing.accelerator.as_deref(), Some("cuda"));
+
+        let understand = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "analyze",
+            "understand",
+            "multimodal-audio",
+            "--input",
+            "clip.wav",
+            "--prompt",
+            "What is happening?",
+            "--max-new-tokens",
+            "64",
+            "--temperature",
+            "0.2",
+            "--top-p",
+            "0.9",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command:
+                AudioCommands::Analyze(crate::media_cli::AudioAnalyzeArgs {
+                    command: AudioAnalyzeCommands::Understand(args),
+                }),
+        } = understand.command.unwrap()
+        else {
+            panic!("audio understanding command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::AudioUnderstanding).unwrap();
+        assert_eq!(
+            parameters.get("audio.max_new_tokens"),
+            Some(&ParameterValue::Integer(64))
+        );
+        assert_eq!(
+            parameters.get("audio.temperature"),
+            Some(&ParameterValue::Number(0.2))
+        );
+        assert_eq!(
+            parameters.get("audio.top_p"),
+            Some(&ParameterValue::Number(0.9))
+        );
+
+        let embed = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "embed",
+            "audio-embedder",
+            "--input",
+            "clip.wav",
+            "--no-normalize",
+            "--pooling",
+            "mean",
+            "--output-format",
+            "json",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Embed(args),
+        } = embed.command.unwrap()
+        else {
+            panic!("audio embedding command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::AudioEmbedding).unwrap();
+        assert_eq!(
+            parameters.get("audio.normalize"),
+            Some(&ParameterValue::Boolean(false))
+        );
+        assert_eq!(
+            parameters.get("audio.pooling"),
+            Some(&ParameterValue::String("mean".to_string()))
+        );
     }
 
     #[test]
@@ -6997,7 +10747,21 @@ mod tests {
             let store = test_store("gguf-auto-rocm-gating");
             let plain =
                 runtime_candidate_ids_for_selection(&store, &manifest, RequestedBackend::Auto);
-            assert!(!plain.contains(&RuntimeId::LlamaServerRocm));
+            assert_eq!(
+                plain.contains(&RuntimeId::LlamaServerRocm),
+                cfg!(feature = "release-linux-strix-halo")
+            );
+            if cfg!(feature = "release-linux-strix-halo") {
+                let rocm = plain
+                    .iter()
+                    .position(|id| *id == RuntimeId::LlamaServerRocm)
+                    .unwrap();
+                let cuda = plain
+                    .iter()
+                    .position(|id| *id == RuntimeId::LlamaServerCuda)
+                    .unwrap();
+                assert!(rocm < cuda);
+            }
 
             install_fake_managed_llama_server(&store, LlamaCppMode::Rocm);
             let gated =
@@ -7040,6 +10804,28 @@ mod tests {
             routing_candidates_for_debug(requested, &onnx),
             vec![RuntimeId::OnnxRuntimeRocm]
         );
+    }
+
+    #[test]
+    fn strix_profile_keeps_explicit_vllm_accelerator_provenance() {
+        if cfg!(feature = "release-linux-strix-halo") {
+            let store = test_store("strix-explicit-vllm-provenance");
+            let manifest = test_manifest(ModelFormat::SafeTensors, Some("nemotron_h"));
+            let candidates =
+                runtime_candidate_ids_for_selection(&store, &manifest, RequestedBackend::Vllm);
+
+            assert_eq!(candidates.first(), Some(&RuntimeId::VllmRocm));
+            assert!(candidates.contains(&RuntimeId::VllmCuda));
+
+            match selected_backend_for_manifest(&store, BackendChoice::Vllm, &manifest) {
+                Ok(selected) => assert!(matches!(selected, BackendChoice::VllmRocm)),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains("vLLM ROCm"), "{message}");
+                    assert!(message.contains("vLLM CUDA"), "{message}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -7193,6 +10979,37 @@ mod tests {
         assert_eq!(onnx.display_name, "ONNX Runtime CUDA");
         assert!(onnx.implemented);
         assert_eq!(onnx.install_target, None);
+    }
+
+    #[test]
+    fn vllm_install_hint_is_hidden_where_managed_install_is_unavailable() {
+        assert_eq!(
+            runtime_install_target_for_platform(Some("vllm"), "linux", "x86_64", false),
+            Some("vllm")
+        );
+        assert_eq!(
+            runtime_install_target_for_platform(Some("vllm"), "linux", "x86_64", true),
+            None
+        );
+        for (operating_system, architecture) in [
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            assert_eq!(
+                runtime_install_target_for_platform(
+                    Some("vllm"),
+                    operating_system,
+                    architecture,
+                    false,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            runtime_install_target_for_platform(Some("llama-cuda"), "linux", "aarch64", false,),
+            Some("llama-cuda")
+        );
     }
 
     #[test]
@@ -7604,6 +11421,50 @@ mod tests {
     }
 
     #[test]
+    fn gguf_vision_readiness_requires_mmproj_and_a_multimodal_llama_server() {
+        let ready_store = test_store("gguf-vision-ready");
+        let mut ready = test_manifest(ModelFormat::Gguf, Some("qwen3_vl"));
+        ready.model_path = Some("files/model.gguf".to_string());
+        ready.files = vec![
+            model_file("files/model.gguf", 4),
+            model_file("files/mmproj-f16.gguf", 4),
+        ];
+        ready.metadata.tasks = vec![
+            InferenceTask::TextGeneration,
+            InferenceTask::ImageUnderstanding,
+        ];
+        write_store_file(&ready_store, &ready, "files/model.gguf", "gguf");
+        write_store_file(&ready_store, &ready, "files/mmproj-f16.gguf", "proj");
+        install_fake_multimodal_llama_server(&ready_store, LlamaCppMode::Cpu);
+
+        let readiness = generation_backend_task_readiness(
+            &ready_store,
+            BackendChoice::GgufPreferred {
+                llama: LlamaCppMode::Cpu,
+                candle: CandleDeviceMode::Cpu,
+            },
+            &ready,
+            InferenceTask::ImageUnderstanding,
+        );
+        assert_eq!(readiness.status, TaskReadinessStatus::Available);
+        assert_eq!(readiness.adapter.as_deref(), Some("llama-server-cpu"));
+
+        let missing_store = test_store("gguf-vision-missing-projector");
+        let mut missing = ready.clone();
+        missing.files.truncate(1);
+        write_store_file(&missing_store, &missing, "files/model.gguf", "gguf");
+        let readiness = generation_backend_task_readiness(
+            &missing_store,
+            BackendChoice::Auto,
+            &missing,
+            InferenceTask::ImageUnderstanding,
+        );
+        assert_eq!(readiness.status, TaskReadinessStatus::Unavailable);
+        assert!(readiness.detail.contains("multimodal projector"));
+        assert!(!managed_backend_dir(&missing_store, LlamaCppMode::Cpu).exists());
+    }
+
+    #[test]
     fn prepare_backend_for_chat_prepares_before_session() {
         #[derive(Clone)]
         struct RecordingBackend {
@@ -7655,14 +11516,323 @@ mod tests {
     }
 
     #[test]
+    fn explicit_mlx_backend_dispatches_text_and_vlm_manifests_truthfully() {
+        #[derive(Clone)]
+        struct RecordingMlxBackend {
+            label: &'static str,
+            calls: StdArc<StdMutex<Vec<&'static str>>>,
+        }
+
+        impl GenerationBackend for RecordingMlxBackend {
+            fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
+                self.calls.lock().unwrap().push("prepare");
+                Ok(())
+            }
+
+            fn start_chat_session(
+                &self,
+                _manifest: &ModelManifest,
+                _seed: Option<u64>,
+            ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+                self.calls.lock().unwrap().push("start_chat_session");
+                Ok(None)
+            }
+
+            fn task_readiness(
+                &self,
+                _manifest: &ModelManifest,
+                task: InferenceTask,
+            ) -> Option<TaskReadiness> {
+                self.calls.lock().unwrap().push("task_readiness");
+                (task == InferenceTask::ImageUnderstanding).then(|| TaskReadiness {
+                    status: TaskReadinessStatus::Available,
+                    detail: format!("{} is ready", self.label),
+                    adapter: Some(self.label.to_string()),
+                    required_backend: None,
+                    install_command: None,
+                    fallback_backend: None,
+                    missing_dependencies: Vec::new(),
+                    missing_dependency_groups: Vec::new(),
+                })
+            }
+
+            fn generate(
+                &self,
+                _manifest: &ModelManifest,
+                _request: GenerateRequest,
+            ) -> Result<crate::backend::GenerateResponse> {
+                self.calls.lock().unwrap().push("generate");
+                Ok(crate::backend::GenerateResponse {
+                    text: self.label.to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    finish_reason: "stop".to_string(),
+                    timings: GenerationTimings::default(),
+                    backend_diagnostics: Vec::new(),
+                })
+            }
+
+            fn generate_stream(
+                &self,
+                _manifest: ModelManifest,
+                _request: GenerateRequest,
+            ) -> crate::backend::GenerateStream {
+                self.calls.lock().unwrap().push("generate_stream");
+                Box::pin(tokio_stream::iter(vec![Ok(
+                    GenerateStreamEvent::TextChunk(self.label.to_string()),
+                )]))
+            }
+        }
+
+        let text_calls = StdArc::new(StdMutex::new(Vec::new()));
+        let vision_calls = StdArc::new(StdMutex::new(Vec::new()));
+        let backend = MlxPreferredBackend::with_backends(
+            Arc::new(RecordingMlxBackend {
+                label: "mlx-lm",
+                calls: text_calls.clone(),
+            }),
+            Arc::new(RecordingMlxBackend {
+                label: "mlx-vlm",
+                calls: vision_calls.clone(),
+            }),
+        );
+        let text_manifest = test_manifest(ModelFormat::Mlx, Some("qwen3"));
+        let mut vision_manifest = test_manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        vision_manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::ImageUnderstanding);
+        let text_request = GenerateRequest {
+            prompt: "hello".to_string(),
+            messages: Vec::new(),
+            image_urls: Vec::new(),
+            max_tokens: 8,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+        let mut vision_request = text_request.clone();
+        vision_request.image_urls = vec!["data:image/png;base64,AAAA".to_string()];
+
+        backend.prepare(&text_manifest).unwrap();
+        assert!(
+            backend
+                .start_chat_session(&text_manifest, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .generate(&text_manifest, text_request.clone())
+                .unwrap()
+                .text,
+            "mlx-lm"
+        );
+
+        backend.prepare(&vision_manifest).unwrap();
+        assert!(
+            backend
+                .start_chat_session(&vision_manifest, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .generate(&vision_manifest, text_request)
+                .unwrap()
+                .text,
+            "mlx-vlm"
+        );
+        let readiness = backend
+            .task_readiness(&vision_manifest, InferenceTask::ImageUnderstanding)
+            .unwrap();
+        assert_eq!(readiness.adapter.as_deref(), Some("mlx-vlm"));
+        assert_eq!(
+            backend
+                .generate(&vision_manifest, vision_request)
+                .unwrap()
+                .text,
+            "mlx-vlm"
+        );
+        assert_eq!(
+            text_calls.lock().unwrap().as_slice(),
+            &["prepare", "start_chat_session", "generate"]
+        );
+        assert_eq!(
+            vision_calls.lock().unwrap().as_slice(),
+            &[
+                "prepare",
+                "start_chat_session",
+                "generate",
+                "task_readiness",
+                "generate"
+            ]
+        );
+    }
+
+    #[test]
+    fn top_level_explicit_mlx_backend_exposes_mlx_vlm_readiness() {
+        let store = test_store("explicit-mlx-serve-vision-readiness");
+        let backend = build_generation_backend(
+            store.clone(),
+            BackendChoice::Mlx,
+            LlamaRuntimeOptions::default(),
+            SelectionOptions::default(),
+        )
+        .unwrap();
+        let mut manifest = test_manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::ImageUnderstanding);
+
+        let readiness = backend
+            .task_readiness(&manifest, InferenceTask::ImageUnderstanding)
+            .expect("explicit MLX must expose MLX-VLM vision readiness");
+
+        assert_eq!(readiness.adapter.as_deref(), Some("mlx-vlm"));
+        let _ = fs::remove_dir_all(store.home());
+    }
+
+    #[test]
+    fn explicit_vllm_backend_runs_the_selected_cuda_or_rocm_adapter() {
+        #[derive(Clone)]
+        struct RecordingVllmBackend {
+            label: &'static str,
+            calls: StdArc<StdMutex<Vec<&'static str>>>,
+        }
+
+        impl GenerationBackend for RecordingVllmBackend {
+            fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
+                self.calls.lock().unwrap().push("prepare");
+                Ok(())
+            }
+
+            fn task_readiness(
+                &self,
+                _manifest: &ModelManifest,
+                task: InferenceTask,
+            ) -> Option<TaskReadiness> {
+                self.calls.lock().unwrap().push("task_readiness");
+                (task == InferenceTask::ImageUnderstanding).then(|| TaskReadiness {
+                    status: TaskReadinessStatus::Available,
+                    detail: format!("{} is ready", self.label),
+                    adapter: Some(self.label.to_string()),
+                    required_backend: None,
+                    install_command: None,
+                    fallback_backend: None,
+                    missing_dependencies: Vec::new(),
+                    missing_dependency_groups: Vec::new(),
+                })
+            }
+
+            fn generate(
+                &self,
+                _manifest: &ModelManifest,
+                _request: GenerateRequest,
+            ) -> Result<crate::backend::GenerateResponse> {
+                self.calls.lock().unwrap().push("generate");
+                Ok(crate::backend::GenerateResponse {
+                    text: self.label.to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    finish_reason: "stop".to_string(),
+                    timings: GenerationTimings::default(),
+                    backend_diagnostics: Vec::new(),
+                })
+            }
+
+            fn generate_stream(
+                &self,
+                _manifest: ModelManifest,
+                _request: GenerateRequest,
+            ) -> crate::backend::GenerateStream {
+                unreachable!("not used")
+            }
+        }
+
+        let store = test_store("explicit-vllm-selected-adapter");
+        let cuda_calls = StdArc::new(StdMutex::new(Vec::new()));
+        let rocm_calls = StdArc::new(StdMutex::new(Vec::new()));
+        let backend = VllmPreferredBackend::with_backends(
+            store.clone(),
+            SelectionOptions::default(),
+            Arc::new(RecordingVllmBackend {
+                label: "vllm-cuda",
+                calls: cuda_calls.clone(),
+            }),
+            Arc::new(RecordingVllmBackend {
+                label: "vllm-rocm",
+                calls: rocm_calls.clone(),
+            }),
+            |has_images| {
+                if has_images {
+                    BackendChoice::VllmRocm
+                } else {
+                    BackendChoice::Vllm
+                }
+            },
+        );
+        let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("qwen3_vl"));
+        manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::ImageUnderstanding);
+        let text_request = GenerateRequest {
+            prompt: "hello".to_string(),
+            messages: Vec::new(),
+            image_urls: Vec::new(),
+            max_tokens: 8,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+        let mut image_request = text_request.clone();
+        image_request.image_urls = vec!["data:image/png;base64,AAAA".to_string()];
+
+        backend.prepare(&manifest).unwrap();
+        assert_eq!(
+            backend.generate(&manifest, text_request).unwrap().text,
+            "vllm-cuda"
+        );
+        let readiness = backend
+            .task_readiness(&manifest, InferenceTask::ImageUnderstanding)
+            .unwrap();
+        assert_eq!(readiness.adapter.as_deref(), Some("vllm-rocm"));
+        assert_eq!(
+            backend.generate(&manifest, image_request).unwrap().text,
+            "vllm-rocm"
+        );
+        assert_eq!(
+            cuda_calls.lock().unwrap().as_slice(),
+            &["prepare", "generate"]
+        );
+        assert_eq!(
+            rocm_calls.lock().unwrap().as_slice(),
+            &["task_readiness", "generate"]
+        );
+        let _ = fs::remove_dir_all(store.home());
+    }
+
+    #[test]
     fn startup_banner_is_limited_to_interactive_terminal_commands() {
         let serve = Commands::Serve {
             host: "127.0.0.1".to_string(),
             port: 11434,
             model: None,
+            image_model: None,
             api_key: None,
             api_keys: None,
             allow_unauthenticated: false,
+            cors_origins: Vec::new(),
             verbose: false,
         };
         assert!(should_print_startup_banner_for(&serve, true, true));
@@ -7699,6 +11869,38 @@ mod tests {
         assert!(should_print_startup_banner_for(&chat, true, true));
         assert!(!should_print_startup_banner_for(&chat, true, false));
 
+        for args in [
+            vec![
+                "werk",
+                "image",
+                "generate",
+                "tiny-image",
+                "--prompt",
+                "hello",
+            ],
+            vec![
+                "werk",
+                "video",
+                "generate",
+                "tiny-video",
+                "--prompt",
+                "hello",
+            ],
+            vec![
+                "werk",
+                "audio",
+                "generate",
+                "tiny-audio",
+                "--prompt",
+                "hello",
+            ],
+        ] {
+            let media = Cli::try_parse_from(args).unwrap().command.unwrap();
+            assert!(should_print_startup_banner_for(&media, true, true));
+            assert!(should_print_startup_banner_for(&media, true, false));
+            assert!(!should_print_startup_banner_for(&media, false, true));
+        }
+
         let bench = Commands::Bench {
             model: "tiny".to_string(),
             prompt: "hello".to_string(),
@@ -7716,7 +11918,14 @@ mod tests {
         assert!(!should_print_startup_banner_for(&bench, true, true));
 
         assert!(!should_print_startup_banner_for(
-            &Commands::List,
+            &Commands::List {
+                task: None,
+                input: None,
+                output: None,
+                family: None,
+                layout: None,
+                json: false,
+            },
             true,
             true
         ));
@@ -7727,6 +11936,213 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn explicit_cli_output_replaces_managed_artifact_without_leaving_a_duplicate() {
+        let store = test_store("published-output");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store.create_output_dir("out-cli-publish").unwrap();
+        let source = output_dir.join("generated.png");
+        fs::write(&source, b"generated image").unwrap();
+        let destination = store.home().join("published.png");
+        let mut result = test_inference_result("out-cli-publish", &source);
+
+        publish_and_release_cli_outputs(&output_store, &mut result, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"generated image");
+        assert!(!output_dir.exists());
+        assert_eq!(result.outputs[0].path, destination.display().to_string());
+    }
+
+    #[test]
+    fn missing_cli_output_uses_a_friendly_file_in_the_managed_output_root() {
+        let store = test_store("default-output");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-1784968751-807fe1a83ad7fb22")
+            .unwrap();
+        let source = output_dir.join("image_generation-opaque-1.png");
+        fs::write(&source, b"generated image").unwrap();
+        let mut result = test_inference_result("out-1784968751-807fe1a83ad7fb22", &source);
+        result.model = "Segmind/Tiny SD".to_string();
+        result.effective_request.prompt = Some("private robot prompt".to_string());
+
+        publish_default_cli_outputs(&output_store, &mut result).unwrap();
+
+        let expected = output_store
+            .root()
+            .join("segmind-tiny-sd-image-generation-1784968751-807fe1a83ad7fb22.png");
+        assert_eq!(fs::read(&expected).unwrap(), b"generated image");
+        assert!(!output_dir.exists());
+        assert_eq!(result.outputs[0].path, expected.display().to_string());
+        assert!(!expected.to_string_lossy().contains("private"));
+    }
+
+    #[test]
+    fn default_cli_output_names_multiple_files_uniquely() {
+        let store = test_store("default-multiple-outputs");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-1784968752-a5a791686518b221")
+            .unwrap();
+        let first = output_dir.join("opaque-a.png");
+        let second = output_dir.join("opaque-b.webp");
+        fs::write(&first, b"first image").unwrap();
+        fs::write(&second, b"second image").unwrap();
+        let mut result = test_inference_result("out-1784968752-a5a791686518b221", &first);
+        result.model = "tiny-sd".to_string();
+        let mut second_output = result.outputs[0].clone();
+        second_output.id = "out-1784968752-a5a791686518b221-1".to_string();
+        second_output.path = second.display().to_string();
+        second_output.mime_type = "image/webp".to_string();
+        result.outputs.push(second_output);
+
+        publish_default_cli_outputs(&output_store, &mut result).unwrap();
+
+        assert_eq!(
+            result.outputs[0].path,
+            output_store
+                .root()
+                .join("tiny-sd-image-generation-1784968752-a5a791686518b221-01.png")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            result.outputs[1].path,
+            output_store
+                .root()
+                .join("tiny-sd-image-generation-1784968752-a5a791686518b221-02.webp")
+                .display()
+                .to_string()
+        );
+        assert!(!output_dir.exists());
+    }
+
+    #[test]
+    fn default_cli_output_collision_preserves_the_managed_result() {
+        let store = test_store("default-output-collision");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-1784968753-a5a791686518b222")
+            .unwrap();
+        let source = output_dir.join("opaque.png");
+        fs::write(&source, b"managed image").unwrap();
+        let mut result = test_inference_result("out-1784968753-a5a791686518b222", &source);
+        result.model = "tiny-sd".to_string();
+        let destination = output_store
+            .root()
+            .join("tiny-sd-image-generation-1784968753-a5a791686518b222.png");
+        fs::write(&destination, b"existing image").unwrap();
+
+        let error = publish_default_cli_outputs(&output_store, &mut result).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(fs::read(&source).unwrap(), b"managed image");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing image");
+        assert!(output_dir.exists());
+    }
+
+    #[test]
+    fn default_cli_output_rejects_an_empty_backend_result() {
+        let store = test_store("default-empty-output");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-1784968754-a5a791686518b223")
+            .unwrap();
+        let source = output_dir.join("placeholder.png");
+        fs::write(&source, b"placeholder").unwrap();
+        let mut result = test_inference_result("out-1784968754-a5a791686518b223", &source);
+        result.outputs.clear();
+
+        let error = publish_default_cli_outputs(&output_store, &mut result).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("without producing an output file")
+        );
+        assert!(output_dir.exists());
+    }
+
+    #[test]
+    fn cli_output_slug_is_portable_bounded_and_has_a_fallback() {
+        assert_eq!(cli_output_slug("../CON: Tiny SD 🤖", 48), "con-tiny-sd");
+        assert_eq!(cli_output_slug("🤖", 48), "model");
+        assert_eq!(cli_output_slug(&"A".repeat(100), 48).len(), 48);
+    }
+
+    #[test]
+    fn failed_cli_publish_preserves_the_managed_result() {
+        let store = test_store("failed-publish");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store.create_output_dir("out-cli-failure").unwrap();
+        let source = output_dir.join("generated.png");
+        fs::write(&source, b"managed image").unwrap();
+        let destination = store.home().join("existing.png");
+        fs::write(&destination, b"existing image").unwrap();
+        let mut result = test_inference_result("out-cli-failure", &source);
+
+        let error =
+            publish_and_release_cli_outputs(&output_store, &mut result, &destination).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert!(output_dir.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"managed image");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing image");
+        assert_eq!(result.outputs[0].path, source.display().to_string());
+    }
+
+    #[test]
+    fn cli_output_rejects_destinations_inside_the_managed_store() {
+        let store = test_store("managed-destination");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-cli-managed-destination")
+            .unwrap();
+        let source = output_dir.join("generated.png");
+        fs::write(&source, b"managed image").unwrap();
+        let destination = output_store.root().join("loose.png");
+        let mut result = test_inference_result("out-cli-managed-destination", &source);
+
+        let error =
+            publish_and_release_cli_outputs(&output_store, &mut result, &destination).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--output must be outside the managed output store")
+        );
+        assert!(output_dir.exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn duplicate_cli_output_names_fail_before_any_file_is_copied() {
+        let store = test_store("duplicate-output-names");
+        let output_store = OutputStore::new(store.home());
+        let output_dir = output_store
+            .create_output_dir("out-cli-duplicate-names")
+            .unwrap();
+        let first = output_dir.join("first").join("generated.png");
+        let second = output_dir.join("second").join("generated.png");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, b"first image").unwrap();
+        fs::write(&second, b"second image").unwrap();
+        let destination = store.home().join("published");
+        let mut result = test_inference_result("out-cli-duplicate-names", &first);
+        let mut second_output = result.outputs[0].clone();
+        second_output.id = "out-cli-duplicate-names-1".to_string();
+        second_output.path = second.display().to_string();
+        result.outputs.push(second_output);
+
+        let error =
+            publish_and_release_cli_outputs(&output_store, &mut result, &destination).unwrap_err();
+
+        assert!(error.to_string().contains("same destination"));
+        assert!(output_dir.exists());
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -8214,7 +12630,7 @@ mod tests {
 
         let estimate = kv_cache_estimate(4 * GIB, Some("llama"), &Some(config));
 
-        assert_eq!(estimate.bytes, 24 * 8 * 64 * 2 * 4096 * 2);
+        assert_eq!(estimate.bytes, 24 * 8 * 64 * 2 * 8192 * 2);
         assert_eq!(estimate.confidence, EstimateConfidence::High);
         assert!(estimate.config_used);
     }
@@ -8299,8 +12715,11 @@ mod tests {
 
         assert!(report.config_used);
         assert_eq!(report.confidence, EstimateConfidence::High);
-        assert!(report.kv_cache_bytes < scale_bytes(3 * GIB, 0.35));
-        assert!(report.estimated_total_bytes < 5 * GIB);
+        assert_eq!(report.kv_cache_bytes, 24 * 32 * 64 * 2 * 8192 * 2);
+        assert_eq!(
+            report.estimated_total_bytes,
+            report.model_files_bytes + report.runtime_overhead_bytes + report.kv_cache_bytes
+        );
     }
 
     #[test]
@@ -8434,6 +12853,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn media_debug_and_verbose_enable_backend_install_details() {
+        let image_debug =
+            Cli::try_parse_from(["werk", "image", "generate", "model", "--debug"]).unwrap();
+        assert!(command_backend_install_verbose(
+            image_debug.command.as_ref().unwrap()
+        ));
+
+        let audio_verbose = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "speak",
+            "model",
+            "--text",
+            "hello",
+            "--verbose",
+        ])
+        .unwrap();
+        assert!(command_backend_install_verbose(
+            audio_verbose.command.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn cli_vision_image_paths_become_portable_data_urls() {
+        let store = test_store("vision-image-source");
+        store.ensure().unwrap();
+        let image = store.home().join("layout.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+
+        let normalized = normalize_cli_image_sources(&[
+            image.display().to_string(),
+            "https://example.test/reference.png".to_string(),
+        ])
+        .unwrap();
+
+        assert!(normalized[0].starts_with("data:image/png;base64,"));
+        assert_eq!(normalized[1], "https://example.test/reference.png");
+        let _ = fs::remove_dir_all(store.home());
+    }
+
+    #[test]
+    fn cli_vision_message_preserves_text_then_images_and_counts_visual_tokens() {
+        let images = vec![
+            "data:image/png;base64,AAAA".to_string(),
+            "https://example.test/second.png".to_string(),
+        ];
+        let message = vision_user_message("Inspect the layout", &images);
+        let MessageContent::Parts(parts) = message.content.as_ref().unwrap() else {
+            panic!("vision message was flattened")
+        };
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["text", "image_url", "image_url"]
+        );
+        assert_eq!(image_urls_from_messages(&[message.clone()]), images);
+        assert!(cli_message_content_tokens(message.content.as_ref().unwrap()) >= 2 * 1024);
+    }
+
     fn test_store(name: &str) -> ModelStore {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8444,6 +12925,74 @@ mod tests {
             std::process::id()
         ));
         ModelStore::resolve(Some(root)).unwrap()
+    }
+
+    fn test_inference_result(id: &str, output: &Path) -> InferenceResult {
+        let task = InferenceTask::ImageGeneration;
+        InferenceResult {
+            id: id.to_string(),
+            task,
+            model: "test-model".to_string(),
+            runtime: "test-runtime".to_string(),
+            outputs: vec![OutputMetadata {
+                id: format!("{id}-0"),
+                task,
+                model: "test-model".to_string(),
+                runtime: "test-runtime".to_string(),
+                path: output.display().to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: fs::metadata(output).unwrap().len(),
+                width: Some(16),
+                height: Some(16),
+                duration: None,
+                seed: Some(1),
+                effective_parameters: Default::default(),
+                created_unix: 1,
+                backend_metadata: Value::Null,
+            }],
+            effective_request: EffectiveInferenceRequest {
+                model: "test-model".to_string(),
+                task,
+                prompt: Some("test".to_string()),
+                negative_prompt: None,
+                inputs: Vec::new(),
+                output_modality: OutputModality::Image,
+                parameters: Default::default(),
+                explicit_parameters: Default::default(),
+                parameter_policy: ParameterPolicy::Strict,
+                warnings: Vec::new(),
+            },
+            estimate: WorkloadEstimate {
+                task,
+                download_size_bytes: None,
+                weight_payload_bytes: None,
+                accelerator_peak_bytes: None,
+                accelerator_memory_limit_bytes: None,
+                host_peak_bytes: None,
+                host_memory_limit_bytes: None,
+                output_size_bytes: Some(fs::metadata(output).unwrap().len()),
+                fit: FitAssessment::Fits,
+                confidence: WorkloadEstimateConfidence::Exact,
+                assumptions: Vec::new(),
+                warnings: Vec::new(),
+                recommendations: Vec::new(),
+            },
+            plan: ExecutionPlan {
+                task,
+                selected_runtime: Some("test-runtime".to_string()),
+                selected_backend: Some("test-backend".to_string()),
+                score: Some(1),
+                candidates: Vec::new(),
+                backend_fallback: false,
+                degradations: Vec::new(),
+                model_or_quality_downgrades: Vec::new(),
+                task_readiness: None,
+            },
+            backend_metadata: Value::Null,
+            timings: Default::default(),
+            warnings: Vec::new(),
+            created_unix: 1,
+        }
     }
 
     fn test_manifest(format: ModelFormat, architecture: Option<&str>) -> ModelManifest {
@@ -8461,6 +13010,7 @@ mod tests {
             created_unix: 1,
             files: Vec::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         }
     }
 
@@ -8513,6 +13063,17 @@ mod tests {
         let path = managed_backend_dir(store, mode).join("llama-server");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&path);
+    }
+
+    fn install_fake_multimodal_llama_server(store: &ModelStore, mode: LlamaCppMode) {
+        let path = managed_backend_dir(store, mode).join("llama-server");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            b"#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo --mmproj; fi\nexit 0\n",
+        )
+        .unwrap();
         make_executable(&path);
     }
 

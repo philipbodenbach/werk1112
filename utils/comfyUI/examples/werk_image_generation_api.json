@@ -1,0 +1,85 @@
+{
+  "1": {
+    "class_type": "WerkConnection",
+    "inputs": {
+      "server_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout_seconds": 900,
+      "verify_tls": true
+    }
+  },
+  "2": {
+    "class_type": "WerkImageModels",
+    "inputs": {
+      "connection": ["1", 0],
+      "refresh_token": 0,
+      "preferred_model": "black-forest-labs/FLUX.2-klein-4B",
+      "require_available": true
+    }
+  },
+  "3": {
+    "class_type": "WerkRoutingConfig",
+    "inputs": {
+      "backend": "",
+      "accelerator": "",
+      "device": "",
+      "precision": "",
+      "quantization": "",
+      "profile": "",
+      "quality": "inherit",
+      "performance_preference": "inherit",
+      "fallback_policy": "inherit",
+      "parameter_policy": "inherit",
+      "allow_cpu_offload": "enabled",
+      "allow_sequential_offload": "inherit",
+      "allow_component_offload": "enabled",
+      "allow_disk_offload": "inherit",
+      "attention_backend": "",
+      "compile": "inherit",
+      "inference_timeout_seconds": 0,
+      "additional_routing_parameters_json": "{}"
+    }
+  },
+  "4": {
+    "class_type": "WerkImageConfig",
+    "inputs": {
+      "routing": ["3", 0],
+      "width": 512,
+      "height": 512,
+      "count": 1,
+      "batch_size": 1,
+      "steps": 28,
+      "guidance": 3.5,
+      "seed": 0,
+      "output_format": "png",
+      "response_format": "b64_json",
+      "style": "none",
+      "vae_tiling": "enabled",
+      "vae_slicing": "inherit",
+      "additional_image_parameters_json": "{}"
+    }
+  },
+  "5": {
+    "class_type": "WerkImageGenerate",
+    "inputs": {
+      "connection": ["1", 0],
+      "model": ["2", 0],
+      "config": ["4", 0],
+      "prompt": "A compact service robot standing in a quiet orbital greenhouse, cinematic lighting, detailed concept art",
+      "negative_prompt": "malformed geometry, text, watermark"
+    }
+  },
+  "6": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": ["5", 0]
+    }
+  },
+  "7": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "Werk1112",
+      "images": ["5", 0]
+    }
+  }
+}

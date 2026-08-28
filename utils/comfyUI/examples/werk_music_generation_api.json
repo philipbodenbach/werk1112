@@ -1,0 +1,78 @@
+{
+  "1": {
+    "class_type": "WerkConnection",
+    "inputs": {
+      "server_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout_seconds": 1800,
+      "verify_tls": true
+    }
+  },
+  "2": {
+    "class_type": "WerkAudioModels",
+    "inputs": {
+      "connection": ["1", 0],
+      "task": "music-generation",
+      "refresh_token": 0,
+      "preferred_model": "",
+      "require_available": true
+    }
+  },
+  "3": {
+    "class_type": "WerkRoutingConfig",
+    "inputs": {
+      "backend": "auto",
+      "accelerator": "cuda",
+      "device": "",
+      "precision": "fp16",
+      "quantization": "",
+      "profile": "",
+      "quality": "inherit",
+      "performance_preference": "inherit",
+      "fallback_policy": "none",
+      "parameter_policy": "inherit",
+      "allow_cpu_offload": "inherit",
+      "allow_sequential_offload": "inherit",
+      "allow_component_offload": "inherit",
+      "allow_disk_offload": "inherit",
+      "attention_backend": "",
+      "compile": "inherit",
+      "inference_timeout_seconds": 0,
+      "additional_routing_parameters_json": "{}"
+    }
+  },
+  "4": {
+    "class_type": "WerkAudioConfig",
+    "inputs": {
+      "routing": ["3", 0],
+      "task": "music-generation",
+      "duration": 10.0,
+      "variations": 1,
+      "seed": 1112,
+      "sample_rate": 0,
+      "channels": 0,
+      "output_format": "wav",
+      "instrumental": "inherit",
+      "voice": "",
+      "speed": 1.0,
+      "additional_audio_parameters_json": "{}"
+    }
+  },
+  "5": {
+    "class_type": "WerkAudioGenerate",
+    "inputs": {
+      "connection": ["1", 0],
+      "model": ["2", 0],
+      "task": "music-generation",
+      "prompt": "Ten-second instrumental cinematic synthwave, warm analogue pulse, no vocals, clean ending",
+      "negative_prompt": "",
+      "config": ["4", 0]
+    }
+  },
+  "6": {
+    "class_type": "PreviewAudio",
+    "inputs": {
+      "audio": ["5", 0]
+    }
+  }
+}

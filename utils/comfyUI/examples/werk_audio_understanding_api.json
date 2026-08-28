@@ -1,0 +1,38 @@
+{
+  "1": {
+    "class_type": "WerkConnection",
+    "inputs": {
+      "server_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout_seconds": 900,
+      "verify_tls": true
+    }
+  },
+  "2": {
+    "class_type": "WerkAudioModels",
+    "inputs": {
+      "connection": ["1", 0],
+      "task": "audio-understanding",
+      "refresh_token": 0,
+      "preferred_model": "audio-understanding-model",
+      "require_available": true
+    }
+  },
+  "3": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": "example.wav"
+    }
+  },
+  "4": {
+    "class_type": "WerkAudioAnalyze",
+    "inputs": {
+      "connection": ["1", 0],
+      "model": ["2", 0],
+      "task": "audio-understanding",
+      "source_audio": ["3", 0],
+      "prompt": "Describe the speakers, events, and acoustic setting.",
+      "additional_audio_parameters_json": "{}"
+    }
+  }
+}

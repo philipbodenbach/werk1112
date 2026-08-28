@@ -28,7 +28,6 @@ impl ChatCompletionRequest {
         self.max_completion_tokens
             .or(self.max_tokens)
             .unwrap_or(256)
-            .min(4096)
     }
 
     pub fn stop_strings(&self) -> Vec<String> {
@@ -209,6 +208,11 @@ pub fn messages_to_prompt_for_model_with_template(
     }
 
     if options.model_template_preferred && options.default_source == ChatTemplateSource::Model {
+        if let Some(template) = manifest.metadata.chat_template.as_ref()
+            && template.applied_by_werk
+        {
+            return messages_to_prompt_with_template_override(messages, &template.name);
+        }
         return model_template_prompt(messages, None);
     }
 
@@ -397,6 +401,17 @@ pub fn image_urls_from_messages(messages: &[ChatMessage]) -> Vec<String> {
         .filter_map(|message| message.content.as_ref())
         .flat_map(MessageContent::image_urls)
         .collect()
+}
+
+pub fn generation_messages_for_prompt(
+    prompt: &PromptSpec,
+    messages: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    if prompt.chat_template.source == ChatTemplateSource::Model {
+        messages
+    } else {
+        Vec::new()
+    }
 }
 
 fn uses_qwen_chat_template(manifest: &ModelManifest) -> bool {
@@ -680,7 +695,7 @@ pub struct ErrorObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_store::{ModelFile, ModelFormat};
+    use crate::model_store::{ModelFile, ModelFormat, ResolvedChatTemplate};
 
     #[test]
     fn deserializes_openai_message_content_shapes() {
@@ -714,6 +729,79 @@ mod tests {
     }
 
     #[test]
+    fn explicit_completion_budget_is_not_silently_capped() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_completion_tokens": 8192
+        }))
+        .unwrap();
+
+        assert_eq!(request.max_completion_tokens(), 8192);
+    }
+
+    #[test]
+    fn inferred_llama3_template_replaces_missing_preferred_gguf_template() {
+        let mut manifest = ModelManifest {
+            id: "renamed-model".to_string(),
+            source: ModelSource::LocalPath {
+                path: "model".to_string(),
+            },
+            format: ModelFormat::Gguf,
+            architecture: Some("llama".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: Some("files/model.gguf".to_string()),
+            backend: "llama-server".to_string(),
+            created_unix: 1,
+            files: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: Default::default(),
+        };
+        manifest.metadata.chat_template = Some(ResolvedChatTemplate {
+            name: "llama3".to_string(),
+            source: "tokenizer_special_tokens".to_string(),
+            confidence: "high".to_string(),
+            applied_by_werk: true,
+            required_tokens: ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"]
+                .iter()
+                .map(|token| (*token).to_string())
+                .collect(),
+            stop_tokens: vec!["<|eot_id|>".to_string()],
+        });
+        let messages = [ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            name: None,
+        }];
+
+        let prompt = messages_to_prompt_for_model_with_template(
+            &manifest,
+            &messages,
+            ChatTemplateOptions {
+                default_source: ChatTemplateSource::Model,
+                model_template_preferred: true,
+                override_name: None,
+            },
+        );
+
+        assert_eq!(prompt.chat_template.source, ChatTemplateSource::Werk);
+        assert_eq!(prompt.chat_template.name, "llama3");
+        assert!(prompt.chat_template.applied_by_werk);
+        assert!(
+            prompt
+                .prompt
+                .contains("<|start_header_id|>user<|end_header_id|>")
+        );
+        assert!(
+            prompt
+                .prompt
+                .ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        );
+        assert!(prompt.stop.contains(&"<|eot_id|>".to_string()));
+        assert!(generation_messages_for_prompt(&prompt, messages.to_vec()).is_empty());
+    }
+
+    #[test]
     fn tinyllama_uses_chatml_prompt_shape() {
         let manifest = ModelManifest {
             id: "TinyLLama-1B-GGUF".to_string(),
@@ -729,6 +817,7 @@ mod tests {
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,
@@ -768,6 +857,7 @@ mod tests {
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,
@@ -812,6 +902,7 @@ mod tests {
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,
@@ -872,6 +963,7 @@ mod tests {
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,

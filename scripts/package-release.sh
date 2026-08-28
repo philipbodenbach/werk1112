@@ -13,16 +13,99 @@ die() {
 
 usage() {
     cat >&2 <<'USAGE'
-Usage: ./scripts/package-release.sh <linux|windows|macos|all>
+Usage: ./scripts/package-release.sh <linux|linux-strix-halo|linux-aarch64|windows|macos>
 
 Builds release artifacts into releases/.
-Artifacts are universal runtime-router binaries, one per supported OS/architecture,
-with the platform accelerator path compiled in.
+Artifacts are runtime-router binaries, one per configured platform profile.
+Accelerator support may be compiled in or discovered through companion runtimes.
 USAGE
 }
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+is_dgx_spark_signal() {
+    local signal="$1"
+    local normalized
+
+    normalized="$(printf '%s\n' "$signal" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' ' ')"
+    case " $normalized " in
+        *" NVIDIA DGX SPARK "*|*" GB10 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_dgx_spark_host() {
+    local os
+    local arch
+    local signal
+
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    [[ "$os" == "Linux" ]] || return 1
+    [[ "$arch" == "aarch64" || "$arch" == "arm64" ]] || return 1
+
+    if [[ -r /proc/device-tree/model ]]; then
+        signal="$(tr '\000' ' ' </proc/device-tree/model)"
+        is_dgx_spark_signal "$signal" && return 0
+    fi
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if signal="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"; then
+            is_dgx_spark_signal "$signal" && return 0
+        fi
+    fi
+    return 1
+}
+
+is_strix_halo_signal() {
+    local signal="$1"
+    local normalized
+
+    normalized="$(printf '%s\n' "$signal" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' ' ')"
+    case " $normalized " in
+        *" AMD RYZEN AI MAX "*|*" STRIX HALO "*|*" RADEON 8060S "*|*" RADEON 8050S "*|*" RADEON 8040S "*|*" GFX1151 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_strix_halo_host() {
+    local os
+    local arch
+    local signal
+
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    [[ "$os" == "Linux" ]] || return 1
+    [[ "$arch" == "x86_64" ]] || return 1
+
+    if [[ -r /proc/cpuinfo ]]; then
+        signal="$(sed -n 's/^[Mm]odel name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo)"
+        is_strix_halo_signal "$signal" && return 0
+    fi
+    local dmi_path
+    for dmi_path in /sys/class/dmi/id/product_name /sys/class/dmi/id/board_name; do
+        if [[ -r "$dmi_path" ]]; then
+            signal="$(sed -n '1p' "$dmi_path")"
+            is_strix_halo_signal "$signal" && return 0
+        fi
+    done
+    if command -v lscpu >/dev/null 2>&1; then
+        if signal="$(lscpu 2>/dev/null)"; then
+            is_strix_halo_signal "$signal" && return 0
+        fi
+    fi
+    if command -v rocm_agent_enumerator >/dev/null 2>&1; then
+        if signal="$(rocm_agent_enumerator 2>/dev/null)"; then
+            is_strix_halo_signal "$signal" && return 0
+        fi
+    fi
+    if command -v rocminfo >/dev/null 2>&1; then
+        if signal="$(rocminfo 2>/dev/null)"; then
+            is_strix_halo_signal "$signal" && return 0
+        fi
+    fi
+    return 1
 }
 
 package_version() {
@@ -65,6 +148,18 @@ package_target() {
             binary_path="target/x86_64-unknown-linux-gnu/release/werk"
             artifact_name="werk1112-v${VERSION}-linux-x86_64.tar.gz"
             ;;
+        linux-strix-halo)
+            is_strix_halo_host || die "linux-strix-halo release packaging must run natively on AMD Ryzen AI Max/Strix Halo (gfx1151)"
+            cargo_alias="build-linux-strix-halo"
+            binary_path="target/x86_64-unknown-linux-gnu/release/werk"
+            artifact_name="werk1112-v${VERSION}-linux-x86_64-amd-strix-halo.tar.gz"
+            ;;
+        linux-aarch64)
+            is_dgx_spark_host || die "linux-aarch64 release packaging must run natively on NVIDIA DGX Spark/GB10"
+            cargo_alias="build-linux-aarch64"
+            binary_path="target/aarch64-unknown-linux-gnu/release/werk"
+            artifact_name="werk1112-v${VERSION}-linux-aarch64-dgx-spark.tar.gz"
+            ;;
         windows)
             cargo_alias="build-windows"
             binary_path="target/x86_64-pc-windows-msvc/release/werk.exe"
@@ -85,7 +180,7 @@ package_target() {
     artifact="$REPO_ROOT/releases/$artifact_name"
 
     printf '\n==> Building %s release artifact\n' "$platform"
-    printf '    Note: release artifacts are universal runtime-router binaries with platform accelerator support compiled in.\n'
+    printf '    Note: release artifacts are runtime-router binaries; platform profiles may use compiled or companion accelerator support.\n'
     printf '    If cross-compilation is unavailable for your environment, build this artifact on the matching target OS.\n'
     printf '    Running: cargo %s\n' "$cargo_alias"
 
@@ -100,16 +195,17 @@ package_target() {
 
     cp "$binary_path" "$staging_dir/$binary_name"
     cp "$REPO_ROOT/README.md" "$staging_dir/README.md"
+    cp "$REPO_ROOT/LICENSE" "$staging_dir/LICENSE"
     rm -f "$artifact" "$artifact.sha256"
 
     case "$platform" in
         windows)
             require_command zip
-            (cd "$staging_dir" && zip -q "$artifact" "$binary_name" README.md)
+            (cd "$staging_dir" && zip -q "$artifact" "$binary_name" README.md LICENSE)
             ;;
-        linux|macos)
+        linux|linux-strix-halo|linux-aarch64|macos)
             require_command tar
-            tar -czf "$artifact" -C "$staging_dir" "$binary_name" README.md
+            tar -czf "$artifact" -C "$staging_dir" "$binary_name" README.md LICENSE
             ;;
     esac
 
@@ -130,13 +226,8 @@ VERSION="$(package_version)"
 mkdir -p "$REPO_ROOT/releases" "$REPO_ROOT/target/package"
 
 case "$1" in
-    linux|windows|macos)
+    linux|linux-strix-halo|linux-aarch64|windows|macos)
         package_target "$1"
-        ;;
-    all)
-        package_target linux
-        package_target windows
-        package_target macos
         ;;
     -h|--help|help)
         usage

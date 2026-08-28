@@ -5,9 +5,9 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -18,13 +18,27 @@ use super::{
     ChatGenerationSession, GenerateRequest, GenerateResponse, GenerateStream, GenerateStreamEvent,
     GenerationBackend, GenerationTimings, LlamaCppMode, LlamaRuntimeOptions,
 };
-use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
+use crate::{
+    capabilities::InferenceTask,
+    inference::{TaskReadiness, TaskReadinessStatus},
+    model_store::{ModelFile, ModelFormat, ModelManifest, ModelStore},
+};
 
 const DEFAULT_CTX_SIZE: usize = 4096;
 const DEFAULT_BATCH_SIZE: usize = 2048;
 const DEFAULT_UBATCH_SIZE: u32 = 512;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+static STRIX_HALO: OnceLock<bool> = OnceLock::new();
+static SELECTED_ROCM_DEVICE_STATUS: OnceLock<SelectedRocmDeviceStatus> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectedRocmDeviceStatus {
+    StrixHalo,
+    Other,
+    Unknown,
+}
 
 #[derive(Clone)]
 pub struct LlamaServerBackend {
@@ -40,6 +54,8 @@ struct LlamaServerProcess {
     discovery_source: String,
     args: Vec<String>,
     model_path: PathBuf,
+    projector_path: Option<PathBuf>,
+    model_id: String,
     url: String,
     pid: u32,
     mode: LlamaCppMode,
@@ -112,6 +128,60 @@ impl LlamaServerBackend {
         ))
     }
 
+    /// Validates the model-side assets required by llama.cpp multimodal
+    /// inference without discovering, installing, or starting a runtime.
+    pub(crate) fn validate_image_model(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+    ) -> Result<PathBuf> {
+        if manifest.format != ModelFormat::Gguf {
+            bail!("llama.cpp image input requires a GGUF model");
+        }
+        let model_path = manifest
+            .model_path
+            .as_deref()
+            .context("GGUF manifest has no model_path")?;
+        let absolute_model_path = store.absolute_model_file(manifest, model_path);
+        if !absolute_model_path.is_file() {
+            bail!(
+                "GGUF model file for '{}' is missing from the local model store",
+                manifest.id
+            );
+        }
+        discover_multimodal_projector(store, manifest, &absolute_model_path)?.ok_or_else(|| {
+            anyhow!(
+                "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
+                manifest.id
+            )
+        })
+    }
+
+    /// Probes the configured llama-server's multimodal CLI support. This only
+    /// executes `--help`; it does not start the server or load model weights.
+    pub(crate) fn probe_image_input(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        mode: LlamaCppMode,
+    ) -> Result<String> {
+        let projector = Self::validate_image_model(store, manifest)?;
+        let discovery = require_llama_server(store, mode)?;
+        let executable = discovery
+            .path
+            .as_ref()
+            .context("llama-server discovery had no executable path")?;
+        if !supported_args(executable).mmproj {
+            bail!(
+                "llama-server {} is installed but does not advertise --mmproj support",
+                display_name(mode)
+            );
+        }
+        Ok(format!(
+            "llama.cpp server {} is ready for image input with projector {}",
+            display_name(mode),
+            projector.display()
+        ))
+    }
+
     pub fn discover(store: &ModelStore, mode: LlamaCppMode) -> LlamaServerDiscovery {
         discover_llama_server(store, mode)
     }
@@ -123,6 +193,7 @@ impl LlamaServerBackend {
     fn cached_server(
         &self,
         manifest: &ModelManifest,
+        require_projector: bool,
     ) -> Result<(Arc<LlamaServerProcess>, bool, f64)> {
         if manifest.format != ModelFormat::Gguf {
             bail!(
@@ -136,10 +207,23 @@ impl LlamaServerBackend {
             .as_deref()
             .context("GGUF manifest has no model_path")?;
         let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
+        let projector_path =
+            discover_multimodal_projector(&self.store, manifest, &absolute_model_path)?;
+        if require_projector && projector_path.is_none() {
+            bail!(
+                "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
+                manifest.id
+            );
+        }
+        let projector_cache_key = projector_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}",
             manifest.id,
             absolute_model_path.display(),
+            projector_cache_key,
             label(self.mode),
             self.runtime_options.ctx_size.unwrap_or(DEFAULT_CTX_SIZE),
             self.runtime_options
@@ -170,6 +254,7 @@ impl LlamaServerBackend {
             self.mode,
             manifest,
             &absolute_model_path,
+            projector_path.as_deref(),
             &self.runtime_options,
         )?);
         let load_seconds = started.elapsed().as_secs_f64();
@@ -186,14 +271,12 @@ impl LlamaServerBackend {
         request: GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<GenerateResponse> {
-        if !request.image_urls.is_empty() {
-            bail!(
-                "llama.cpp server backend is text-only for now; use a VLM-capable backend/model for image inputs"
-            );
-        }
-
         let total_started = Instant::now();
-        let (server, reused, load_seconds) = self.cached_server(manifest)?;
+        let has_images = request_has_images(&request);
+        if has_images {
+            validate_llama_image_sources(&request)?;
+        }
+        let (server, reused, load_seconds) = self.cached_server(manifest, has_images)?;
         server.print_debug(&request, reused);
         let completion = server.complete(&request, tx)?;
         Ok(GenerateResponse {
@@ -216,7 +299,7 @@ impl LlamaServerBackend {
 
 impl GenerationBackend for LlamaServerBackend {
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
-        self.cached_server(manifest).map(|_| ())
+        self.cached_server(manifest, false).map(|_| ())
     }
 
     fn start_chat_session(
@@ -227,8 +310,51 @@ impl GenerationBackend for LlamaServerBackend {
         if manifest.format != ModelFormat::Gguf {
             return Ok(None);
         }
-        let (server, _, _) = self.cached_server(manifest)?;
+        let (server, _, _) = self.cached_server(manifest, false)?;
         Ok(Some(Box::new(LlamaServerChatSession { server })))
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task != InferenceTask::ImageUnderstanding {
+            return None;
+        }
+        let readiness = if !manifest.supports_task(task) {
+            Err(anyhow!(
+                "model '{}' does not advertise image-understanding",
+                manifest.id
+            ))
+        } else {
+            Self::probe_image_input(&self.store, manifest, self.mode).map(|_| ())
+        };
+        Some(match readiness {
+            Ok(()) => TaskReadiness {
+                status: TaskReadinessStatus::Available,
+                detail: format!(
+                    "{} can execute image understanding without loading model weights during capability discovery",
+                    display_name(self.mode)
+                ),
+                adapter: Some(format!("llama-server-{}", label(self.mode))),
+                required_backend: None,
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            },
+            Err(error) => TaskReadiness {
+                status: TaskReadinessStatus::Unavailable,
+                detail: error.to_string(),
+                adapter: Some(format!("llama-server-{}", label(self.mode))),
+                required_backend: Some(format!("llama-server-{}", label(self.mode))),
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            },
+        })
     }
 
     fn generate(
@@ -306,7 +432,8 @@ impl LlamaServerProcess {
         store: &ModelStore,
         mode: LlamaCppMode,
         manifest: &ModelManifest,
-        model_path: &PathBuf,
+        model_path: &Path,
+        projector_path: Option<&Path>,
         runtime_options: &LlamaRuntimeOptions,
     ) -> Result<Self> {
         let discovery = require_llama_server(store, mode)?;
@@ -317,9 +444,20 @@ impl LlamaServerProcess {
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         let supported = supported_args(&executable);
+        if let Some(projector_path) = projector_path
+            && !supported.mmproj
+        {
+            bail!(
+                "local multimodal projector '{}' was found for model '{}', but llama-server at '{}' does not advertise --mmproj support",
+                projector_path.display(),
+                manifest.id,
+                executable.display()
+            );
+        }
         let args = llama_server_args(
             mode,
             model_path,
+            projector_path,
             port,
             runtime_options,
             &supported,
@@ -352,7 +490,9 @@ impl LlamaServerProcess {
             executable,
             discovery_source: discovery.source,
             args,
-            model_path: model_path.clone(),
+            model_path: model_path.to_path_buf(),
+            projector_path: projector_path.map(Path::to_path_buf),
+            model_id: manifest.id.clone(),
             url,
             pid,
             mode,
@@ -367,8 +507,14 @@ impl LlamaServerProcess {
         request: &GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<ServerCompletion> {
+        if request_has_images(request) && self.projector_path.is_none() {
+            bail!(
+                "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
+                self.model_id
+            );
+        }
         let started = Instant::now();
-        let use_chat_endpoint = !request.messages.is_empty();
+        let use_chat_endpoint = !request.messages.is_empty() || request_has_images(request);
         let (path, body) = if use_chat_endpoint {
             ("/v1/chat/completions", chat_completion_body(request))
         } else {
@@ -503,6 +649,13 @@ impl LlamaServerProcess {
         eprintln!("discovery source: {}", self.discovery_source);
         eprintln!("full llama-server args: {}", shell_join(&self.args));
         eprintln!("model path: {}", self.model_path.display());
+        eprintln!(
+            "multimodal projector path: {}",
+            self.projector_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        );
         eprintln!("server PID: {}", self.pid);
         eprintln!("server URL: {}", self.url);
         eprintln!("reused existing server: {reused}");
@@ -553,7 +706,8 @@ impl SseAccumulator {
 
 fn llama_server_args(
     mode: LlamaCppMode,
-    model_path: &PathBuf,
+    model_path: &Path,
+    projector_path: Option<&Path>,
     port: u16,
     runtime_options: &LlamaRuntimeOptions,
     supported: &SupportedArgs,
@@ -589,6 +743,13 @@ fn llama_server_args(
         "-np".to_string(),
         "1".to_string(),
     ];
+
+    if let Some(projector_path) = projector_path
+        && supported.mmproj
+    {
+        args.push("--mmproj".to_string());
+        args.push(projector_path.display().to_string());
+    }
 
     if supported.flash_attn {
         args.push("-fa".to_string());
@@ -693,15 +854,15 @@ fn chat_completion_body(request: &GenerateRequest) -> Value {
 }
 
 fn llama_chat_messages(request: &GenerateRequest) -> Vec<Value> {
-    request
+    let mut messages = request
         .messages
         .iter()
         .map(|message| {
             let content = message
                 .content
                 .as_ref()
-                .map(|content| content.as_text())
-                .unwrap_or_default();
+                .map(llama_chat_content)
+                .unwrap_or(Value::Null);
             let mut value = json!({
                 "role": message.role.as_str(),
                 "content": content,
@@ -711,7 +872,179 @@ fn llama_chat_messages(request: &GenerateRequest) -> Vec<Value> {
             }
             value
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let messages_have_images = request.messages.iter().any(|message| {
+        message
+            .content
+            .as_ref()
+            .is_some_and(|content| !content.image_urls().is_empty())
+    });
+    if !request.image_urls.is_empty() && !messages_have_images {
+        append_fallback_image_parts(&mut messages, &request.prompt, &request.image_urls);
+    }
+    messages
+}
+
+fn llama_chat_content(content: &crate::openai::MessageContent) -> Value {
+    match content {
+        crate::openai::MessageContent::Text(text) => json!(text),
+        crate::openai::MessageContent::Parts(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|part| {
+                    let mut value = serde_json::Map::new();
+                    // `input_image` is accepted as a Werk/OpenAI input alias,
+                    // while llama.cpp's chat endpoint consumes `image_url`.
+                    let kind = if part.kind == "input_image" {
+                        "image_url"
+                    } else {
+                        part.kind.as_str()
+                    };
+                    value.insert("type".to_string(), json!(kind));
+                    if let Some(text) = &part.text {
+                        value.insert("text".to_string(), json!(text));
+                    }
+                    if let Some(image_url) = &part.image_url {
+                        let image_url = match image_url {
+                            crate::openai::ImageUrlSpec::Url(url) => json!({"url": url}),
+                            crate::openai::ImageUrlSpec::Object(_) => {
+                                serde_json::to_value(image_url)
+                                    .expect("ImageUrlSpec serialization cannot fail")
+                            }
+                        };
+                        value.insert("image_url".to_string(), image_url);
+                    }
+                    Value::Object(value)
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn append_fallback_image_parts(messages: &mut Vec<Value>, prompt: &str, image_urls: &[String]) {
+    if messages.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": prompt,
+        }));
+    }
+    let target = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(messages.len() - 1);
+    let content = messages[target]
+        .get_mut("content")
+        .map(Value::take)
+        .unwrap_or(Value::Null);
+    let mut parts = match content {
+        Value::Array(parts) => parts,
+        Value::String(text) if !text.is_empty() => vec![json!({
+            "type": "text",
+            "text": text,
+        })],
+        _ => Vec::new(),
+    };
+    parts.extend(image_urls.iter().map(|url| {
+        json!({
+            "type": "image_url",
+            "image_url": {"url": url},
+        })
+    }));
+    messages[target]["content"] = Value::Array(parts);
+}
+
+fn request_has_images(request: &GenerateRequest) -> bool {
+    !request.image_urls.is_empty()
+        || request.messages.iter().any(|message| {
+            message
+                .content
+                .as_ref()
+                .is_some_and(|content| !content.image_urls().is_empty())
+        })
+}
+
+fn validate_llama_image_sources(request: &GenerateRequest) -> Result<()> {
+    let mut sources = request.image_urls.clone();
+    if sources.is_empty() {
+        sources.extend(request.messages.iter().flat_map(|message| {
+            message
+                .content
+                .as_ref()
+                .map(crate::openai::MessageContent::image_urls)
+                .unwrap_or_default()
+        }));
+    }
+    for source in sources {
+        let source = source.trim();
+        if source.starts_with("data:image/")
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+        {
+            continue;
+        }
+        bail!(
+            "llama.cpp vision input does not expose local filesystem paths to its HTTP endpoint; send an image data URL or HTTP(S) URL (CLI --image paths are converted automatically)"
+        );
+    }
+    Ok(())
+}
+
+fn discover_multimodal_projector(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    model_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let model_root = store.absolute_model_file(manifest, "");
+    discover_multimodal_projector_from_files(&model_root, &manifest.files, model_path)
+}
+
+fn discover_multimodal_projector_from_files(
+    model_root: &Path,
+    files: &[ModelFile],
+    model_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let mut candidates = files
+        .iter()
+        .filter_map(|file| {
+            let relative = Path::new(&file.path);
+            if !safe_manifest_relative_path(relative)
+                || !relative
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            {
+                return None;
+            }
+            let filename = relative.file_name()?.to_str()?.to_ascii_lowercase();
+            if !filename.contains("mmproj") && !filename.contains("projector") {
+                return None;
+            }
+            let candidate = model_root.join(relative);
+            (candidate != model_path && candidate.is_file()).then_some(candidate)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [candidate] => Ok(Some(candidate.clone())),
+        _ => bail!(
+            "multiple local multimodal projector GGUF files are listed in the model manifest; cannot choose safely: {}",
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn safe_manifest_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn update_completion_from_event(completion: &mut ServerCompletion, value: &Value) {
@@ -1000,6 +1333,7 @@ struct SupportedArgs {
     log_disable: bool,
     reasoning: bool,
     chat_template_kwargs: bool,
+    mmproj: bool,
 }
 
 fn supported_args(executable: &PathBuf) -> SupportedArgs {
@@ -1018,6 +1352,10 @@ fn supported_args(executable: &PathBuf) -> SupportedArgs {
         log_disable: text.contains("--log-disable"),
         reasoning: text.contains("--reasoning ") || text.contains("-rea,"),
         chat_template_kwargs: text.contains("--chat-template-kwargs"),
+        mmproj: text.split_whitespace().any(|argument| {
+            argument.trim_matches(|character: char| character == ',' || character == ';')
+                == "--mmproj"
+        }),
     }
 }
 
@@ -1138,6 +1476,24 @@ pub fn install_managed_llama_server_with_options(
         }
         LlamaCppMode::Rocm => {
             configure.arg("-DGGML_HIP=ON");
+            if let Some(target) = rocm_gpu_targets() {
+                if options.verbose {
+                    eprintln!("Using ROCm GPU target {target}");
+                }
+                configure.arg(format!("-DGPU_TARGETS={target}"));
+            }
+            if let Some(no_vmm) = rocm_hip_no_vmm() {
+                if options.verbose {
+                    eprintln!(
+                        "HIP virtual-memory manager disabled: {}",
+                        if no_vmm { "yes" } else { "no" }
+                    );
+                }
+                configure.arg(format!(
+                    "-DGGML_HIP_NO_VMM={}",
+                    if no_vmm { "ON" } else { "OFF" }
+                ));
+            }
         }
         LlamaCppMode::Vulkan => {
             configure.arg("-DGGML_VULKAN=ON");
@@ -1191,19 +1547,28 @@ pub fn backend_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
             &["--version"],
             "required to configure/build llama.cpp",
         ),
-        command_check(
+    ];
+    if current_host_is_strix_halo() {
+        checks.push(command_check(
+            "hipcc",
+            &["--version"],
+            "required to compile the managed llama.cpp ROCm/HIP backend",
+        ));
+    } else {
+        checks.push(command_check(
             "nvidia-smi",
             &[],
             "required to verify NVIDIA driver visibility for CUDA backends",
-        ),
-        command_check(
+        ));
+        checks.push(command_check(
             "nvcc",
             &["--version"],
             "required to build llama.cpp CUDA backends from source",
-        ),
-    ];
-    checks.push(cuda_host_compiler_check());
-    checks.push(cuda_architecture_check());
+        ));
+        checks.push(cuda_host_compiler_check());
+        checks.push(cuda_architecture_check());
+    }
+    checks.push(rocm_build_profile_check());
     checks.push(cache_write_check(store));
     checks
 }
@@ -1260,6 +1625,26 @@ fn require_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<LlamaS
 }
 
 fn discover_llama_server(store: &ModelStore, mode: LlamaCppMode) -> LlamaServerDiscovery {
+    let strict_strix_rocm = strict_strix_rocm_discovery(
+        current_host_is_strix_halo(),
+        current_selected_rocm_device_status(),
+    );
+    discover_llama_server_for_host(store, mode, strict_strix_rocm)
+}
+
+fn strict_strix_rocm_discovery(
+    strix_halo_host: bool,
+    selected_device: SelectedRocmDeviceStatus,
+) -> bool {
+    selected_device == SelectedRocmDeviceStatus::StrixHalo
+        || (strix_halo_host && selected_device == SelectedRocmDeviceStatus::Unknown)
+}
+
+fn discover_llama_server_for_host(
+    store: &ModelStore,
+    mode: LlamaCppMode,
+    strict_strix_rocm_profile: bool,
+) -> LlamaServerDiscovery {
     let mut attempts = Vec::new();
     let specific_env = mode_env_name(mode);
     if let Some(path) = env::var_os(specific_env).map(PathBuf::from) {
@@ -1283,6 +1668,52 @@ fn discover_llama_server(store: &ModelStore, mode: LlamaCppMode) -> LlamaServerD
             path: None,
             exists: false,
         });
+    }
+
+    let strict_strix_rocm = strict_strix_rocm_profile && mode == LlamaCppMode::Rocm;
+    if strict_strix_rocm {
+        let managed_root = managed_backend_dir(store, mode);
+        if let Some(path) = find_managed_server(store, mode) {
+            attempts.push(LlamaServerDiscoveryAttempt {
+                label: "managed cache".to_string(),
+                path: Some(path.clone()),
+                exists: true,
+            });
+            return LlamaServerDiscovery {
+                mode,
+                path: Some(path),
+                source: "managed cache".to_string(),
+                attempts,
+            };
+        }
+        attempts.push(LlamaServerDiscoveryAttempt {
+            label: "managed cache".to_string(),
+            path: Some(managed_root),
+            exists: false,
+        });
+
+        let generic_path = env::var_os("WERK_LLAMA_SERVER").map(PathBuf::from);
+        attempts.push(LlamaServerDiscoveryAttempt {
+            label: "WERK_LLAMA_SERVER (not mode-specific for Strix Halo ROCm; use WERK_LLAMA_SERVER_ROCM)"
+                .to_string(),
+            exists: generic_path.as_ref().is_some_and(|path| path.is_file()),
+            path: generic_path,
+        });
+        let path_server = find_in_path(default_executable_name());
+        attempts.push(LlamaServerDiscoveryAttempt {
+            label: format!(
+                "PATH: {} (not mode-verified for Strix Halo ROCm)",
+                default_executable_name()
+            ),
+            exists: path_server.is_some(),
+            path: path_server,
+        });
+        return LlamaServerDiscovery {
+            mode,
+            path: None,
+            source: "missing".to_string(),
+            attempts,
+        };
     }
 
     if let Some(path) = env::var_os("WERK_LLAMA_SERVER").map(PathBuf::from) {
@@ -1470,10 +1901,10 @@ fn cuda_compiler() -> Option<PathBuf> {
 }
 
 fn cuda_host_compiler() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("WERK_LLAMA_CUDA_HOST_COMPILER").map(PathBuf::from) {
-        if path.is_file() {
-            return Some(path);
-        }
+    if let Some(path) = env::var_os("WERK_LLAMA_CUDA_HOST_COMPILER").map(PathBuf::from)
+        && path.is_file()
+    {
+        return Some(path);
     }
     if cuda_major_version().is_some_and(|major| major <= 11) {
         let candidate = PathBuf::from("/usr/bin/g++-10");
@@ -1495,6 +1926,283 @@ fn matching_c_compiler(cxx_compiler: &Path) -> Option<PathBuf> {
     };
     let c_compiler = cxx_compiler.with_file_name(c_name);
     c_compiler.is_file().then_some(c_compiler)
+}
+
+fn rocm_gpu_targets() -> Option<String> {
+    let werk_override = env::var("WERK_LLAMA_ROCM_ARCH").ok();
+    let cmake_override = env::var("GPU_TARGETS").ok();
+    select_rocm_gpu_targets(
+        current_selected_rocm_device_is_strix_halo(),
+        werk_override.as_deref(),
+        cmake_override.as_deref(),
+    )
+}
+
+fn select_rocm_gpu_targets(
+    strix_halo: bool,
+    werk_override: Option<&str>,
+    cmake_override: Option<&str>,
+) -> Option<String> {
+    werk_override
+        .and_then(non_empty_trimmed)
+        .or_else(|| cmake_override.and_then(non_empty_trimmed))
+        .map(ToString::to_string)
+        .or_else(|| strix_halo.then(|| "gfx1151".to_string()))
+}
+
+fn rocm_hip_no_vmm() -> Option<bool> {
+    let werk_override = env::var("WERK_LLAMA_HIP_NO_VMM").ok();
+    let upstream_override = env::var("GGML_HIP_NO_VMM").ok();
+    select_rocm_hip_no_vmm(
+        current_selected_rocm_device_is_strix_halo(),
+        werk_override.as_deref(),
+        upstream_override.as_deref(),
+    )
+}
+
+fn select_rocm_hip_no_vmm(
+    strix_halo: bool,
+    werk_override: Option<&str>,
+    upstream_override: Option<&str>,
+) -> Option<bool> {
+    werk_override
+        .and_then(parse_boolean_setting)
+        .or_else(|| upstream_override.and_then(parse_boolean_setting))
+        .or_else(|| strix_halo.then_some(true))
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn parse_boolean_setting(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn current_host_is_strix_halo() -> bool {
+    let supported_platform = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+    if !supported_platform {
+        return false;
+    }
+    // A specialized release artifact is itself an authoritative platform
+    // signal. This keeps the profile active in containers that hide DMI and
+    // /proc CPU names and do not expose rocminfo until runtime provisioning.
+    if strix_halo_profile_selected(
+        supported_platform,
+        cfg!(feature = "release-linux-strix-halo"),
+        false,
+    ) {
+        return true;
+    }
+    strix_halo_profile_selected(
+        supported_platform,
+        false,
+        *STRIX_HALO.get_or_init(probe_current_host_is_strix_halo),
+    )
+}
+
+/// Returns whether logical ROCm device zero resolves to Strix Halo's gfx1151
+/// architecture. Host-level Strix detection is intentionally insufficient:
+/// a workstation can expose another AMD GPU before its integrated gfx1151.
+pub(crate) fn current_selected_rocm_device_is_strix_halo() -> bool {
+    current_selected_rocm_device_status() == SelectedRocmDeviceStatus::StrixHalo
+}
+
+pub(crate) fn current_selected_rocm_device_status() -> SelectedRocmDeviceStatus {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return SelectedRocmDeviceStatus::Unknown;
+    }
+    *SELECTED_ROCM_DEVICE_STATUS.get_or_init(probe_selected_rocm_device_status)
+}
+
+fn probe_selected_rocm_device_status() -> SelectedRocmDeviceStatus {
+    let Some(output) = Command::new("rocminfo")
+        // Enumerate physical agents, then apply the process visibility selector
+        // below. This avoids depending on which aliases a given rocminfo build
+        // happens to honor.
+        .env_remove("ROCR_VISIBLE_DEVICES")
+        .env_remove("HIP_VISIBLE_DEVICES")
+        .env_remove("CUDA_VISIBLE_DEVICES")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+    else {
+        return SelectedRocmDeviceStatus::Unknown;
+    };
+    selected_rocm_device_status(
+        &String::from_utf8_lossy(&output.stdout),
+        env::var("ROCR_VISIBLE_DEVICES").ok().as_deref(),
+        env::var("HIP_VISIBLE_DEVICES").ok().as_deref(),
+        env::var("CUDA_VISIBLE_DEVICES").ok().as_deref(),
+    )
+}
+
+#[cfg(test)]
+fn selected_rocm_device_is_strix_halo(
+    rocminfo: &str,
+    rocr_visible_devices: Option<&str>,
+    hip_visible_devices: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+) -> bool {
+    selected_rocm_device_status(
+        rocminfo,
+        rocr_visible_devices,
+        hip_visible_devices,
+        cuda_visible_devices,
+    ) == SelectedRocmDeviceStatus::StrixHalo
+}
+
+fn selected_rocm_device_status(
+    rocminfo: &str,
+    rocr_visible_devices: Option<&str>,
+    hip_visible_devices: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+) -> SelectedRocmDeviceStatus {
+    let architectures = rocminfo_gfx_architectures(rocminfo);
+    let Some(index) = selected_rocm_physical_index(
+        rocr_visible_devices,
+        hip_visible_devices,
+        cuda_visible_devices,
+        &architectures,
+    ) else {
+        return SelectedRocmDeviceStatus::Unknown;
+    };
+    match architectures.get(index) {
+        Some(architecture) if architecture.eq_ignore_ascii_case("gfx1151") => {
+            SelectedRocmDeviceStatus::StrixHalo
+        }
+        Some(_) => SelectedRocmDeviceStatus::Other,
+        None => SelectedRocmDeviceStatus::Unknown,
+    }
+}
+
+fn rocminfo_gfx_architectures(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (label, value) = line.split_once(':')?;
+            if !label.trim().eq_ignore_ascii_case("name") {
+                return None;
+            }
+            let architecture = value.split_whitespace().next()?;
+            let lower = architecture.to_ascii_lowercase();
+            let suffix = lower.strip_prefix("gfx")?;
+            (!suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit()))
+                .then_some(architecture)
+        })
+        .collect()
+}
+
+fn selected_rocm_physical_index(
+    rocr_visible_devices: Option<&str>,
+    hip_visible_devices: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+    architectures: &[&str],
+) -> Option<usize> {
+    let Some(selector) = [
+        rocr_visible_devices,
+        hip_visible_devices,
+        cuda_visible_devices,
+    ]
+    .into_iter()
+    .flatten()
+    .next() else {
+        return Some(0);
+    };
+    let first = selector.split(',').next()?.trim();
+    if first.is_empty()
+        || matches!(
+            first.to_ascii_lowercase().as_str(),
+            "-1" | "none" | "disabled" | "void"
+        )
+    {
+        return None;
+    }
+    if first.eq_ignore_ascii_case("all") {
+        return Some(0);
+    }
+    if let Ok(index) = first.parse::<usize>() {
+        return Some(index);
+    }
+    let official_gpu_uuid = first
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GPU-"));
+    if official_gpu_uuid
+        && (architectures.len() == 1
+            || (!architectures.is_empty()
+                && architectures
+                    .iter()
+                    .all(|architecture| architecture.eq_ignore_ascii_case("gfx1151"))))
+    {
+        return Some(0);
+    }
+    // A UUID cannot be mapped safely to a mixed rocminfo agent list without
+    // parsing the matching agent identity. Keep hybrid selections unknown
+    // instead of accidentally enabling UMA and gfx1151 build defaults.
+    None
+}
+
+fn strix_halo_profile_selected(
+    supported_platform: bool,
+    specialized_build: bool,
+    host_signal: bool,
+) -> bool {
+    supported_platform && (specialized_build || host_signal)
+}
+
+fn probe_current_host_is_strix_halo() -> bool {
+    let cpu_info = fs::read_to_string("/proc/cpuinfo").ok();
+    let product_name = fs::read_to_string("/sys/class/dmi/id/product_name").ok();
+    let board_name = fs::read_to_string("/sys/class/dmi/id/board_name").ok();
+    if strix_halo_host_signals(
+        env::consts::ARCH,
+        [
+            cpu_info.as_deref(),
+            product_name.as_deref(),
+            board_name.as_deref(),
+        ],
+    ) {
+        return true;
+    }
+
+    let rocminfo = Command::new("rocminfo")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    strix_halo_host_signals(env::consts::ARCH, [rocminfo.as_deref()])
+}
+
+fn strix_halo_host_signals<'a>(
+    architecture: &str,
+    signals: impl IntoIterator<Item = Option<&'a str>>,
+) -> bool {
+    architecture == "x86_64"
+        && signals
+            .into_iter()
+            .flatten()
+            .any(signal_identifies_strix_halo)
+}
+
+fn signal_identifies_strix_halo(signal: &str) -> bool {
+    let lower = signal.to_ascii_lowercase();
+    lower.contains("strix halo")
+        || lower.contains("ryzen ai max")
+        || lower.contains("radeon 8060s")
+        || lower.contains("radeon 8050s")
+        || lower.contains("radeon 8040s")
+        || signal_has_exact_token(&lower, "gfx1151")
+}
+
+fn signal_has_exact_token(signal: &str, expected: &str) -> bool {
+    signal
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(expected))
 }
 
 fn cuda_major_version() -> Option<u32> {
@@ -1528,6 +2236,12 @@ fn cuda_architecture() -> Option<String> {
     {
         return Some(value.trim().to_string());
     }
+    if current_host_is_dgx_spark() {
+        // llama.cpp's CMake build accepts the architecture-specific GB10
+        // target documented by NVIDIA. Candle's CUDA_COMPUTE_CAP uses the
+        // separate numeric `121` spelling and is configured in Cargo.
+        return Some("121a-real".to_string());
+    }
     let output = Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
@@ -1540,6 +2254,45 @@ fn cuda_architecture() -> Option<String> {
         .find_map(|line| {
             let arch = line.trim().replace('.', "");
             (!arch.is_empty() && arch.chars().all(|ch| ch.is_ascii_digit())).then_some(arch)
+        })
+}
+
+fn current_host_is_dgx_spark() -> bool {
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        return false;
+    }
+    let device_tree_model = fs::read_to_string("/proc/device-tree/model").ok();
+    let gpu_names = Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    dgx_spark_host_signals(
+        env::consts::ARCH,
+        device_tree_model.as_deref(),
+        gpu_names.as_deref(),
+    )
+}
+
+fn dgx_spark_host_signals(
+    architecture: &str,
+    device_tree_model: Option<&str>,
+    gpu_names: Option<&str>,
+) -> bool {
+    if architecture != "aarch64" {
+        return false;
+    }
+    [device_tree_model, gpu_names]
+        .into_iter()
+        .flatten()
+        .map(str::to_ascii_lowercase)
+        .any(|signal| {
+            signal.contains("dgx spark")
+                || signal.contains("nvidia spark")
+                || signal
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|token| token == "gb10")
         })
 }
 
@@ -1577,6 +2330,87 @@ fn cuda_architecture_check() -> BackendDoctorCheck {
                 .to_string(),
         },
     }
+}
+
+fn rocm_build_profile_check() -> BackendDoctorCheck {
+    if !current_selected_rocm_device_is_strix_halo() {
+        return BackendDoctorCheck {
+            name: "ROCm build profile".to_string(),
+            ok: true,
+            detail: rocm_gpu_targets().map_or_else(
+                || "generic host; llama.cpp performs its normal ROCm target selection".to_string(),
+                |target| format!("explicit GPU_TARGETS={target}"),
+            ),
+        };
+    }
+
+    match Command::new("rocminfo").output() {
+        Ok(output)
+            if output.status.success()
+                && signal_has_exact_token(&String::from_utf8_lossy(&output.stdout), "gfx1151") =>
+        {
+            BackendDoctorCheck {
+                name: "ROCm build profile".to_string(),
+                ok: true,
+                detail: strix_halo_rocm_profile_detail(),
+            }
+        }
+        Ok(output) if output.status.success() => BackendDoctorCheck {
+            name: "ROCm build profile".to_string(),
+            ok: false,
+            detail: "Strix Halo host detected, but rocminfo did not report gfx1151; install a supported ROCm stack before building llama-rocm"
+                .to_string(),
+        },
+        Ok(output) => BackendDoctorCheck {
+            name: "ROCm build profile".to_string(),
+            ok: false,
+            detail: format!(
+                "Strix Halo host detected, but rocminfo exited with {}; install a supported ROCm stack before building llama-rocm",
+                output.status
+            ),
+        },
+        Err(err) => BackendDoctorCheck {
+            name: "ROCm build profile".to_string(),
+            ok: false,
+            detail: format!(
+                "Strix Halo host detected, but rocminfo is unavailable ({err}); install a supported ROCm stack before building llama-rocm"
+            ),
+        },
+    }
+}
+
+fn strix_halo_rocm_profile_detail() -> String {
+    let target = rocm_gpu_targets().unwrap_or_else(|| "gfx1151".to_string());
+    let unified_memory_override = env::var("GGML_CUDA_ENABLE_UNIFIED_MEMORY").ok();
+    format_strix_halo_rocm_profile_detail(
+        &target,
+        rocm_hip_no_vmm(),
+        unified_memory_override.as_deref(),
+    )
+}
+
+fn format_strix_halo_rocm_profile_detail(
+    target: &str,
+    hip_no_vmm: Option<bool>,
+    unified_memory_override: Option<&str>,
+) -> String {
+    let vmm = match hip_no_vmm {
+        Some(true) => "HIP VMM disabled".to_string(),
+        Some(false) => "HIP VMM enabled by explicit override".to_string(),
+        None => "HIP VMM follows the upstream default".to_string(),
+    };
+    let unified_memory = unified_memory_override.map_or_else(
+        || "GGML_CUDA_ENABLE_UNIFIED_MEMORY unset; Werk does not enable this experimental switch automatically on gfx1151".to_string(),
+        |value| {
+            format!(
+                "GGML_CUDA_ENABLE_UNIFIED_MEMORY is present with value '{}'; llama.cpp treats presence as an explicit experimental opt-in",
+                value.trim()
+            )
+        },
+    );
+    format!(
+        "Strix Halo gfx1151 verified; managed llama-rocm uses GPU_TARGETS={target}; {vmm}; {unified_memory}"
+    )
 }
 
 fn command_check(command: &str, args: &[&str], detail: &str) -> BackendDoctorCheck {
@@ -1852,7 +2686,7 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openai::{ChatMessage, MessageContent};
+    use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
     use std::{
         env,
         ffi::OsString,
@@ -1900,6 +2734,10 @@ mod tests {
             root.join("backends").join("llama-cuda")
         );
         assert_eq!(
+            managed_backend_dir(&store, LlamaCppMode::Rocm),
+            root.join("backends").join("llama-rocm")
+        );
+        assert_eq!(
             managed_backend_dir(&store, LlamaCppMode::Vulkan),
             root.join("backends").join("llama-vulkan")
         );
@@ -1911,6 +2749,222 @@ mod tests {
             managed_backend_dir(&store, LlamaCppMode::Cpu),
             root.join("backends").join("llama-cpu")
         );
+    }
+
+    #[test]
+    fn dgx_spark_selects_the_architecture_specific_llama_cmake_target() {
+        assert!(dgx_spark_host_signals(
+            "aarch64",
+            Some("NVIDIA DGX Spark\0"),
+            None
+        ));
+        assert!(dgx_spark_host_signals(
+            "aarch64",
+            None,
+            Some("NVIDIA GB10\n")
+        ));
+        assert!(!dgx_spark_host_signals(
+            "x86_64",
+            Some("NVIDIA DGX Spark"),
+            Some("NVIDIA GB10")
+        ));
+        assert!(!dgx_spark_host_signals(
+            "aarch64",
+            Some("generic arm server"),
+            Some("NVIDIA H100")
+        ));
+        assert!(!dgx_spark_host_signals(
+            "aarch64",
+            None,
+            Some("NVIDIA GB100")
+        ));
+    }
+
+    #[test]
+    fn strix_halo_detection_requires_x86_64_and_a_specific_gfx1151_signal() {
+        assert!(strix_halo_host_signals(
+            "x86_64",
+            [Some("Name: gfx1151\nMarketing Name: Radeon 8060S Graphics")]
+        ));
+        assert!(strix_halo_host_signals(
+            "x86_64",
+            [Some("AMD Ryzen AI Max+ PRO 395 w/ Radeon 8060S")]
+        ));
+        assert!(strix_halo_host_signals(
+            "x86_64",
+            [Some("AMD Ryzen AI Max 380 w/ Radeon 8040S")]
+        ));
+        assert!(!strix_halo_host_signals(
+            "aarch64",
+            [Some("gfx1151 Strix Halo")]
+        ));
+        assert!(!strix_halo_host_signals(
+            "x86_64",
+            [Some("AMD Radeon Graphics gfx1100")]
+        ));
+        assert!(!strix_halo_host_signals("x86_64", [Some("Name: gfx11510")]));
+        assert!(!strix_halo_host_signals("x86_64", [Some("NVIDIA GB100")]));
+    }
+
+    #[test]
+    fn selected_rocm_device_must_be_gfx1151_on_hybrid_amd_hosts() {
+        let discrete_first = r#"
+Agent 1
+  Name:                    AMD Ryzen Processor
+Agent 2
+  Name:                    gfx1100
+Agent 3
+  Name:                    gfx1151
+"#;
+        assert!(!selected_rocm_device_is_strix_halo(
+            discrete_first,
+            None,
+            None,
+            None,
+        ));
+        assert!(selected_rocm_device_is_strix_halo(
+            discrete_first,
+            Some("1"),
+            None,
+            None,
+        ));
+
+        let integrated_first = r#"
+Agent 1
+  Name:                    AMD Ryzen Processor
+Agent 2
+  Name:                    gfx1151
+Agent 3
+  Name:                    gfx1100
+"#;
+        assert!(selected_rocm_device_is_strix_halo(
+            integrated_first,
+            None,
+            None,
+            None,
+        ));
+        assert!(!selected_rocm_device_is_strix_halo(
+            integrated_first,
+            None,
+            Some("1"),
+            None,
+        ));
+        assert!(!selected_rocm_device_is_strix_halo(
+            integrated_first,
+            Some("-1"),
+            None,
+            None,
+        ));
+        assert!(!selected_rocm_device_is_strix_halo(
+            integrated_first,
+            Some(""),
+            None,
+            None,
+        ));
+        assert_eq!(
+            selected_rocm_device_status(integrated_first, Some(""), None, None),
+            SelectedRocmDeviceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn rocm_gpu_uuid_is_resolved_only_when_the_architecture_is_unambiguous() {
+        let single_strix = r#"
+Agent 1
+  Name:                    AMD Ryzen Processor
+Agent 2
+  Name:                    gfx1151
+"#;
+        assert_eq!(
+            selected_rocm_device_status(single_strix, Some("GPU-deadbeef"), None, None),
+            SelectedRocmDeviceStatus::StrixHalo
+        );
+
+        let hybrid = r#"
+Agent 1
+  Name:                    AMD Ryzen Processor
+Agent 2
+  Name:                    gfx1100
+Agent 3
+  Name:                    gfx1151
+"#;
+        assert_eq!(
+            selected_rocm_device_status(hybrid, Some("GPU-deadbeef"), None, None),
+            SelectedRocmDeviceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn strix_rocm_discovery_is_generic_only_for_a_confirmed_other_device() {
+        assert!(strict_strix_rocm_discovery(
+            true,
+            SelectedRocmDeviceStatus::StrixHalo
+        ));
+        assert!(strict_strix_rocm_discovery(
+            true,
+            SelectedRocmDeviceStatus::Unknown
+        ));
+        assert!(!strict_strix_rocm_discovery(
+            true,
+            SelectedRocmDeviceStatus::Other
+        ));
+        assert!(!strict_strix_rocm_discovery(
+            false,
+            SelectedRocmDeviceStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn specialized_strix_halo_artifact_keeps_its_profile_without_host_signals() {
+        assert!(strix_halo_profile_selected(true, true, false));
+        assert!(strix_halo_profile_selected(true, false, true));
+        assert!(!strix_halo_profile_selected(true, false, false));
+        assert!(!strix_halo_profile_selected(false, true, true));
+    }
+
+    #[cfg(feature = "release-linux-strix-halo")]
+    #[test]
+    fn specialized_strix_halo_feature_is_an_authoritative_current_host_signal() {
+        assert!(current_host_is_strix_halo());
+    }
+
+    #[test]
+    fn strix_halo_rocm_build_profile_is_targeted_without_spoofing() {
+        assert_eq!(
+            select_rocm_gpu_targets(true, None, None).as_deref(),
+            Some("gfx1151")
+        );
+        assert_eq!(
+            select_rocm_gpu_targets(true, Some(" gfx1100 "), Some("gfx1151")).as_deref(),
+            Some("gfx1100")
+        );
+        assert_eq!(
+            select_rocm_gpu_targets(true, Some("  "), Some("gfx942;gfx1151")).as_deref(),
+            Some("gfx942;gfx1151")
+        );
+        assert_eq!(select_rocm_gpu_targets(false, None, None), None);
+
+        assert_eq!(select_rocm_hip_no_vmm(true, None, None), Some(true));
+        assert_eq!(
+            select_rocm_hip_no_vmm(true, Some("off"), Some("on")),
+            Some(false)
+        );
+        assert_eq!(
+            select_rocm_hip_no_vmm(true, Some("invalid"), Some("0")),
+            Some(false)
+        );
+        assert_eq!(select_rocm_hip_no_vmm(false, None, None), None);
+
+        let overridden_detail =
+            format_strix_halo_rocm_profile_detail("gfx1100", Some(false), Some("0"));
+        assert!(overridden_detail.contains("GPU_TARGETS=gfx1100"));
+        assert!(overridden_detail.contains("HIP VMM enabled by explicit override"));
+        assert!(overridden_detail.contains("is present with value '0'"));
+        assert!(overridden_detail.contains("presence as an explicit experimental opt-in"));
+
+        let safe_default = format_strix_halo_rocm_profile_detail("gfx1151", Some(true), None);
+        assert!(safe_default.contains("HIP VMM disabled"));
+        assert!(safe_default.contains("does not enable this experimental switch automatically"));
     }
 
     #[test]
@@ -1943,6 +2997,176 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["stop"][0], "stop");
+    }
+
+    #[test]
+    fn chat_completion_body_preserves_multimodal_parts_and_detail() {
+        let request = GenerateRequest {
+            prompt: "flattened prompt must not replace message parts".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart {
+                        kind: "text".to_string(),
+                        text: Some("Inspect this layout".to_string()),
+                        image_url: None,
+                    },
+                    ContentPart {
+                        kind: "image_url".to_string(),
+                        text: None,
+                        image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
+                            url: "data:image/png;base64,AAAA".to_string(),
+                            detail: Some("high".to_string()),
+                        })),
+                    },
+                    ContentPart {
+                        kind: "input_image".to_string(),
+                        text: None,
+                        image_url: Some(ImageUrlSpec::Url(
+                            "https://example.test/second.png".to_string(),
+                        )),
+                    },
+                ])),
+                name: Some("visual-check".to_string()),
+            }],
+            image_urls: vec![
+                "data:image/png;base64,AAAA".to_string(),
+                "https://example.test/second.png".to_string(),
+            ],
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let body = chat_completion_body(&request);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "Inspect this layout"})
+        );
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(content[1]["image_url"]["detail"], "high");
+        assert_eq!(content[2]["type"], "image_url");
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "https://example.test/second.png"
+        );
+        assert_eq!(body["messages"][0]["name"], "visual-check");
+    }
+
+    #[test]
+    fn llama_vision_rejects_unexposed_local_image_paths() {
+        let request = GenerateRequest {
+            prompt: "Inspect".to_string(),
+            messages: Vec::new(),
+            image_urls: vec!["file:///tmp/private.png".to_string()],
+            max_tokens: 32,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let error = validate_llama_image_sources(&request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("data URL or HTTP(S) URL"));
+    }
+
+    #[test]
+    fn standalone_image_urls_are_added_to_the_last_user_message() {
+        let request = GenerateRequest {
+            prompt: "Inspect this image".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Inspect this image".to_string())),
+                name: None,
+            }],
+            image_urls: vec!["https://example.test/layout.png".to_string()],
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let messages = llama_chat_messages(&request);
+        let content = messages[0]["content"].as_array().unwrap();
+
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "Inspect this image"})
+        );
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "https://example.test/layout.png"
+        );
+    }
+
+    #[test]
+    fn projector_discovery_requires_one_safe_local_manifest_file() {
+        let root = temp_root("mmproj-discovery");
+        let model = touch(root.join("model-q4.gguf"));
+        let projector = touch(root.join("vision").join("model-mmproj-f16.GGUF"));
+        let _unlisted = touch(root.join("unlisted-mmproj.gguf"));
+        let files = vec![
+            model_file("model-q4.gguf"),
+            model_file("vision/model-mmproj-f16.GGUF"),
+            model_file("../unsafe-mmproj.gguf"),
+            model_file("missing-projector.gguf"),
+            model_file("notes-projector.txt"),
+        ];
+
+        let found = discover_multimodal_projector_from_files(&root, &files, &model).unwrap();
+
+        assert_eq!(found.as_deref(), Some(projector.as_path()));
+    }
+
+    #[test]
+    fn projector_discovery_never_treats_the_model_itself_as_a_projector() {
+        let root = temp_root("mmproj-excludes-model");
+        let model = touch(root.join("projector-model.gguf"));
+        let files = vec![model_file("projector-model.gguf")];
+
+        let found = discover_multimodal_projector_from_files(&root, &files, &model).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn projector_discovery_rejects_ambiguous_manifest_candidates() {
+        let root = temp_root("mmproj-ambiguous");
+        let model = touch(root.join("model.gguf"));
+        let _first = touch(root.join("mmproj-f16.gguf"));
+        let _second = touch(root.join("vision-projector-q8.gguf"));
+        let files = vec![
+            model_file("model.gguf"),
+            model_file("mmproj-f16.gguf"),
+            model_file("vision-projector-q8.gguf"),
+        ];
+
+        let error = discover_multimodal_projector_from_files(&root, &files, &model)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("multiple local multimodal projector GGUF files"));
+        assert!(error.contains("mmproj-f16.gguf"));
+        assert!(error.contains("vision-projector-q8.gguf"));
     }
 
     #[test]
@@ -2047,6 +3271,76 @@ mod tests {
         let discovery = discover_llama_server(&store, LlamaCppMode::Cuda);
         assert_eq!(discovery.path.as_deref(), Some(cache_server.as_path()));
         assert_eq!(discovery.source, "managed cache");
+    }
+
+    #[test]
+    fn strix_halo_rocm_managed_cache_wins_over_generic_env_and_path() {
+        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_ROCM", "WERK_LLAMA_SERVER", "PATH"]);
+        let root = temp_root("strix-rocm-managed");
+        let generic = touch(root.join("generic").join(default_executable_name()));
+        let path_dir = root.join("path");
+        let _path_server = touch(path_dir.join(default_executable_name()));
+        let store = ModelStore::resolve(Some(root.join("werk-home"))).unwrap();
+        let managed = touch(
+            managed_backend_dir(&store, LlamaCppMode::Rocm)
+                .join("build")
+                .join("bin")
+                .join(default_executable_name()),
+        );
+        unsafe {
+            env::remove_var("WERK_LLAMA_SERVER_ROCM");
+            env::set_var("WERK_LLAMA_SERVER", &generic);
+            env::set_var("PATH", &path_dir);
+        }
+
+        let discovery = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        assert_eq!(discovery.path.as_deref(), Some(managed.as_path()));
+        assert_eq!(discovery.source, "managed cache");
+    }
+
+    #[test]
+    fn strix_halo_rocm_rejects_unverified_generic_servers_but_accepts_specific_env() {
+        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_ROCM", "WERK_LLAMA_SERVER", "PATH"]);
+        let root = temp_root("strix-rocm-specific");
+        let generic = touch(root.join("generic").join(default_executable_name()));
+        let path_dir = root.join("path");
+        let _path_server = touch(path_dir.join(default_executable_name()));
+        let specific = touch(root.join("specific").join(default_executable_name()));
+        let store = ModelStore::resolve(Some(root.join("werk-home"))).unwrap();
+        unsafe {
+            env::remove_var("WERK_LLAMA_SERVER_ROCM");
+            env::set_var("WERK_LLAMA_SERVER", &generic);
+            env::set_var("PATH", &path_dir);
+        }
+
+        let non_strix_device = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, false);
+        assert_eq!(non_strix_device.path.as_deref(), Some(generic.as_path()));
+        assert_eq!(non_strix_device.source, "env WERK_LLAMA_SERVER");
+
+        let rejected = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        assert_eq!(rejected.path, None);
+        assert_eq!(rejected.source, "missing");
+        assert!(
+            rejected
+                .attempts
+                .iter()
+                .any(|attempt| attempt.label.contains("not mode-specific"))
+        );
+        assert!(
+            rejected
+                .attempts
+                .iter()
+                .any(|attempt| attempt.label.contains("not mode-verified"))
+        );
+
+        unsafe {
+            env::set_var("WERK_LLAMA_SERVER_ROCM", &specific);
+        }
+        let accepted = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        assert_eq!(accepted.path.as_deref(), Some(specific.as_path()));
+        assert_eq!(accepted.source, "env WERK_LLAMA_SERVER_ROCM");
     }
 
     #[test]
@@ -2173,6 +3467,7 @@ mod tests {
         let args = llama_server_args(
             LlamaCppMode::Cuda,
             &PathBuf::from("/tmp/model.gguf"),
+            None,
             12345,
             &LlamaRuntimeOptions::default(),
             &SupportedArgs {
@@ -2196,6 +3491,7 @@ mod tests {
         let args = llama_server_args(
             LlamaCppMode::Cuda,
             &PathBuf::from("/tmp/model.gguf"),
+            None,
             12345,
             &runtime_options,
             &SupportedArgs {
@@ -2212,10 +3508,34 @@ mod tests {
     }
 
     #[test]
+    fn server_args_attach_discovered_projector_when_supported() {
+        let projector = PathBuf::from("/tmp/mmproj-model-f16.gguf");
+        let args = llama_server_args(
+            LlamaCppMode::Cuda,
+            &PathBuf::from("/tmp/model.gguf"),
+            Some(&projector),
+            12345,
+            &LlamaRuntimeOptions::default(),
+            &SupportedArgs {
+                mmproj: true,
+                ..SupportedArgs::default()
+            },
+            false,
+        );
+
+        let mmproj = args.iter().position(|arg| arg == "--mmproj").unwrap();
+        assert_eq!(
+            args.get(mmproj + 1).map(String::as_str),
+            Some("/tmp/mmproj-model-f16.gguf")
+        );
+    }
+
+    #[test]
     fn server_args_disable_qwen3_thinking_when_supported() {
         let args = llama_server_args(
             LlamaCppMode::Cuda,
             &PathBuf::from("/tmp/model.gguf"),
+            None,
             12345,
             &LlamaRuntimeOptions::default(),
             &SupportedArgs {
@@ -2263,5 +3583,13 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         path
+    }
+
+    fn model_file(path: &str) -> ModelFile {
+        ModelFile {
+            path: path.to_string(),
+            size: 1,
+            checksum: String::new(),
+        }
     }
 }

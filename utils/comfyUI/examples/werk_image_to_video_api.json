@@ -1,0 +1,88 @@
+{
+  "1": {
+    "class_type": "WerkConnection",
+    "inputs": {
+      "server_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout_seconds": 1800,
+      "verify_tls": true
+    }
+  },
+  "2": {
+    "class_type": "WerkVideoModels",
+    "inputs": {
+      "connection": ["1", 0],
+      "task": "image-to-video",
+      "refresh_token": 0,
+      "preferred_model": "wan22-ti2v-5b",
+      "require_available": true
+    }
+  },
+  "3": {
+    "class_type": "WerkRoutingConfig",
+    "inputs": {
+      "backend": "",
+      "accelerator": "",
+      "device": "",
+      "precision": "bf16",
+      "quantization": "",
+      "profile": "",
+      "quality": "inherit",
+      "performance_preference": "inherit",
+      "fallback_policy": "inherit",
+      "parameter_policy": "inherit",
+      "allow_cpu_offload": "enabled",
+      "allow_sequential_offload": "inherit",
+      "allow_component_offload": "inherit",
+      "allow_disk_offload": "inherit",
+      "attention_backend": "",
+      "compile": "inherit",
+      "inference_timeout_seconds": 0,
+      "additional_routing_parameters_json": "{}"
+    }
+  },
+  "4": {
+    "class_type": "WerkVideoConfig",
+    "inputs": {
+      "routing": ["3", 0],
+      "width": 1280,
+      "height": 704,
+      "count": 1,
+      "batch_size": 1,
+      "frames": 121,
+      "fps": 24.0,
+      "steps": 50,
+      "guidance": 5.0,
+      "seed": 0,
+      "output_format": "mp4",
+      "temporal_vae_tiling": "inherit",
+      "additional_video_parameters_json": "{}"
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "station.png"
+    }
+  },
+  "6": {
+    "class_type": "WerkVideoGenerate",
+    "inputs": {
+      "connection": ["1", 0],
+      "model": ["2", 0],
+      "config": ["4", 0],
+      "initial_image": ["5", 0],
+      "prompt": "A slow, stable camera orbit around the station",
+      "negative_prompt": "text, watermark, abrupt camera shake"
+    }
+  },
+  "7": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["6", 0],
+      "filename_prefix": "video/Werk1112-I2V",
+      "format": "auto",
+      "codec": "auto"
+    }
+  }
+}
