@@ -12911,7 +12911,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["text", "image_url", "image_url"]
         );
-        assert_eq!(image_urls_from_messages(&[message.clone()]), images);
+        assert_eq!(
+            image_urls_from_messages(std::slice::from_ref(&message)),
+            images
+        );
         assert!(cli_message_content_tokens(message.content.as_ref().unwrap()) >= 2 * 1024);
     }
 

@@ -234,6 +234,7 @@ pub(super) fn integer_descriptor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn bounded_integer_descriptor(
     path: &str,
     cli_flag: &str,

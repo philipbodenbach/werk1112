@@ -177,6 +177,7 @@ authentication, limits, persistence and known gaps.
 
 | Topic | Document |
 | --- | --- |
+| Release notes and upgrade changes | [CHANGELOG.md](CHANGELOG.md) |
 | Documentation home and wiki roadmap | [docs/README.md](docs/README.md) |
 | Installation and first run | [docs/getting-started.md](docs/getting-started.md) |
 | CLI command groups and semantics | [docs/reference/cli.md](docs/reference/cli.md) |

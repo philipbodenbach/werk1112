@@ -514,7 +514,7 @@ pub(super) fn decode_base64(data: &str) -> Result<Vec<u8>> {
         encoded.push(b'=');
     }
     let mut output = Vec::with_capacity(encoded.len() / 4 * 3);
-    for (chunk_index, chunk) in encoded.chunks_exact(4).enumerate() {
+    for (chunk_index, chunk) in encoded.as_chunks::<4>().0.iter().enumerate() {
         let last = chunk_index + 1 == encoded.len() / 4;
         let padding = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
         if padding > 2 || (!last && padding > 0) || chunk[..chunk.len() - padding].contains(&b'=') {
