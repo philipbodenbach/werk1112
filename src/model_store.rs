@@ -472,6 +472,7 @@ impl ModelStore {
             None
         };
         let include_file = explicit_file.or(auto_file);
+        let include_files = selected_lfs_include_files(&tmp, include_file.as_deref())?;
 
         if tmp.join(".gitattributes").is_file() {
             let mut lfs_install_command = Command::new("git");
@@ -488,7 +489,7 @@ impl ModelStore {
                 |_| {},
             )?;
 
-            let total_bytes = lfs_pointer_total(&tmp, include_file.as_deref())?;
+            let total_bytes = lfs_pointer_total_for_files(&tmp, &include_files)?;
             progress(PullProgress::LfsStarted {
                 file: include_file.clone(),
                 total_bytes,
@@ -500,10 +501,10 @@ impl ModelStore {
                 .arg(&tmp)
                 .args(["lfs", "pull"]);
             configure_huggingface_git_auth(&mut lfs_command, auth_token.as_deref());
-            if let Some(include_file) = include_file.as_deref() {
+            if !include_files.is_empty() {
                 lfs_command
                     .arg("--include")
-                    .arg(include_file)
+                    .arg(include_files.join(","))
                     .arg("--exclude")
                     .arg("");
             }
@@ -542,7 +543,7 @@ impl ModelStore {
             progress(PullProgress::LfsFinished);
         }
 
-        if let Some(include_file) = include_file.as_deref() {
+        for include_file in &include_files {
             ensure_lfs_file_downloaded(&tmp, include_file)?;
         }
         let import_tmp = tmp.with_file_name(format!(
@@ -551,8 +552,8 @@ impl ModelStore {
                 .and_then(OsStr::to_str)
                 .unwrap_or("pull-import")
         ));
-        let import_source = if let Some(include_file) = include_file.as_deref() {
-            prepare_included_file_import_tree(&tmp, include_file, &import_tmp)?;
+        let import_source = if include_file.is_some() {
+            prepare_included_file_import_tree(&tmp, &include_files, &import_tmp)?;
             import_tmp.as_path()
         } else {
             tmp.as_path()
@@ -1449,6 +1450,21 @@ fn default_lfs_include_file(root: &Path) -> Result<Option<String>> {
     })
 }
 
+fn selected_lfs_include_files(root: &Path, primary: Option<&str>) -> Result<Vec<String>> {
+    let Some(primary) = primary else {
+        return Ok(Vec::new());
+    };
+    let mut selected = vec![primary.to_string()];
+    if extension_eq(Path::new(primary), "gguf") && !is_gguf_projector_path(primary) {
+        let mut files = Vec::new();
+        collect_files(root, &mut files)?;
+        if let Some(projector) = first_gguf_projector_path(root, &files) {
+            selected.push(projector);
+        }
+    }
+    Ok(selected)
+}
+
 fn resolve_pull_file(root: &Path, file: &str) -> Result<String> {
     let file = normalize_relative_repo_path(file)?;
     if root.join(&file).exists() {
@@ -1531,7 +1547,11 @@ fn ensure_no_lfs_pointers_remaining_in(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn prepare_included_file_import_tree(root: &Path, include_file: &str, dest: &Path) -> Result<()> {
+fn prepare_included_file_import_tree(
+    root: &Path,
+    include_files: &[String],
+    dest: &Path,
+) -> Result<()> {
     if dest.exists() {
         fs::remove_dir_all(dest).with_context(|| {
             format!(
@@ -1542,12 +1562,14 @@ fn prepare_included_file_import_tree(root: &Path, include_file: &str, dest: &Pat
     }
     fs::create_dir_all(dest)?;
 
-    let include_path = root.join(include_file);
-    if !include_path.is_file() {
-        bail!("selected file was not downloaded: {include_file}");
+    for selected_file in include_files {
+        let selected_path = root.join(selected_file);
+        if !selected_path.is_file() {
+            bail!("selected file was not downloaded: {selected_file}");
+        }
+        copy_repo_file(root, &selected_path, dest)?;
     }
-    copy_repo_file(root, &include_path, dest)?;
-    copy_included_import_metadata(root, root, dest, include_file)?;
+    copy_included_import_metadata(root, root, dest, include_files)?;
     Ok(())
 }
 
@@ -1555,7 +1577,7 @@ fn copy_included_import_metadata(
     root: &Path,
     path: &Path,
     dest: &Path,
-    include_file: &str,
+    include_files: &[String],
 ) -> Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -1565,7 +1587,7 @@ fn copy_included_import_metadata(
 
         let entry_path = entry.path();
         if entry_path.is_dir() {
-            copy_included_import_metadata(root, &entry_path, dest, include_file)?;
+            copy_included_import_metadata(root, &entry_path, dest, include_files)?;
             continue;
         }
         if !entry_path.is_file() {
@@ -1575,7 +1597,7 @@ fn copy_included_import_metadata(
         let Some(relative_path) = relative_string(root, &entry_path) else {
             continue;
         };
-        if relative_path == include_file {
+        if include_files.iter().any(|file| file == &relative_path) {
             continue;
         }
         if should_copy_included_import_metadata(&entry_path, &relative_path)? {
@@ -1684,6 +1706,19 @@ fn is_likely_model_artifact_path(relative_path: &str) -> bool {
 fn lfs_pointer_total(path: &Path, include_file: Option<&str>) -> Result<Option<u64>> {
     let mut total = 0u64;
     collect_lfs_pointer_total(path, path, include_file, &mut total)?;
+    Ok((total > 0).then_some(total))
+}
+
+fn lfs_pointer_total_for_files(path: &Path, include_files: &[String]) -> Result<Option<u64>> {
+    if include_files.is_empty() {
+        return lfs_pointer_total(path, None);
+    }
+    let mut total = 0u64;
+    for include_file in include_files {
+        if let Some(size) = lfs_pointer_size(&path.join(include_file))? {
+            total = total.saturating_add(size);
+        }
+    }
     Ok((total > 0).then_some(total))
 }
 
@@ -1946,7 +1981,9 @@ fn first_gguf_model_path(model_dir: &Path, files: &[PathBuf]) -> Option<String> 
     let mut candidates = files
         .iter()
         .filter(|path| extension_eq(path, "gguf"))
-        .filter_map(|path| relative_string(model_dir, path).map(|rel| (gguf_priority(&rel), rel)))
+        .filter_map(|path| relative_string(model_dir, path))
+        .filter(|path| !is_gguf_projector_path(path))
+        .map(|rel| (gguf_priority(&rel), rel))
         .collect::<Vec<_>>();
     candidates.sort_by(|(left_priority, left), (right_priority, right)| {
         left_priority
@@ -1954,6 +1991,38 @@ fn first_gguf_model_path(model_dir: &Path, files: &[PathBuf]) -> Option<String> 
             .then_with(|| left.cmp(right))
     });
     candidates.into_iter().map(|(_, path)| path).next()
+}
+
+fn first_gguf_projector_path(model_dir: &Path, files: &[PathBuf]) -> Option<String> {
+    let mut candidates = files
+        .iter()
+        .filter(|path| extension_eq(path, "gguf"))
+        .filter_map(|path| relative_string(model_dir, path))
+        .filter(|path| is_gguf_projector_path(path))
+        .map(|path| (gguf_projector_priority(&path), path))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_priority, left), (right_priority, right)| {
+        left_priority
+            .cmp(right_priority)
+            .then_with(|| left.cmp(right))
+    });
+    candidates.into_iter().map(|(_, path)| path).next()
+}
+
+fn is_gguf_projector_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".gguf")
+        && ["mmproj", "mm-proj", "vision-projector", "vision_projector"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+}
+
+fn gguf_projector_priority(path: &str) -> usize {
+    let lower = path.to_ascii_lowercase();
+    ["f16", "bf16", "q8_0", "f32"]
+        .iter()
+        .position(|kind| lower.contains(kind))
+        .unwrap_or(usize::MAX)
 }
 
 fn gguf_priority(path: &str) -> usize {
@@ -2942,6 +3011,12 @@ fn infer_model_family(
         (&["llava"][..], "llava"),
         (&["paligemma"][..], "paligemma"),
         (&["qwen2_vl", "qwen2-vl"][..], "qwen2-vl"),
+        (
+            &["qwen2_5_vl", "qwen2.5-vl", "qwen2.5_vl"][..],
+            "qwen2.5-vl",
+        ),
+        (&["qwen3_vl", "qwen3-vl", "qwen3vl"][..], "qwen3-vl"),
+        (&["glm4v", "glm-4v", "glm4.1v", "glm4.5v"][..], "glm4v"),
         (&["gemma4"][..], "gemma4"),
         (&["gemma3"][..], "gemma3"),
         (&["qwen3-tts", "qwen3_tts", "qwen3tts"][..], "qwen3-tts"),
@@ -3411,6 +3486,18 @@ fn infer_inference_tasks(
             "idefics",
             "qwen2_vl",
             "qwen2-vl",
+            "qwen2.5_vl",
+            "qwen2.5-vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3-vl",
+            "qwen3vl",
+            "glm4v",
+            "glm-4v",
+            "glm4.1v",
+            "glm-4.1v",
+            "glm4.5v",
+            "glm-4.5v",
             "gemma4",
         ],
     ) || (!audio && hint.contains("vlm"))
@@ -4753,6 +4840,50 @@ mod tests {
     }
 
     #[test]
+    fn qwen3_vl_and_glm4v_configs_infer_image_understanding() {
+        let tmp = test_dir("modern-vlm-architecture-tasks");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+
+        for (id, model_type, family) in [
+            ("qwen-vl", "qwen3_vl_moe", "qwen3-vl"),
+            ("glm-v", "glm4v_moe", "glm4v"),
+        ] {
+            let source = tmp.join(format!("source-{id}"));
+            fs::create_dir_all(&source).unwrap();
+            fs::write(
+                source.join("config.json"),
+                format!(r#"{{"model_type":"{model_type}","vision_config":{{}}}}"#),
+            )
+            .unwrap();
+            fs::write(source.join("model.safetensors"), b"weights").unwrap();
+
+            let manifest = store.import_path(&source, id).unwrap();
+            assert_eq!(manifest.architecture.as_deref(), Some(model_type));
+            assert_eq!(manifest.metadata.family.as_deref(), Some(family));
+            assert!(
+                manifest
+                    .metadata
+                    .tasks
+                    .contains(&InferenceTask::TextGeneration)
+            );
+            assert!(
+                manifest
+                    .metadata
+                    .tasks
+                    .contains(&InferenceTask::ImageUnderstanding)
+            );
+            assert!(
+                manifest
+                    .metadata
+                    .input_modalities
+                    .contains(&InputModality::Image)
+            );
+        }
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn legacy_whisper_manifest_gains_translation_without_losing_curated_tasks() {
         let tmp = test_dir("legacy-whisper-translation-task");
         let source = tmp.join("source");
@@ -5344,6 +5475,55 @@ mod tests {
     }
 
     #[test]
+    fn gguf_selection_excludes_projector_and_pull_includes_it() {
+        let tmp = test_dir("gguf-vlm-pull-files");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        write_lfs_pointer(&source.join("Qwen3-VL-Q4_K_M.gguf"), 4_000_000_000);
+        write_lfs_pointer(&source.join("mmproj-Qwen3-VL-f16.gguf"), 900_000_000);
+        write_lfs_pointer(&source.join("mmproj-Qwen3-VL-f32.gguf"), 1_800_000_000);
+
+        let primary = default_lfs_include_file(&source).unwrap().unwrap();
+        assert_eq!(primary, "Qwen3-VL-Q4_K_M.gguf");
+        assert_eq!(
+            selected_lfs_include_files(&source, Some(&primary)).unwrap(),
+            vec![
+                "Qwen3-VL-Q4_K_M.gguf".to_string(),
+                "mmproj-Qwen3-VL-f16.gguf".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn included_file_import_tree_keeps_selected_vlm_projector() {
+        let tmp = test_dir("included-vlm-projector");
+        let source = tmp.join("source");
+        let filtered = tmp.join("filtered");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("model-Q4_K_M.gguf"), b"model").unwrap();
+        fs::write(source.join("mmproj-model-f16.gguf"), b"projector").unwrap();
+        write_lfs_pointer(&source.join("model-Q8_0.gguf"), 8_000_000_000);
+
+        prepare_included_file_import_tree(
+            &source,
+            &[
+                "model-Q4_K_M.gguf".to_string(),
+                "mmproj-model-f16.gguf".to_string(),
+            ],
+            &filtered,
+        )
+        .unwrap();
+
+        assert!(filtered.join("model-Q4_K_M.gguf").is_file());
+        assert!(filtered.join("mmproj-model-f16.gguf").is_file());
+        assert!(!filtered.join("model-Q8_0.gguf").exists());
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn dir_size_skips_git_metadata_for_transfer_progress() {
         let tmp = test_dir("transfer-dir-size");
         let source = tmp.join("source");
@@ -5611,7 +5791,12 @@ mod tests {
         fs::create_dir_all(source.join(".git/lfs/objects")).unwrap();
         write_lfs_pointer(&source.join(".git/lfs/objects/object"), 1024);
 
-        prepare_included_file_import_tree(&source, "Qwen3.5-4B-Q4_K_M.gguf", &filtered).unwrap();
+        prepare_included_file_import_tree(
+            &source,
+            &["Qwen3.5-4B-Q4_K_M.gguf".to_string()],
+            &filtered,
+        )
+        .unwrap();
         ensure_no_lfs_pointers_remaining(&filtered).unwrap();
 
         assert!(filtered.join("Qwen3.5-4B-Q4_K_M.gguf").is_file());
@@ -5633,8 +5818,12 @@ mod tests {
         write_lfs_pointer(&source.join("quantized/model.Q5_K_M.gguf"), 5_000_000_000);
         fs::write(source.join("tokenizer_config.json"), b"{}").unwrap();
 
-        prepare_included_file_import_tree(&source, "quantized/model.Q4_K_M.gguf", &filtered)
-            .unwrap();
+        prepare_included_file_import_tree(
+            &source,
+            &["quantized/model.Q4_K_M.gguf".to_string()],
+            &filtered,
+        )
+        .unwrap();
         ensure_no_lfs_pointers_remaining(&filtered).unwrap();
 
         assert!(filtered.join("quantized/model.Q4_K_M.gguf").is_file());

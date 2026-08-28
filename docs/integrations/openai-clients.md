@@ -56,7 +56,11 @@ print(completion.choices[0].message.content)
 
 Chat supports the documented subset of messages, streaming, temperature,
 top-p, completion limits, stop strings and seed. Text and image content parts
-can be used with a compatible vision model and runtime. Tools, tool calls,
+can be used with a compatible vision model and runtime. Ordered
+<code>image_url</code> parts accept data URLs or runtime-reachable URLs and an
+optional <code>detail</code> hint. See
+[Vision and visual quality assurance](vision.md) for a Python-independent curl
+example, the supported backend matrix and visual-inspection guidance. Tools, tool calls,
 structured response formats, audio/video message content, log probabilities
 and stream usage summaries are not implemented by this endpoint.
 

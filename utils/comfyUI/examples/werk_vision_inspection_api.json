@@ -1,0 +1,48 @@
+{
+  "1": {
+    "class_type": "WerkConnection",
+    "inputs": {
+      "server_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout_seconds": 900,
+      "verify_tls": true
+    }
+  },
+  "2": {
+    "class_type": "WerkVisionModels",
+    "inputs": {
+      "connection": ["1", 0],
+      "refresh_token": 0,
+      "preferred_model": "qwen3-vl",
+      "require_available": true
+    }
+  },
+  "3": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "rendered-page.png"
+    }
+  },
+  "4": {
+    "class_type": "WerkVisionConfig",
+    "inputs": {
+      "temperature": 0.1,
+      "top_p": 0.9,
+      "max_completion_tokens": 2048,
+      "seed": 1112,
+      "image_detail": "high",
+      "stop_sequences_json": "[]"
+    }
+  },
+  "5": {
+    "class_type": "WerkVisionAnalyze",
+    "inputs": {
+      "connection": ["1", 0],
+      "model": ["2", 0],
+      "images": ["3", 0],
+      "config": ["4", 0],
+      "system_prompt": "You are a meticulous visual QA inspector. Report only issues visible in the supplied render.",
+      "prompt": "Inspect this rendered page for missing buttons, clipped or overflowing text, misaligned grids, overlaps, inconsistent spacing, and broken visual hierarchy. Return a concise severity-ranked defect list with approximate locations."
+    }
+  }
+}

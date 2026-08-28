@@ -17,7 +17,7 @@ for the managed directory layout.
 | `WERK_HOME` | Managed store root. A global `--model-home` value wins. See the [store resolution order](../concepts/models-manifests-and-store.md#store-root). |
 | `WERK_API_KEY` | Single bearer key for `werk serve`; also the ComfyUI client's default key. A configured serve key must not be empty. |
 | `WERK_API_KEYS` | TOML key file for `werk serve`. The uninstall scripts also consult it when locating an optional key file to remove. |
-| `WERK_API_BODY_LIMIT_BYTES` | Positive request-body limit for audio transcription/translation uploads and generic-job creation. Default: 128 MiB; maximum: 512 MiB. Invalid values use the default. |
+| `WERK_API_BODY_LIMIT_BYTES` | Positive request-body limit for chat completions (including inline vision data), audio transcription/translation uploads and generic-job creation. Default: 128 MiB; maximum: 512 MiB. Invalid values use the default. |
 | `WERK_OUTPUT_MAX_BYTES` | Output-store retention ceiling. Default: 20 GiB; invalid values use the default. Oldest outputs are removed first. |
 | `WERK_OUTPUT_RETENTION_SECONDS` | Maximum output age. Default: 2,592,000 seconds (30 days); invalid values use the default. |
 | `WERK_ACCELERATOR_MEMORY_BYTES` | Unsigned byte estimate overriding detected non-CPU accelerator memory for planning. |
@@ -128,10 +128,11 @@ These variables are read by the Python custom node, not by the Werk server:
 | `WERK_MAX_VIDEO_BYTES` | 536,870,912 | Maximum video bytes accepted by the node. |
 | `WERK_MAX_AUDIO_BYTES` | 268,435,456 | Maximum returned/downloaded audio bytes. |
 | `WERK_MAX_AUDIO_INPUT_BYTES` | 67,108,864 | Maximum input audio bytes before Base64 encoding. |
+| `WERK_MAX_VISION_INPUT_BYTES` | 67,108,864 | Maximum aggregate PNG bytes embedded by the ComfyUI vision node before Base64 encoding. |
 
 ComfyUI labels such as `WERK_CONNECTION`, `WERK_ROUTING_CONFIG`,
-`WERK_IMAGE_CONFIG`, `WERK_VIDEO_CONFIG`, and `WERK_AUDIO_CONFIG` are socket
-type names, not environment variables.
+`WERK_IMAGE_CONFIG`, `WERK_VISION_CONFIG`, `WERK_VIDEO_CONFIG`, and
+`WERK_AUDIO_CONFIG` are socket type names, not environment variables.
 
 ## Recognized host and toolchain variables
 

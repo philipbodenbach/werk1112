@@ -81,6 +81,33 @@ werk video generate VIDEO_MODEL \
   --verbose --debug
 ~~~
 
+## Vision-language routing
+
+An image attached to `werk run`, `werk chat` or
+`POST /v1/chat/completions` changes runtime eligibility. The model manifest must
+advertise image input and `image-understanding`; a text-only model is rejected
+even if an installed backend can execute some other VLM.
+
+| Runtime route | Current eligible model shape | Additional requirement |
+| --- | --- | --- |
+| Persistent llama.cpp server | Compatible VLM GGUF | Exactly one safe local projector GGUF listed in the manifest; its filename contains `mmproj` or `projector`, and `llama-server --help` advertises `--mmproj` |
+| vLLM | Transformers safetensors with exact architecture `qwen2_vl`, `qwen2_5_vl`, `qwen3_vl`, `qwen3_vl_moe`, `glm4v` or `glm4v_moe` | Compatible installed vLLM version and model-specific processor; local or explicitly configured remote endpoint |
+| MLX-VLM | MLX or safetensors `gemma4_unified` repository | Importable `mlx-vlm` environment on Apple Silicon |
+| Candle | None | The in-process Candle adapter is currently text-only |
+
+vLLM is optional and is not what makes a model visual. The vision encoder,
+projector and preprocessing belong to the checkpoint/runtime implementation.
+The primary non-vLLM path is llama.cpp plus the model's matching multimodal
+projector. Model weights remain resident in persistent llama.cpp/vLLM server
+processes, although cache details and image-embedding reuse remain
+backend-specific.
+
+Werk preserves ordered text/image parts and the image `detail` hint for the
+llama.cpp and vLLM chat transports. The MLX-VLM subprocess currently receives
+the prompt and image list but not arbitrary interleaving or `detail` semantics.
+See [Vision and visual quality assurance](integrations/vision.md) for API and
+CLI examples, body limits and the rendered HTML/slide inspection workflow.
+
 ## Fallback policies
 
 | Policy | Candidate behavior | Quality or memory adjustment |

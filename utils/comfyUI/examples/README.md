@@ -13,6 +13,14 @@ node IDs map to `{class_type, inputs}` objects and connected values use
 `[origin_node_id, output_slot]`. It includes both `PreviewImage` and
 `SaveImage` output nodes.
 
+`werk_vision_inspection_api.json` is an API prompt for post-render visual QA.
+It connects **Load Image** through **WERK Vision Models**, **WERK Vision
+Config**, and **WERK Vision Analyze**, then asks for missing controls, clipped
+or overflowing text, misaligned grids, overlaps, spacing, and hierarchy defects.
+Replace its illustrative `qwen3-vl` alias with an installed model that Werk
+reports as runtime-available for `image-understanding`, and upload or rename
+`rendered-page.png` before submitting it.
+
 `werk_video_generation_api.json` and `werk_image_to_video_api.json` are API
 prompts for the new native `VIDEO` path. Both make the task and
 `preferred_model=wan22-ti2v-5b` explicit, leave backend selection at Werk's
@@ -66,6 +74,9 @@ The examples assume:
   discovered executable Werk audio models. The voice-conversion example is
   intentionally unavailable with the bundled companion until a reliable
   generic adapter exists.
+- the vision example uses a current ComfyUI `IMAGE`, sends the image batch as
+  bounded inline PNG data URLs, and requires a Werk vision runtime; text-only
+  execution of the same model repository is insufficient.
 
 No credential is included. The example explicitly enables CPU and component
 offload for the FLUX model. Update the model, routing choices, and connection

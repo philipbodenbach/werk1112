@@ -16,17 +16,20 @@ try:
         WerkConnection,
         WerkImageConfig,
         WerkRoutingConfig,
+        WerkVisionConfig,
         WerkVideoConfig,
         environment_api_key,
         environment_max_audio_input_bytes,
         environment_max_audio_bytes,
         environment_max_image_pixels,
+        environment_max_vision_input_bytes,
         environment_max_video_bytes,
         environment_server_url,
     )
     from .audio_utils import audio_bytes_to_comfy, comfy_audio_to_api_input
     from .image_utils import (
         batch_image_tensors,
+        comfy_images_to_data_urls,
         decode_base64_image,
         image_bytes_to_tensor,
     )
@@ -39,17 +42,20 @@ except ImportError:  # pragma: no cover - direct-module development
         WerkConnection,
         WerkImageConfig,
         WerkRoutingConfig,
+        WerkVisionConfig,
         WerkVideoConfig,
         environment_api_key,
         environment_max_audio_input_bytes,
         environment_max_audio_bytes,
         environment_max_image_pixels,
+        environment_max_vision_input_bytes,
         environment_max_video_bytes,
         environment_server_url,
     )
     from audio_utils import audio_bytes_to_comfy, comfy_audio_to_api_input
     from image_utils import (
         batch_image_tensors,
+        comfy_images_to_data_urls,
         decode_base64_image,
         image_bytes_to_tensor,
     )
@@ -57,6 +63,7 @@ except ImportError:  # pragma: no cover - direct-module development
 
 
 IMAGE_TASK = "image-generation"
+VISION_TASK = "image-understanding"
 VIDEO_GENERATION_TASK = "video-generation"
 IMAGE_TO_VIDEO_TASK = "image-to-video"
 VIDEO_TASKS = (VIDEO_GENERATION_TASK, IMAGE_TO_VIDEO_TASK)
@@ -234,6 +241,13 @@ ALLOWED_IMAGE_REQUEST_FIELDS = {
 ALLOWED_VIDEO_REQUEST_FIELDS = {"n", "size", "response_format"}
 ALLOWED_AUDIO_GENERATION_REQUEST_FIELDS = {"n", "response_format"}
 ALLOWED_TTS_REQUEST_FIELDS = {"voice", "speed", "response_format"}
+ALLOWED_VISION_REQUEST_FIELDS = {
+    "temperature",
+    "top_p",
+    "max_completion_tokens",
+    "stop",
+    "seed",
+}
 
 
 def _json_text(value: Any) -> str:
@@ -391,6 +405,51 @@ def classify_image_models(
                 "id": model_id,
                 "declares_image_generation": IMAGE_TASK in tasks,
                 "image_generation_probe_eligible": IMAGE_TASK in available_tasks,
+                "tasks": tasks,
+                "available_tasks": available_tasks,
+                "task_statuses": task_statuses,
+            }
+        )
+    return {
+        "installed": installed_ids,
+        "declared": declared,
+        "available": available,
+        "models": metadata,
+    }
+
+
+def classify_vision_models(
+    models_payload: Any, capabilities_payload: Any
+) -> dict[str, Any]:
+    """Classify models by Werk's authoritative image-understanding task."""
+
+    installed = _model_entries(models_payload)
+    installed_ids = [entry["id"] for entry in installed]
+    capability_by_id = {
+        entry["id"]: entry for entry in _capability_entries(capabilities_payload)
+    }
+    declared: list[str] = []
+    available: list[str] = []
+    metadata: list[dict[str, Any]] = []
+    for model in installed:
+        model_id = model["id"]
+        capability = capability_by_id.get(model_id, model)
+        tasks = _normalized_tasks(capability.get("tasks", model.get("tasks", [])))
+        available_tasks = _normalized_tasks(
+            capability.get("available_tasks", model.get("available_tasks", []))
+        )
+        task_statuses = _task_statuses(capability, model)
+        if VISION_TASK in tasks:
+            declared.append(model_id)
+        if VISION_TASK in available_tasks:
+            available.append(model_id)
+        metadata.append(
+            {
+                "id": model_id,
+                "declares_image_understanding": VISION_TASK in tasks,
+                "image_understanding_probe_eligible": (
+                    VISION_TASK in available_tasks
+                ),
                 "tasks": tasks,
                 "available_tasks": available_tasks,
                 "task_statuses": task_statuses,
@@ -749,6 +808,72 @@ def routing_config_payload(config: WerkRoutingConfig) -> dict[str, Any]:
     return {
         "request_options": dict(config.request_options),
         "parameters": dict(config.parameters),
+    }
+
+
+def _vision_stop_sequences(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value or "[]")
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"stop_sequences_json is invalid JSON: {error.msg}"
+        ) from error
+    if not isinstance(parsed, list) or any(
+        not isinstance(item, str) for item in parsed
+    ):
+        raise ValueError("stop_sequences_json must contain an array of strings")
+    if any(not item for item in parsed):
+        raise ValueError("stop sequences must not be empty")
+    return parsed
+
+
+def build_vision_config(
+    *,
+    temperature: float = 0.2,
+    top_p: float = 1.0,
+    max_completion_tokens: int = 1024,
+    seed: int = 0,
+    image_detail: str = "auto",
+    stop_sequences_json: str = "[]",
+) -> WerkVisionConfig:
+    """Build only fields accepted by Werk's chat-completions contract."""
+
+    temperature_value = float(temperature)
+    top_p_value = float(top_p)
+    token_value = int(max_completion_tokens)
+    seed_value = int(seed)
+    detail_value = str(image_detail or "auto").strip().lower()
+    if not math.isfinite(temperature_value) or temperature_value < 0.0:
+        raise ValueError("temperature must be finite and at least 0")
+    if not math.isfinite(top_p_value) or not 0.0 <= top_p_value <= 1.0:
+        raise ValueError("top_p must be finite and between 0 and 1")
+    if token_value < 1:
+        raise ValueError("max_completion_tokens must be at least 1")
+    if not 0 <= seed_value <= 0x7FFFFFFFFFFFFFFF:
+        raise ValueError("seed must be between 0 and 9223372036854775807")
+    if detail_value not in {"auto", "low", "high"}:
+        raise ValueError("image_detail must be auto, low, or high")
+    stop = _vision_stop_sequences(stop_sequences_json)
+    request_fields: dict[str, Any] = {
+        "temperature": temperature_value,
+        "top_p": top_p_value,
+        "max_completion_tokens": token_value,
+        "seed": seed_value,
+    }
+    if stop:
+        request_fields["stop"] = stop
+    return WerkVisionConfig(
+        request_fields=request_fields,
+        image_detail=detail_value,
+    )
+
+
+def vision_config_payload(config: WerkVisionConfig) -> dict[str, Any]:
+    if not isinstance(config, WerkVisionConfig):
+        raise TypeError("config must be a WerkVisionConfig")
+    return {
+        "request_fields": dict(config.request_fields),
+        "image_detail": config.image_detail,
     }
 
 
@@ -1121,6 +1246,62 @@ def build_configured_image_request(
     if str(negative_prompt or "").strip():
         request["negative_prompt"] = str(negative_prompt)
     return request
+
+
+def build_vision_request(
+    *,
+    model: str,
+    prompt: str,
+    images: Any,
+    config: WerkVisionConfig,
+    system_prompt: str = "",
+) -> dict[str, Any]:
+    """Build one ordered, non-streaming multimodal chat-completion request."""
+
+    model_value = str(model or "").strip()
+    prompt_value = str(prompt or "").strip()
+    if not model_value:
+        raise ValueError("model must not be empty; connect WERK Vision Models")
+    if not prompt_value:
+        raise ValueError("prompt must not be empty")
+    if not isinstance(config, WerkVisionConfig):
+        raise TypeError("config must be a WerkVisionConfig")
+    vision_config = config
+    unknown_fields = set(vision_config.request_fields) - ALLOWED_VISION_REQUEST_FIELDS
+    if unknown_fields:
+        raise ValueError(
+            "vision config contains unsupported chat field(s): "
+            + ", ".join(sorted(unknown_fields))
+        )
+
+    data_urls = comfy_images_to_data_urls(
+        images,
+        max_pixels=environment_max_image_pixels(),
+        max_bytes=environment_max_vision_input_bytes(),
+    )
+    content: list[dict[str, Any]] = [
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": data_url,
+                "detail": vision_config.image_detail,
+            },
+        }
+        for data_url in data_urls
+    ]
+    content.append({"type": "text", "text": prompt_value})
+    messages: list[dict[str, Any]] = []
+    if str(system_prompt or "").strip():
+        messages.append(
+            {"role": "system", "content": str(system_prompt).strip()}
+        )
+    messages.append({"role": "user", "content": content})
+    return {
+        "model": model_value,
+        "messages": messages,
+        "stream": False,
+        **dict(vision_config.request_fields),
+    }
 
 
 def build_configured_video_request(
@@ -1842,6 +2023,43 @@ def execute_audio_analysis_request(
     )
 
 
+def execute_vision_request(
+    connection: WerkConnection,
+    request: Mapping[str, Any],
+):
+    response = _object(
+        WerkClient(connection).post_json("/v1/chat/completions", dict(request)),
+        "vision analysis",
+    )
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("Werk vision response contains no choices")
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise ValueError("Werk vision response contains an invalid choice")
+    message = choice.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        raise ValueError("Werk vision response contains no assistant text")
+    completion_id = response.get("id")
+    finish_reason = choice.get("finish_reason")
+    metadata = {
+        key: value
+        for key, value in response.items()
+        if key != "choices"
+    }
+    metadata["choice"] = {
+        "index": choice.get("index", 0),
+        "finish_reason": finish_reason,
+        "role": message.get("role", "assistant"),
+    }
+    return (
+        message["content"],
+        _json_text(metadata),
+        str(completion_id) if isinstance(completion_id, str) else "",
+        str(finish_reason) if isinstance(finish_reason, str) else "",
+    )
+
+
 def execute_image_request(
     connection: WerkConnection,
     request: Mapping[str, Any],
@@ -1943,12 +2161,14 @@ class WerkServerInfoNode:
         except WerkApiError as error:
             optional_error = str(error)
         classified = classify_image_models(models, capabilities)
+        vision_classified = classify_vision_models(models, capabilities)
         video_classified = classify_video_models(models, capabilities)
         audio_classified = classify_audio_models(models, capabilities)
         metadata = {
             "models": models,
             "capabilities": capabilities,
             "classification": classified,
+            "vision_classification": vision_classified,
             "video_classification": video_classified,
             "audio_classification": audio_classified,
         }
@@ -2031,6 +2251,79 @@ class WerkImageModelsNode:
             )
         else:
             raise ValueError("no installed Werk model declares image-generation")
+        return selected, "\n".join(candidates), _json_text(classified)
+
+
+class WerkVisionModelsNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "refresh_token": ("INT", {"default": 0}),
+                "preferred_model": ("STRING", {"default": ""}),
+                "require_available": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("model", "available_models", "metadata_json")
+    FUNCTION = "select"
+    CATEGORY = "WERK/Discovery"
+
+    def select(
+        self,
+        connection: WerkConnection,
+        refresh_token: int,
+        preferred_model: str,
+        require_available: bool,
+    ):
+        del refresh_token
+        client = WerkClient(connection)
+        models = client.get_json("/v1/models")
+        try:
+            capabilities = client.get_json("/v1/capabilities")
+        except WerkApiError:
+            capabilities = {}
+        classified = classify_vision_models(models, capabilities)
+        candidates = (
+            classified["available"] if require_available else classified["declared"]
+        )
+        preferred = preferred_model.strip()
+        if preferred:
+            if preferred in candidates:
+                selected = preferred
+            elif preferred in classified["declared"] and require_available:
+                raise ValueError(
+                    _unavailable_task_message(
+                        VISION_TASK,
+                        [preferred],
+                        classified["models"],
+                    )
+                )
+            elif preferred in classified["installed"]:
+                raise ValueError(
+                    f"preferred Werk model {preferred!r} does not declare {VISION_TASK}"
+                )
+            else:
+                raise ValueError(f"preferred Werk model {preferred!r} is not installed")
+        elif len(candidates) == 1:
+            selected = candidates[0]
+        elif len(candidates) > 1:
+            raise ValueError(
+                "multiple matching Werk vision models; set preferred_model to one of: "
+                + ", ".join(candidates)
+            )
+        elif classified["declared"] and require_available:
+            raise ValueError(
+                _unavailable_task_message(
+                    VISION_TASK,
+                    classified["declared"],
+                    classified["models"],
+                )
+            )
+        else:
+            raise ValueError("no installed Werk model declares image-understanding")
         return selected, "\n".join(candidates), _json_text(classified)
 
 
@@ -2404,6 +2697,48 @@ class WerkRoutingConfigNode:
     def configure(self, **inputs):
         config = build_routing_config(**inputs)
         return config, _json_text(routing_config_payload(config))
+
+
+class WerkVisionConfigNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.2, "min": 0.0, "step": 0.05},
+                ),
+                "top_p": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "max_completion_tokens": (
+                    "INT",
+                    {"default": 1024, "min": 1},
+                ),
+                "seed": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 0x7FFFFFFFFFFFFFFF},
+                ),
+                "image_detail": (
+                    ["auto", "low", "high"],
+                    {"default": "auto"},
+                ),
+                "stop_sequences_json": (
+                    "STRING",
+                    {"default": "[]", "multiline": True},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("WERK_VISION_CONFIG", "STRING")
+    RETURN_NAMES = ("config", "config_json")
+    FUNCTION = "configure"
+    CATEGORY = "WERK/Configuration"
+
+    def configure(self, **inputs):
+        config = build_vision_config(**inputs)
+        return config, _json_text(vision_config_payload(config))
 
 
 class WerkImageConfigNode:
@@ -2922,12 +3257,69 @@ class WerkAudioAnalyzeNode:
         return execute_audio_analysis_request(connection, selected_task, request)
 
 
+class WerkVisionAnalyzeNode:
+    """Inspect one or more native ComfyUI images through Werk chat vision."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "connection": ("WERK_CONNECTION",),
+                "model": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Connect the model output from WERK Vision Models.",
+                    },
+                ),
+                "images": ("IMAGE",),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "system_prompt": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+                "config": ("WERK_VISION_CONFIG",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = (
+        "analysis",
+        "metadata_json",
+        "completion_id",
+        "finish_reason",
+    )
+    FUNCTION = "analyze"
+    CATEGORY = "WERK/Vision"
+    OUTPUT_NODE = True
+
+    def analyze(
+        self,
+        connection: WerkConnection,
+        model: str,
+        images: Any,
+        prompt: str,
+        system_prompt: str,
+        config: WerkVisionConfig,
+    ):
+        request = build_vision_request(
+            model=model,
+            prompt=prompt,
+            images=images,
+            system_prompt=system_prompt,
+            config=config,
+        )
+        return execute_vision_request(connection, request)
+
+
 NODE_CLASS_MAPPINGS = {
     "WerkConnection": WerkConnectionNode,
     "WerkServerInfo": WerkServerInfoNode,
     "WerkImageModels": WerkImageModelsNode,
+    "WerkVisionModels": WerkVisionModelsNode,
     "WerkImageParameters": WerkImageParametersNode,
     "WerkRoutingConfig": WerkRoutingConfigNode,
+    "WerkVisionConfig": WerkVisionConfigNode,
     "WerkImageConfig": WerkImageConfigNode,
     "WerkImageGenerate": WerkImageGenerateNode,
     "WerkVideoModels": WerkVideoModelsNode,
@@ -2940,14 +3332,17 @@ NODE_CLASS_MAPPINGS = {
     "WerkAudioGenerate": WerkAudioGenerateNode,
     "WerkAudioProcess": WerkAudioProcessNode,
     "WerkAudioAnalyze": WerkAudioAnalyzeNode,
+    "WerkVisionAnalyze": WerkVisionAnalyzeNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WerkConnection": "WERK Connection (Beta)",
     "WerkServerInfo": "WERK Server Info (Beta)",
     "WerkImageModels": "WERK Image Models (Beta)",
+    "WerkVisionModels": "WERK Vision Models (Beta)",
     "WerkImageParameters": "WERK Image Parameters (Beta)",
     "WerkRoutingConfig": "WERK Routing Config (Beta)",
+    "WerkVisionConfig": "WERK Vision Config (Beta)",
     "WerkImageConfig": "WERK Image Config (Beta)",
     "WerkImageGenerate": "WERK Image Generate (Beta)",
     "WerkVideoModels": "WERK Video Models (Beta)",
@@ -2960,4 +3355,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WerkAudioGenerate": "WERK Audio Generate (Beta)",
     "WerkAudioProcess": "WERK Audio Process (Beta)",
     "WerkAudioAnalyze": "WERK Audio Analyze (Beta)",
+    "WerkVisionAnalyze": "WERK Vision Analyze (Beta)",
 }

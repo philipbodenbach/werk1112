@@ -125,12 +125,14 @@ router. The <code>x-werk-output-id</code> response header is exposed.
 The following JSON routes default to 128 MiB and can be configured up to
 512 MiB with <code>WERK_API_BODY_LIMIT_BYTES</code>:
 
+- <code>POST /v1/chat/completions</code>
 - <code>POST /v1/jobs</code>
 - <code>POST /v1/audio/transcriptions</code>
 - <code>POST /v1/audio/translations</code>
 
-Other JSON routes retain Axum's smaller default, approximately 2 MiB. This is
-especially relevant for Base64 image edits and large inline media.
+Other JSON routes retain Axum's smaller default, approximately 2 MiB. The
+larger chat limit permits inline vision data URLs but remains a bound on the
+complete JSON body, not just the decoded image.
 
 Base64 expands binary data by roughly one third. Prefer server-local paths when
 the client and server intentionally share a trusted filesystem.
@@ -363,9 +365,29 @@ silently clamp an explicit response budget; the selected model context and
 backend remain authoritative and return an actionable error when they cannot
 satisfy it.
 
-Message content is either a string or an array of content parts. Supported
-parts are text plus <code>image_url</code> or <code>input_image</code> for an
-image-capable model/backend.
+Message content is either a string or an ordered array of content parts.
+Supported parts are:
+
+| Part type | Fields | Behavior |
+| --- | --- | --- |
+| <code>text</code> | string <code>text</code> | Text at this position in the message |
+| <code>image_url</code> | <code>image_url</code> URL string, or object with string <code>url</code> and optional <code>detail</code> | Image input for an image-capable model/backend |
+| <code>input_image</code> | same <code>image_url</code> field | Accepted image-input alias |
+
+The source can be an inline data URL or a URL that the selected runtime can
+read. The API preserves content-part order and the `detail` value. llama.cpp
+and vLLM forward that multipart structure to their chat endpoints; the current
+MLX-VLM subprocess accepts the image list but does not preserve arbitrary
+interleaving or `detail`. A hint such as `detail: "high"` does not guarantee an
+identical resolution policy across model processors.
+
+Image input additionally requires a model manifest that advertises
+<code>image-understanding</code> and an eligible vision runtime. Current routes
+are compatible llama.cpp VLM GGUF models with one multimodal projector,
+optional vLLM for the explicitly supported Qwen-VL/GLM4V architectures, and
+the supported MLX-VLM Gemma4 path. Candle remains text-only. See
+[Vision and visual quality assurance](integrations/vision.md) for the exact
+matrix, routing behavior and a complete rendered-output inspection example.
 
 Example:
 
@@ -379,6 +401,33 @@ curl -fsS http://127.0.0.1:11434/v1/chat/completions \
     "max_completion_tokens": 256
   }'
 ~~~
+
+Multimodal example (replace the abbreviated data with a complete Base64 PNG):
+
+~~~bash
+curl -fsS http://127.0.0.1:11434/v1/chat/completions \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "visual-qa-model",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Report visible clipping and alignment defects."},
+        {"type": "image_url", "image_url": {
+          "url": "data:image/png;base64,BASE64_PNG",
+          "detail": "high"
+        }}
+      ]
+    }],
+    "max_completion_tokens": 512
+  }'
+~~~
+
+With <code>--backend auto</code>, image input participates in server-side
+runtime selection. <code>backend</code>, <code>accelerator</code> and Werk media
+<code>routing</code> are not chat request fields; constrain the backend when
+starting Werk when an exact route is required.
 
 Not implemented:
 

@@ -59,8 +59,18 @@ Use the custom-node package when a workflow needs Werk-native behavior such as:
 - synchronous image generation;
 - persisted video generation and polling;
 - native ComfyUI `IMAGE`, `VIDEO` and `AUDIO` values;
+- native `IMAGE` batches sent to `POST /v1/chat/completions` for visual QA and
+  image understanding;
 - audio generation, speech, transcription, analysis and transform jobs;
 - authenticated output retrieval and sanitized inference metadata.
+
+The vision path uses **WERK Vision Models**, **WERK Vision Config**, and
+**WERK Vision Analyze**. It is intended for inspecting rendered HTML, slides,
+documents, generated images, and UI screenshots for missing elements,
+overflow, clipping, alignment, spacing, and similar visual defects. Werk must
+report the selected model/runtime as available for `image-understanding`;
+text-only execution of a multimodal repository is not sufficient. See the
+[ready API-prompt example](../../utils/comfyUI/examples/werk_vision_inspection_api.json).
 
 Installation, node sockets, workflow examples, limits and troubleshooting are
 maintained beside the package in the

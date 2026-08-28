@@ -36,10 +36,10 @@ pub use qwen_tts::{
     install_managed_qwen_tts, managed_qwen_tts_dir, managed_qwen_tts_python,
     qwen_tts_python_status, require_qwen_tts_python,
 };
-pub(crate) use vllm::vllm_rocm_signals;
 pub use vllm::{
     VllmBackend, VllmDiscovery, install_managed_vllm, managed_vllm_dir, vllm_doctor_checks,
 };
+pub(crate) use vllm::{vllm_architecture_supports_images, vllm_rocm_signals};
 
 /// Exact targets accepted by `werk backend install`.
 ///
@@ -73,7 +73,7 @@ pub fn validated_backend_install_command(command: &str) -> Option<String> {
 
 use crate::{
     capabilities::{InferenceTask, RepositoryLayout},
-    inference::ParameterSupportStatus,
+    inference::{ParameterSupportStatus, TaskReadiness},
     model_store::{ModelFormat, ModelManifest},
     openai::ChatMessage,
 };
@@ -237,9 +237,23 @@ const TEXT_STREAMING: RuntimeCapabilities = RuntimeCapabilities {
     streaming: true,
 };
 
+const VLM_STREAMING: RuntimeCapabilities = RuntimeCapabilities {
+    text_generation: true,
+    vision_language: true,
+    embeddings: false,
+    streaming: true,
+};
+
 const TEXT_EMBEDDING_STREAMING: RuntimeCapabilities = RuntimeCapabilities {
     text_generation: true,
     vision_language: false,
+    embeddings: true,
+    streaming: true,
+};
+
+const VLM_EMBEDDING_STREAMING: RuntimeCapabilities = RuntimeCapabilities {
+    text_generation: true,
+    vision_language: true,
     embeddings: true,
     streaming: true,
 };
@@ -285,6 +299,14 @@ const VLLM_ARCHES: &[&str] = &[
     "gemma3",
     "nemotron_h",
     "nemotron_h_moe",
+    // Multimodal support is additionally guarded by
+    // `vllm_architecture_supports_images` at routing and execution time.
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    "glm4v",
+    "glm4v_moe",
 ];
 const TRANSFORMERS_COMPAT_ARCHES: &[&str] = &["chatglm"];
 const MLX_VLM_ARCHES: &[&str] = &["gemma4_unified"];
@@ -294,6 +316,11 @@ const TEXT_AND_EMBEDDING_TASKS: &[InferenceTask] =
     &[InferenceTask::TextGeneration, InferenceTask::TextEmbedding];
 const VLM_TASKS: &[InferenceTask] = &[
     InferenceTask::TextGeneration,
+    InferenceTask::ImageUnderstanding,
+];
+const VLM_AND_EMBEDDING_TASKS: &[InferenceTask] = &[
+    InferenceTask::TextGeneration,
+    InferenceTask::TextEmbedding,
     InferenceTask::ImageUnderstanding,
 ];
 const MEDIA_TASKS: &[InferenceTask] = &[
@@ -465,11 +492,11 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         display_name: "llama.cpp server CUDA",
         supported_formats: GGUF_FORMATS,
         supported_architectures: ANY_ARCH,
-        supported_tasks: TEXT_AND_EMBEDDING_TASKS,
+        supported_tasks: VLM_AND_EMBEDDING_TASKS,
         supported_layouts: GGUF_LAYOUTS,
         accelerators: &[BackendAccelerator::Cuda],
         parameter_support: TEXT_PARAMETER_SUPPORT,
-        capabilities: TEXT_EMBEDDING_STREAMING,
+        capabilities: VLM_EMBEDDING_STREAMING,
         supports_offloading: true,
         supports_quantization: true,
         supports_compile: false,
@@ -484,11 +511,11 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         display_name: "llama.cpp server ROCm/HIP",
         supported_formats: GGUF_FORMATS,
         supported_architectures: ANY_ARCH,
-        supported_tasks: TEXT_AND_EMBEDDING_TASKS,
+        supported_tasks: VLM_AND_EMBEDDING_TASKS,
         supported_layouts: GGUF_LAYOUTS,
         accelerators: &[BackendAccelerator::Rocm],
         parameter_support: TEXT_PARAMETER_SUPPORT,
-        capabilities: TEXT_EMBEDDING_STREAMING,
+        capabilities: VLM_EMBEDDING_STREAMING,
         supports_offloading: true,
         supports_quantization: true,
         supports_compile: false,
@@ -503,11 +530,11 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         display_name: "llama.cpp server Vulkan",
         supported_formats: GGUF_FORMATS,
         supported_architectures: ANY_ARCH,
-        supported_tasks: TEXT_AND_EMBEDDING_TASKS,
+        supported_tasks: VLM_AND_EMBEDDING_TASKS,
         supported_layouts: GGUF_LAYOUTS,
         accelerators: &[BackendAccelerator::Vulkan],
         parameter_support: TEXT_PARAMETER_SUPPORT,
-        capabilities: TEXT_EMBEDDING_STREAMING,
+        capabilities: VLM_EMBEDDING_STREAMING,
         supports_offloading: true,
         supports_quantization: true,
         supports_compile: false,
@@ -522,11 +549,11 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         display_name: "llama.cpp server Metal",
         supported_formats: GGUF_FORMATS,
         supported_architectures: ANY_ARCH,
-        supported_tasks: TEXT_AND_EMBEDDING_TASKS,
+        supported_tasks: VLM_AND_EMBEDDING_TASKS,
         supported_layouts: GGUF_LAYOUTS,
         accelerators: &[BackendAccelerator::Metal],
         parameter_support: TEXT_PARAMETER_SUPPORT,
-        capabilities: TEXT_EMBEDDING_STREAMING,
+        capabilities: VLM_EMBEDDING_STREAMING,
         supports_offloading: true,
         supports_quantization: true,
         supports_compile: false,
@@ -541,11 +568,11 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         display_name: "llama.cpp server CPU",
         supported_formats: GGUF_FORMATS,
         supported_architectures: ANY_ARCH,
-        supported_tasks: TEXT_AND_EMBEDDING_TASKS,
+        supported_tasks: VLM_AND_EMBEDDING_TASKS,
         supported_layouts: GGUF_LAYOUTS,
         accelerators: &[BackendAccelerator::Cpu],
         parameter_support: TEXT_PARAMETER_SUPPORT,
-        capabilities: TEXT_EMBEDDING_STREAMING,
+        capabilities: VLM_EMBEDDING_STREAMING,
         supports_offloading: true,
         supports_quantization: true,
         supports_compile: false,
@@ -693,11 +720,11 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         display_name: "vLLM CUDA",
         supported_formats: SAFETENSORS_FORMATS,
         supported_architectures: VLLM_ARCHES,
-        supported_tasks: TEXT_GENERATION_TASKS,
+        supported_tasks: VLM_TASKS,
         supported_layouts: TRANSFORMERS_LAYOUTS,
         accelerators: &[BackendAccelerator::Cuda],
         parameter_support: TEXT_PARAMETER_SUPPORT,
-        capabilities: TEXT_STREAMING,
+        capabilities: VLM_STREAMING,
         supports_offloading: true,
         supports_quantization: true,
         supports_compile: true,
@@ -712,11 +739,11 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         display_name: "vLLM ROCm",
         supported_formats: SAFETENSORS_FORMATS,
         supported_architectures: VLLM_ARCHES,
-        supported_tasks: TEXT_GENERATION_TASKS,
+        supported_tasks: VLM_TASKS,
         supported_layouts: TRANSFORMERS_LAYOUTS,
         accelerators: &[BackendAccelerator::Rocm],
         parameter_support: TEXT_PARAMETER_SUPPORT,
-        capabilities: TEXT_STREAMING,
+        capabilities: VLM_STREAMING,
         supports_offloading: true,
         supports_quantization: true,
         supports_compile: true,
@@ -905,7 +932,10 @@ pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) ->
 }
 
 pub fn backend_supports_images(runtime: BackendRuntime) -> bool {
-    matches!(runtime, BackendRuntime::MlxVlm)
+    matches!(
+        runtime,
+        BackendRuntime::LlamaServer | BackendRuntime::MlxVlm | BackendRuntime::Vllm
+    )
 }
 
 pub fn backend_supports_accelerator(
@@ -1120,6 +1150,21 @@ pub trait GenerationBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Reports whether this already-configured generation backend can execute
+    /// a declared task for `manifest` without loading model weights or
+    /// provisioning a missing runtime.
+    ///
+    /// Backends should return `None` for tasks they do not own. The API uses
+    /// this additive hook to complement media-companion capability discovery;
+    /// in particular, image understanding is a chat-generation capability.
+    fn task_readiness(
+        &self,
+        _manifest: &ModelManifest,
+        _task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        None
+    }
+
     fn generate(
         &self,
         manifest: &ModelManifest,
@@ -1209,6 +1254,9 @@ mod tests {
         let llama = runtime_descriptor(RuntimeId::LlamaServerCpu);
         assert!(llama.supports_task(InferenceTask::TextGeneration));
         assert!(llama.supports_task(InferenceTask::TextEmbedding));
+        assert!(llama.supports_task(InferenceTask::ImageUnderstanding));
+        assert!(llama.capabilities.vision_language);
+        assert!(backend_supports_images(BackendRuntime::LlamaServer));
         assert!(llama.supports_layout(RepositoryLayout::Gguf));
 
         let mlx_vlm = runtime_descriptor(RuntimeId::MlxVlm);
@@ -1218,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn vllm_registry_accepts_text_only_nemotron_h_architectures() {
+    fn vllm_registry_accepts_text_nemotron_and_exact_vlm_architectures() {
         let vllm = runtime_descriptor(RuntimeId::VllmCuda);
         for architecture in ["nemotron_h", "nemotron_h_moe", "NEMOTRON_H"] {
             assert!(runtime_supports_model(
@@ -1226,10 +1274,27 @@ mod tests {
                 &ModelFormat::SafeTensors,
                 Some(architecture),
             ));
+            assert!(!vllm_architecture_supports_images(Some(architecture)));
+        }
+        for architecture in [
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "glm4v",
+            "glm4v_moe",
+        ] {
+            assert!(runtime_supports_model(
+                vllm,
+                &ModelFormat::SafeTensors,
+                Some(architecture),
+            ));
+            assert!(vllm_architecture_supports_images(Some(architecture)));
         }
         assert!(vllm.capabilities.text_generation);
-        assert!(!vllm.capabilities.vision_language);
-        assert!(!vllm.supports_task(InferenceTask::ImageUnderstanding));
+        assert!(vllm.capabilities.vision_language);
+        assert!(vllm.supports_task(InferenceTask::ImageUnderstanding));
+        assert!(backend_supports_images(BackendRuntime::Vllm));
     }
 
     #[test]

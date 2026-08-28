@@ -5,7 +5,12 @@ from PIL import Image
 import pytest
 import torch
 
-from ..image_utils import batch_image_tensors, decode_base64_image, image_bytes_to_tensor
+from ..image_utils import (
+    batch_image_tensors,
+    comfy_images_to_data_urls,
+    decode_base64_image,
+    image_bytes_to_tensor,
+)
 
 
 def png_bytes(mode="RGB", size=(2, 3), color=None):
@@ -65,3 +70,34 @@ def test_mismatched_dimensions_fail_without_resize():
     with pytest.raises(ValueError, match="different dimensions"):
         batch_image_tensors(images)
 
+
+def test_comfy_image_batch_encodes_ordered_bounded_png_data_urls():
+    images = torch.stack(
+        [
+            torch.full((2, 3, 3), 0.1),
+            torch.full((2, 3, 3), 0.9),
+        ]
+    )
+    values = comfy_images_to_data_urls(images, max_pixels=12, max_bytes=4096)
+    assert len(values) == 2
+    decoded = [Image.open(BytesIO(decode_base64_image(value))).getpixel((0, 0)) for value in values]
+    assert decoded == [(26, 26, 26), (230, 230, 230)]
+
+
+def test_comfy_image_batch_limits_aggregate_pixels_and_encoded_bytes():
+    images = torch.zeros((2, 2, 3, 3))
+    with pytest.raises(ValueError, match="pixel limit"):
+        comfy_images_to_data_urls(images, max_pixels=11, max_bytes=4096)
+    with pytest.raises(ValueError, match="exceeds 1 bytes"):
+        comfy_images_to_data_urls(images, max_pixels=12, max_bytes=1)
+
+
+def test_comfy_image_batch_rejects_invalid_shape_channels_and_values():
+    with pytest.raises(ValueError, match="at least one"):
+        comfy_images_to_data_urls(torch.zeros((0, 2, 3, 3)), max_pixels=10, max_bytes=10)
+    with pytest.raises(ValueError, match="1, 3, or 4 channels"):
+        comfy_images_to_data_urls(torch.zeros((1, 2, 3, 2)), max_pixels=10, max_bytes=10)
+    invalid = torch.zeros((1, 1, 1, 3))
+    invalid[0, 0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        comfy_images_to_data_urls(invalid, max_pixels=10, max_bytes=100)

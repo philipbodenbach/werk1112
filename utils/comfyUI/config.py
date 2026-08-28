@@ -14,6 +14,7 @@ DEFAULT_MAX_IMAGE_PIXELS = 64 * 1024 * 1024
 DEFAULT_MAX_VIDEO_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_AUDIO_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_AUDIO_INPUT_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_VISION_INPUT_BYTES = 64 * 1024 * 1024
 
 
 def normalize_server_url(value: str) -> str:
@@ -88,6 +89,22 @@ def environment_max_audio_input_bytes() -> int:
     return value
 
 
+def environment_max_vision_input_bytes() -> int:
+    """Maximum aggregate PNG bytes embedded in one vision chat request."""
+
+    raw = os.environ.get(
+        "WERK_MAX_VISION_INPUT_BYTES",
+        str(DEFAULT_MAX_VISION_INPUT_BYTES),
+    )
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("WERK_MAX_VISION_INPUT_BYTES must be an integer") from error
+    if value <= 0:
+        raise ValueError("WERK_MAX_VISION_INPUT_BYTES must be greater than zero")
+    return value
+
+
 @dataclass(frozen=True, repr=False)
 class WerkConnection:
     server_url: str
@@ -142,6 +159,30 @@ class WerkRoutingConfig:
             "WerkRoutingConfig("
             f"request_options={dict(self.request_options)!r}, "
             f"parameters={dict(self.parameters)!r})"
+        )
+
+
+@dataclass(frozen=True, repr=False, eq=False)
+class WerkVisionConfig:
+    """Validated OpenAI-compatible controls for one vision chat request."""
+
+    request_fields: Mapping[str, Any] = field(default_factory=dict)
+    image_detail: str = "auto"
+
+    def __post_init__(self) -> None:
+        detail = str(self.image_detail or "auto").strip().lower()
+        if detail not in {"auto", "low", "high"}:
+            raise ValueError("image_detail must be auto, low, or high")
+        object.__setattr__(self, "image_detail", detail)
+        object.__setattr__(
+            self, "request_fields", _immutable_mapping(self.request_fields)
+        )
+
+    def __repr__(self) -> str:
+        return (
+            "WerkVisionConfig("
+            f"request_fields={dict(self.request_fields)!r}, "
+            f"image_detail={self.image_detail!r})"
         )
 
 

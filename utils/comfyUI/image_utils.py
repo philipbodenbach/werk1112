@@ -65,3 +65,65 @@ def batch_image_tensors(images: Iterable[torch.Tensor]) -> torch.Tensor:
     if any(tuple(value.shape[1:]) != shape for value in values):
         raise ValueError("Werk returned images with different dimensions; they cannot form one ComfyUI batch")
     return torch.cat(values, dim=0).to(dtype=torch.float32)
+
+
+def comfy_images_to_data_urls(
+    images: torch.Tensor,
+    *,
+    max_pixels: int,
+    max_bytes: int,
+) -> list[str]:
+    """Encode an ordered ComfyUI IMAGE batch as bounded RGB PNG data URLs."""
+
+    if not isinstance(images, torch.Tensor):
+        raise TypeError("images must be a ComfyUI IMAGE tensor")
+    if images.ndim != 4 or images.shape[0] < 1:
+        raise ValueError("images must contain at least one ComfyUI image")
+    batch, height, width, channels = (int(value) for value in images.shape)
+    if height <= 0 or width <= 0:
+        raise ValueError("image dimensions must be greater than zero")
+    if channels not in {1, 3, 4}:
+        raise ValueError("images must have 1, 3, or 4 channels")
+    if max_pixels <= 0:
+        raise ValueError("max_pixels must be greater than zero")
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be greater than zero")
+    total_pixels = batch * height * width
+    if total_pixels > max_pixels:
+        raise ValueError(
+            f"vision image batch contains {total_pixels} pixels and exceeds "
+            f"the {max_pixels}-pixel limit"
+        )
+
+    values = images.detach().to(device="cpu", dtype=torch.float32).numpy()
+    if not np.isfinite(values).all():
+        raise ValueError("images contain non-finite pixel values")
+    values = np.clip(np.rint(values * 255.0), 0, 255).astype(np.uint8)
+
+    encoded_images: list[bytes] = []
+    total_bytes = 0
+    for values_for_image in values:
+        if channels == 1:
+            rgb = np.repeat(values_for_image, 3, axis=2)
+        elif channels == 4:
+            color = values_for_image[..., :3].astype(np.float32)
+            alpha = values_for_image[..., 3:4].astype(np.float32) / 255.0
+            rgb = np.rint(
+                (color * alpha) + (255.0 * (1.0 - alpha))
+            ).astype(np.uint8)
+        else:
+            rgb = values_for_image
+        buffer = BytesIO()
+        Image.fromarray(rgb).save(buffer, format="PNG")
+        encoded = buffer.getvalue()
+        total_bytes += len(encoded)
+        if total_bytes > max_bytes:
+            raise ValueError(
+                f"encoded vision image batch exceeds {max_bytes} bytes"
+            )
+        encoded_images.append(encoded)
+
+    return [
+        "data:image/png;base64," + base64.b64encode(value).decode("ascii")
+        for value in encoded_images
+    ]

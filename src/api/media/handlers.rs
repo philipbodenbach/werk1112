@@ -211,7 +211,12 @@ pub(in crate::api) async fn capabilities_handler(
         return response;
     }
     let service = state.inference_service.clone();
-    match tokio::task::spawn_blocking(move || service.capabilities()).await {
+    let generation_backend = state.backend.clone();
+    match tokio::task::spawn_blocking(move || {
+        service.capabilities_with_generation_backend(generation_backend.as_ref())
+    })
+    .await
+    {
         Ok(Ok(capabilities)) => Json(capabilities).into_response(),
         Ok(Err(error)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), None),
         Err(error) => api_error(

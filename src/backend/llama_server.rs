@@ -5,7 +5,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex, OnceLock},
     thread,
@@ -18,7 +18,11 @@ use super::{
     ChatGenerationSession, GenerateRequest, GenerateResponse, GenerateStream, GenerateStreamEvent,
     GenerationBackend, GenerationTimings, LlamaCppMode, LlamaRuntimeOptions,
 };
-use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
+use crate::{
+    capabilities::InferenceTask,
+    inference::{TaskReadiness, TaskReadinessStatus},
+    model_store::{ModelFile, ModelFormat, ModelManifest, ModelStore},
+};
 
 const DEFAULT_CTX_SIZE: usize = 4096;
 const DEFAULT_BATCH_SIZE: usize = 2048;
@@ -50,6 +54,8 @@ struct LlamaServerProcess {
     discovery_source: String,
     args: Vec<String>,
     model_path: PathBuf,
+    projector_path: Option<PathBuf>,
+    model_id: String,
     url: String,
     pid: u32,
     mode: LlamaCppMode,
@@ -122,6 +128,60 @@ impl LlamaServerBackend {
         ))
     }
 
+    /// Validates the model-side assets required by llama.cpp multimodal
+    /// inference without discovering, installing, or starting a runtime.
+    pub(crate) fn validate_image_model(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+    ) -> Result<PathBuf> {
+        if manifest.format != ModelFormat::Gguf {
+            bail!("llama.cpp image input requires a GGUF model");
+        }
+        let model_path = manifest
+            .model_path
+            .as_deref()
+            .context("GGUF manifest has no model_path")?;
+        let absolute_model_path = store.absolute_model_file(manifest, model_path);
+        if !absolute_model_path.is_file() {
+            bail!(
+                "GGUF model file for '{}' is missing from the local model store",
+                manifest.id
+            );
+        }
+        discover_multimodal_projector(store, manifest, &absolute_model_path)?.ok_or_else(|| {
+            anyhow!(
+                "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
+                manifest.id
+            )
+        })
+    }
+
+    /// Probes the configured llama-server's multimodal CLI support. This only
+    /// executes `--help`; it does not start the server or load model weights.
+    pub(crate) fn probe_image_input(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        mode: LlamaCppMode,
+    ) -> Result<String> {
+        let projector = Self::validate_image_model(store, manifest)?;
+        let discovery = require_llama_server(store, mode)?;
+        let executable = discovery
+            .path
+            .as_ref()
+            .context("llama-server discovery had no executable path")?;
+        if !supported_args(executable).mmproj {
+            bail!(
+                "llama-server {} is installed but does not advertise --mmproj support",
+                display_name(mode)
+            );
+        }
+        Ok(format!(
+            "llama.cpp server {} is ready for image input with projector {}",
+            display_name(mode),
+            projector.display()
+        ))
+    }
+
     pub fn discover(store: &ModelStore, mode: LlamaCppMode) -> LlamaServerDiscovery {
         discover_llama_server(store, mode)
     }
@@ -133,6 +193,7 @@ impl LlamaServerBackend {
     fn cached_server(
         &self,
         manifest: &ModelManifest,
+        require_projector: bool,
     ) -> Result<(Arc<LlamaServerProcess>, bool, f64)> {
         if manifest.format != ModelFormat::Gguf {
             bail!(
@@ -146,10 +207,23 @@ impl LlamaServerBackend {
             .as_deref()
             .context("GGUF manifest has no model_path")?;
         let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
+        let projector_path =
+            discover_multimodal_projector(&self.store, manifest, &absolute_model_path)?;
+        if require_projector && projector_path.is_none() {
+            bail!(
+                "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
+                manifest.id
+            );
+        }
+        let projector_cache_key = projector_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}",
             manifest.id,
             absolute_model_path.display(),
+            projector_cache_key,
             label(self.mode),
             self.runtime_options.ctx_size.unwrap_or(DEFAULT_CTX_SIZE),
             self.runtime_options
@@ -180,6 +254,7 @@ impl LlamaServerBackend {
             self.mode,
             manifest,
             &absolute_model_path,
+            projector_path.as_deref(),
             &self.runtime_options,
         )?);
         let load_seconds = started.elapsed().as_secs_f64();
@@ -196,14 +271,12 @@ impl LlamaServerBackend {
         request: GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<GenerateResponse> {
-        if !request.image_urls.is_empty() {
-            bail!(
-                "llama.cpp server backend is text-only for now; use a VLM-capable backend/model for image inputs"
-            );
-        }
-
         let total_started = Instant::now();
-        let (server, reused, load_seconds) = self.cached_server(manifest)?;
+        let has_images = request_has_images(&request);
+        if has_images {
+            validate_llama_image_sources(&request)?;
+        }
+        let (server, reused, load_seconds) = self.cached_server(manifest, has_images)?;
         server.print_debug(&request, reused);
         let completion = server.complete(&request, tx)?;
         Ok(GenerateResponse {
@@ -226,7 +299,7 @@ impl LlamaServerBackend {
 
 impl GenerationBackend for LlamaServerBackend {
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
-        self.cached_server(manifest).map(|_| ())
+        self.cached_server(manifest, false).map(|_| ())
     }
 
     fn start_chat_session(
@@ -237,8 +310,51 @@ impl GenerationBackend for LlamaServerBackend {
         if manifest.format != ModelFormat::Gguf {
             return Ok(None);
         }
-        let (server, _, _) = self.cached_server(manifest)?;
+        let (server, _, _) = self.cached_server(manifest, false)?;
         Ok(Some(Box::new(LlamaServerChatSession { server })))
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task != InferenceTask::ImageUnderstanding {
+            return None;
+        }
+        let readiness = if !manifest.supports_task(task) {
+            Err(anyhow!(
+                "model '{}' does not advertise image-understanding",
+                manifest.id
+            ))
+        } else {
+            Self::probe_image_input(&self.store, manifest, self.mode).map(|_| ())
+        };
+        Some(match readiness {
+            Ok(()) => TaskReadiness {
+                status: TaskReadinessStatus::Available,
+                detail: format!(
+                    "{} can execute image understanding without loading model weights during capability discovery",
+                    display_name(self.mode)
+                ),
+                adapter: Some(format!("llama-server-{}", label(self.mode))),
+                required_backend: None,
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            },
+            Err(error) => TaskReadiness {
+                status: TaskReadinessStatus::Unavailable,
+                detail: error.to_string(),
+                adapter: Some(format!("llama-server-{}", label(self.mode))),
+                required_backend: Some(format!("llama-server-{}", label(self.mode))),
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            },
+        })
     }
 
     fn generate(
@@ -317,6 +433,7 @@ impl LlamaServerProcess {
         mode: LlamaCppMode,
         manifest: &ModelManifest,
         model_path: &Path,
+        projector_path: Option<&Path>,
         runtime_options: &LlamaRuntimeOptions,
     ) -> Result<Self> {
         let discovery = require_llama_server(store, mode)?;
@@ -327,9 +444,20 @@ impl LlamaServerProcess {
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         let supported = supported_args(&executable);
+        if let Some(projector_path) = projector_path
+            && !supported.mmproj
+        {
+            bail!(
+                "local multimodal projector '{}' was found for model '{}', but llama-server at '{}' does not advertise --mmproj support",
+                projector_path.display(),
+                manifest.id,
+                executable.display()
+            );
+        }
         let args = llama_server_args(
             mode,
             model_path,
+            projector_path,
             port,
             runtime_options,
             &supported,
@@ -363,6 +491,8 @@ impl LlamaServerProcess {
             discovery_source: discovery.source,
             args,
             model_path: model_path.to_path_buf(),
+            projector_path: projector_path.map(Path::to_path_buf),
+            model_id: manifest.id.clone(),
             url,
             pid,
             mode,
@@ -377,8 +507,14 @@ impl LlamaServerProcess {
         request: &GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<ServerCompletion> {
+        if request_has_images(request) && self.projector_path.is_none() {
+            bail!(
+                "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
+                self.model_id
+            );
+        }
         let started = Instant::now();
-        let use_chat_endpoint = !request.messages.is_empty();
+        let use_chat_endpoint = !request.messages.is_empty() || request_has_images(request);
         let (path, body) = if use_chat_endpoint {
             ("/v1/chat/completions", chat_completion_body(request))
         } else {
@@ -513,6 +649,13 @@ impl LlamaServerProcess {
         eprintln!("discovery source: {}", self.discovery_source);
         eprintln!("full llama-server args: {}", shell_join(&self.args));
         eprintln!("model path: {}", self.model_path.display());
+        eprintln!(
+            "multimodal projector path: {}",
+            self.projector_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        );
         eprintln!("server PID: {}", self.pid);
         eprintln!("server URL: {}", self.url);
         eprintln!("reused existing server: {reused}");
@@ -564,6 +707,7 @@ impl SseAccumulator {
 fn llama_server_args(
     mode: LlamaCppMode,
     model_path: &Path,
+    projector_path: Option<&Path>,
     port: u16,
     runtime_options: &LlamaRuntimeOptions,
     supported: &SupportedArgs,
@@ -599,6 +743,13 @@ fn llama_server_args(
         "-np".to_string(),
         "1".to_string(),
     ];
+
+    if let Some(projector_path) = projector_path
+        && supported.mmproj
+    {
+        args.push("--mmproj".to_string());
+        args.push(projector_path.display().to_string());
+    }
 
     if supported.flash_attn {
         args.push("-fa".to_string());
@@ -703,15 +854,15 @@ fn chat_completion_body(request: &GenerateRequest) -> Value {
 }
 
 fn llama_chat_messages(request: &GenerateRequest) -> Vec<Value> {
-    request
+    let mut messages = request
         .messages
         .iter()
         .map(|message| {
             let content = message
                 .content
                 .as_ref()
-                .map(|content| content.as_text())
-                .unwrap_or_default();
+                .map(llama_chat_content)
+                .unwrap_or(Value::Null);
             let mut value = json!({
                 "role": message.role.as_str(),
                 "content": content,
@@ -721,7 +872,179 @@ fn llama_chat_messages(request: &GenerateRequest) -> Vec<Value> {
             }
             value
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let messages_have_images = request.messages.iter().any(|message| {
+        message
+            .content
+            .as_ref()
+            .is_some_and(|content| !content.image_urls().is_empty())
+    });
+    if !request.image_urls.is_empty() && !messages_have_images {
+        append_fallback_image_parts(&mut messages, &request.prompt, &request.image_urls);
+    }
+    messages
+}
+
+fn llama_chat_content(content: &crate::openai::MessageContent) -> Value {
+    match content {
+        crate::openai::MessageContent::Text(text) => json!(text),
+        crate::openai::MessageContent::Parts(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|part| {
+                    let mut value = serde_json::Map::new();
+                    // `input_image` is accepted as a Werk/OpenAI input alias,
+                    // while llama.cpp's chat endpoint consumes `image_url`.
+                    let kind = if part.kind == "input_image" {
+                        "image_url"
+                    } else {
+                        part.kind.as_str()
+                    };
+                    value.insert("type".to_string(), json!(kind));
+                    if let Some(text) = &part.text {
+                        value.insert("text".to_string(), json!(text));
+                    }
+                    if let Some(image_url) = &part.image_url {
+                        let image_url = match image_url {
+                            crate::openai::ImageUrlSpec::Url(url) => json!({"url": url}),
+                            crate::openai::ImageUrlSpec::Object(_) => {
+                                serde_json::to_value(image_url)
+                                    .expect("ImageUrlSpec serialization cannot fail")
+                            }
+                        };
+                        value.insert("image_url".to_string(), image_url);
+                    }
+                    Value::Object(value)
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn append_fallback_image_parts(messages: &mut Vec<Value>, prompt: &str, image_urls: &[String]) {
+    if messages.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": prompt,
+        }));
+    }
+    let target = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(messages.len() - 1);
+    let content = messages[target]
+        .get_mut("content")
+        .map(Value::take)
+        .unwrap_or(Value::Null);
+    let mut parts = match content {
+        Value::Array(parts) => parts,
+        Value::String(text) if !text.is_empty() => vec![json!({
+            "type": "text",
+            "text": text,
+        })],
+        _ => Vec::new(),
+    };
+    parts.extend(image_urls.iter().map(|url| {
+        json!({
+            "type": "image_url",
+            "image_url": {"url": url},
+        })
+    }));
+    messages[target]["content"] = Value::Array(parts);
+}
+
+fn request_has_images(request: &GenerateRequest) -> bool {
+    !request.image_urls.is_empty()
+        || request.messages.iter().any(|message| {
+            message
+                .content
+                .as_ref()
+                .is_some_and(|content| !content.image_urls().is_empty())
+        })
+}
+
+fn validate_llama_image_sources(request: &GenerateRequest) -> Result<()> {
+    let mut sources = request.image_urls.clone();
+    if sources.is_empty() {
+        sources.extend(request.messages.iter().flat_map(|message| {
+            message
+                .content
+                .as_ref()
+                .map(crate::openai::MessageContent::image_urls)
+                .unwrap_or_default()
+        }));
+    }
+    for source in sources {
+        let source = source.trim();
+        if source.starts_with("data:image/")
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+        {
+            continue;
+        }
+        bail!(
+            "llama.cpp vision input does not expose local filesystem paths to its HTTP endpoint; send an image data URL or HTTP(S) URL (CLI --image paths are converted automatically)"
+        );
+    }
+    Ok(())
+}
+
+fn discover_multimodal_projector(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    model_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let model_root = store.absolute_model_file(manifest, "");
+    discover_multimodal_projector_from_files(&model_root, &manifest.files, model_path)
+}
+
+fn discover_multimodal_projector_from_files(
+    model_root: &Path,
+    files: &[ModelFile],
+    model_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let mut candidates = files
+        .iter()
+        .filter_map(|file| {
+            let relative = Path::new(&file.path);
+            if !safe_manifest_relative_path(relative)
+                || !relative
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            {
+                return None;
+            }
+            let filename = relative.file_name()?.to_str()?.to_ascii_lowercase();
+            if !filename.contains("mmproj") && !filename.contains("projector") {
+                return None;
+            }
+            let candidate = model_root.join(relative);
+            (candidate != model_path && candidate.is_file()).then_some(candidate)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [candidate] => Ok(Some(candidate.clone())),
+        _ => bail!(
+            "multiple local multimodal projector GGUF files are listed in the model manifest; cannot choose safely: {}",
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn safe_manifest_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn update_completion_from_event(completion: &mut ServerCompletion, value: &Value) {
@@ -1010,6 +1333,7 @@ struct SupportedArgs {
     log_disable: bool,
     reasoning: bool,
     chat_template_kwargs: bool,
+    mmproj: bool,
 }
 
 fn supported_args(executable: &PathBuf) -> SupportedArgs {
@@ -1028,6 +1352,10 @@ fn supported_args(executable: &PathBuf) -> SupportedArgs {
         log_disable: text.contains("--log-disable"),
         reasoning: text.contains("--reasoning ") || text.contains("-rea,"),
         chat_template_kwargs: text.contains("--chat-template-kwargs"),
+        mmproj: text.split_whitespace().any(|argument| {
+            argument.trim_matches(|character: char| character == ',' || character == ';')
+                == "--mmproj"
+        }),
     }
 }
 
@@ -2358,7 +2686,7 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openai::{ChatMessage, MessageContent};
+    use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
     use std::{
         env,
         ffi::OsString,
@@ -2672,6 +3000,176 @@ Agent 3
     }
 
     #[test]
+    fn chat_completion_body_preserves_multimodal_parts_and_detail() {
+        let request = GenerateRequest {
+            prompt: "flattened prompt must not replace message parts".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart {
+                        kind: "text".to_string(),
+                        text: Some("Inspect this layout".to_string()),
+                        image_url: None,
+                    },
+                    ContentPart {
+                        kind: "image_url".to_string(),
+                        text: None,
+                        image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
+                            url: "data:image/png;base64,AAAA".to_string(),
+                            detail: Some("high".to_string()),
+                        })),
+                    },
+                    ContentPart {
+                        kind: "input_image".to_string(),
+                        text: None,
+                        image_url: Some(ImageUrlSpec::Url(
+                            "https://example.test/second.png".to_string(),
+                        )),
+                    },
+                ])),
+                name: Some("visual-check".to_string()),
+            }],
+            image_urls: vec![
+                "data:image/png;base64,AAAA".to_string(),
+                "https://example.test/second.png".to_string(),
+            ],
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let body = chat_completion_body(&request);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "Inspect this layout"})
+        );
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(content[1]["image_url"]["detail"], "high");
+        assert_eq!(content[2]["type"], "image_url");
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "https://example.test/second.png"
+        );
+        assert_eq!(body["messages"][0]["name"], "visual-check");
+    }
+
+    #[test]
+    fn llama_vision_rejects_unexposed_local_image_paths() {
+        let request = GenerateRequest {
+            prompt: "Inspect".to_string(),
+            messages: Vec::new(),
+            image_urls: vec!["file:///tmp/private.png".to_string()],
+            max_tokens: 32,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let error = validate_llama_image_sources(&request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("data URL or HTTP(S) URL"));
+    }
+
+    #[test]
+    fn standalone_image_urls_are_added_to_the_last_user_message() {
+        let request = GenerateRequest {
+            prompt: "Inspect this image".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Inspect this image".to_string())),
+                name: None,
+            }],
+            image_urls: vec!["https://example.test/layout.png".to_string()],
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let messages = llama_chat_messages(&request);
+        let content = messages[0]["content"].as_array().unwrap();
+
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "Inspect this image"})
+        );
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "https://example.test/layout.png"
+        );
+    }
+
+    #[test]
+    fn projector_discovery_requires_one_safe_local_manifest_file() {
+        let root = temp_root("mmproj-discovery");
+        let model = touch(root.join("model-q4.gguf"));
+        let projector = touch(root.join("vision").join("model-mmproj-f16.GGUF"));
+        let _unlisted = touch(root.join("unlisted-mmproj.gguf"));
+        let files = vec![
+            model_file("model-q4.gguf"),
+            model_file("vision/model-mmproj-f16.GGUF"),
+            model_file("../unsafe-mmproj.gguf"),
+            model_file("missing-projector.gguf"),
+            model_file("notes-projector.txt"),
+        ];
+
+        let found = discover_multimodal_projector_from_files(&root, &files, &model).unwrap();
+
+        assert_eq!(found.as_deref(), Some(projector.as_path()));
+    }
+
+    #[test]
+    fn projector_discovery_never_treats_the_model_itself_as_a_projector() {
+        let root = temp_root("mmproj-excludes-model");
+        let model = touch(root.join("projector-model.gguf"));
+        let files = vec![model_file("projector-model.gguf")];
+
+        let found = discover_multimodal_projector_from_files(&root, &files, &model).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn projector_discovery_rejects_ambiguous_manifest_candidates() {
+        let root = temp_root("mmproj-ambiguous");
+        let model = touch(root.join("model.gguf"));
+        let _first = touch(root.join("mmproj-f16.gguf"));
+        let _second = touch(root.join("vision-projector-q8.gguf"));
+        let files = vec![
+            model_file("model.gguf"),
+            model_file("mmproj-f16.gguf"),
+            model_file("vision-projector-q8.gguf"),
+        ];
+
+        let error = discover_multimodal_projector_from_files(&root, &files, &model)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("multiple local multimodal projector GGUF files"));
+        assert!(error.contains("mmproj-f16.gguf"));
+        assert!(error.contains("vision-projector-q8.gguf"));
+    }
+
+    #[test]
     fn chat_completion_event_parses_delta_finish_reason_and_usage() {
         let mut completion = ServerCompletion::default();
         let value = json!({
@@ -2969,6 +3467,7 @@ Agent 3
         let args = llama_server_args(
             LlamaCppMode::Cuda,
             &PathBuf::from("/tmp/model.gguf"),
+            None,
             12345,
             &LlamaRuntimeOptions::default(),
             &SupportedArgs {
@@ -2992,6 +3491,7 @@ Agent 3
         let args = llama_server_args(
             LlamaCppMode::Cuda,
             &PathBuf::from("/tmp/model.gguf"),
+            None,
             12345,
             &runtime_options,
             &SupportedArgs {
@@ -3008,10 +3508,34 @@ Agent 3
     }
 
     #[test]
+    fn server_args_attach_discovered_projector_when_supported() {
+        let projector = PathBuf::from("/tmp/mmproj-model-f16.gguf");
+        let args = llama_server_args(
+            LlamaCppMode::Cuda,
+            &PathBuf::from("/tmp/model.gguf"),
+            Some(&projector),
+            12345,
+            &LlamaRuntimeOptions::default(),
+            &SupportedArgs {
+                mmproj: true,
+                ..SupportedArgs::default()
+            },
+            false,
+        );
+
+        let mmproj = args.iter().position(|arg| arg == "--mmproj").unwrap();
+        assert_eq!(
+            args.get(mmproj + 1).map(String::as_str),
+            Some("/tmp/mmproj-model-f16.gguf")
+        );
+    }
+
+    #[test]
     fn server_args_disable_qwen3_thinking_when_supported() {
         let args = llama_server_args(
             LlamaCppMode::Cuda,
             &PathBuf::from("/tmp/model.gguf"),
+            None,
             12345,
             &LlamaRuntimeOptions::default(),
             &SupportedArgs {
@@ -3059,5 +3583,13 @@ Agent 3
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         path
+    }
+
+    fn model_file(path: &str) -> ModelFile {
+        ModelFile {
+            path: path.to_string(),
+            size: 1,
+            checksum: String::new(),
+        }
     }
 }

@@ -587,12 +587,12 @@ GET    /v1/jobs/{id}
 DELETE /v1/jobs/{id}
 ```
 
-JSON bodies on `/v1/jobs`, `/v1/audio/transcriptions`, and
-`/v1/audio/translations` default to 128 MiB, which bounds inline Base64 audio;
-other routes retain Axum's smaller default. `WERK_API_BODY_LIMIT_BYTES` can set
-a positive media-upload limit up to 512 MiB for trusted deployments. Local-path
-inputs avoid Base64 expansion when the Werk server can read the same
-filesystem.
+JSON bodies on `/v1/chat/completions`, `/v1/jobs`,
+`/v1/audio/transcriptions`, and `/v1/audio/translations` default to 128 MiB.
+This bounds inline Base64 images and audio; other routes retain Axum's smaller
+default. `WERK_API_BODY_LIMIT_BYTES` can set a positive upload limit up to
+512 MiB for trusted deployments. Local-path inputs avoid Base64 expansion when
+the Werk server and selected runtime can read the same filesystem.
 
 Persisted states are `queued`, `loading`, `running`, `encoding`, `completed`,
 `failed`, and `cancelled`. `/v1/audio/speech` returns audio bytes directly;

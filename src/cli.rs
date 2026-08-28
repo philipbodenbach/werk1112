@@ -2,6 +2,7 @@ mod media_diagnostics;
 mod terminal_activity;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,8 @@ use crate::{
         install_managed_qwen_tts, install_managed_vllm, llama_server_help_ok, managed_backend_dir,
         managed_runner_path as managed_onnx_runner_path, managed_vllm_dir, probe_device,
         runtime_descriptor, runtime_registry, runtime_supports_model,
-        validated_backend_install_command, vllm_doctor_checks, vllm_rocm_signals,
+        validated_backend_install_command, vllm_architecture_supports_images, vllm_doctor_checks,
+        vllm_rocm_signals,
     },
     banner::print_banner,
     capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
@@ -70,8 +72,9 @@ use crate::{
         PullProgress,
     },
     openai::{
-        ChatMessage, ChatTemplateOptions, ChatTemplateSource, MessageContent, PromptSpec,
-        messages_to_prompt_for_model, messages_to_prompt_for_model_with_template,
+        ChatMessage, ChatTemplateOptions, ChatTemplateSource, ContentPart, ImageUrlSpec,
+        MessageContent, PromptSpec, image_urls_from_messages, messages_to_prompt_for_model,
+        messages_to_prompt_for_model_with_template,
     },
     runtime_planner::{
         RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
@@ -82,6 +85,7 @@ use crate::{
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
 const CHAT_CONTEXT_SAFETY_TOKENS: usize = 64;
+const DEFAULT_MAX_VISION_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 #[cfg(test)]
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -1073,6 +1077,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             debug,
         } => {
             let prompt = prompt.join(" ");
+            let images = normalize_cli_image_sources(&images)?;
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
@@ -1108,18 +1113,19 @@ pub async fn run(cli: Cli) -> Result<()> {
                 llama_options.clone(),
                 selection_options,
             )?;
-            let messages = vec![ChatMessage {
-                role: "user".to_string(),
-                content: Some(MessageContent::Text(prompt)),
-                name: None,
-            }];
+            let messages = vec![vision_user_message(&prompt, &images)];
             let prompt = prompt_for_backend(&manifest, &messages, selected_backend, chat_template);
             let prompt_diagnostics = prompt_diagnostics(&prompt, messages.len(), None);
             let request_messages = generation_request_messages(&prompt, &messages);
+            let request_image_urls = if request_messages.is_empty() {
+                images
+            } else {
+                image_urls_from_messages(&request_messages)
+            };
             let request = GenerateRequest {
                 prompt: prompt.prompt,
                 messages: request_messages,
-                image_urls: images,
+                image_urls: request_image_urls,
                 max_tokens,
                 temperature,
                 top_p,
@@ -1166,6 +1172,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             verbose,
             debug,
         } => {
+            let images = normalize_cli_image_sources(&images)?;
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
@@ -2709,6 +2716,125 @@ fn resolve_optional_text(explicit: Option<&str>, file: Option<&Path>) -> Result<
 
 fn path_input(modality: InputModality, role: &str, path: &Path) -> InferenceInput {
     string_input(modality, role, &path.to_string_lossy())
+}
+
+fn vision_user_message(text: &str, image_urls: &[String]) -> ChatMessage {
+    let content = if image_urls.is_empty() {
+        MessageContent::Text(text.to_string())
+    } else {
+        let mut parts = Vec::with_capacity(image_urls.len() + 1);
+        parts.push(ContentPart {
+            kind: "text".to_string(),
+            text: Some(text.to_string()),
+            image_url: None,
+        });
+        parts.extend(image_urls.iter().map(|url| ContentPart {
+            kind: "image_url".to_string(),
+            text: None,
+            image_url: Some(ImageUrlSpec::Url(url.clone())),
+        }));
+        MessageContent::Parts(parts)
+    };
+    ChatMessage {
+        role: "user".to_string(),
+        content: Some(content),
+        name: None,
+    }
+}
+
+fn normalize_cli_image_sources(values: &[String]) -> Result<Vec<String>> {
+    let max_bytes = env::var("WERK_MAX_VISION_INPUT_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_VISION_INPUT_BYTES);
+    let mut total_bytes = 0usize;
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            bail!("--image value must not be empty");
+        }
+        if value.starts_with("http://") || value.starts_with("https://") {
+            normalized.push(value.to_string());
+            continue;
+        }
+        if value.starts_with("data:") {
+            if !value.starts_with("data:image/") || !value.contains(";base64,") {
+                bail!("--image data URL must contain a base64-encoded image MIME type");
+            }
+            total_bytes = total_bytes
+                .checked_add(value.len())
+                .context("vision input byte count overflowed")?;
+            if total_bytes > max_bytes.saturating_mul(4).div_ceil(3) {
+                bail!("vision image inputs exceed WERK_MAX_VISION_INPUT_BYTES ({max_bytes} bytes)");
+            }
+            normalized.push(value.to_string());
+            continue;
+        }
+
+        let path = cli_image_path(value);
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read --image {}", path.display()))?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .context("vision input byte count overflowed")?;
+        if total_bytes > max_bytes {
+            bail!("vision image inputs exceed WERK_MAX_VISION_INPUT_BYTES ({max_bytes} bytes)");
+        }
+        let mime = image_mime_type(&path, &bytes)?;
+        normalized.push(format!(
+            "data:{mime};base64,{}",
+            BASE64_STANDARD.encode(bytes)
+        ));
+    }
+    Ok(normalized)
+}
+
+fn cli_image_path(value: &str) -> PathBuf {
+    let Some(path) = value.strip_prefix("file://") else {
+        return PathBuf::from(value);
+    };
+    #[cfg(windows)]
+    let path = path
+        .strip_prefix('/')
+        .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+        .unwrap_or(path);
+    PathBuf::from(path)
+}
+
+fn image_mime_type(path: &Path, bytes: &[u8]) -> Result<&'static str> {
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("png") => Some("image/png"),
+            Some("jpg" | "jpeg") => Some("image/jpeg"),
+            Some("gif") => Some("image/gif"),
+            Some("webp") => Some("image/webp"),
+            Some("bmp") => Some("image/bmp"),
+            _ => None,
+        }
+    };
+    mime.ok_or_else(|| {
+        anyhow!(
+            "unsupported --image format for {}; use PNG, JPEG, GIF, WebP, or BMP",
+            path.display()
+        )
+    })
 }
 
 fn string_input(modality: InputModality, role: &str, value: &str) -> InferenceInput {
@@ -5934,8 +6060,14 @@ async fn chat_loop(
     debug: bool,
     show_loading_spinner: bool,
 ) -> Result<()> {
-    let chat_session =
-        prepare_backend_for_chat(backend.as_ref(), &manifest, seed, show_loading_spinner)?;
+    // Session selection predates multimodal request capabilities. Keep image
+    // chats on the request-aware backend path so a llama.cpp server is started
+    // with its projector and no cached text-only session can pin the route.
+    let chat_session = if images.is_empty() {
+        prepare_backend_for_chat(backend.as_ref(), &manifest, seed, show_loading_spinner)?
+    } else {
+        None
+    };
 
     println!(
         "Chatting with {}. Type /exit or /quit to stop.",
@@ -5957,11 +6089,7 @@ async fn chat_loop(
             break;
         }
 
-        let user_message = ChatMessage {
-            role: "user".to_string(),
-            content: Some(MessageContent::Text(input.to_string())),
-            name: None,
-        };
+        let user_message = vision_user_message(input, &images);
 
         let mut request_messages =
             request_messages_for_turn(&mut messages, user_message, history_enabled);
@@ -5991,10 +6119,15 @@ async fn chat_loop(
         let prompt_diagnostics =
             prompt_diagnostics(&prompt, request_messages.len(), Some(history_enabled));
         let generation_messages = generation_request_messages(&prompt, &request_messages);
+        let request_image_urls = if generation_messages.is_empty() {
+            images.clone()
+        } else {
+            image_urls_from_messages(&generation_messages)
+        };
         let request = GenerateRequest {
             prompt: prompt.prompt,
             messages: generation_messages,
-            image_urls: images.clone(),
+            image_urls: request_image_urls,
             max_tokens,
             temperature,
             top_p,
@@ -6208,17 +6341,40 @@ fn estimate_chat_prompt_tokens(prompt: &PromptSpec, messages: &[ChatMessage]) ->
     let structured = messages
         .iter()
         .map(|message| {
-            let content_bytes = message
+            let content_tokens = message
                 .content
                 .as_ref()
-                .map(MessageContent::as_text)
-                .map(|content| content.len())
+                .map(cli_message_content_tokens)
                 .unwrap_or_default();
-            content_bytes.div_ceil(3) + 16
+            content_tokens + 16
         })
         .sum::<usize>()
         + 16;
     rendered.max(structured)
+}
+
+fn cli_message_content_tokens(content: &MessageContent) -> usize {
+    match content {
+        MessageContent::Text(text) => text.len().div_ceil(3),
+        MessageContent::Parts(parts) => parts.iter().fold(0usize, |tokens, part| {
+            let part_tokens = match part.kind.as_str() {
+                "text" => part.text.as_deref().unwrap_or_default().len().div_ceil(3),
+                "image_url" | "input_image" => {
+                    let detail = part.image_url.as_ref().and_then(|image| match image {
+                        ImageUrlSpec::Object(image) => image.detail.as_deref(),
+                        ImageUrlSpec::Url(_) => None,
+                    });
+                    match detail {
+                        Some("low") => 256,
+                        Some("high") => 2048,
+                        _ => 1024,
+                    }
+                }
+                _ => 0,
+            };
+            tokens.saturating_add(part_tokens)
+        }),
+    }
 }
 
 fn prompt_for_backend(
@@ -7231,6 +7387,19 @@ struct GgufPreferredBackend {
     backends: Mutex<HashMap<&'static str, Arc<dyn GenerationBackend>>>,
 }
 
+struct MlxPreferredBackend {
+    text_backend: Arc<dyn GenerationBackend>,
+    vision_backend: Arc<dyn GenerationBackend>,
+}
+
+struct VllmPreferredBackend {
+    store: ModelStore,
+    selection_options: SelectionOptions,
+    backends: Mutex<HashMap<&'static str, Arc<dyn GenerationBackend>>>,
+    #[cfg(test)]
+    selection_override: Option<Arc<dyn Fn(bool) -> BackendChoice + Send + Sync>>,
+}
+
 impl AutoBackend {
     fn new(
         store: ModelStore,
@@ -7302,6 +7471,16 @@ impl GenerationBackend for AutoBackend {
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         self.backend_for(manifest)?
             .start_chat_session(manifest, seed)
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        (task == InferenceTask::ImageUnderstanding).then(|| {
+            generation_backend_task_readiness(&self.store, BackendChoice::Auto, manifest, task)
+        })
     }
 
     fn generate(
@@ -7406,6 +7585,265 @@ impl GenerationBackend for GgufPreferredBackend {
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         self.backend_for(manifest)?
             .start_chat_session(manifest, seed)
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task != InferenceTask::ImageUnderstanding {
+            return None;
+        }
+        let requested = match (self.gguf_backend, self.fallback_backend) {
+            (BackendChoice::LlamaServer(llama), BackendChoice::Candle(candle)) => {
+                BackendChoice::GgufPreferred { llama, candle }
+            }
+            _ => self.gguf_backend,
+        };
+        Some(generation_backend_task_readiness(
+            &self.store,
+            requested,
+            manifest,
+            task,
+        ))
+    }
+
+    fn generate(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::GenerateResponse> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .generate(manifest, request)
+    }
+
+    fn generate_stream(
+        &self,
+        manifest: ModelManifest,
+        request: GenerateRequest,
+    ) -> crate::backend::GenerateStream {
+        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+            Ok(backend) => backend.generate_stream(manifest, request),
+            Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
+        }
+    }
+}
+
+impl MlxPreferredBackend {
+    fn new(store: ModelStore) -> Self {
+        Self {
+            text_backend: Arc::new(MlxBackend::new(store.clone())),
+            vision_backend: Arc::new(MlxVlmBackend::new(store)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backends(
+        text_backend: Arc<dyn GenerationBackend>,
+        vision_backend: Arc<dyn GenerationBackend>,
+    ) -> Self {
+        Self {
+            text_backend,
+            vision_backend,
+        }
+    }
+
+    fn backend_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Arc<dyn GenerationBackend> {
+        if has_images || manifest_requires_mlx_vlm(manifest) {
+            self.vision_backend.clone()
+        } else {
+            self.text_backend.clone()
+        }
+    }
+}
+
+fn manifest_requires_mlx_vlm(manifest: &ModelManifest) -> bool {
+    manifest.supports_task(InferenceTask::ImageUnderstanding)
+        && manifest
+            .architecture
+            .as_deref()
+            .is_some_and(|architecture| architecture.eq_ignore_ascii_case("gemma4_unified"))
+}
+
+impl GenerationBackend for MlxPreferredBackend {
+    fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
+        self.backend_for_request(manifest, false).prepare(manifest)
+    }
+
+    fn start_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for_request(manifest, false)
+            .start_chat_session(manifest, seed)
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task == InferenceTask::ImageUnderstanding {
+            self.vision_backend.task_readiness(manifest, task)
+        } else {
+            self.text_backend.task_readiness(manifest, task)
+        }
+    }
+
+    fn generate(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::GenerateResponse> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())
+            .generate(manifest, request)
+    }
+
+    fn generate_stream(
+        &self,
+        manifest: ModelManifest,
+        request: GenerateRequest,
+    ) -> crate::backend::GenerateStream {
+        self.backend_for_request(&manifest, !request.image_urls.is_empty())
+            .generate_stream(manifest, request)
+    }
+}
+
+impl VllmPreferredBackend {
+    fn new(store: ModelStore, selection_options: SelectionOptions) -> Self {
+        Self {
+            store,
+            selection_options,
+            backends: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            selection_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backends(
+        store: ModelStore,
+        selection_options: SelectionOptions,
+        cuda_backend: Arc<dyn GenerationBackend>,
+        rocm_backend: Arc<dyn GenerationBackend>,
+        selection_override: impl Fn(bool) -> BackendChoice + Send + Sync + 'static,
+    ) -> Self {
+        let mut backends = HashMap::new();
+        backends.insert(backend_label(BackendChoice::Vllm), cuda_backend);
+        backends.insert(backend_label(BackendChoice::VllmRocm), rocm_backend);
+        Self {
+            store,
+            selection_options,
+            backends: Mutex::new(backends),
+            selection_override: Some(Arc::new(selection_override)),
+        }
+    }
+
+    fn backend_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        let selected =
+            self.select_backend_for_request(manifest, has_images, self.selection_options)?;
+        self.cached_backend(selected)
+    }
+
+    fn select_backend_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        selection_options: SelectionOptions,
+    ) -> Result<BackendChoice> {
+        #[cfg(test)]
+        if let Some(select) = &self.selection_override {
+            return Ok(select(has_images));
+        }
+
+        selected_backend_for_request(
+            &self.store,
+            BackendChoice::Vllm,
+            manifest,
+            has_images,
+            selection_options,
+        )
+    }
+
+    fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
+        if !matches!(backend, BackendChoice::Vllm | BackendChoice::VllmRocm) {
+            bail!(
+                "explicit vLLM routing selected incompatible backend {}",
+                backend_label(backend)
+            );
+        }
+        let key = backend_label(backend);
+        if let Some(backend) = self
+            .backends
+            .lock()
+            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?
+            .get(key)
+            .cloned()
+        {
+            return Ok(backend);
+        }
+
+        let concrete: Arc<dyn GenerationBackend> = match backend {
+            BackendChoice::Vllm => Arc::new(VllmBackend::new(self.store.clone())),
+            BackendChoice::VllmRocm => Arc::new(VllmBackend::new_rocm(self.store.clone())),
+            _ => unreachable!("validated above"),
+        };
+        self.backends
+            .lock()
+            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?
+            .insert(key, concrete.clone());
+        Ok(concrete)
+    }
+}
+
+impl GenerationBackend for VllmPreferredBackend {
+    fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
+        self.backend_for_request(manifest, false)?.prepare(manifest)
+    }
+
+    fn start_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for_request(manifest, false)?
+            .start_chat_session(manifest, seed)
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task != InferenceTask::ImageUnderstanding {
+            return None;
+        }
+        let readiness = self
+            .select_backend_for_request(manifest, true, SelectionOptions::default())
+            .and_then(|selected| self.cached_backend(selected));
+        match readiness {
+            Ok(backend) => backend.task_readiness(manifest, task),
+            Err(error) => Some(TaskReadiness {
+                status: TaskReadinessStatus::Unavailable,
+                detail: compact_reason(&error.to_string()),
+                adapter: None,
+                required_backend: None,
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            }),
+        }
     }
 
     fn generate(
@@ -7514,6 +7952,11 @@ fn build_generation_backend(
         BackendChoice::Auto => Ok(Arc::new(AutoBackend::new(
             store,
             runtime_options,
+            selection_options,
+        ))),
+        BackendChoice::Mlx => Ok(Arc::new(MlxPreferredBackend::new(store))),
+        BackendChoice::Vllm => Ok(Arc::new(VllmPreferredBackend::new(
+            store,
             selection_options,
         ))),
         backend => build_concrete_backend(store, backend, runtime_options, selection_options),
@@ -7682,6 +8125,16 @@ fn select_backend_from_runtime_candidates(
             ));
             continue;
         }
+        if capabilities.image_input
+            && descriptor.runtime == BackendRuntime::Vllm
+            && !vllm_architecture_supports_images(manifest.architecture.as_deref())
+        {
+            rejected.push(format!(
+                "{}: vLLM does not support image input for this architecture",
+                descriptor.display_name
+            ));
+            continue;
+        }
         if capabilities.image_input && !descriptor.capabilities.vision_language {
             rejected.push(format!(
                 "{}: runtime is not VLM-capable",
@@ -7696,10 +8149,14 @@ fn select_backend_from_runtime_candidates(
             ));
             continue;
         };
-        if let Some(reason) =
-            backend_unavailability_reason(store, backend, manifest, selection_options)
-        {
-            let reason = if candidates.len() == 1 {
+        if let Some(reason) = backend_unavailability_reason_for_request(
+            store,
+            backend,
+            manifest,
+            capabilities.image_input,
+            selection_options,
+        ) {
+            let reason = if candidates.len() == 1 && !capabilities.image_input {
                 unavailable_backend_message(store, backend, manifest)
             } else {
                 reason
@@ -7882,6 +8339,44 @@ fn backend_unavailability_reason(
     }
 }
 
+fn backend_unavailability_reason_for_request(
+    store: &ModelStore,
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    has_images: bool,
+    selection_options: SelectionOptions,
+) -> Option<String> {
+    if has_images
+        && matches!(backend, BackendChoice::LlamaServer(_))
+        && let Err(error) = LlamaServerBackend::validate_image_model(store, manifest)
+    {
+        // Reject unusable model assets before optional runtime provisioning.
+        return Some(compact_reason(&error.to_string()));
+    }
+
+    let unavailable = backend_unavailability_reason(store, backend, manifest, selection_options);
+    if unavailable.is_some() || !has_images {
+        return unavailable;
+    }
+
+    match backend {
+        BackendChoice::LlamaServer(mode) => {
+            LlamaServerBackend::probe_image_input(store, manifest, mode)
+                .err()
+                .map(|error| compact_reason(&error.to_string()))
+        }
+        BackendChoice::Vllm | BackendChoice::VllmRocm
+            if !vllm_architecture_supports_images(manifest.architecture.as_deref()) =>
+        {
+            Some(format!(
+                "vLLM does not support image input for architecture '{}'",
+                manifest.architecture.as_deref().unwrap_or("unknown")
+            ))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 fn selected_backend_for_manifest(
     store: &ModelStore,
@@ -7891,6 +8386,60 @@ fn selected_backend_for_manifest(
     selected_backend_for_request(store, backend, manifest, false, SelectionOptions::default())
 }
 
+fn generation_backend_task_readiness(
+    store: &ModelStore,
+    requested_backend: BackendChoice,
+    manifest: &ModelManifest,
+    task: InferenceTask,
+) -> TaskReadiness {
+    debug_assert_eq!(task, InferenceTask::ImageUnderstanding);
+    if !manifest.supports_task(task) {
+        return TaskReadiness {
+            status: TaskReadinessStatus::Unavailable,
+            detail: format!(
+                "model '{}' does not advertise image-understanding",
+                manifest.id
+            ),
+            adapter: None,
+            required_backend: None,
+            install_command: None,
+            fallback_backend: None,
+            missing_dependencies: Vec::new(),
+            missing_dependency_groups: Vec::new(),
+        };
+    }
+
+    // Capability discovery must be read-only: explicitly ignore the serve
+    // command's auto-install policy while reusing the real request router.
+    let readiness_options = SelectionOptions::default();
+    match selected_backend_for_request(store, requested_backend, manifest, true, readiness_options)
+    {
+        Ok(selected) => TaskReadiness {
+            status: TaskReadinessStatus::Available,
+            detail: format!(
+                "image understanding is routable through {} without loading model weights during capability discovery",
+                verbose_backend_label(selected)
+            ),
+            adapter: Some(backend_label(selected).to_string()),
+            required_backend: None,
+            install_command: None,
+            fallback_backend: None,
+            missing_dependencies: Vec::new(),
+            missing_dependency_groups: Vec::new(),
+        },
+        Err(error) => TaskReadiness {
+            status: TaskReadinessStatus::Unavailable,
+            detail: compact_reason(&error.to_string()),
+            adapter: None,
+            required_backend: None,
+            install_command: None,
+            fallback_backend: None,
+            missing_dependencies: Vec::new(),
+            missing_dependency_groups: Vec::new(),
+        },
+    }
+}
+
 fn selected_backend_for_request(
     store: &ModelStore,
     backend: BackendChoice,
@@ -7898,6 +8447,12 @@ fn selected_backend_for_request(
     has_images: bool,
     selection_options: SelectionOptions,
 ) -> Result<BackendChoice> {
+    if has_images && !manifest.supports_task(InferenceTask::ImageUnderstanding) {
+        bail!(
+            "model '{}' does not advertise image-understanding; select a vision-language model",
+            manifest.id
+        );
+    }
     let capabilities = request_capabilities(has_images);
     match backend {
         BackendChoice::Auto
@@ -7969,8 +8524,13 @@ fn select_backend_with_planner(
     selection_options: SelectionOptions,
 ) -> Result<BackendChoice> {
     let requested = requested_backend_for_choice(backend);
-    let availability =
-        runtime_availabilities_for_request(store, manifest, requested, selection_options);
+    let availability = runtime_availabilities_for_request(
+        store,
+        manifest,
+        requested,
+        capabilities,
+        selection_options,
+    );
     let selected = select_runtime(manifest, requested, capabilities, &availability)
         .map_err(|err| anyhow!("{}", format_runtime_plan_error(manifest, &err)))?;
     runtime_id_to_backend_for_request(selected.runtime_id, requested).ok_or_else(|| {
@@ -8018,6 +8578,7 @@ fn runtime_availabilities_for_request(
     store: &ModelStore,
     manifest: &ModelManifest,
     requested: RequestedBackend,
+    capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
 ) -> Vec<RuntimeAvailability> {
     runtime_candidate_ids_for_selection(store, manifest, requested)
@@ -8029,6 +8590,7 @@ fn runtime_availabilities_for_request(
                     runtime_id,
                     backend,
                     manifest,
+                    capabilities,
                     selection_options,
                 );
                 RuntimeAvailability {
@@ -8136,6 +8698,7 @@ fn runtime_unavailability_reason(
     runtime_id: RuntimeId,
     backend: BackendChoice,
     manifest: &ModelManifest,
+    capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
 ) -> Option<String> {
     match runtime_id {
@@ -8145,7 +8708,13 @@ fn runtime_unavailability_reason(
         RuntimeId::VllmRocm => VllmBackend::probe_rocm(store)
             .err()
             .map(|_| VllmBackend::rocm_unavailable_reason(store)),
-        _ => backend_unavailability_reason(store, backend, manifest, selection_options),
+        _ => backend_unavailability_reason_for_request(
+            store,
+            backend,
+            manifest,
+            capabilities.image_input,
+            selection_options,
+        ),
     }
 }
 
@@ -8308,6 +8877,7 @@ fn print_routing_debug(
         store,
         manifest,
         requested_backend,
+        capabilities,
         SelectionOptions::default(),
     );
     let plan = plan_runtime(manifest, requested_backend, capabilities, &availability);
@@ -10851,6 +11421,50 @@ mod tests {
     }
 
     #[test]
+    fn gguf_vision_readiness_requires_mmproj_and_a_multimodal_llama_server() {
+        let ready_store = test_store("gguf-vision-ready");
+        let mut ready = test_manifest(ModelFormat::Gguf, Some("qwen3_vl"));
+        ready.model_path = Some("files/model.gguf".to_string());
+        ready.files = vec![
+            model_file("files/model.gguf", 4),
+            model_file("files/mmproj-f16.gguf", 4),
+        ];
+        ready.metadata.tasks = vec![
+            InferenceTask::TextGeneration,
+            InferenceTask::ImageUnderstanding,
+        ];
+        write_store_file(&ready_store, &ready, "files/model.gguf", "gguf");
+        write_store_file(&ready_store, &ready, "files/mmproj-f16.gguf", "proj");
+        install_fake_multimodal_llama_server(&ready_store, LlamaCppMode::Cpu);
+
+        let readiness = generation_backend_task_readiness(
+            &ready_store,
+            BackendChoice::GgufPreferred {
+                llama: LlamaCppMode::Cpu,
+                candle: CandleDeviceMode::Cpu,
+            },
+            &ready,
+            InferenceTask::ImageUnderstanding,
+        );
+        assert_eq!(readiness.status, TaskReadinessStatus::Available);
+        assert_eq!(readiness.adapter.as_deref(), Some("llama-server-cpu"));
+
+        let missing_store = test_store("gguf-vision-missing-projector");
+        let mut missing = ready.clone();
+        missing.files.truncate(1);
+        write_store_file(&missing_store, &missing, "files/model.gguf", "gguf");
+        let readiness = generation_backend_task_readiness(
+            &missing_store,
+            BackendChoice::Auto,
+            &missing,
+            InferenceTask::ImageUnderstanding,
+        );
+        assert_eq!(readiness.status, TaskReadinessStatus::Unavailable);
+        assert!(readiness.detail.contains("multimodal projector"));
+        assert!(!managed_backend_dir(&missing_store, LlamaCppMode::Cpu).exists());
+    }
+
+    #[test]
     fn prepare_backend_for_chat_prepares_before_session() {
         #[derive(Clone)]
         struct RecordingBackend {
@@ -10899,6 +11513,313 @@ mod tests {
             calls.lock().unwrap().as_slice(),
             &["prepare", "start_chat_session"]
         );
+    }
+
+    #[test]
+    fn explicit_mlx_backend_dispatches_text_and_vlm_manifests_truthfully() {
+        #[derive(Clone)]
+        struct RecordingMlxBackend {
+            label: &'static str,
+            calls: StdArc<StdMutex<Vec<&'static str>>>,
+        }
+
+        impl GenerationBackend for RecordingMlxBackend {
+            fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
+                self.calls.lock().unwrap().push("prepare");
+                Ok(())
+            }
+
+            fn start_chat_session(
+                &self,
+                _manifest: &ModelManifest,
+                _seed: Option<u64>,
+            ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+                self.calls.lock().unwrap().push("start_chat_session");
+                Ok(None)
+            }
+
+            fn task_readiness(
+                &self,
+                _manifest: &ModelManifest,
+                task: InferenceTask,
+            ) -> Option<TaskReadiness> {
+                self.calls.lock().unwrap().push("task_readiness");
+                (task == InferenceTask::ImageUnderstanding).then(|| TaskReadiness {
+                    status: TaskReadinessStatus::Available,
+                    detail: format!("{} is ready", self.label),
+                    adapter: Some(self.label.to_string()),
+                    required_backend: None,
+                    install_command: None,
+                    fallback_backend: None,
+                    missing_dependencies: Vec::new(),
+                    missing_dependency_groups: Vec::new(),
+                })
+            }
+
+            fn generate(
+                &self,
+                _manifest: &ModelManifest,
+                _request: GenerateRequest,
+            ) -> Result<crate::backend::GenerateResponse> {
+                self.calls.lock().unwrap().push("generate");
+                Ok(crate::backend::GenerateResponse {
+                    text: self.label.to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    finish_reason: "stop".to_string(),
+                    timings: GenerationTimings::default(),
+                    backend_diagnostics: Vec::new(),
+                })
+            }
+
+            fn generate_stream(
+                &self,
+                _manifest: ModelManifest,
+                _request: GenerateRequest,
+            ) -> crate::backend::GenerateStream {
+                self.calls.lock().unwrap().push("generate_stream");
+                Box::pin(tokio_stream::iter(vec![Ok(
+                    GenerateStreamEvent::TextChunk(self.label.to_string()),
+                )]))
+            }
+        }
+
+        let text_calls = StdArc::new(StdMutex::new(Vec::new()));
+        let vision_calls = StdArc::new(StdMutex::new(Vec::new()));
+        let backend = MlxPreferredBackend::with_backends(
+            Arc::new(RecordingMlxBackend {
+                label: "mlx-lm",
+                calls: text_calls.clone(),
+            }),
+            Arc::new(RecordingMlxBackend {
+                label: "mlx-vlm",
+                calls: vision_calls.clone(),
+            }),
+        );
+        let text_manifest = test_manifest(ModelFormat::Mlx, Some("qwen3"));
+        let mut vision_manifest = test_manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        vision_manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::ImageUnderstanding);
+        let text_request = GenerateRequest {
+            prompt: "hello".to_string(),
+            messages: Vec::new(),
+            image_urls: Vec::new(),
+            max_tokens: 8,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+        let mut vision_request = text_request.clone();
+        vision_request.image_urls = vec!["data:image/png;base64,AAAA".to_string()];
+
+        backend.prepare(&text_manifest).unwrap();
+        assert!(
+            backend
+                .start_chat_session(&text_manifest, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .generate(&text_manifest, text_request.clone())
+                .unwrap()
+                .text,
+            "mlx-lm"
+        );
+
+        backend.prepare(&vision_manifest).unwrap();
+        assert!(
+            backend
+                .start_chat_session(&vision_manifest, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .generate(&vision_manifest, text_request)
+                .unwrap()
+                .text,
+            "mlx-vlm"
+        );
+        let readiness = backend
+            .task_readiness(&vision_manifest, InferenceTask::ImageUnderstanding)
+            .unwrap();
+        assert_eq!(readiness.adapter.as_deref(), Some("mlx-vlm"));
+        assert_eq!(
+            backend
+                .generate(&vision_manifest, vision_request)
+                .unwrap()
+                .text,
+            "mlx-vlm"
+        );
+        assert_eq!(
+            text_calls.lock().unwrap().as_slice(),
+            &["prepare", "start_chat_session", "generate"]
+        );
+        assert_eq!(
+            vision_calls.lock().unwrap().as_slice(),
+            &[
+                "prepare",
+                "start_chat_session",
+                "generate",
+                "task_readiness",
+                "generate"
+            ]
+        );
+    }
+
+    #[test]
+    fn top_level_explicit_mlx_backend_exposes_mlx_vlm_readiness() {
+        let store = test_store("explicit-mlx-serve-vision-readiness");
+        let backend = build_generation_backend(
+            store.clone(),
+            BackendChoice::Mlx,
+            LlamaRuntimeOptions::default(),
+            SelectionOptions::default(),
+        )
+        .unwrap();
+        let mut manifest = test_manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::ImageUnderstanding);
+
+        let readiness = backend
+            .task_readiness(&manifest, InferenceTask::ImageUnderstanding)
+            .expect("explicit MLX must expose MLX-VLM vision readiness");
+
+        assert_eq!(readiness.adapter.as_deref(), Some("mlx-vlm"));
+        let _ = fs::remove_dir_all(store.home());
+    }
+
+    #[test]
+    fn explicit_vllm_backend_runs_the_selected_cuda_or_rocm_adapter() {
+        #[derive(Clone)]
+        struct RecordingVllmBackend {
+            label: &'static str,
+            calls: StdArc<StdMutex<Vec<&'static str>>>,
+        }
+
+        impl GenerationBackend for RecordingVllmBackend {
+            fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
+                self.calls.lock().unwrap().push("prepare");
+                Ok(())
+            }
+
+            fn task_readiness(
+                &self,
+                _manifest: &ModelManifest,
+                task: InferenceTask,
+            ) -> Option<TaskReadiness> {
+                self.calls.lock().unwrap().push("task_readiness");
+                (task == InferenceTask::ImageUnderstanding).then(|| TaskReadiness {
+                    status: TaskReadinessStatus::Available,
+                    detail: format!("{} is ready", self.label),
+                    adapter: Some(self.label.to_string()),
+                    required_backend: None,
+                    install_command: None,
+                    fallback_backend: None,
+                    missing_dependencies: Vec::new(),
+                    missing_dependency_groups: Vec::new(),
+                })
+            }
+
+            fn generate(
+                &self,
+                _manifest: &ModelManifest,
+                _request: GenerateRequest,
+            ) -> Result<crate::backend::GenerateResponse> {
+                self.calls.lock().unwrap().push("generate");
+                Ok(crate::backend::GenerateResponse {
+                    text: self.label.to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    finish_reason: "stop".to_string(),
+                    timings: GenerationTimings::default(),
+                    backend_diagnostics: Vec::new(),
+                })
+            }
+
+            fn generate_stream(
+                &self,
+                _manifest: ModelManifest,
+                _request: GenerateRequest,
+            ) -> crate::backend::GenerateStream {
+                unreachable!("not used")
+            }
+        }
+
+        let store = test_store("explicit-vllm-selected-adapter");
+        let cuda_calls = StdArc::new(StdMutex::new(Vec::new()));
+        let rocm_calls = StdArc::new(StdMutex::new(Vec::new()));
+        let backend = VllmPreferredBackend::with_backends(
+            store.clone(),
+            SelectionOptions::default(),
+            Arc::new(RecordingVllmBackend {
+                label: "vllm-cuda",
+                calls: cuda_calls.clone(),
+            }),
+            Arc::new(RecordingVllmBackend {
+                label: "vllm-rocm",
+                calls: rocm_calls.clone(),
+            }),
+            |has_images| {
+                if has_images {
+                    BackendChoice::VllmRocm
+                } else {
+                    BackendChoice::Vllm
+                }
+            },
+        );
+        let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("qwen3_vl"));
+        manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::ImageUnderstanding);
+        let text_request = GenerateRequest {
+            prompt: "hello".to_string(),
+            messages: Vec::new(),
+            image_urls: Vec::new(),
+            max_tokens: 8,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+        let mut image_request = text_request.clone();
+        image_request.image_urls = vec!["data:image/png;base64,AAAA".to_string()];
+
+        backend.prepare(&manifest).unwrap();
+        assert_eq!(
+            backend.generate(&manifest, text_request).unwrap().text,
+            "vllm-cuda"
+        );
+        let readiness = backend
+            .task_readiness(&manifest, InferenceTask::ImageUnderstanding)
+            .unwrap();
+        assert_eq!(readiness.adapter.as_deref(), Some("vllm-rocm"));
+        assert_eq!(
+            backend.generate(&manifest, image_request).unwrap().text,
+            "vllm-rocm"
+        );
+        assert_eq!(
+            cuda_calls.lock().unwrap().as_slice(),
+            &["prepare", "generate"]
+        );
+        assert_eq!(
+            rocm_calls.lock().unwrap().as_slice(),
+            &["task_readiness", "generate"]
+        );
+        let _ = fs::remove_dir_all(store.home());
     }
 
     #[test]
@@ -11955,6 +12876,45 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cli_vision_image_paths_become_portable_data_urls() {
+        let store = test_store("vision-image-source");
+        store.ensure().unwrap();
+        let image = store.home().join("layout.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+
+        let normalized = normalize_cli_image_sources(&[
+            image.display().to_string(),
+            "https://example.test/reference.png".to_string(),
+        ])
+        .unwrap();
+
+        assert!(normalized[0].starts_with("data:image/png;base64,"));
+        assert_eq!(normalized[1], "https://example.test/reference.png");
+        let _ = fs::remove_dir_all(store.home());
+    }
+
+    #[test]
+    fn cli_vision_message_preserves_text_then_images_and_counts_visual_tokens() {
+        let images = vec![
+            "data:image/png;base64,AAAA".to_string(),
+            "https://example.test/second.png".to_string(),
+        ];
+        let message = vision_user_message("Inspect the layout", &images);
+        let MessageContent::Parts(parts) = message.content.as_ref().unwrap() else {
+            panic!("vision message was flattened")
+        };
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["text", "image_url", "image_url"]
+        );
+        assert_eq!(image_urls_from_messages(&[message.clone()]), images);
+        assert!(cli_message_content_tokens(message.content.as_ref().unwrap()) >= 2 * 1024);
+    }
+
     fn test_store(name: &str) -> ModelStore {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -12103,6 +13063,17 @@ mod tests {
         let path = managed_backend_dir(store, mode).join("llama-server");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&path);
+    }
+
+    fn install_fake_multimodal_llama_server(store: &ModelStore, mode: LlamaCppMode) {
+        let path = managed_backend_dir(store, mode).join("llama-server");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            b"#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo --mmproj; fi\nexit 0\n",
+        )
+        .unwrap();
         make_executable(&path);
     }
 

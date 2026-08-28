@@ -93,9 +93,9 @@ the format and derived metadata.
 
 | Format | Detection evidence | Current routing status |
 | --- | --- | --- |
-| GGUF | `.gguf` | Persistent llama.cpp server for CPU/CUDA/ROCm/Vulkan/Metal when the matching runtime is available; Candle is a legacy compatibility path for selected architectures. |
-| MLX | MLX metadata in a safetensors header or `.npz`; an MLX path-name hint is a later fallback | External `mlx-lm`/MLX routes when configured. |
-| Safetensors | `.safetensors` not classified as MLX | Text routes are architecture/runtime dependent; compatible Transformers or Diffusers media repositories can use the media companion. |
+| GGUF | `.gguf` | Persistent llama.cpp server for CPU/CUDA/ROCm/Vulkan/Metal when the matching runtime is available. Vision requires a compatible VLM plus exactly one manifest-listed multimodal projector GGUF. Candle is a legacy text-only compatibility path for selected architectures. |
+| MLX | MLX metadata in a safetensors header or `.npz`; an MLX path-name hint is a later fallback | External `mlx-lm` text route and the model-dependent `mlx-vlm` Gemma4 route when configured. |
+| Safetensors | `.safetensors` not classified as MLX | Text routes are architecture/runtime dependent. Vision can use optional vLLM for its exact supported Qwen-VL/GLM4V architecture set or the supported MLX-VLM path; compatible Transformers or Diffusers media repositories can use the media companion. |
 | ONNX | `.onnx` | ONNX Runtime route when a compatible Werk runner is installed. |
 | TensorRT | `.engine` or `.plan` | Catalog/import only; no registered TensorRT execution backend. |
 | OpenVINO | both `.xml` and `.bin` | Catalog/import only; no registered OpenVINO execution backend. |

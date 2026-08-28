@@ -19,7 +19,9 @@ of Werk releases.
 | --- | --- |
 | Werk CLI/server binary | Native backend-neutral `linux-x86_64-amd-strix-halo` archive |
 | GGUF text models | llama.cpp through ROCm/HIP or Vulkan; concrete checkpoint and upstream build dependent |
+| Compatible VLM GGUF plus projector | Image understanding through llama.cpp ROCm/HIP or Vulkan when `llama-server` advertises `--mmproj`; smoke-test the exact model on `gfx1151` |
 | Text-only Nemotron-H safetensors | Eligible for a compatible vLLM ROCm server; real `gfx1151` validation remains required |
+| Qwen2/2.5/3-VL or GLM4V safetensors | Eligible for typed image understanding through a compatible vLLM ROCm server; exact architecture/version and real-hardware validation required |
 | Local vLLM | Use an operator-provisioned ROCm environment or container that explicitly supports `gfx1151` |
 | Remote vLLM | Supported through its OpenAI endpoint; declare the ROCm accelerator explicitly |
 | Image, video and audio | Werk media companion through an operator-provisioned ROCm PyTorch interpreter; model/package dependent |

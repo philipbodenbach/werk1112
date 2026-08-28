@@ -18,9 +18,11 @@ from one Nemotron variant to another.
 | Werk CLI/server binary | Native `linux-aarch64-dgx-spark` archive, built for GB10 `sm_121` |
 | Official Nemotron 4B GGUF | Text chat through a compatible llama.cpp server; model/runtime dependent |
 | Text-only Nemotron-H safetensors | Text chat through local or remote vLLM |
+| Qwen2/2.5/3-VL or GLM4V safetensors | Image understanding through a compatible local or remote vLLM version; exact Werk architecture allowlist applies |
+| Compatible VLM GGUF plus projector | Image understanding through a llama.cpp server that advertises `--mmproj` |
 | Spark-compatible vLLM container | Recommended integration route; Werk connects to its OpenAI endpoint |
 | `werk backend install vllm` | Deliberately not offered on Spark; a generic pip wheel is not a verified CUDA 13/ARM64 deployment |
-| Nemotron Omni image/audio/video inputs | Not implemented by Werk's text-only vLLM adapter |
+| Nemotron Omni image/audio/video inputs | Not eligible for Werk's current exact Qwen-VL/GLM4V vision allowlist; audio/video chat input remains unsupported |
 | TensorRT-LLM or NIM | No native Werk adapter; an OpenAI-compatible vLLM endpoint is the implemented remote contract |
 | Model fit estimates | Conservative only: Spark uses unified memory, not independent host-RAM and VRAM pools |
 
@@ -169,8 +171,10 @@ Common failures are intentionally actionable:
 - wrong served name: inspect `/v1/models` and set `WERK_VLLM_MODEL`;
 - unsupported architecture/layout: choose a text-only Nemotron-H safetensors or
   supported GGUF checkpoint;
-- Omni media input: use the upstream multimodal API directly until Werk has a
-  typed multimodal vLLM adapter;
+- Nemotron Omni media input: the current typed vision adapter deliberately
+  accepts only the documented Qwen-VL/GLM4V architecture set; use a supported
+  checkpoint or its upstream deployment contract instead of relying on name
+  similarity;
 - cold-start timeout: increase `WERK_VLLM_HEALTH_TIMEOUT_SECONDS` instead of
   changing the inference timeout; Werk polls `/v1/models` for both a supervised
   local vLLM and an explicitly configured remote/container endpoint;

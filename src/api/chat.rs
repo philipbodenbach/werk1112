@@ -267,16 +267,41 @@ fn estimate_message_tokens(messages: &[crate::openai::ChatMessage]) -> usize {
     messages
         .iter()
         .map(|message| {
-            let content_bytes = message
+            message
                 .content
                 .as_ref()
-                .map(crate::openai::MessageContent::as_text)
-                .map(|content| content.len())
-                .unwrap_or_default();
-            content_bytes.div_ceil(3) + 16
+                .map(estimate_content_tokens)
+                .unwrap_or_default()
+                .saturating_add(16)
         })
         .sum::<usize>()
         + 16
+}
+
+fn estimate_content_tokens(content: &crate::openai::MessageContent) -> usize {
+    use crate::openai::{ImageUrlSpec, MessageContent};
+
+    match content {
+        MessageContent::Text(text) => text.len().div_ceil(3),
+        MessageContent::Parts(parts) => parts.iter().fold(0usize, |tokens, part| {
+            let part_tokens = match part.kind.as_str() {
+                "text" => part.text.as_deref().unwrap_or_default().len().div_ceil(3),
+                "image_url" | "input_image" => {
+                    let detail = part.image_url.as_ref().and_then(|image| match image {
+                        ImageUrlSpec::Object(image) => image.detail.as_deref(),
+                        ImageUrlSpec::Url(_) => None,
+                    });
+                    match detail {
+                        Some("low") => 256,
+                        Some("high") => 2048,
+                        _ => 1024,
+                    }
+                }
+                _ => 0,
+            };
+            tokens.saturating_add(part_tokens)
+        }),
+    }
 }
 
 async fn complete_chat_response(
@@ -287,7 +312,15 @@ async fn complete_chat_response(
     let backend = state.backend.clone();
     let verbose = state.verbose;
     let model = manifest.id.clone();
-    let chat_session = match state.chat_session(&manifest, generate_request.seed) {
+    // Session selection currently happens before the request reaches AutoBackend and therefore
+    // cannot account for modality. Image requests use the request-aware backend path directly;
+    // persistent backends still retain their model/server and may reuse their own prefix cache.
+    let has_images = !generate_request.image_urls.is_empty();
+    let chat_session = match if has_images {
+        Ok(None)
+    } else {
+        state.chat_session(&manifest, generate_request.seed)
+    } {
         Ok(session) => session,
         Err(err) => {
             eprintln!("[werk serve] complete model={model} -> session error: {err}");
@@ -361,7 +394,12 @@ fn stream_chat_response(
     let body_model = model.clone();
     let body_model_for_log = model.clone();
     let verbose = state.verbose;
-    let body_stream = match state.chat_session(&manifest, generate_request.seed) {
+    let has_images = !generate_request.image_urls.is_empty();
+    let body_stream = match if has_images {
+        Ok(None)
+    } else {
+        state.chat_session(&manifest, generate_request.seed)
+    } {
         Ok(Some(session)) => session.generate_stream(generate_request),
         Ok(None) => state.backend.generate_stream(manifest, generate_request),
         Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
@@ -492,5 +530,34 @@ fn to_chat_completion(model: String, response: GenerateResponse) -> ChatCompleti
             completion_tokens: response.completion_tokens,
             total_tokens: response.prompt_tokens + response.completion_tokens,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openai::{ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
+
+    #[test]
+    fn multimodal_context_estimate_accounts_for_image_detail() {
+        let low = MessageContent::Parts(vec![ContentPart {
+            kind: "image_url".to_string(),
+            text: None,
+            image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: Some("low".to_string()),
+            })),
+        }]);
+        let high = MessageContent::Parts(vec![ContentPart {
+            kind: "input_image".to_string(),
+            text: None,
+            image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: Some("high".to_string()),
+            })),
+        }]);
+
+        assert_eq!(estimate_content_tokens(&low), 256);
+        assert_eq!(estimate_content_tokens(&high), 2048);
     }
 }

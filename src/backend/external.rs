@@ -1,13 +1,16 @@
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 #[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::{fs::DirBuilderExt, process::ExitStatusExt};
 #[cfg(feature = "llama-cpp")]
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
@@ -23,7 +26,11 @@ use super::{
     GenerateRequest, GenerateResponse, GenerateStream, GenerateStreamEvent, GenerationBackend,
     GenerationTimings,
 };
-use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
+use crate::{
+    capabilities::InferenceTask,
+    inference::{TaskReadiness, TaskReadinessStatus},
+    model_store::{ModelFormat, ModelManifest, ModelStore},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -42,6 +49,7 @@ const DEFAULT_N_UBATCH: u32 = 512;
 const GEMMA4_UNIFIED_MODEL_TYPE: &str = "gemma4_unified";
 const GEMMA4_UNIFIED_MLX_COMPAT_DIR: &str = "mlx-gemma4-unified-text";
 const GEMMA4_UNIFIED_MLX_COMPAT_MODEL_FILE: &str = "werk_gemma4_unified_compat.py";
+const DEFAULT_MAX_MLX_VLM_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const TRANSFORMERS_COMPAT_STATS_PREFIX: &str = "WERK_TRANSFORMERS_STATS ";
 const TRANSFORMERS_COMPAT_OUTPUT_PREFIX: &str = "WERK_TRANSFORMERS_OUTPUT ";
 const TRANSFORMERS_COMPAT_PY: &str = r#"
@@ -439,6 +447,184 @@ pub struct MlxVlmBackend {
     store: ModelStore,
     python: PathBuf,
     module: String,
+}
+
+struct PreparedMlxVlmCommand {
+    command: Command,
+    _images: MlxVlmImageInputs,
+}
+
+#[derive(Debug)]
+struct MlxVlmImageInputs {
+    arguments: Vec<OsString>,
+    temp_dir: Option<PathBuf>,
+}
+
+impl MlxVlmImageInputs {
+    fn prepare(sources: &[String]) -> Result<Self> {
+        let max_bytes = env::var("WERK_MAX_VISION_INPUT_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_MLX_VLM_IMAGE_BYTES);
+        Self::prepare_with_limit(sources, max_bytes)
+    }
+
+    fn prepare_with_limit(sources: &[String], max_bytes: usize) -> Result<Self> {
+        let mut prepared = Self {
+            arguments: Vec::with_capacity(sources.len()),
+            temp_dir: None,
+        };
+        let mut total_bytes = 0usize;
+
+        for (index, source) in sources.iter().enumerate() {
+            if !source
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+            {
+                prepared.arguments.push(OsString::from(source));
+                continue;
+            }
+
+            let (extension, bytes) =
+                decode_mlx_vlm_data_image(source, max_bytes.saturating_sub(total_bytes))?;
+            total_bytes = total_bytes
+                .checked_add(bytes.len())
+                .context("MLX-VLM image input byte count overflowed")?;
+            if total_bytes > max_bytes {
+                bail!(
+                    "MLX-VLM inline image inputs exceed WERK_MAX_VISION_INPUT_BYTES ({max_bytes} bytes)"
+                );
+            }
+
+            if prepared.temp_dir.is_none() {
+                prepared.temp_dir = Some(create_mlx_vlm_image_temp_dir()?);
+            }
+            let path = prepared
+                .temp_dir
+                .as_ref()
+                .expect("MLX-VLM image staging directory was initialized")
+                .join(format!("image-{index:04}.{extension}"));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| {
+                    format!(
+                        "failed to create temporary MLX-VLM image {}",
+                        path.display()
+                    )
+                })?;
+            std::io::Write::write_all(&mut file, &bytes).with_context(|| {
+                format!("failed to write temporary MLX-VLM image {}", path.display())
+            })?;
+            prepared.arguments.push(path.into_os_string());
+        }
+
+        Ok(prepared)
+    }
+}
+
+impl Drop for MlxVlmImageInputs {
+    fn drop(&mut self) {
+        if let Some(temp_dir) = self.temp_dir.take() {
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+    }
+}
+
+fn decode_mlx_vlm_data_image(source: &str, max_bytes: usize) -> Result<(&'static str, Vec<u8>)> {
+    let (header, payload) = source
+        .split_once(',')
+        .context("MLX-VLM data image URL is missing its comma separator")?;
+    let metadata = header
+        .get(5..)
+        .context("MLX-VLM image input is not a valid data URL")?;
+    let mut metadata_parts = metadata.split(';');
+    let mime_type = metadata_parts
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if metadata_parts.next() != Some("base64") || metadata_parts.next().is_some() {
+        bail!("MLX-VLM data image URLs must use data:image/<type>;base64,... encoding");
+    }
+
+    let extension = match mime_type.as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" | "image/x-ms-bmp" => "bmp",
+        _ => bail!(
+            "unsupported MLX-VLM inline image MIME type '{mime_type}'; use PNG, JPEG, GIF, WebP, or BMP"
+        ),
+    };
+
+    let max_encoded_bytes = max_bytes.div_ceil(3).saturating_mul(4);
+    if payload.len() > max_encoded_bytes {
+        bail!(
+            "MLX-VLM inline image inputs exceed WERK_MAX_VISION_INPUT_BYTES (remaining allowance: {max_bytes} bytes)"
+        );
+    }
+    let bytes = BASE64_STANDARD
+        .decode(payload)
+        .context("MLX-VLM data image URL contains invalid base64")?;
+    if bytes.is_empty() {
+        bail!("MLX-VLM data image URL contains no image bytes");
+    }
+    if bytes.len() > max_bytes {
+        bail!(
+            "MLX-VLM inline image inputs exceed WERK_MAX_VISION_INPUT_BYTES (remaining allowance: {max_bytes} bytes)"
+        );
+    }
+    if !mlx_vlm_image_signature_matches(extension, &bytes) {
+        bail!("MLX-VLM inline image bytes do not match the declared MIME type '{mime_type}'");
+    }
+
+    Ok((extension, bytes))
+}
+
+fn mlx_vlm_image_signature_matches(extension: &str, bytes: &[u8]) -> bool {
+    match extension {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        "bmp" => bytes.starts_with(b"BM"),
+        _ => false,
+    }
+}
+
+fn create_mlx_vlm_image_temp_dir() -> Result<PathBuf> {
+    for _ in 0..16 {
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|error| anyhow!("failed to generate MLX-VLM image staging ID: {error}"))?;
+        let suffix = nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = env::temp_dir().join(format!(
+            "werk-mlx-vlm-images-{}-{suffix}",
+            std::process::id()
+        ));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create temporary MLX-VLM image directory {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!("failed to allocate a unique temporary MLX-VLM image directory")
 }
 
 #[derive(Debug, Clone)]
@@ -958,6 +1144,9 @@ impl MlxBackend {
         if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
             bail!("mlx backend supports MLX or Hugging Face-style safetensors model directories");
         }
+        if !request.image_urls.is_empty() {
+            bail!("mlx-lm is text-only; route image input through the mlx-vlm backend");
+        }
         let model_dir = resolve_mlx_model_dir(&self.store, manifest)?;
         let chat_template_config = mlx_chat_template_config(manifest, &model_dir)?;
 
@@ -974,9 +1163,6 @@ impl MlxBackend {
         }
         if let Some(temperature) = request.temperature {
             command.arg("--temp").arg(format_float(temperature));
-        }
-        for image in &request.image_urls {
-            command.arg("--image").arg(image);
         }
         Ok(command)
     }
@@ -1042,13 +1228,14 @@ impl MlxVlmBackend {
         manifest: &ModelManifest,
         request: &GenerateRequest,
         verbose_backend_output: bool,
-    ) -> Result<Command> {
+    ) -> Result<PreparedMlxVlmCommand> {
         if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
             bail!(
                 "mlx-vlm backend supports MLX or Hugging Face-style safetensors model directories"
             );
         }
         let model_dir = original_mlx_model_dir(&self.store, manifest)?;
+        let images = MlxVlmImageInputs::prepare(&request.image_urls)?;
 
         let mut command = self.mlx_vlm_generate_command();
         command
@@ -1070,13 +1257,16 @@ impl MlxVlmBackend {
         if let Some(seed) = request.seed {
             command.arg("--seed").arg(seed_u32(seed).to_string());
         }
-        if !request.image_urls.is_empty() {
+        if !images.arguments.is_empty() {
             command.arg("--image");
-            for image in &request.image_urls {
+            for image in &images.arguments {
                 command.arg(image);
             }
         }
-        Ok(command)
+        Ok(PreparedMlxVlmCommand {
+            command,
+            _images: images,
+        })
     }
 
     fn mlx_vlm_generate_command(&self) -> Command {
@@ -1539,15 +1729,69 @@ impl GenerationBackend for MlxVlmBackend {
         Ok(())
     }
 
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task != InferenceTask::ImageUnderstanding {
+            return None;
+        }
+        let readiness = if !manifest.supports_task(task) {
+            Err(anyhow!(
+                "model '{}' does not advertise image-understanding",
+                manifest.id
+            ))
+        } else if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
+            Err(anyhow!(
+                "mlx-vlm requires an MLX or Hugging Face safetensors model"
+            ))
+        } else if !manifest
+            .architecture
+            .as_deref()
+            .is_some_and(|architecture| architecture == GEMMA4_UNIFIED_MODEL_TYPE)
+        {
+            Err(anyhow!(
+                "Werk's mlx-vlm route does not support image input for architecture '{}'",
+                manifest.architecture.as_deref().unwrap_or("unknown")
+            ))
+        } else {
+            Self::probe().map(|_| ())
+        };
+        Some(match readiness {
+            Ok(()) => TaskReadiness {
+                status: TaskReadinessStatus::Available,
+                detail: "mlx-vlm can execute image understanding without loading model weights during capability discovery".to_string(),
+                adapter: Some("mlx-vlm".to_string()),
+                required_backend: None,
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            },
+            Err(error) => TaskReadiness {
+                status: TaskReadinessStatus::Unavailable,
+                detail: error.to_string(),
+                adapter: Some("mlx-vlm".to_string()),
+                required_backend: Some("mlx-vlm".to_string()),
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            },
+        })
+    }
+
     fn generate(
         &self,
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        let mut command = self.command_for(manifest, &request, request.verbose)?;
-        let program = command.get_program().to_string_lossy().to_string();
+        let mut prepared = self.command_for(manifest, &request, request.verbose)?;
+        let program = prepared.command.get_program().to_string_lossy().to_string();
         let started = Instant::now();
-        let output = command
+        let output = prepared
+            .command
             .output()
             .with_context(|| format!("failed to execute {program}"))?;
         if !output.status.success() {
@@ -1694,12 +1938,16 @@ impl MlxVlmBackend {
         request: GenerateRequest,
         tx: mpsc::Sender<Result<GenerateStreamEvent, String>>,
     ) -> Result<()> {
-        let mut command = self.command_for(manifest, &request, true)?;
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut prepared = self.command_for(manifest, &request, true)?;
+        prepared
+            .command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        let program = command.get_program().to_string_lossy().to_string();
+        let program = prepared.command.get_program().to_string_lossy().to_string();
         let started = Instant::now();
-        let mut child = command
+        let mut child = prepared
+            .command
             .spawn()
             .with_context(|| format!("failed to execute {program}"))?;
         let mut stdout = child
@@ -2795,8 +3043,9 @@ mod tests {
         request.image_urls = vec!["one.png".to_string(), "two.png".to_string()];
         request.verbose = false;
 
-        let command = backend.command_for(&manifest, &request, false).unwrap();
-        let args = command
+        let prepared = backend.command_for(&manifest, &request, false).unwrap();
+        let args = prepared
+            .command
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -2817,6 +3066,89 @@ mod tests {
             Some("two.png")
         );
         assert_eq!(args.iter().filter(|arg| *arg == "--image").count(), 1);
+    }
+
+    #[test]
+    fn mlx_vlm_data_image_is_staged_for_command_lifetime() {
+        let store = test_store("mlx-vlm-data-image-command");
+        let manifest = test_manifest("Gemma4-12B-JANG", "gemma4_unified");
+        let model_dir = store.model_dir(&manifest.id).join("files");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(
+            model_dir.join("config.json"),
+            r#"{"model_type":"gemma4_unified"}"#,
+        )
+        .unwrap();
+
+        let backend = MlxVlmBackend {
+            store,
+            python: PathBuf::from("python3"),
+            module: "mlx_vlm".to_string(),
+        };
+        let png_signature = b"\x89PNG\r\n\x1a\n";
+        let mut request = test_request("Describe this image.");
+        request.image_urls = vec![format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(png_signature)
+        )];
+
+        let prepared = backend.command_for(&manifest, &request, false).unwrap();
+        let args = prepared
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let image_index = args.iter().position(|arg| arg == "--image").unwrap();
+        let staged_path = PathBuf::from(&args[image_index + 1]);
+        let temp_dir = prepared._images.temp_dir.clone().unwrap();
+
+        assert!(staged_path.starts_with(&temp_dir));
+        assert_eq!(
+            staged_path.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert_eq!(fs::read(&staged_path).unwrap(), png_signature);
+        assert!(temp_dir.exists());
+
+        drop(prepared);
+        assert!(!temp_dir.exists());
+    }
+
+    #[test]
+    fn mlx_vlm_image_staging_preserves_non_data_sources() {
+        let sources = vec![
+            "https://example.test/screenshot.png".to_string(),
+            "/tmp/local screenshot.png".to_string(),
+            "file:///tmp/another.png".to_string(),
+        ];
+
+        let prepared = MlxVlmImageInputs::prepare_with_limit(&sources, 1).unwrap();
+
+        assert_eq!(
+            prepared.arguments,
+            sources.iter().map(OsString::from).collect::<Vec<_>>()
+        );
+        assert!(prepared.temp_dir.is_none());
+    }
+
+    #[test]
+    fn mlx_vlm_image_staging_rejects_unsafe_inline_inputs() {
+        let png = BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\n");
+        let mismatched = format!("data:image/jpeg;base64,{png}");
+        let unsupported = format!("data:image/svg+xml;base64,{png}");
+        let malformed = "data:image/png,not-base64".to_string();
+        let oversized = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nextra")
+        );
+
+        assert!(MlxVlmImageInputs::prepare_with_limit(&[mismatched], 64).is_err());
+        assert!(MlxVlmImageInputs::prepare_with_limit(&[unsupported], 64).is_err());
+        assert!(MlxVlmImageInputs::prepare_with_limit(&[malformed], 64).is_err());
+        let error = MlxVlmImageInputs::prepare_with_limit(&[oversized], 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("WERK_MAX_VISION_INPUT_BYTES"));
     }
 
     #[test]

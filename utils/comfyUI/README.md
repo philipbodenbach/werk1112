@@ -95,9 +95,9 @@ werk serve --image-model tiny-sd --allow-unauthenticated
 ```
 
 `--image-model` supplies the alias used by image compatibility endpoints; the
-Werk-native image, video, and audio model nodes discover installed models and
-select one explicitly in the graph. They do not need server-wide video/audio
-aliases.
+Werk-native image, vision, video, and audio model nodes discover installed
+models and select one explicitly in the graph. They do not need server-wide
+video/audio aliases.
 
 The normal address is `http://127.0.0.1:11434`. Put the address and key into a
 **WERK Connection** node, or set `WERK_BASE_URL` and `WERK_API_KEY` before
@@ -139,6 +139,16 @@ is not required by these HTTP-backed Werk nodes.
   **WERK Connection**, click **Refresh Models**, and select a model from the
   **available_model** dropdown.
 - **WERK Image Parameters** reads the active model/runtime parameter schema.
+- **WERK Vision Models** discovers only models that authoritatively declare
+  `image-understanding`, and distinguishes declaration from current runtime
+  probe eligibility.
+- **WERK Vision Config** exposes the supported non-streaming chat controls:
+  temperature, top-p, completion budget, seed, image detail, and stop strings.
+  Per-request routing is deliberately absent because the current chat endpoint
+  is routed by the `werk serve` configuration and ignores media routing fields.
+- **WERK Vision Analyze** accepts a native ComfyUI `IMAGE` batch, preserves its
+  order as PNG data URLs in one multimodal user message, and returns the
+  assistant inspection plus sanitized completion metadata.
 - **WERK Video Models** discovers video models per explicit task. Choose
   `video-generation` for T2V or `image-to-video` for I2V, refresh discovery,
   and select `preferred_model` when more than one eligible model exists.
@@ -218,6 +228,34 @@ widget or private model dropdown: its `model` input uses ComfyUI's
 embedded Base64 response. The default batch size is treated as inherited and
 is not sent explicitly. For a reproducible and visible workflow, connecting an
 explicit **WERK Image Config** is recommended.
+
+### Recommended vision inspection workflow
+
+Use Vision Analyze after rendering a page, slide, frame, or other generated
+asset that needs visual QA:
+
+```text
+WERK Connection.connection --------+--> WERK Vision Models.connection
+                                    +--> WERK Vision Analyze.connection
+
+WERK Vision Models.model --------------> WERK Vision Analyze.model
+Load Image.IMAGE -----------------------> WERK Vision Analyze.images
+WERK Vision Config.config --------------> WERK Vision Analyze.config
+```
+
+One `IMAGE` tensor may contain a batch; every batch item becomes a separate
+`image_url` content part in the original order. The prompt and all image parts
+are sent together in one user message to `POST /v1/chat/completions`. An
+optional system prompt can establish a reusable QA rubric. Vision Analyze
+requires an active Vision Config so a bypassed configuration cannot silently
+disappear from the queued request.
+
+Model execution still depends on an installed model/backend pair that Werk
+reports as runtime-available for `image-understanding`. Merely being able to
+run the text side of Qwen3-VL, GLM-4V, Gemma, or another multimodal repository
+does not make its vision path available. **WERK Vision Models** fails honestly
+when the server declares a vision model but no compatible runtime passes the
+probe.
 
 ### Recommended video workflows
 
@@ -345,7 +383,9 @@ Ready API-prompt examples are provided for
 [music generation](examples/werk_music_generation_api.json),
 [text-to-speech](examples/werk_text_to_speech_api.json),
 [audio understanding](examples/werk_audio_understanding_api.json), and
-[voice conversion](examples/werk_voice_conversion_api.json). They contain no
+[voice conversion](examples/werk_voice_conversion_api.json), plus a
+[vision inspection](examples/werk_vision_inspection_api.json) workflow for
+missing controls, overflow, clipping, alignment, and spacing checks. They contain no
 credential; read the [example assumptions](examples/README.md) before
 submitting them to ComfyUI. Voice conversion demonstrates the prepared node
 contract only; the bundled companion currently advertises no executable
@@ -628,6 +668,7 @@ GET /v1/parameters?task=image-generation&model=MODEL&backend=auto
 GET /v1/parameters?task=video-generation&model=MODEL&backend=auto
 GET /v1/parameters?task=image-to-video&model=MODEL&backend=auto
 GET /v1/parameters?task=AUDIO_TASK&model=MODEL&backend=auto
+POST /v1/chat/completions
 POST /v1/images/generations
 POST /v1/videos/generations
 POST /v1/audio/generations
@@ -674,6 +715,9 @@ and use `WERK_MAX_AUDIO_BYTES`. Source audio has a separate aggregate
 `WERK_MAX_AUDIO_INPUT_BYTES`; it is enforced before Base64 allocation. The
 smaller input default keeps Base64 plus JSON safely below Werk's default
 128-MiB HTTP body limit, including the two-input voice-conversion path.
+Vision input uses the same conservative 67,108,864-byte aggregate limit for
+encoded PNG bytes, controlled by `WERK_MAX_VISION_INPUT_BYTES`. The existing
+`WERK_MAX_IMAGE_PIXELS` limit applies to the aggregate vision batch as well.
 
 ## Tests
 

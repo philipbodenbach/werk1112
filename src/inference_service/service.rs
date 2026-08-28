@@ -11,7 +11,8 @@ use super::{
     types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome, RuntimeAttemptTiming},
 };
 use crate::{
-    backend::validated_backend_install_command,
+    backend::{GenerationBackend, validated_backend_install_command},
+    capabilities::InferenceTask,
     inference::{
         EffectiveInferenceRequest, ExecutionDegradation, ExecutionPlan, HostResources,
         InferenceRequest, MemoryTopology, ParameterSource, ParameterValue, PlanCandidateStatus,
@@ -401,6 +402,24 @@ impl InferenceService {
     }
 
     pub fn capabilities(&self) -> Result<Value> {
+        self.capabilities_with_optional_generation_backend(None)
+    }
+
+    /// Returns media capabilities enriched with readiness from the chat
+    /// generation backend. This keeps ordinary media discovery independent,
+    /// while allowing `/v1/capabilities` to describe chat-native tasks such as
+    /// image understanding truthfully.
+    pub fn capabilities_with_generation_backend(
+        &self,
+        generation_backend: &dyn GenerationBackend,
+    ) -> Result<Value> {
+        self.capabilities_with_optional_generation_backend(Some(generation_backend))
+    }
+
+    fn capabilities_with_optional_generation_backend(
+        &self,
+        generation_backend: Option<&dyn GenerationBackend>,
+    ) -> Result<Value> {
         let models = self
             .store
             .list()?
@@ -418,40 +437,51 @@ impl InferenceService {
                             .map(|descriptor| descriptor.path)
                             .collect::<Vec<_>>();
                         let probe = self.backend.probe(&self.store, &manifest, task, &paths);
-                        (task, probe)
+                        let generation_readiness = (task == InferenceTask::ImageUnderstanding)
+                            .then(|| {
+                                generation_backend
+                                    .and_then(|backend| backend.task_readiness(&manifest, task))
+                            })
+                            .flatten();
+                        (task, probe, generation_readiness)
                     })
                     .collect::<Vec<_>>();
                 let available_tasks = task_probes
                     .iter()
-                    .filter(|(task, probe)| {
-                        probe.candidates.iter().any(|candidate| {
-                            candidate.available && candidate.supported_tasks.contains(task)
-                        })
+                    .filter(|(task, probe, generation_readiness)| {
+                        probe_task_available(*task, probe)
+                            || generation_readiness
+                                .as_ref()
+                                .is_some_and(task_readiness_is_available)
                     })
-                    .map(|(task, _)| *task)
+                    .map(|(task, _, _)| *task)
                     .collect::<Vec<_>>();
                 let task_statuses = task_probes
                     .into_iter()
-                    .map(|(task, probe)| {
-                        let mut readiness = probe.readiness.unwrap_or_else(|| {
-                            let available = probe.candidates.iter().any(|candidate| {
-                                candidate.available && candidate.supported_tasks.contains(&task)
-                            });
-                            TaskReadiness {
-                                status: if available {
-                                    TaskReadinessStatus::Available
-                                } else {
-                                    TaskReadinessStatus::Unavailable
-                                },
-                                detail: probe.detail,
-                                adapter: None,
-                                required_backend: None,
-                                install_command: None,
-                                fallback_backend: None,
-                                missing_dependencies: Vec::new(),
-                                missing_dependency_groups: Vec::new(),
-                            }
+                    .map(|(task, probe, generation_readiness)| {
+                        let media_available = probe_task_available(task, &probe);
+                        let media_readiness = probe.readiness.unwrap_or_else(|| TaskReadiness {
+                            status: if media_available {
+                                TaskReadinessStatus::Available
+                            } else {
+                                TaskReadinessStatus::Unavailable
+                            },
+                            detail: probe.detail,
+                            adapter: None,
+                            required_backend: None,
+                            install_command: None,
+                            fallback_backend: None,
+                            missing_dependencies: Vec::new(),
+                            missing_dependency_groups: Vec::new(),
                         });
+                        let mut readiness = match generation_readiness {
+                            Some(generation)
+                                if task_readiness_is_available(&generation) || !media_available =>
+                            {
+                                generation
+                            }
+                            _ => media_readiness,
+                        };
                         normalize_task_readiness(&mut readiness);
                         readiness.detail = sanitize_capability_detail(&readiness.detail);
                         let task_key = serde_json::to_value(task)
@@ -609,6 +639,20 @@ fn dynamic_tools(models: &[Value]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn probe_task_available(task: InferenceTask, probe: &BackendProbe) -> bool {
+    probe
+        .candidates
+        .iter()
+        .any(|candidate| candidate.available && candidate.supported_tasks.contains(&task))
+}
+
+fn task_readiness_is_available(readiness: &TaskReadiness) -> bool {
+    matches!(
+        readiness.status,
+        TaskReadinessStatus::Available | TaskReadinessStatus::FallbackAvailable
+    )
 }
 
 fn append_unique(target: &mut Vec<String>, values: Vec<String>) {

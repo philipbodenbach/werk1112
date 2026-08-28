@@ -15,6 +15,7 @@ try:
     from .nodes import (
         classify_audio_models,
         classify_image_models,
+        classify_vision_models,
         classify_video_models,
     )
 except ImportError:  # pragma: no cover - direct-module development
@@ -23,6 +24,7 @@ except ImportError:  # pragma: no cover - direct-module development
     from nodes import (
         classify_audio_models,
         classify_image_models,
+        classify_vision_models,
         classify_video_models,
     )
 
@@ -62,18 +64,22 @@ def discover_connection(
     except WerkApiError as error:
         warning = str(error)
     classification = classify_image_models(models, capabilities)
+    vision_classification = classify_vision_models(models, capabilities)
     video_classification = classify_video_models(models, capabilities)
     audio_classification = classify_audio_models(models, capabilities)
     model_count = len(classification["installed"])
     available_count = len(classification["available"])
+    available_vision_count = len(vision_classification["available"])
     available_video_count = len(video_classification["available"])
     available_audio_count = len(audio_classification["available"])
     model_word = "model" if model_count == 1 else "models"
     image_word = "image" if available_count == 1 else "images"
+    vision_word = "vision model" if available_vision_count == 1 else "vision models"
     video_word = "video" if available_video_count == 1 else "videos"
     audio_word = "audio model" if available_audio_count == 1 else "audio models"
     status = (
         f"Connected · {model_count} {model_word} · {available_count} {image_word}"
+        f" · {available_vision_count} {vision_word}"
         f" · {available_video_count} {video_word}"
         f" · {available_audio_count} {audio_word}"
     )
@@ -87,6 +93,10 @@ def discover_connection(
         "image_models": {
             "declared": classification["declared"],
             "available": classification["available"],
+        },
+        "vision_models": {
+            "declared": vision_classification["declared"],
+            "available": vision_classification["available"],
         },
         "video_models": {
             "declared": video_classification["declared"],

@@ -40,7 +40,10 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
     let router = Router::new()
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{id}", get(model_handler))
-        .route("/v1/chat/completions", post(chat_completions_handler))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
+        )
         .route("/v1/images/generations", post(image_generations_handler))
         .route("/v1/images/edits", post(image_edits_handler))
         .route(

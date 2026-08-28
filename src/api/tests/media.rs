@@ -51,7 +51,19 @@ async fn generic_audio_jobs_accept_large_bounded_json_bodies() {
         None,
     )
     .await;
-    assert_eq!(unrelated_large_body.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(unrelated_large_body.status(), StatusCode::NOT_FOUND);
+
+    let oversized_chat_body = post_json(
+        &app,
+        "/v1/chat/completions",
+        json!({
+            "model": "missing-chat-model",
+            "messages": [{"role": "user", "content": "A".repeat(body_limit + 1024)}]
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(oversized_chat_body.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
     let above_configured_limit =
         post_json(&app, "/v1/jobs", payload(body_limit + 1024), None).await;
@@ -745,5 +757,152 @@ async fn capability_and_parameter_routes_are_authenticated() {
             .as_array()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[derive(Clone)]
+struct VisionReadyGenerationBackend;
+
+impl GenerationBackend for VisionReadyGenerationBackend {
+    fn task_readiness(
+        &self,
+        _manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        (task == InferenceTask::ImageUnderstanding).then(|| TaskReadiness {
+            status: TaskReadinessStatus::Available,
+            detail: "mock chat vision route is ready".to_string(),
+            adapter: Some("mock-generation-vlm".to_string()),
+            required_backend: None,
+            install_command: None,
+            fallback_backend: None,
+            missing_dependencies: Vec::new(),
+            missing_dependency_groups: Vec::new(),
+        })
+    }
+
+    fn generate(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResponse> {
+        GenerationBackend::generate(&MockBackend, manifest, request)
+    }
+
+    fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
+        GenerationBackend::generate_stream(&MockBackend, manifest, request)
+    }
+}
+
+#[derive(Clone)]
+struct VisionBlindMediaBackend;
+
+impl MediaInferenceBackend for VisionBlindMediaBackend {
+    fn probe(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        _task: InferenceTask,
+        _schema_paths: &[String],
+    ) -> BackendProbe {
+        BackendProbe {
+            available: false,
+            detail: "media companion does not own chat vision".to_string(),
+            candidates: Vec::new(),
+            parameter_support: BTreeMap::new(),
+            readiness: Some(TaskReadiness {
+                status: TaskReadinessStatus::Unavailable,
+                detail: "media companion does not own chat vision".to_string(),
+                adapter: Some("mock-media".to_string()),
+                required_backend: None,
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _store: &ModelStore,
+        _manifest: &ModelManifest,
+        _request: &EffectiveInferenceRequest,
+        _output_dir: &Path,
+        _runtime: &str,
+    ) -> anyhow::Result<BackendExecution> {
+        anyhow::bail!("not used")
+    }
+}
+
+#[tokio::test]
+async fn capabilities_include_chat_generation_vision_readiness() {
+    let store = test_store();
+    let manifest = ModelManifest {
+        id: "vision".to_string(),
+        source: ModelSource::LocalPath {
+            path: "test".to_string(),
+        },
+        format: ModelFormat::SafeTensors,
+        architecture: Some("qwen3_vl".to_string()),
+        tokenizer_path: None,
+        config_path: None,
+        model_path: Some("model.safetensors".to_string()),
+        backend: "test".to_string(),
+        created_unix: 1,
+        files: Vec::new(),
+        artifacts: Vec::new(),
+        metadata: ModelMetadata {
+            tasks: vec![
+                InferenceTask::TextGeneration,
+                InferenceTask::ImageUnderstanding,
+            ],
+            input_modalities: vec![InputModality::Text, InputModality::Image],
+            output_modalities: vec![OutputModality::Text],
+            ..ModelMetadata::default()
+        },
+    };
+    fs::create_dir_all(store.model_dir("vision")).unwrap();
+    fs::write(
+        store
+            .model_dir("vision")
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let inference_service =
+        InferenceService::with_backend(store.clone(), Arc::new(VisionBlindMediaBackend));
+    let app = router(
+        ApiState::new(store, Arc::new(VisionReadyGenerationBackend))
+            .with_inference_service(inference_service),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let capabilities = response_json(response).await;
+    let model = capabilities["models"]
+        .as_array()
+        .and_then(|models| models.iter().find(|model| model["id"] == "vision"))
+        .expect("vision model should be present in capabilities");
+    assert!(
+        model["available_tasks"]
+            .as_array()
+            .is_some_and(|tasks| tasks.contains(&json!("image_understanding")))
+    );
+    assert_eq!(
+        model["task_statuses"]["image_understanding"]["status"],
+        "available"
+    );
+    assert_eq!(
+        model["task_statuses"]["image_understanding"]["adapter"],
+        "mock-generation-vlm"
     );
 }

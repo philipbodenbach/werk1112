@@ -20,7 +20,11 @@ use super::{
     current_host_is_strix_halo, current_selected_rocm_device_is_strix_halo,
     current_selected_rocm_device_status,
 };
-use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
+use crate::{
+    capabilities::InferenceTask,
+    inference::{TaskReadiness, TaskReadinessStatus},
+    model_store::{ModelFormat, ModelManifest, ModelStore},
+};
 
 const DEFAULT_HEALTH_TIMEOUT_SECONDS: u64 = 300;
 const DGX_SPARK_HEALTH_TIMEOUT_SECONDS: u64 = 900;
@@ -29,6 +33,19 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HEALTH_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Exact Hugging Face `config.json.model_type` values for vLLM-backed VLMs.
+///
+/// Keep this deliberately narrower than vLLM's text architecture allowlist:
+/// advertising a text-only sibling such as `qwen3` as image-capable would let
+/// image requests reach a model which cannot consume their multipart content.
+pub(crate) const VLLM_VISION_ARCHITECTURES: &[&str] = &[
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    "glm4v",
+    "glm4v_moe",
+];
 const WSL_VLLM_MESSAGE: &str = "vLLM is a Linux-native runtime. Your environment appears to be WSL, where vLLM can fail because required GPU memory features such as UVA/CUDA IPC are unavailable. Werk will fall back to Candle CUDA. For best vLLM support use native Linux or a remote vLLM server.";
 const DGX_SPARK_VLLM_MESSAGE: &str = "DGX Spark detected (Linux aarch64 / GB10). Use NVIDIA's Spark-compatible vLLM container and expose its OpenAI endpoint, then set WERK_VLLM_HOST, WERK_VLLM_PORT, and, when its served name differs from the Werk model ID, WERK_VLLM_MODEL. A generic managed `pip install vllm` is intentionally not offered on DGX Spark.";
 const STRIX_HALO_VLLM_MESSAGE: &str = "AMD Strix Halo detected (Linux x86_64 / gfx1151). A generic managed `pip install vllm` is intentionally not offered because Strix Halo requires a matching ROCm vLLM build. Use an official ROCm vLLM container and set WERK_VLLM_HOST plus WERK_VLLM_PORT, or set WERK_VLLM_PYTHON to a preprovisioned Python whose PyTorch reports both torch.version.hip and gfx1151. Set WERK_VLLM_ACCELERATOR=rocm (or WERK_VLLM_ROCM=1) for a remote ROCm endpoint.";
@@ -80,6 +97,63 @@ struct VllmProcess {
 
 struct VllmChatSession {
     server: Arc<VllmProcess>,
+    architecture: Option<String>,
+}
+
+pub(crate) fn vllm_architecture_supports_images(architecture: Option<&str>) -> bool {
+    architecture.is_some_and(|architecture| {
+        VLLM_VISION_ARCHITECTURES
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(architecture))
+    })
+}
+
+fn multipart_image_urls(request: &GenerateRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_ref())
+        .flat_map(crate::openai::MessageContent::image_urls)
+        .collect()
+}
+
+fn validate_vllm_image_request(
+    architecture: Option<&str>,
+    request: &GenerateRequest,
+) -> Result<()> {
+    let multipart_images = multipart_image_urls(request);
+    if request.image_urls.is_empty() && multipart_images.is_empty() {
+        return Ok(());
+    }
+
+    let architecture_label = architecture.unwrap_or("unknown");
+    if !vllm_architecture_supports_images(architecture) {
+        bail!(
+            "vLLM image inputs require an explicitly supported VLM architecture; model architecture '{architecture_label}' is not one of: {}",
+            VLLM_VISION_ARCHITECTURES.join(", ")
+        );
+    }
+    if multipart_images.is_empty() {
+        bail!(
+            "vLLM image inputs must be present in the ordered OpenAI multipart messages; separate image URLs without multipart message content cannot be forwarded safely"
+        );
+    }
+    if multipart_images != request.image_urls {
+        bail!("vLLM image routing metadata does not match the ordered multipart message images");
+    }
+    for source in &multipart_images {
+        let source = source.trim();
+        if source.starts_with("data:image/")
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+        {
+            continue;
+        }
+        bail!(
+            "vLLM vision input does not expose local filesystem paths to its OpenAI endpoint; send an image data URL or HTTP(S) URL (CLI --image paths are converted automatically)"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -285,9 +359,7 @@ impl VllmBackend {
         request: GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<GenerateResponse> {
-        if !request.image_urls.is_empty() {
-            bail!("vLLM text backend received image inputs; use a VLM-capable model/runtime");
-        }
+        validate_vllm_image_request(manifest.architecture.as_deref(), &request)?;
 
         let total_started = Instant::now();
         let (server, reused, load_seconds) = self.cached_server(manifest)?;
@@ -325,7 +397,68 @@ impl GenerationBackend for VllmBackend {
             return Ok(None);
         }
         let (server, _, _) = self.cached_server(manifest)?;
-        Ok(Some(Box::new(VllmChatSession { server })))
+        Ok(Some(Box::new(VllmChatSession {
+            server,
+            architecture: manifest.architecture.clone(),
+        })))
+    }
+
+    fn task_readiness(
+        &self,
+        manifest: &ModelManifest,
+        task: InferenceTask,
+    ) -> Option<TaskReadiness> {
+        if task != InferenceTask::ImageUnderstanding {
+            return None;
+        }
+        let readiness = if !manifest.supports_task(task) {
+            Err(anyhow!(
+                "model '{}' does not advertise image-understanding",
+                manifest.id
+            ))
+        } else if manifest.format != ModelFormat::SafeTensors {
+            Err(anyhow!(
+                "vLLM image understanding requires a Hugging Face safetensors model"
+            ))
+        } else if !vllm_architecture_supports_images(manifest.architecture.as_deref()) {
+            Err(anyhow!(
+                "vLLM does not support image input for architecture '{}'",
+                manifest.architecture.as_deref().unwrap_or("unknown")
+            ))
+        } else {
+            match self.accelerator {
+                VllmAccelerator::Cuda => Self::probe(&self.store),
+                VllmAccelerator::Rocm => Self::probe_rocm(&self.store),
+            }
+            .map(|_| ())
+        };
+        let adapter = self.accelerator.backend_label().to_string();
+        Some(match readiness {
+            Ok(()) => TaskReadiness {
+                status: TaskReadinessStatus::Available,
+                detail: format!(
+                    "{} can route image understanding for architecture '{}' without loading model weights during capability discovery",
+                    self.accelerator.backend_label(),
+                    manifest.architecture.as_deref().unwrap_or("unknown")
+                ),
+                adapter: Some(adapter),
+                required_backend: None,
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            },
+            Err(error) => TaskReadiness {
+                status: TaskReadinessStatus::Unavailable,
+                detail: error.to_string(),
+                adapter: Some(adapter.clone()),
+                required_backend: Some(adapter),
+                install_command: None,
+                fallback_backend: None,
+                missing_dependencies: Vec::new(),
+                missing_dependency_groups: Vec::new(),
+            },
+        })
     }
 
     fn generate(
@@ -349,6 +482,7 @@ impl GenerationBackend for VllmBackend {
 
 impl ChatGenerationSession for VllmChatSession {
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
+        validate_vllm_image_request(self.architecture.as_deref(), &request)?;
         let total_started = Instant::now();
         self.server.print_debug(&request, true);
         let completion = self.server.complete(&request, None)?;
@@ -371,12 +505,13 @@ impl ChatGenerationSession for VllmChatSession {
 
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream {
         let server = self.server.clone();
+        let architecture = self.architecture.clone();
         let (tx, rx) = mpsc::channel(16);
         tokio::task::spawn_blocking(move || {
             let total_started = Instant::now();
             server.print_debug(&request, true);
-            let result = server
-                .complete(&request, Some(tx.clone()))
+            let result = validate_vllm_image_request(architecture.as_deref(), &request)
+                .and_then(|()| server.complete(&request, Some(tx.clone())))
                 .map(|completion| GenerateResponse {
                     text: completion.text,
                     prompt_tokens: completion.prompt_tokens,
@@ -1125,7 +1260,7 @@ fn chat_completion_body(model_name: &str, request: &GenerateRequest) -> Value {
             "content": request.prompt,
         }])
     } else {
-        json!(request.messages)
+        vllm_chat_messages(&request.messages)
     };
     let mut body = json!({
         "model": model_name,
@@ -1147,6 +1282,29 @@ fn chat_completion_body(model_name: &str, request: &GenerateRequest) -> Value {
         body["seed"] = json!(seed);
     }
     body
+}
+
+fn vllm_chat_messages(messages: &[crate::openai::ChatMessage]) -> Value {
+    let mut messages =
+        serde_json::to_value(messages).expect("ChatMessage serialization cannot fail");
+    if let Some(messages) = messages.as_array_mut() {
+        for message in messages {
+            let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                    part["type"] = json!("image_url");
+                }
+                if matches!(part.get("type").and_then(Value::as_str), Some("image_url"))
+                    && let Some(url) = part.get("image_url").and_then(Value::as_str)
+                {
+                    part["image_url"] = json!({"url": url});
+                }
+            }
+        }
+    }
+    messages
 }
 
 fn update_completion_from_event(completion: &mut VllmCompletion, value: &Value) {
@@ -2853,7 +3011,7 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::model_store::ModelSource;
-    use crate::openai::{ChatMessage, MessageContent};
+    use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -2883,6 +3041,188 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "hello");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn vllm_vision_architecture_allowlist_is_exact() {
+        for architecture in [
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "glm4v",
+            "glm4v_moe",
+            "QWEN3_VL",
+        ] {
+            assert!(
+                vllm_architecture_supports_images(Some(architecture)),
+                "expected {architecture} to be image-capable"
+            );
+        }
+        for architecture in [
+            None,
+            Some("qwen2"),
+            Some("qwen3"),
+            Some("chatglm"),
+            Some("glm4"),
+            Some("qwen3-vl"),
+        ] {
+            assert!(
+                !vllm_architecture_supports_images(architecture),
+                "unexpected image support for {architecture:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vllm_multimodal_body_preserves_order_urls_and_detail() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(MessageContent::Text("Inspect carefully.".to_string())),
+                name: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart {
+                        kind: "text".to_string(),
+                        text: Some("Compare these screenshots:".to_string()),
+                        image_url: None,
+                    },
+                    ContentPart {
+                        kind: "image_url".to_string(),
+                        text: None,
+                        image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
+                            url: "data:image/png;base64,first".to_string(),
+                            detail: Some("high".to_string()),
+                        })),
+                    },
+                    ContentPart {
+                        kind: "text".to_string(),
+                        text: Some("against".to_string()),
+                        image_url: None,
+                    },
+                    ContentPart {
+                        kind: "input_image".to_string(),
+                        text: None,
+                        image_url: Some(ImageUrlSpec::Url(
+                            "https://example.test/second.png".to_string(),
+                        )),
+                    },
+                ])),
+                name: None,
+            },
+        ];
+        let request = GenerateRequest {
+            prompt: "rendered prompt must not replace multipart messages".to_string(),
+            messages: messages.clone(),
+            image_urls: vec![
+                "data:image/png;base64,first".to_string(),
+                "https://example.test/second.png".to_string(),
+            ],
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: super::super::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        validate_vllm_image_request(Some("qwen3_vl"), &request).unwrap();
+        let body = chat_completion_body("vlm", &request);
+        assert_eq!(
+            body["messages"][0],
+            serde_json::to_value(&messages[0]).unwrap()
+        );
+        assert_eq!(body["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][1]["content"][1]["image_url"]["detail"],
+            "high"
+        );
+        assert_eq!(body["messages"][1]["content"][2]["text"], "against");
+        assert_eq!(body["messages"][1]["content"][3]["type"], "image_url");
+        assert_eq!(
+            body["messages"][1]["content"][3]["image_url"]["url"],
+            "https://example.test/second.png"
+        );
+    }
+
+    #[test]
+    fn vllm_image_validation_rejects_local_file_urls() {
+        let request = GenerateRequest {
+            prompt: "inspect".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![ContentPart {
+                    kind: "image_url".to_string(),
+                    text: None,
+                    image_url: Some(ImageUrlSpec::Url("file:///tmp/private.png".to_string())),
+                }])),
+                name: None,
+            }],
+            image_urls: vec!["file:///tmp/private.png".to_string()],
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: super::super::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let error = validate_vllm_image_request(Some("qwen3_vl"), &request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("data URL or HTTP(S) URL"));
+    }
+
+    #[test]
+    fn vllm_image_validation_rejects_text_siblings_and_unstructured_images() {
+        let multipart_message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Parts(vec![ContentPart {
+                kind: "image_url".to_string(),
+                text: None,
+                image_url: Some(ImageUrlSpec::Url("image.png".to_string())),
+            }])),
+            name: None,
+        };
+        let mut request = GenerateRequest {
+            prompt: "inspect".to_string(),
+            messages: vec![multipart_message],
+            image_urls: vec!["image.png".to_string()],
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: super::super::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+        };
+
+        let error = validate_vllm_image_request(Some("qwen3"), &request).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("explicitly supported VLM architecture")
+        );
+
+        request.messages.clear();
+        let error = validate_vllm_image_request(Some("qwen3_vl"), &request).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ordered OpenAI multipart messages")
+        );
+
+        request.image_urls.clear();
+        validate_vllm_image_request(Some("qwen3"), &request).unwrap();
     }
 
     #[test]

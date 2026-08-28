@@ -98,6 +98,20 @@ werk audio generate speech TTS_MODEL \
   --output speech.wav
 ~~~
 
+Inspect a rendered page or slide with a compatible vision-language model:
+
+~~~bash
+werk --backend auto run VISION_MODEL \
+  "Find clipped text, missing controls, overlap and grid misalignment." \
+  --image /absolute/path/to/render.png \
+  --debug
+~~~
+
+Vision is supplied by the model and its processor, not by vLLM itself. Werk
+can route compatible requests through llama.cpp with a GGUF projector, optional
+vLLM, or the supported MLX-VLM path. See
+[Vision and visual quality assurance](docs/integrations/vision.md).
+
 Werk chooses among accepted runtimes when the backend is <code>auto</code>.
 Use verbose diagnostics to see the effective request and decision:
 
@@ -175,6 +189,7 @@ authentication, limits, persistence and known gaps.
 | Building from source | [docs/development/build.md](docs/development/build.md) |
 | Packaging and releases | [docs/development/packaging-releases.md](docs/development/packaging-releases.md) |
 | DGX Spark and AMD Strix Halo | [docs/integrations/dgx-spark.md](docs/integrations/dgx-spark.md) · [docs/integrations/strix-halo.md](docs/integrations/strix-halo.md) |
+| Vision models and rendered-output QA | [docs/integrations/vision.md](docs/integrations/vision.md) |
 | Client integration guides | [docs/README.md#integrations](docs/README.md#integrations) |
 | ComfyUI custom nodes | [utils/comfyUI/README.md](utils/comfyUI/README.md) |
 

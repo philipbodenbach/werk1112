@@ -5,6 +5,7 @@ use crate::{
         BackendAccelerator, BackendRuntime, RuntimeId, backend_supports_images,
         explain_backend_rejection, is_transformers_compat_model, runtime_descriptor,
         runtime_registry, runtime_supports_layout, runtime_supports_model, runtime_supports_task,
+        vllm_architecture_supports_images,
     },
     capabilities::{InferenceTask, InputModality, OutputModality},
     model_store::{ModelFormat, ModelManifest},
@@ -695,6 +696,11 @@ fn rejection_reason(
         return Some(model_support_rejection(manifest, descriptor.runtime));
     }
     if request_capabilities.task.is_none() {
+        if request_capabilities.image_input
+            && !manifest.supports_task(InferenceTask::ImageUnderstanding)
+        {
+            return Some("model does not advertise image-understanding".to_string());
+        }
         if request_capabilities.text_generation && !descriptor.capabilities.text_generation {
             return Some("runtime does not support text generation".to_string());
         }
@@ -709,6 +715,14 @@ fn rejection_reason(
         if request_capabilities.embeddings && !descriptor.capabilities.embeddings {
             return Some("runtime does not support embeddings".to_string());
         }
+    }
+    let requests_vision = request_capabilities.image_input
+        || request_capabilities.task == Some(InferenceTask::ImageUnderstanding);
+    if requests_vision
+        && descriptor.runtime == BackendRuntime::Vllm
+        && !vllm_architecture_supports_images(manifest.architecture.as_deref())
+    {
+        return Some("vLLM does not support image input for this architecture".to_string());
     }
     if request_capabilities.streaming && !descriptor.capabilities.streaming {
         return Some("runtime does not support streaming".to_string());
@@ -1006,9 +1020,83 @@ mod tests {
                 image_plan
                     .candidates
                     .iter()
-                    .any(|decision| decision.reason.contains("VLM"))
+                    .any(|decision| decision.reason.contains("image-understanding"))
             );
         }
+    }
+
+    #[test]
+    fn qwen3_vl_image_request_routes_to_vllm_but_text_qwen3_does_not() {
+        let available = [RuntimeAvailability {
+            runtime_id: RuntimeId::VllmCuda,
+            available: true,
+            reason: None,
+        }];
+        let mut vision = manifest(ModelFormat::SafeTensors, Some("qwen3_vl_moe"));
+        vision.metadata.tasks = vec![
+            InferenceTask::TextGeneration,
+            InferenceTask::ImageUnderstanding,
+        ];
+
+        let selected = select_runtime(
+            &vision,
+            RequestedBackend::Vllm,
+            RequestCapabilities::text_with_images(true, true),
+            &available,
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::VllmCuda);
+
+        let mut text_qwen = manifest(ModelFormat::SafeTensors, Some("qwen3"));
+        text_qwen.metadata.tasks = vision.metadata.tasks.clone();
+        let rejected = plan_runtime(
+            &text_qwen,
+            RequestedBackend::Vllm,
+            RequestCapabilities::text_with_images(true, true),
+            &available,
+        );
+        assert!(rejected.selected.is_none());
+        assert!(rejected.candidates.iter().any(|decision| {
+            decision
+                .reason
+                .contains("vLLM does not support image input for this architecture")
+        }));
+
+        let task_probe = plan_runtime(
+            &text_qwen,
+            RequestedBackend::Vllm,
+            RequestCapabilities::for_task(InferenceTask::ImageUnderstanding),
+            &available,
+        );
+        assert!(task_probe.selected.is_none());
+        assert!(task_probe.candidates.iter().any(|decision| {
+            decision
+                .reason
+                .contains("vLLM does not support image input for this architecture")
+        }));
+    }
+
+    #[test]
+    fn gguf_vlm_image_request_routes_to_llama_server() {
+        let mut vision = manifest(ModelFormat::Gguf, Some("qwen3_vl"));
+        vision.metadata.tasks = vec![
+            InferenceTask::TextGeneration,
+            InferenceTask::ImageUnderstanding,
+        ];
+        let available = [RuntimeAvailability {
+            runtime_id: RuntimeId::LlamaServerCpu,
+            available: true,
+            reason: None,
+        }];
+
+        let selected = select_runtime(
+            &vision,
+            RequestedBackend::Cpu,
+            RequestCapabilities::text_with_images(true, true),
+            &available,
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::LlamaServerCpu);
     }
 
     #[test]
@@ -1189,13 +1277,17 @@ mod tests {
         assert!(
             plan.candidates
                 .iter()
-                .any(|decision| decision.reason.contains("VLM"))
+                .any(|decision| decision.reason.contains("image-understanding"))
         );
     }
 
     #[test]
     fn gemma4_unified_image_request_prefers_mlx_vlm() {
-        let manifest = manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        let mut manifest = manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        manifest.metadata.tasks = vec![
+            InferenceTask::TextGeneration,
+            InferenceTask::ImageUnderstanding,
+        ];
         let available = [
             RuntimeAvailability {
                 runtime_id: RuntimeId::MlxVlm,

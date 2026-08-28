@@ -187,7 +187,7 @@ Artifacts are runtime-specific derivatives stored separately from source model
 files. An explicit ONNX route may attempt an artifact build when no usable ONNX
 artifact exists; normal automatic safetensors routing does not require ONNX.
 
-## Text inference
+## Text and vision inference
 
 Start an interactive chat:
 
@@ -198,6 +198,25 @@ werk chat model-id --max-tokens 128
 `--max-tokens` is a hard completion cap and can stop text mid-sentence. Terminal
 chat streams decoded pieces by default. Use `--stream-granularity chunk` to
 reduce terminal flushes and `--verbose` for prompt/decode timing and throughput.
+
+Attach one or more images to a compatible vision-language model with repeatable
+`--image` values:
+
+```bash
+werk --backend auto run vision-model \
+  "Inspect this render for clipped text and alignment defects." \
+  --image /absolute/path/to/render.png \
+  --max-tokens 512 --debug
+
+werk --backend auto chat vision-model \
+  --image /absolute/path/to/render.png \
+  --no-history --debug
+```
+
+The model manifest must advertise image understanding and an image-capable
+runtime must pass its probe. For GGUF, the llama.cpp server path additionally
+requires a manifest-listed multimodal projector. See
+[Vision and visual quality assurance](../integrations/vision.md).
 
 ## Media inference
 
@@ -251,4 +270,3 @@ werk backend install TARGET
 The supported install targets, operating-system matrix and manual cleanup
 procedure are documented in [Backends](../backends.md). There is currently no
 managed `werk backend uninstall` command.
-

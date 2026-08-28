@@ -28,6 +28,9 @@ from ..nodes import (
     WerkVideoGenerateNode,
     WerkVideoModelsNode,
     WerkVideoParametersNode,
+    WerkVisionAnalyzeNode,
+    WerkVisionConfigNode,
+    WerkVisionModelsNode,
     build_configured_image_request,
     build_configured_video_request,
     build_image_config,
@@ -1156,8 +1159,10 @@ def test_node_exports_and_display_names_are_complete():
         "WerkConnection",
         "WerkServerInfo",
         "WerkImageModels",
+        "WerkVisionModels",
         "WerkImageParameters",
         "WerkRoutingConfig",
+        "WerkVisionConfig",
         "WerkImageConfig",
         "WerkImageGenerate",
         "WerkVideoModels",
@@ -1170,6 +1175,7 @@ def test_node_exports_and_display_names_are_complete():
         "WerkAudioGenerate",
         "WerkAudioProcess",
         "WerkAudioAnalyze",
+        "WerkVisionAnalyze",
     }
     assert set(NODE_CLASS_MAPPINGS) == expected
     assert set(NODE_DISPLAY_NAME_MAPPINGS) == expected
@@ -1180,6 +1186,9 @@ def test_node_exports_and_display_names_are_complete():
     assert NODE_CLASS_MAPPINGS["WerkVideoParameters"] is WerkVideoParametersNode
     assert NODE_CLASS_MAPPINGS["WerkVideoConfig"] is WerkVideoConfigNode
     assert NODE_CLASS_MAPPINGS["WerkVideoGenerate"] is WerkVideoGenerateNode
+    assert NODE_CLASS_MAPPINGS["WerkVisionModels"] is WerkVisionModelsNode
+    assert NODE_CLASS_MAPPINGS["WerkVisionConfig"] is WerkVisionConfigNode
+    assert NODE_CLASS_MAPPINGS["WerkVisionAnalyze"] is WerkVisionAnalyzeNode
     assert NODE_DISPLAY_NAME_MAPPINGS["WerkImageGenerate"] == "WERK Image Generate (Beta)"
     assert NODE_DISPLAY_NAME_MAPPINGS["WerkVideoGenerate"] == "WERK Video Generate (Beta)"
     assert all(name.endswith(" (Beta)") for name in NODE_DISPLAY_NAME_MAPPINGS.values())
@@ -1190,6 +1199,8 @@ def test_node_exports_and_display_names_are_complete():
     assert "updateVideoModelsNode" in frontend
     assert 'const AUDIO_MODELS_CLASS = "WerkAudioModels"' in frontend
     assert "updateAudioModelsNode" in frontend
+    assert 'const VISION_MODELS_CLASS = "WerkVisionModels"' in frontend
+    assert "updateVisionModelsNode" in frontend
 
 
 def test_example_workflows_are_distinct_valid_json_shapes():
@@ -1199,6 +1210,9 @@ def test_example_workflows_are_distinct_valid_json_shapes():
     video_api = json.loads((examples / "werk_video_generation_api.json").read_text())
     image_to_video_api = json.loads(
         (examples / "werk_image_to_video_api.json").read_text()
+    )
+    vision_api = json.loads(
+        (examples / "werk_vision_inspection_api.json").read_text()
     )
     assert ui["version"] == 0.4
     assert {node["type"] for node in ui["nodes"]} >= {
@@ -1238,6 +1252,14 @@ def test_example_workflows_are_distinct_valid_json_shapes():
     assert image_to_video_api["6"]["class_type"] == "WerkVideoGenerate"
     assert image_to_video_api["6"]["inputs"]["initial_image"] == ["5", 0]
     assert image_to_video_api["7"]["inputs"]["video"] == ["6", 0]
+
+    assert vision_api["2"]["class_type"] == "WerkVisionModels"
+    assert vision_api["3"]["class_type"] == "LoadImage"
+    assert vision_api["4"]["class_type"] == "WerkVisionConfig"
+    assert vision_api["5"]["class_type"] == "WerkVisionAnalyze"
+    assert vision_api["5"]["inputs"]["images"] == ["3", 0]
+    assert vision_api["5"]["inputs"]["model"] == ["2", 0]
+    assert vision_api["5"]["inputs"]["config"] == ["4", 0]
 
 
 def test_package_reload_performs_no_network_request(monkeypatch):

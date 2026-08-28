@@ -1,5 +1,46 @@
 use super::support::*;
 
+#[derive(Clone)]
+struct VisionRecordingBackend {
+    request: Arc<std::sync::Mutex<Option<GenerateRequest>>>,
+}
+
+impl GenerationBackend for VisionRecordingBackend {
+    fn start_chat_session(
+        &self,
+        _manifest: &ModelManifest,
+        _seed: Option<u64>,
+    ) -> anyhow::Result<Option<Box<dyn crate::backend::ChatGenerationSession>>> {
+        anyhow::bail!("image requests must bypass modality-blind API chat sessions")
+    }
+
+    fn generate(
+        &self,
+        _manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResponse> {
+        *self.request.lock().unwrap() = Some(request);
+        Ok(GenerateResponse {
+            text: "visual inspection complete".to_string(),
+            prompt_tokens: 32,
+            completion_tokens: 3,
+            finish_reason: "stop".to_string(),
+            timings: GenerationTimings::default(),
+            backend_diagnostics: Vec::new(),
+        })
+    }
+
+    fn generate_stream(
+        &self,
+        _manifest: ModelManifest,
+        _request: GenerateRequest,
+    ) -> GenerateStream {
+        Box::pin(tokio_stream::iter(vec![Err(
+            "streaming is not used by this test".to_string(),
+        )]))
+    }
+}
+
 #[tokio::test]
 async fn models_and_chat_routes_use_openai_shapes() {
     let store = test_store();
@@ -85,6 +126,113 @@ async fn models_and_chat_routes_use_openai_shapes() {
     assert!(stream.contains("\"object\":\"chat.completion.chunk\""));
     assert!(stream.contains("\"content\":\"hello\""));
     assert!(stream.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn vision_chat_preserves_ordered_parts_and_bypasses_text_session_cache() {
+    let store = test_store();
+    let manifest = ModelManifest {
+        id: "qwen3-vl-test".to_string(),
+        source: ModelSource::LocalPath {
+            path: "test".to_string(),
+        },
+        format: ModelFormat::SafeTensors,
+        architecture: Some("qwen3_vl".to_string()),
+        tokenizer_path: None,
+        config_path: None,
+        model_path: Some("model.safetensors".to_string()),
+        backend: "test".to_string(),
+        created_unix: 1,
+        files: Vec::new(),
+        artifacts: Vec::new(),
+        metadata: ModelMetadata {
+            tasks: vec![
+                InferenceTask::TextGeneration,
+                InferenceTask::ImageUnderstanding,
+            ],
+            input_modalities: vec![InputModality::Text, InputModality::Image],
+            output_modalities: vec![OutputModality::Text],
+            ..Default::default()
+        },
+    };
+    fs::create_dir_all(store.model_dir("qwen3-vl-test")).unwrap();
+    fs::write(
+        store
+            .model_dir("qwen3-vl-test")
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let recorded = Arc::new(std::sync::Mutex::new(None));
+    let backend = VisionRecordingBackend {
+        request: recorded.clone(),
+    };
+    let resolver: PromptOptionsResolver = Arc::new(|_, _, has_images| {
+        assert!(has_images);
+        Ok(ChatTemplateOptions {
+            default_source: ChatTemplateSource::Model,
+            model_template_preferred: true,
+            override_name: None,
+        })
+    });
+    let app = router(ApiState::new_with_default_model_and_prompt_options(
+        store,
+        Arc::new(backend),
+        None,
+        Some(resolver),
+    ));
+    let payload = json!({
+        "model": "qwen3-vl-test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare the heading"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,AAAA", "detail": "high"
+                }},
+                {"type": "text", "text": "Then check the button alignment"},
+                {"type": "input_image", "image_url": "https://example.test/page-2.png"}
+            ]
+        }]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = recorded.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        request.image_urls,
+        [
+            "data:image/png;base64,AAAA".to_string(),
+            "https://example.test/page-2.png".to_string(),
+        ]
+    );
+    let content = request.messages[0].content.as_ref().unwrap();
+    let crate::openai::MessageContent::Parts(parts) = content else {
+        panic!("vision message content was flattened")
+    };
+    assert_eq!(
+        parts
+            .iter()
+            .map(|part| part.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["text", "image_url", "text", "input_image"]
+    );
+    let crate::openai::ImageUrlSpec::Object(image) = parts[1].image_url.as_ref().unwrap() else {
+        panic!("image detail object was flattened")
+    };
+    assert_eq!(image.detail.as_deref(), Some("high"));
 }
 
 #[tokio::test]

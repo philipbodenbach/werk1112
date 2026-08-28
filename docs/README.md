@@ -16,6 +16,7 @@ matrices and operational behavior belong here.
 | Install or select a backend | [Backends](backends.md) |
 | Run Werk and Nemotron on NVIDIA DGX Spark | [DGX Spark](integrations/dgx-spark.md) |
 | Run Werk on AMD Strix Halo | [AMD Strix Halo](integrations/strix-halo.md) |
+| Inspect rendered pages and slides with a VLM | [Vision and visual QA](integrations/vision.md) |
 | Look up tasks, modalities, layouts or formats | [Tasks and formats](reference/tasks-and-formats.md) |
 | Understand manifests and managed model storage | [Models, manifests and the store](concepts/models-manifests-and-store.md) |
 | Look up an environment variable | [Environment variables](reference/environment-variables.md) |
@@ -82,6 +83,12 @@ authoritative for exact flags.
 guide: canonical tasks, schemas, parameter provenance, estimation, planning,
 the Python companion, jobs, outputs, Wan video examples and audio smoke tests.
 It will be split into smaller image, video, audio and operations pages later.
+
+### Vision
+
+[integrations/vision.md](integrations/vision.md) documents multimodal chat,
+supported VLM/runtime combinations, GGUF projectors, ordered image content,
+visual inspection prompts, routing and persistence boundaries.
 
 ### Models and configuration
 

@@ -18,6 +18,7 @@ class FakeClient:
                     {"id": "image-unavailable", "object": "model"},
                     {"id": "video-ready", "object": "model"},
                     {"id": "video-i2v", "object": "model"},
+                    {"id": "vision-ready", "object": "model"},
                     {"id": "text", "object": "model"},
                 ],
             }
@@ -50,6 +51,11 @@ class FakeClient:
                         "tasks": ["image_to_video"],
                         "available_tasks": ["image_to_video"],
                     },
+                    {
+                        "id": "vision-ready",
+                        "tasks": ["text_generation", "image_understanding"],
+                        "available_tasks": ["text_generation", "image_understanding"],
+                    },
                 ],
             }
         raise AssertionError(path)
@@ -73,6 +79,7 @@ def test_connection_discovery_returns_safe_status_and_model_lists():
         "image-unavailable",
         "video-ready",
         "video-i2v",
+        "vision-ready",
         "text",
     ]
     assert result["image_models"] == {
@@ -94,8 +101,12 @@ def test_connection_discovery_returns_safe_status_and_model_lists():
         },
     }
     assert result["audio_models"]["declared"] == []
+    assert result["vision_models"] == {
+        "declared": ["vision-ready"],
+        "available": ["vision-ready"],
+    }
     assert result["status"] == (
-        "Connected · 5 models · 1 image · 2 videos · 0 audio models"
+        "Connected · 6 models · 1 image · 1 vision model · 2 videos · 0 audio models"
     )
     assert "never-return-this" not in repr(result)
 
@@ -115,6 +126,7 @@ def test_connection_discovery_tolerates_optional_capabilities_failure():
     assert result["image_models"] == {"declared": [], "available": []}
     assert result["video_models"]["declared"] == []
     assert result["audio_models"]["declared"] == []
+    assert result["vision_models"] == {"declared": [], "available": []}
     assert "not supported" in result["warning"]
 
 

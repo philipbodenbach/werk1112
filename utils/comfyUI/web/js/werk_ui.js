@@ -3,6 +3,7 @@ import { api } from "../../scripts/api.js";
 
 const CONNECTION_CLASS = "WerkConnection";
 const IMAGE_MODELS_CLASS = "WerkImageModels";
+const VISION_MODELS_CLASS = "WerkVisionModels";
 const VIDEO_MODELS_CLASS = "WerkVideoModels";
 const AUDIO_MODELS_CLASS = "WerkAudioModels";
 const STATUS_MARGIN = 4;
@@ -172,6 +173,13 @@ function imageModelValues(discovery, requireAvailable = true) {
     return Array.isArray(values) ? values.filter((value) => typeof value === "string") : [];
 }
 
+function visionModelValues(discovery, requireAvailable = true) {
+    const values = requireAvailable
+        ? discovery?.vision_models?.available
+        : discovery?.vision_models?.declared;
+    return Array.isArray(values) ? values.filter((value) => typeof value === "string") : [];
+}
+
 function setComboValues(node, combo, backing, values) {
     const unique = [...new Set(values)].sort((left, right) => left.localeCompare(right));
     combo.options.values.splice(0, combo.options.values.length, ...unique);
@@ -195,6 +203,21 @@ function updateImageModelsNode(node, discovery) {
         : requireAvailable && declared
           ? `No runtime-available image model (${declared} declared)`
           : "No image-generation model found";
+    node._werkModelStatus?.setWerkStatus?.(message, values.length ? "success" : "error");
+}
+
+function updateVisionModelsNode(node, discovery) {
+    if (!node?._werkModelCombo || !node?._werkModelBacking) return;
+    const requireAvailable = Boolean(widget(node, "require_available")?.value ?? true);
+    const values = visionModelValues(discovery, requireAvailable);
+    setComboValues(node, node._werkModelCombo, node._werkModelBacking, values);
+    const declared = discovery?.vision_models?.declared?.length ?? 0;
+    const available = discovery?.vision_models?.available?.length ?? 0;
+    const message = values.length
+        ? `${available} available · ${declared} declared · image-understanding`
+        : requireAvailable && declared
+          ? `No runtime-available vision model (${declared} declared)`
+          : "No image-understanding model found";
     node._werkModelStatus?.setWerkStatus?.(message, values.length ? "success" : "error");
 }
 
@@ -244,6 +267,7 @@ function propagateDiscovery(connectionNode, discovery) {
         if (linkedConnection(node) !== connectionNode) continue;
         const className = nodeClass(node);
         if (className === IMAGE_MODELS_CLASS) updateImageModelsNode(node, discovery);
+        if (className === VISION_MODELS_CLASS) updateVisionModelsNode(node, discovery);
         if (className === VIDEO_MODELS_CLASS) updateVideoModelsNode(node, discovery);
         if (className === AUDIO_MODELS_CLASS) updateAudioModelsNode(node, discovery);
     }
@@ -320,6 +344,62 @@ function installImageModelsUi(nodeType) {
     chainLifecycle(nodeType, "onConnectionsChange", function () {
         const connectionNode = linkedConnection(this);
         if (connectionNode?._werkDiscovery) updateImageModelsNode(this, connectionNode._werkDiscovery);
+    });
+}
+
+function installVisionModelsUi(nodeType) {
+    chainLifecycle(nodeType, "onNodeCreated", function () {
+        const backing = widget(this, "preferred_model");
+        if (!backing) return;
+        backing.hidden = true;
+        backing.options ??= {};
+        backing.options.hidden = true;
+        const values = [];
+        const combo = makeUnserialized(this.addWidget("combo", "available_model", backing.value ?? "", (value) => {
+            backing.value = value;
+            backing.callback?.(value);
+        }, { values }));
+        this._werkModelBacking = backing;
+        this._werkModelCombo = combo;
+        this._werkModelStatus = createStatusWidget(this, "model_discovery_status", "Connect and refresh models");
+        const availability = widget(this, "require_available");
+        if (availability) {
+            const original = availability.callback;
+            const node = this;
+            availability.callback = function (...args) {
+                const result = original?.apply(this, args);
+                const connectionNode = linkedConnection(node);
+                if (connectionNode?._werkDiscovery) {
+                    updateVisionModelsNode(node, connectionNode._werkDiscovery);
+                }
+                return result;
+            };
+        }
+        const button = makeUnserialized(this.addWidget("button", "Refresh Models", null, async () => {
+            const connectionNode = linkedConnection(this);
+            if (!connectionNode) {
+                this._werkModelStatus.setWerkStatus("Connect a WERK Connection first", "error");
+                return;
+            }
+            this._werkModelStatus.setWerkStatus("Refreshing models…", "checking");
+            button.disabled = true;
+            try {
+                const discovery = await verifyConnection(connectionNode);
+                updateVisionModelsNode(this, discovery);
+                const refresh = widget(this, "refresh_token");
+                if (refresh) refresh.value = Number(refresh.value ?? 0) + 1;
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                this._werkModelStatus.setWerkStatus(`Failed: ${message}`, "error");
+            } finally {
+                button.disabled = false;
+            }
+        }));
+        fitWerkNode(this);
+    });
+    chainLifecycle(nodeType, "onConnectionsChange", function () {
+        const connectionNode = linkedConnection(this);
+        if (connectionNode?._werkDiscovery) updateVisionModelsNode(this, connectionNode._werkDiscovery);
     });
 }
 
@@ -446,6 +526,7 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === CONNECTION_CLASS) installConnectionUi(nodeType);
         if (nodeData.name === IMAGE_MODELS_CLASS) installImageModelsUi(nodeType);
+        if (nodeData.name === VISION_MODELS_CLASS) installVisionModelsUi(nodeType);
         if (nodeData.name === VIDEO_MODELS_CLASS) installVideoModelsUi(nodeType);
         if (nodeData.name === AUDIO_MODELS_CLASS) installAudioModelsUi(nodeType);
     },
@@ -454,6 +535,7 @@ app.registerExtension({
         if (
             className === CONNECTION_CLASS
             || className === IMAGE_MODELS_CLASS
+            || className === VISION_MODELS_CLASS
             || className === VIDEO_MODELS_CLASS
             || className === AUDIO_MODELS_CLASS
         ) {
