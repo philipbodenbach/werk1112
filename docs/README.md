@@ -10,6 +10,7 @@ matrices and operational behavior belong here.
 
 | Need | Page |
 | --- | --- |
+| Review release notes and upgrade changes | [Changelog](../CHANGELOG.md) |
 | Install and run a first command | [Getting started](getting-started.md) |
 | Look up CLI commands and semantics | [CLI reference](reference/cli.md) |
 | Understand every HTTP route | [HTTP API](api.md) |

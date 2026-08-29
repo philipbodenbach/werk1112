@@ -12,3 +12,4 @@ __pycache__/
 .webui*
 api-keys.toml
 .api-keys.toml
+/:memory:.ses

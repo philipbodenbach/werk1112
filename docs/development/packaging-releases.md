@@ -196,20 +196,20 @@ release workflow.
 
 ## Local output layout
 
-For package version `1.3.3`, the generated tree is:
+For package version `1.4.0`, the generated tree is:
 
 ~~~text
 releases/
-├── werk1112-v1.3.3-linux-x86_64.tar.gz
-├── werk1112-v1.3.3-linux-x86_64.tar.gz.sha256
-├── werk1112-v1.3.3-linux-x86_64-amd-strix-halo.tar.gz
-├── werk1112-v1.3.3-linux-x86_64-amd-strix-halo.tar.gz.sha256
-├── werk1112-v1.3.3-linux-aarch64-dgx-spark.tar.gz
-├── werk1112-v1.3.3-linux-aarch64-dgx-spark.tar.gz.sha256
-├── werk1112-v1.3.3-windows-x86_64.zip
-├── werk1112-v1.3.3-windows-x86_64.zip.sha256
-├── werk1112-v1.3.3-macos-aarch64.tar.gz
-└── werk1112-v1.3.3-macos-aarch64.tar.gz.sha256
+├── werk1112-v1.4.0-linux-x86_64.tar.gz
+├── werk1112-v1.4.0-linux-x86_64.tar.gz.sha256
+├── werk1112-v1.4.0-linux-x86_64-amd-strix-halo.tar.gz
+├── werk1112-v1.4.0-linux-x86_64-amd-strix-halo.tar.gz.sha256
+├── werk1112-v1.4.0-linux-aarch64-dgx-spark.tar.gz
+├── werk1112-v1.4.0-linux-aarch64-dgx-spark.tar.gz.sha256
+├── werk1112-v1.4.0-windows-x86_64.zip
+├── werk1112-v1.4.0-windows-x86_64.zip.sha256
+├── werk1112-v1.4.0-macos-aarch64.tar.gz
+└── werk1112-v1.4.0-macos-aarch64.tar.gz.sha256
 ~~~
 
 Staging directories are recreated below `target/package/<platform>`. Existing
