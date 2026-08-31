@@ -7,14 +7,14 @@ backend installations, host-installed runtimes and configured remote services.
 
 This page follows the current packaging scripts:
 
-- [`scripts/package-release.sh`](../../scripts/package-release.sh) for the
+- [`scripts/package-release.sh`](https://github.com/philipbodenbach/werk1112/blob/main/scripts/package-release.sh) for the
   shell packaging surface;
-- [`scripts/package-release.ps1`](../../scripts/package-release.ps1) for native
+- [`scripts/package-release.ps1`](https://github.com/philipbodenbach/werk1112/blob/main/scripts/package-release.ps1) for native
   Windows packaging;
-- [`scripts/build-windows.ps1`](../../scripts/build-windows.ps1) for the guarded
+- [`scripts/build-windows.ps1`](https://github.com/philipbodenbach/werk1112/blob/main/scripts/build-windows.ps1) for the guarded
   Windows build;
-- [`.cargo/config.toml`](../../.cargo/config.toml) for target aliases;
-- [`Cargo.toml`](../../Cargo.toml) for the version and release feature bundles.
+- [`.cargo/config.toml`](https://github.com/philipbodenbach/werk1112/blob/main/.cargo/config.toml) for target aliases;
+- [`Cargo.toml`](https://github.com/philipbodenbach/werk1112/blob/main/Cargo.toml) for the version and release feature bundles.
 
 See [Building from source](build.md) for toolchain setup and feature details,
 and [Backend support](../backends.md) for runtime provisioning after release
@@ -312,4 +312,4 @@ externally orchestrated release process.
 
 - [Building Werk1112 from source](build.md)
 - [Backends, routing and platform support](../backends.md)
-- [Documentation home](../README.md)
+- [Documentation home](../documentation.md)

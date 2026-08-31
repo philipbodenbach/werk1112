@@ -69,7 +69,7 @@ use crate::{
     media_companion::CompanionClient,
     model_store::{
         ArtifactStatus, ModelArtifact, ModelFormat, ModelManifest, ModelSource, ModelStore,
-        PullProgress,
+        PullProgress, TempPurgeSummary,
     },
     openai::{
         ChatMessage, ChatTemplateOptions, ChatTemplateSource, ContentPart, ImageUrlSpec,
@@ -731,6 +731,12 @@ pub enum Commands {
         command: AuthCommands,
     },
 
+    #[command(about = "Manage temporary files in the model store")]
+    Temp {
+        #[command(subcommand)]
+        command: TempCommands,
+    },
+
     #[command(about = "Copy a local model file or directory into the managed model store")]
     Import {
         #[arg(help = "Model file or directory to copy")]
@@ -885,6 +891,18 @@ pub enum ArtifactCommands {
         #[arg(help = "Installed model id")]
         model: String,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TempCommands {
+    #[command(about = "Remove temporary files from the model store")]
+    Purge {
+        #[arg(long, help = "Show what would be removed without deleting anything")]
+        dry_run: bool,
+    },
+
+    #[command(about = "Print the temporary-files directory")]
+    Path,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1479,6 +1497,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             },
         },
+        Commands::Temp { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            match command {
+                TempCommands::Purge { dry_run } => {
+                    let summary = store.purge_tmp(dry_run)?;
+                    println!("{}", format_temp_purge_summary(&summary, dry_run));
+                    Ok(())
+                }
+                TempCommands::Path => {
+                    println!("{}", store.tmp_dir().display());
+                    Ok(())
+                }
+            }
+        }
         Commands::Import { path, name } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.import_path(&path, &name)?;
@@ -3851,6 +3883,7 @@ fn should_print_startup_banner_for(
         | Commands::Backend { .. }
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
+        | Commands::Temp { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
         | Commands::Inspect { .. }
@@ -3876,6 +3909,7 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         | Commands::Backend { .. }
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
+        | Commands::Temp { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
         | Commands::Inspect { .. }
@@ -9472,6 +9506,35 @@ fn format_bytes(bytes: u64) -> String {
     format_bytes_f64(bytes as f64)
 }
 
+fn format_temp_purge_summary(summary: &TempPurgeSummary, dry_run: bool) -> String {
+    if summary.entries == 0 {
+        return if dry_run {
+            "Dry run: nothing to purge.".to_string()
+        } else {
+            "Nothing to purge.".to_string()
+        };
+    }
+
+    let entry_label = if summary.entries == 1 {
+        "temporary entry"
+    } else {
+        "temporary entries"
+    };
+    let size = summary
+        .bytes
+        .map(|bytes| format!(" ({})", format_bytes(bytes)))
+        .unwrap_or_default();
+
+    if dry_run {
+        format!(
+            "Dry run: would purge {} {entry_label}{size}; nothing was deleted.",
+            summary.entries
+        )
+    } else {
+        format!("Purged {} {entry_label}{size}.", summary.entries)
+    }
+}
+
 fn format_bytes_per_second(bytes_per_second: f64) -> String {
     format_bytes_f64(bytes_per_second.max(0.0))
 }
@@ -10059,6 +10122,128 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn parses_temp_commands_and_global_model_home() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "--model-home",
+            "/tmp/werk-temp-home",
+            "temp",
+            "purge",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.model_home.as_deref(),
+            Some(Path::new("/tmp/werk-temp-home"))
+        );
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Temp {
+                command: TempCommands::Purge { dry_run: false }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["werk", "temp", "purge", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Temp {
+                command: TempCommands::Purge { dry_run: true }
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "temp",
+            "path",
+            "--model-home",
+            "/tmp/werk-temp-path-home",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.model_home.as_deref(),
+            Some(Path::new("/tmp/werk-temp-path-home"))
+        );
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Temp {
+                command: TempCommands::Path
+            })
+        ));
+    }
+
+    #[test]
+    fn temp_purge_output_matches_the_cli_contract() {
+        assert_eq!(
+            format_temp_purge_summary(
+                &TempPurgeSummary {
+                    entries: 0,
+                    bytes: Some(0),
+                },
+                false,
+            ),
+            "Nothing to purge."
+        );
+        assert_eq!(
+            format_temp_purge_summary(
+                &TempPurgeSummary {
+                    entries: 0,
+                    bytes: None,
+                },
+                true,
+            ),
+            "Dry run: nothing to purge."
+        );
+        assert_eq!(
+            format_temp_purge_summary(
+                &TempPurgeSummary {
+                    entries: 1,
+                    bytes: Some(1024),
+                },
+                true,
+            ),
+            "Dry run: would purge 1 temporary entry (1.00 KiB); nothing was deleted."
+        );
+        assert_eq!(
+            format_temp_purge_summary(
+                &TempPurgeSummary {
+                    entries: 2,
+                    bytes: None,
+                },
+                false,
+            ),
+            "Purged 2 temporary entries."
+        );
+    }
+
+    #[tokio::test]
+    async fn temp_purge_dispatch_uses_the_explicit_model_home_only() {
+        let selected_store = test_store("temp-dispatch-selected");
+        let other_store = test_store("temp-dispatch-other");
+        fs::create_dir_all(selected_store.tmp_dir()).unwrap();
+        fs::create_dir_all(other_store.tmp_dir()).unwrap();
+        let selected_temp_file = selected_store.tmp_dir().join("selected.tmp");
+        let other_temp_file = other_store.tmp_dir().join("other.tmp");
+        fs::write(&selected_temp_file, b"selected").unwrap();
+        fs::write(&other_temp_file, b"other").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "werk".to_string(),
+            "--model-home".to_string(),
+            selected_store.home().display().to_string(),
+            "temp".to_string(),
+            "purge".to_string(),
+        ])
+        .unwrap();
+        run(cli).await.unwrap();
+
+        assert!(!selected_temp_file.exists());
+        assert!(selected_store.tmp_dir().is_dir());
+        assert!(other_temp_file.is_file());
+
+        let _ = fs::remove_dir_all(selected_store.home());
+        let _ = fs::remove_dir_all(other_store.home());
     }
 
     #[test]

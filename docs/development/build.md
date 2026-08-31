@@ -2,16 +2,16 @@
 
 This page documents the current Cargo build surface. It is intended for
 contributors, maintainers and users who need a custom binary. Normal end users
-should prefer the installers in the [project README](../../README.md#install).
+should prefer the installers in the [project README](https://github.com/philipbodenbach/werk1112/blob/main/README.md#install).
 
 The authoritative build definitions are:
 
-- [`Cargo.toml`](../../Cargo.toml) for features and release profiles;
-- [`.cargo/config.toml`](../../.cargo/config.toml) for Cargo aliases and default
+- [`Cargo.toml`](https://github.com/philipbodenbach/werk1112/blob/main/Cargo.toml) for features and release profiles;
+- [`.cargo/config.toml`](https://github.com/philipbodenbach/werk1112/blob/main/.cargo/config.toml) for Cargo aliases and default
   build environment values;
-- [`rust-toolchain.toml`](../../rust-toolchain.toml) for the Rust channel,
+- [`rust-toolchain.toml`](https://github.com/philipbodenbach/werk1112/blob/main/rust-toolchain.toml) for the Rust channel,
   components and target triples;
-- [`scripts/build-windows.ps1`](../../scripts/build-windows.ps1) for the guarded
+- [`scripts/build-windows.ps1`](https://github.com/philipbodenbach/werk1112/blob/main/scripts/build-windows.ps1) for the guarded
   native Windows release build.
 
 See [Packaging and releases](packaging-releases.md) after producing a target
@@ -482,4 +482,4 @@ and remove CUDA stub directories from `LD_LIBRARY_PATH`. Install NCCL or set
 
 - [Package target binaries and checksums](packaging-releases.md)
 - [Install and diagnose runtime backends](../backends.md)
-- [Return to the documentation home](../README.md)
+- [Return to the documentation home](../documentation.md)

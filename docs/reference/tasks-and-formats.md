@@ -148,7 +148,7 @@ support.
 
 ## Source of truth
 
-- canonical task semantics: [`src/capabilities/task.rs`](../../src/capabilities/task.rs)
-- modalities and layouts: [`src/capabilities`](../../src/capabilities)
-- model format and manifest detection: [`src/model_store.rs`](../../src/model_store.rs)
-- registered runtime constraints: [`src/backend/mod.rs`](../../src/backend/mod.rs)
+- canonical task semantics: [`src/capabilities/task.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/capabilities/task.rs)
+- modalities and layouts: [`src/capabilities`](https://github.com/philipbodenbach/werk1112/tree/main/src/capabilities)
+- model format and manifest detection: [`src/model_store.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/model_store.rs)
+- registered runtime constraints: [`src/backend/mod.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/backend/mod.rs)

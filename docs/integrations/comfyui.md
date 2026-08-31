@@ -70,11 +70,11 @@ documents, generated images, and UI screenshots for missing elements,
 overflow, clipping, alignment, spacing, and similar visual defects. Werk must
 report the selected model/runtime as available for `image-understanding`;
 text-only execution of a multimodal repository is not sufficient. See the
-[ready API-prompt example](../../utils/comfyUI/examples/werk_vision_inspection_api.json).
+[ready API-prompt example](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/examples/werk_vision_inspection_api.json).
 
 Installation, node sockets, workflow examples, limits and troubleshooting are
 maintained beside the package in the
-[ComfyUI Werk1112 node documentation](../../utils/comfyUI/README.md). That page
+[ComfyUI Werk1112 node documentation](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/README.md). That page
 is the source of truth for the custom nodes and is not duplicated here.
 
 The custom nodes call Werk over HTTP. They do not load Werk models from
