@@ -348,6 +348,43 @@ impl ModelStore {
         self.home.join("tmp")
     }
 
+    pub(crate) fn list_tmp(&self) -> Result<Vec<PathBuf>> {
+        let tmp = self.tmp_dir();
+        let metadata = match fs::symlink_metadata(&tmp) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect temporary root {}", tmp.display())
+                });
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "refusing to list temporary root {} because it is a symlink",
+                tmp.display()
+            );
+        }
+        if !metadata.is_dir() {
+            bail!(
+                "refusing to list temporary root {} because it is not a directory",
+                tmp.display()
+            );
+        }
+
+        let read_dir = fs::read_dir(&tmp)
+            .with_context(|| format!("failed to enumerate temporary root {}", tmp.display()))?;
+        let mut entries = Vec::new();
+        for entry in read_dir {
+            let entry = entry
+                .with_context(|| format!("failed to enumerate temporary root {}", tmp.display()))?;
+            entries.push(entry.path());
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
     pub(crate) fn purge_tmp(&self, dry_run: bool) -> Result<TempPurgeSummary> {
         let tmp = self.tmp_dir();
         let metadata = match fs::symlink_metadata(&tmp) {
@@ -4418,6 +4455,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn list_tmp_returns_sorted_direct_entries_without_creating_or_mutating() {
+        let root = test_dir("temp-list-direct-entries");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+
+        assert!(store.list_tmp().unwrap().is_empty());
+        assert!(!store.home().exists());
+
+        let tmp = store.tmp_dir();
+        fs::create_dir_all(&tmp).unwrap();
+        assert!(store.list_tmp().unwrap().is_empty());
+
+        fs::create_dir_all(tmp.join("nested")).unwrap();
+        fs::write(tmp.join("z-last.tmp"), b"last").unwrap();
+        fs::write(tmp.join(".hidden.tmp"), b"hidden").unwrap();
+        fs::write(tmp.join("nested/not-a-direct-entry"), b"nested").unwrap();
+
+        assert_eq!(
+            store.list_tmp().unwrap(),
+            vec![
+                tmp.join(".hidden.tmp"),
+                tmp.join("nested"),
+                tmp.join("z-last.tmp"),
+            ]
+        );
+        assert_eq!(
+            fs::read(tmp.join("nested/not-a-direct-entry")).unwrap(),
+            b"nested"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn purge_tmp_removes_only_direct_temp_entries_and_preserves_store_data() {
         let root = test_dir("temp-purge-preservation");
         let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
@@ -4557,6 +4627,10 @@ mod tests {
         fs::create_dir_all(store.home()).unwrap();
         fs::write(store.tmp_dir(), b"not a directory").unwrap();
 
+        let error = store.list_tmp().unwrap_err().to_string();
+        assert!(error.contains(&store.tmp_dir().display().to_string()));
+        assert!(error.contains("not a directory"));
+
         for dry_run in [true, false] {
             let error = store.purge_tmp(dry_run).unwrap_err().to_string();
             assert!(error.contains(&store.tmp_dir().display().to_string()));
@@ -4583,15 +4657,30 @@ mod tests {
         fs::write(&external_file, b"external file data").unwrap();
         fs::create_dir_all(tmp.join("nested")).unwrap();
         fs::write(tmp.join("nested/local"), b"abc").unwrap();
+        symlink(root.join("missing-target"), tmp.join("broken-link")).unwrap();
         symlink(&external_dir, tmp.join("direct-link")).unwrap();
         symlink(&external_file, tmp.join("nested/file-link")).unwrap();
+
+        assert_eq!(
+            store.list_tmp().unwrap(),
+            vec![
+                tmp.join("broken-link"),
+                tmp.join("direct-link"),
+                tmp.join("nested"),
+            ]
+        );
+        assert_eq!(
+            fs::read(external_dir.join("keep")).unwrap(),
+            b"external directory data"
+        );
+        assert_eq!(fs::read(&external_file).unwrap(), b"external file data");
 
         let summary = store.purge_tmp(false).unwrap();
 
         assert_eq!(
             summary,
             TempPurgeSummary {
-                entries: 2,
+                entries: 3,
                 bytes: Some(3),
             }
         );
@@ -4617,6 +4706,10 @@ mod tests {
         fs::create_dir_all(&external).unwrap();
         fs::write(external.join("keep"), b"safe").unwrap();
         symlink(&external, store.tmp_dir()).unwrap();
+
+        let error = store.list_tmp().unwrap_err().to_string();
+        assert!(error.contains(&store.tmp_dir().display().to_string()));
+        assert!(error.contains("symlink"));
 
         for dry_run in [true, false] {
             let error = store.purge_tmp(dry_run).unwrap_err().to_string();

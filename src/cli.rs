@@ -895,6 +895,9 @@ pub enum ArtifactCommands {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum TempCommands {
+    #[command(about = "List temporary entries in the model store")]
+    List,
+
     #[command(about = "Remove temporary files from the model store")]
     Purge {
         #[arg(long, help = "Show what would be removed without deleting anything")]
@@ -1500,6 +1503,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Temp { command } => {
             let store = ModelStore::resolve(model_home)?;
             match command {
+                TempCommands::List => {
+                    println!("{}", format_temp_list(&store.list_tmp()?));
+                    Ok(())
+                }
                 TempCommands::Purge { dry_run } => {
                     let summary = store.purge_tmp(dry_run)?;
                     println!("{}", format_temp_purge_summary(&summary, dry_run));
@@ -9535,6 +9542,18 @@ fn format_temp_purge_summary(summary: &TempPurgeSummary, dry_run: bool) -> Strin
     }
 }
 
+fn format_temp_list(entries: &[PathBuf]) -> String {
+    if entries.is_empty() {
+        return "No temporary entries.".to_string();
+    }
+
+    entries
+        .iter()
+        .map(|entry| entry.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_bytes_per_second(bytes_per_second: f64) -> String {
     format_bytes_f64(bytes_per_second.max(0.0))
 }
@@ -10129,6 +10148,25 @@ mod tests {
         let cli = Cli::try_parse_from([
             "werk",
             "--model-home",
+            "/tmp/werk-temp-list-home",
+            "temp",
+            "list",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.model_home.as_deref(),
+            Some(Path::new("/tmp/werk-temp-list-home"))
+        );
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Temp {
+                command: TempCommands::List
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "--model-home",
             "/tmp/werk-temp-home",
             "temp",
             "purge",
@@ -10215,6 +10253,48 @@ mod tests {
             ),
             "Purged 2 temporary entries."
         );
+    }
+
+    #[test]
+    fn temp_list_output_matches_the_cli_contract() {
+        assert_eq!(format_temp_list(&[]), "No temporary entries.");
+        assert_eq!(
+            format_temp_list(&[
+                PathBuf::from("store/tmp/first.tmp"),
+                PathBuf::from("store/tmp/pull-model-import"),
+            ]),
+            format!(
+                "{}\n{}",
+                Path::new("store/tmp/first.tmp").display(),
+                Path::new("store/tmp/pull-model-import").display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn temp_list_dispatch_uses_the_explicit_model_home() {
+        let selected_store = test_store("temp-list-dispatch");
+        fs::create_dir_all(selected_store.home()).unwrap();
+        fs::write(selected_store.tmp_dir(), b"not a directory").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "werk".to_string(),
+            "--model-home".to_string(),
+            selected_store.home().display().to_string(),
+            "temp".to_string(),
+            "list".to_string(),
+        ])
+        .unwrap();
+        let error = run(cli).await.unwrap_err().to_string();
+
+        assert!(error.contains(&selected_store.tmp_dir().display().to_string()));
+        assert!(error.contains("not a directory"));
+        assert_eq!(
+            fs::read(selected_store.tmp_dir()).unwrap(),
+            b"not a directory"
+        );
+
+        let _ = fs::remove_dir_all(selected_store.home());
     }
 
     #[tokio::test]
