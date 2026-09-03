@@ -3,19 +3,19 @@ import importlib
 import json
 from io import BytesIO
 from pathlib import Path
+from typing import ClassVar
 
-from PIL import Image
 import pytest
 import torch
+from PIL import Image
 
-from .. import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, WEB_DIRECTORY
+from .. import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, WEB_DIRECTORY, nodes
 from ..config import (
     WerkConnection,
     WerkImageConfig,
     WerkRoutingConfig,
     WerkVideoConfig,
 )
-from .. import nodes
 from ..nodes import (
     WerkConnectionNode,
     WerkImageConfigNode,
@@ -70,11 +70,11 @@ def capabilities_payload():
 
 
 class FakeClient:
-    responses = {}
+    responses: ClassVar[dict] = {}
     posted = None
-    downloads = {}
-    deleted = []
-    download_limits = []
+    downloads: ClassVar[dict] = {}
+    deleted: ClassVar[list] = []
+    download_limits: ClassVar[list] = []
 
     def __init__(self, _connection):
         pass
@@ -1176,6 +1176,16 @@ def test_node_exports_and_display_names_are_complete():
         "WerkAudioProcess",
         "WerkAudioAnalyze",
         "WerkVisionAnalyze",
+        "WerkRuntimeInfo",
+        "WerkPersistencePolicy",
+        "WerkRuntimeStates",
+        "WerkStateControl",
+        "WerkStatePrune",
+        "WerkMemoryStatus",
+        "WerkRuntimeExperts",
+        "WerkExpertControl",
+        "WerkPrefill",
+        "WerkDecode",
     }
     assert set(NODE_CLASS_MAPPINGS) == expected
     assert set(NODE_DISPLAY_NAME_MAPPINGS) == expected

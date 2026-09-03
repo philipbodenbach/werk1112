@@ -14,8 +14,8 @@ for the managed directory layout.
 
 | Variable | Meaning |
 | --- | --- |
-| `WERK_HOME` | Managed store root. A global `--model-home` value wins. See the [store resolution order](../concepts/models-manifests-and-store.md#store-root). |
-| `WERK_API_KEY` | Single bearer key for `werk serve`; also the ComfyUI client's default key. A configured serve key must not be empty. |
+| `WERK_HOME` | Managed store root. A global `--model-home` value wins. Runtime-state data is stored beneath `runtime-state/v1` and its private namespace-HMAC key beneath `auth`. See the [store resolution order](../concepts/models-manifests-and-store.md#store-root). |
+| `WERK_API_KEY` | Single bearer key for `werk serve`; also the default for `werk runtime` and the ComfyUI client. A configured serve key must not be empty. |
 | `WERK_API_KEYS` | TOML key file for `werk serve`. The uninstall scripts also consult it when locating an optional key file to remove. |
 | `WERK_API_BODY_LIMIT_BYTES` | Positive request-body limit for chat completions (including inline vision data), audio transcription/translation uploads and generic-job creation. Default: 128 MiB; maximum: 512 MiB. Invalid values use the default. |
 | `WERK_OUTPUT_MAX_BYTES` | Output-store retention ceiling. Default: 20 GiB; invalid values use the default. Oldest outputs are removed first. |
@@ -26,6 +26,26 @@ for the managed directory layout.
 Hugging Face pull authentication is checked in this order: `HF_TOKEN`,
 `HUGGING_FACE_HUB_TOKEN`, the token saved by Werk, then the Hugging Face CLI
 token below `HF_HOME` (or its normal home-directory default).
+
+## Runtime persistence and memory policy
+
+Runtime persistence follows the active **server's** `WERK_HOME`. Setting a
+different store on a machine running `werk runtime` does not redirect the
+remote server's state. The runtime CLI has an explicit `--url` option rather
+than a `WERK_BASE_URL` default; `WERK_API_KEY` supplies its credential.
+
+There is deliberately no environment variable for:
+
+- a caller-supplied runtime-state directory or namespace;
+- memory-pressure thresholds, reservation sizes or eviction policy;
+- handoff contents or lifetime;
+- cross-backend or cross-restart state reuse;
+- enabling experimental capabilities globally.
+
+The current memory thresholds, bounded state catalog, principal isolation and
+dry-run-first maintenance rules are implementation safety policy. A backend
+must report exact capability status and bounded memory requirements through its
+adapter. See [Runtime persistence and memory architecture](../concepts/runtime-persistence-and-memory.md).
 
 ## Media and Qwen-TTS
 
@@ -60,7 +80,7 @@ The matching `werk serve` options override the resource-tuning variables.
 | `WERK_LLAMA_WARMUP` | Set to a false value (`0`, `false`, `no`, `off`) to disable warm-up on compatibility paths. |
 | `WERK_LLAMA_THREADS`, `WERK_LLAMA_THREADS_BATCH` | Generation and batch thread counts. |
 | `WERK_LLAMA_LOG` | Truthy value enables child-runtime logging. |
-| `WERK_LLAMA_ARGS` | Additional whitespace-split arguments appended to `llama-server`. Advanced use: these can change runtime behavior outside Werk's typed validation. |
+| `WERK_LLAMA_ARGS` | Additional whitespace-split arguments appended to `llama-server`. Advanced use: these can change runtime behavior outside Werk's typed validation. If the final arguments override the private single-slot state configuration, Werk leaves runtime-state capabilities unavailable. |
 
 Managed CUDA builds additionally read `WERK_LLAMA_CUDA_COMPILER`,
 `WERK_LLAMA_CUDA_HOST_COMPILER`, and `WERK_LLAMA_CUDA_ARCH`.
@@ -100,6 +120,17 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_TRANSFORMERS_DEVICE` | Device override; `auto` chooses CUDA, then MPS, then CPU. |
 | `WERK_TRANSFORMERS_DTYPE` | `auto`, `float32`/`fp32`/`f32`, `bfloat16`/`bf16`, or `float16`/`fp16`/`f16`/`half`. |
 
+`WERK_VLLM_ARGS` can configure facilities owned by vLLM itself. Werk reports
+`runtime.state.prefix_cache` as `externally_managed` with only the
+`automatic_reuse` operation when at least one Werk-started local process is
+active, no active process is remote, and every active process's effective
+arguments contain the exact `--enable-prefix-caching` flag without
+`--no-enable-prefix-caching`. If every active process explicitly disables APC,
+the status is `unsupported`; remote, mixed or ambiguous evidence is
+`metadata_only`; no active process is `unavailable`. None of these values turns
+APC, KV offload, LMCache or expert residency into a named, persistable or
+Werk-controlled state operation.
+
 `WERK_TRANSFORMERS_OUTPUT` and `WERK_TRANSFORMERS_STATS` are reserved line
 prefixes in Werk's subprocess protocol, not user configuration variables.
 
@@ -131,8 +162,9 @@ These variables are read by the Python custom node, not by the Werk server:
 | `WERK_MAX_VISION_INPUT_BYTES` | 67,108,864 | Maximum aggregate PNG bytes embedded by the ComfyUI vision node before Base64 encoding. |
 
 ComfyUI labels such as `WERK_CONNECTION`, `WERK_ROUTING_CONFIG`,
-`WERK_IMAGE_CONFIG`, `WERK_VISION_CONFIG`, `WERK_VIDEO_CONFIG`, and
-`WERK_AUDIO_CONFIG` are socket type names, not environment variables.
+`WERK_IMAGE_CONFIG`, `WERK_VISION_CONFIG`, `WERK_VIDEO_CONFIG`,
+`WERK_AUDIO_CONFIG`, `WERK_RUNTIME_INFO`, `WERK_PERSISTENCE_POLICY`, and
+`WERK_STATE_HANDOFF` are socket type names, not environment variables.
 
 ## Recognized host and toolchain variables
 
@@ -160,6 +192,8 @@ target-specific `CC_*`/`CXX_*` settings are documented in the
 - serving and retention: [`src/api/router.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/api/router.rs) and
   [`src/inference_service`](https://github.com/philipbodenbach/werk1112/tree/main/src/inference_service)
 - backend discovery: [`src/backend`](https://github.com/philipbodenbach/werk1112/tree/main/src/backend)
+- runtime persistence, memory and principal isolation: [`src/runtime_control`](https://github.com/philipbodenbach/werk1112/tree/main/src/runtime_control)
+- versioned runtime DTOs and client: [`src/werk_protocol`](https://github.com/philipbodenbach/werk1112/tree/main/src/werk_protocol)
 - media companion: [`src/media_companion.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/media_companion.rs) and
   [`runtime/werk_media_companion.py`](https://github.com/philipbodenbach/werk1112/blob/main/runtime/werk_media_companion.py)
 - store and authentication: [`src/model_store.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/model_store.rs)

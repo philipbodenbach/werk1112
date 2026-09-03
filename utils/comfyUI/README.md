@@ -133,6 +133,37 @@ is not required by these HTTP-backed Werk nodes.
   Click **Verify Connection** to perform a real request and show a visible
   success or error status directly on the node.
 - **WERK Server Info** reports installed models and server capabilities.
+- **WERK Runtime Info** performs strict Werk Protocol 1.0 discovery. It reports
+  the active backend, negotiated limits, and every capability using the exact
+  `supported`, `unsupported`, `unavailable`, `experimental`,
+  `externally_managed`, or `metadata_only` status returned by Werk. Unlike the
+  legacy discovery nodes, runtime-control nodes require `/werk/v1` and do not
+  fall back when an older server lacks it.
+- **WERK Persistence Policy** creates a typed `WERK_PERSISTENCE_POLICY` with
+  `auto`, `ephemeral`, `memory`, or `disk` retention; `disabled`, `prefer`, or
+  `required` reuse; an optional TTL; and pinning. A TTL of zero means omitted,
+  so the server retains authority over its default.
+- **WERK Runtime States** lists the caller's visible prefix/runtime states with
+  optional model, tier, page-size, and cursor filters.
+- **WERK State Control** pins, unpins, promotes, demotes, or evicts one explicit
+  state. Dry-run is enabled by default, and promote/demote require a target
+  tier.
+- **WERK State Prune** removes states through an explicit ID list, a constrained
+  filter, or a separately confirmed `all` selector. It defaults to dry-run.
+- **WERK Memory Status** reports host and accelerator capacity, availability,
+  managed/reserved bytes, topology, and pressure without guessing unavailable
+  telemetry.
+- **WERK Runtime Experts** lists bounded pages of backend-reported MoE expert
+  residency, size, hotness, pin state, and last-use telemetry. Model and tier
+  filters are optional; cursors remain opaque.
+- **WERK Expert Control** applies `prefetch`, `pin`, `unpin`, or `evict` to an
+  explicit model and explicit expert IDs. It defaults to dry-run. Prefetch
+  requires an explicit `vram` or `ram` target; other actions reject a target.
+- **WERK Prefill** accepts text or role/content message JSON plus an optional
+  persistence policy. It returns a `WERK_STATE_HANDOFF`, never a string or JSON
+  token.
+- **WERK Decode** is the only consumer of `WERK_STATE_HANDOFF`. It returns text,
+  safe completion metadata, and an optional updated opaque handoff.
 - **WERK Image Models** distinguishes declared image support from currently
   runtime probe-eligible image support. Probe eligibility is not a guarantee
   that a complete model pipeline will load successfully. Connect a
@@ -203,6 +234,46 @@ The interactive verification and dropdown discovery run through a local
 ComfyUI route. The browser sends the connection settings only to its own
 ComfyUI backend; the backend contacts Werk. API keys are never included in the
 route response.
+
+### Runtime persistence, experts, and split prefill/decode
+
+Use the runtime nodes in this shape:
+
+```text
+WERK Connection.connection ----------+--> WERK Runtime Info.connection
+                                     +--> WERK Prefill.connection
+                                     +--> WERK Decode.connection
+
+WERK Persistence Policy.policy ----------> WERK Prefill.policy
+WERK Prefill.handoff ---------------------> WERK Decode.handoff
+
+WERK Connection.connection ----------+--> WERK Runtime Experts.connection
+                                     +--> WERK Expert Control.connection
+WERK Runtime Experts.expert_ids ----------> WERK Expert Control.expert_ids
+```
+
+Prefill and decode are capability-gated. Experimental capabilities remain
+disabled unless the node's explicit opt-in is enabled. The only preflight
+exception is an `unavailable` Prefill/Handoff capability when that opt-in is
+enabled: Prefill may send the request so the server can run its model-scoped
+functional probe, and the server remains the authoritative second gate. Every
+other non-operational status and operation fails closed with the server's
+reason. The handoff is an in-memory, opaque workflow value and is deliberately
+excluded from JSON/STRING metadata outputs, representations, and error text. It
+may be one-time and short-lived, so a stale or reused value can correctly return
+`expired_handoff`.
+
+State pruning affects only runtime states selected by the request. It is not a
+model, artifact, output, job, authentication, backend, or external-path cleanup
+operation. Expert nodes require `runtime.experts.residency`: `supported` is
+operational, `experimental` requires the node's explicit opt-in, and
+`externally_managed` permits read-only expert telemetry but not control.
+`unsupported`, `unavailable`, and `metadata_only` fail closed. Expert Control
+never derives a selection from hotness or from the current page; the model and
+all IDs must be supplied explicitly, and the server enforces its advertised ID
+bound. No current production adapter advertises operational expert residency,
+so these nodes currently report the truthful capability failure without
+claiming that a backend action succeeded.
 
 ### Recommended image workflow
 
@@ -677,6 +748,16 @@ POST /v1/jobs
 GET /v1/jobs/{id}
 DELETE /v1/jobs/{id}
 GET /v1/outputs/{id}
+GET /werk/v1/info
+GET /werk/v1/capabilities
+GET /werk/v1/states
+POST /werk/v1/states/{id}/actions
+POST /werk/v1/states/prune
+GET /werk/v1/memory
+GET /werk/v1/experts
+POST /werk/v1/experts/actions
+POST /werk/v1/prefill
+POST /werk/v1/decode
 ```
 
 ## WSL and containers
@@ -704,6 +785,12 @@ The client sends bearer credentials only to the exact Werk origin (matching
 scheme, host, and effective port), rejects cross-origin redirects, bounds
 downloads, and removes local filesystem paths from visible result metadata.
 Werk URL outputs remain subject to Werk's output-retention policy.
+
+The runtime-protocol transport independently enforces bounded JSON request and
+response bodies, rejects every redirect, validates both the protocol envelope
+and version, preserves typed error code/retry/request IDs, and redacts API keys
+and opaque handoff values from errors. Runtime nodes never try legacy `/v1`
+routes after `/werk/v1` fails.
 
 Image decoding defaults to a 67,108,864-pixel allocation limit. Set
 `WERK_MAX_IMAGE_PIXELS` before starting ComfyUI to choose another positive

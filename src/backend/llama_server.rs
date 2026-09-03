@@ -14,6 +14,13 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+mod runtime_state;
+
+use runtime_state::{
+    LlamaProcessStateRuntime, LlamaRuntimeStateAdapter, cleanup_llama_snapshot_dir,
+    llama_state_args_are_effective, prepare_llama_state_snapshot_dir, probe_llama_process_identity,
+};
+
 use super::{
     ChatGenerationSession, GenerateRequest, GenerateResponse, GenerateStream, GenerateStreamEvent,
     GenerationBackend, GenerationTimings, LlamaCppMode, LlamaRuntimeOptions,
@@ -22,6 +29,7 @@ use crate::{
     capabilities::InferenceTask,
     inference::{TaskReadiness, TaskReadinessStatus},
     model_store::{ModelFile, ModelFormat, ModelManifest, ModelStore},
+    runtime_control::BackendRuntimeAdapter,
 };
 
 const DEFAULT_CTX_SIZE: usize = 4096;
@@ -60,6 +68,8 @@ struct LlamaServerProcess {
     pid: u32,
     mode: LlamaCppMode,
     log_tail: Arc<Mutex<VecDeque<String>>>,
+    state_gate: Mutex<()>,
+    state_runtime: LlamaProcessStateRuntime,
 }
 
 struct LlamaServerChatSession {
@@ -298,6 +308,10 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
+        Arc::new(LlamaRuntimeStateAdapter::new(self.clone()))
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.cached_server(manifest, false).map(|_| ())
     }
@@ -454,7 +468,9 @@ impl LlamaServerProcess {
                 executable.display()
             );
         }
-        let args = llama_server_args(
+        let (generation_id, snapshot_dir) =
+            prepare_llama_state_snapshot_dir(store, &supported).unwrap_or((None, None));
+        let args = llama_server_args_with_state(
             mode,
             model_path,
             projector_path,
@@ -462,7 +478,19 @@ impl LlamaServerProcess {
             runtime_options,
             &supported,
             llama_server_non_thinking(manifest),
+            snapshot_dir.as_deref(),
         );
+        let state_args_effective = generation_id.is_some()
+            && snapshot_dir.is_some()
+            && llama_state_args_are_effective(
+                &args,
+                snapshot_dir.as_deref().unwrap(),
+                model_path,
+                port,
+            );
+        let preflight_identity = state_args_effective
+            .then(|| probe_llama_process_identity(&executable, &args).ok())
+            .flatten();
 
         eprintln!("Using llama.cpp server {} backend", display_name(mode));
         let mut command = Command::new(&executable);
@@ -473,9 +501,17 @@ impl LlamaServerProcess {
         } else {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to start llama-server at {}", executable.display()))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(snapshot_dir) = snapshot_dir.as_deref() {
+                    cleanup_llama_snapshot_dir(snapshot_dir);
+                }
+                return Err(error).with_context(|| {
+                    format!("failed to start llama-server at {}", executable.display())
+                });
+            }
+        };
         if !env_true("WERK_LLAMA_LOG") {
             if let Some(stdout) = child.stdout.take() {
                 spawn_log_tail_reader("stdout", stdout, log_tail.clone());
@@ -485,7 +521,7 @@ impl LlamaServerProcess {
             }
         }
         let pid = child.id();
-        let process = Self {
+        let mut process = Self {
             child: Mutex::new(child),
             executable,
             discovery_source: discovery.source,
@@ -497,8 +533,27 @@ impl LlamaServerProcess {
             pid,
             mode,
             log_tail,
+            state_gate: Mutex::new(()),
+            state_runtime: LlamaProcessStateRuntime {
+                generation_id,
+                snapshot_dir,
+                identity: None,
+                configured: false,
+            },
         };
-        process.wait_until_ready()?;
+        if let Err(error) = process.wait_until_ready() {
+            if let Some(snapshot_dir) = process.state_runtime.snapshot_dir.as_deref() {
+                cleanup_llama_snapshot_dir(snapshot_dir);
+            }
+            return Err(error);
+        }
+        let postflight_identity = state_args_effective
+            .then(|| probe_llama_process_identity(&process.executable, &process.args).ok())
+            .flatten();
+        if preflight_identity.is_some() && preflight_identity == postflight_identity {
+            process.state_runtime.identity = postflight_identity;
+            process.state_runtime.configured = true;
+        }
         Ok(process)
     }
 
@@ -507,6 +562,10 @@ impl LlamaServerProcess {
         request: &GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<ServerCompletion> {
+        let _state_operation = self
+            .state_gate
+            .lock()
+            .map_err(|_| anyhow!("llama-server state operation mutex poisoned"))?;
         if request_has_images(request) && self.projector_path.is_none() {
             bail!(
                 "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
@@ -668,6 +727,9 @@ impl Drop for LlamaServerProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if let Some(snapshot_dir) = self.state_runtime.snapshot_dir.as_deref() {
+            cleanup_llama_snapshot_dir(snapshot_dir);
+        }
     }
 }
 
@@ -704,6 +766,7 @@ impl SseAccumulator {
     }
 }
 
+#[cfg(test)]
 fn llama_server_args(
     mode: LlamaCppMode,
     model_path: &Path,
@@ -712,6 +775,29 @@ fn llama_server_args(
     runtime_options: &LlamaRuntimeOptions,
     supported: &SupportedArgs,
     non_thinking: bool,
+) -> Vec<String> {
+    llama_server_args_with_state(
+        mode,
+        model_path,
+        projector_path,
+        port,
+        runtime_options,
+        supported,
+        non_thinking,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn llama_server_args_with_state(
+    mode: LlamaCppMode,
+    model_path: &Path,
+    projector_path: Option<&Path>,
+    port: u16,
+    runtime_options: &LlamaRuntimeOptions,
+    supported: &SupportedArgs,
+    non_thinking: bool,
+    state_snapshot_dir: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "--model".to_string(),
@@ -797,6 +883,18 @@ fn llama_server_args(
         if supported.chat_template_kwargs {
             args.push("--chat-template-kwargs".to_string());
             args.push(r#"{"enable_thinking":false}"#.to_string());
+        }
+    }
+    if let Some(snapshot_dir) = state_snapshot_dir {
+        args.push("--slots".to_string());
+        args.push("--slot-save-path".to_string());
+        args.push(snapshot_dir.display().to_string());
+        if supported.cache_ram {
+            args.push("--cache-ram".to_string());
+            args.push("0".to_string());
+        }
+        if supported.cache_idle_slots {
+            args.push("--no-cache-idle-slots".to_string());
         }
     }
     if let Ok(extra) = env::var("WERK_LLAMA_ARGS") {
@@ -1334,6 +1432,12 @@ struct SupportedArgs {
     reasoning: bool,
     chat_template_kwargs: bool,
     mmproj: bool,
+    slots: bool,
+    slot_save_path: bool,
+    parallel: bool,
+    cache_ram: bool,
+    cache_idle_slots: bool,
+    help_succeeded: bool,
 }
 
 fn supported_args(executable: &PathBuf) -> SupportedArgs {
@@ -1356,7 +1460,21 @@ fn supported_args(executable: &PathBuf) -> SupportedArgs {
             argument.trim_matches(|character: char| character == ',' || character == ';')
                 == "--mmproj"
         }),
+        slots: help_has_exact_option(&text, "--slots"),
+        slot_save_path: help_has_exact_option(&text, "--slot-save-path"),
+        parallel: help_has_exact_option(&text, "--parallel"),
+        cache_ram: help_has_exact_option(&text, "--cache-ram"),
+        cache_idle_slots: help_has_exact_option(&text, "--cache-idle-slots"),
+        help_succeeded: output.status.success(),
     }
+}
+
+fn help_has_exact_option(help: &str, option: &str) -> bool {
+    help.split_whitespace().any(|argument| {
+        argument.trim_matches(|character: char| {
+            matches!(character, ',' | ';' | '|' | '[' | ']' | '(' | ')')
+        }) == option
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default)]

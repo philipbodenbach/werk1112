@@ -82,8 +82,10 @@ jobs:
               "LICENSE",
               "nodes.py",
               "pyproject.toml",
+              "protocol.py",
               "requirements.txt",
               "routes.py",
+              "runtime_nodes.py",
               "video_utils.py",
               "web/js/werk_ui.js",
           }

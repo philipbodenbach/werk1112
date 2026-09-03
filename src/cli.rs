@@ -80,10 +80,15 @@ use crate::{
         RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
         plan_runtime, runtime_candidate_ids, select_runtime,
     },
+    werk_protocol::{
+        PruneStatesRequest, StateAction, StateActionRequest, StateListFilter, StateSelector,
+        StateTier, WerkProtocolClient,
+    },
 };
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
+const DEFAULT_RUNTIME_CONTROL_TIMEOUT_SECONDS: u64 = 30;
 const CHAT_CONTEXT_SAFETY_TOKENS: usize = 64;
 const DEFAULT_MAX_VISION_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
@@ -737,6 +742,35 @@ pub enum Commands {
         command: TempCommands,
     },
 
+    #[command(about = "Inspect and control a running Werk runtime")]
+    Runtime {
+        #[arg(
+            long,
+            default_value = "http://127.0.0.1:11434",
+            help = "Werk server base URL"
+        )]
+        url: String,
+
+        #[arg(
+            long,
+            env = "WERK_API_KEY",
+            hide_env_values = true,
+            help = "Bearer key for the Werk server"
+        )]
+        api_key: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_RUNTIME_CONTROL_TIMEOUT_SECONDS,
+            value_parser = clap::value_parser!(u64).range(1..=86_400),
+            help = "Timeout in seconds for one runtime-control request"
+        )]
+        timeout_seconds: u64,
+
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
+
     #[command(about = "Copy a local model file or directory into the managed model store")]
     Import {
         #[arg(help = "Model file or directory to copy")]
@@ -906,6 +940,168 @@ pub enum TempCommands {
 
     #[command(about = "Print the temporary-files directory")]
     Path,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum RuntimeCommands {
+    #[command(about = "Show Werk Protocol and active-backend information")]
+    Info,
+
+    #[command(about = "Show truthful runtime capability statuses")]
+    Capabilities,
+
+    #[command(about = "Show live host and accelerator memory telemetry")]
+    Memory,
+
+    #[command(about = "List persistent and volatile inference states")]
+    States {
+        #[arg(long, help = "Filter by installed model ID")]
+        model: Option<String>,
+
+        #[arg(long, value_enum, help = "Filter by state tier")]
+        tier: Option<RuntimeStateTierArg>,
+
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=100), help = "Maximum entries")]
+        limit: Option<u16>,
+
+        #[arg(long, help = "Opaque pagination cursor from a previous response")]
+        cursor: Option<String>,
+    },
+
+    #[command(about = "Apply an explicit action to one inference state")]
+    State {
+        #[arg(help = "Opaque runtime-state ID")]
+        id: String,
+
+        #[command(subcommand)]
+        command: RuntimeStateCommands,
+    },
+
+    #[command(about = "Prune explicitly selected inference states; dry-run by default")]
+    Prune {
+        #[arg(long = "id", action = ArgAction::Append, help = "Exact state ID; repeat as needed")]
+        ids: Vec<String>,
+
+        #[arg(long, help = "Select states for one installed model")]
+        model: Option<String>,
+
+        #[arg(long, value_enum, help = "Select states in one tier")]
+        tier: Option<RuntimeStateTierArg>,
+
+        #[arg(
+            long,
+            help = "Select states last accessed before this Unix millisecond"
+        )]
+        older_than_unix_ms: Option<u64>,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Select every visible state")]
+        all: bool,
+
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
+            requires = "all",
+            help = "Required acknowledgement when --all is used"
+        )]
+        confirm_all: bool,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually delete; otherwise only preview")]
+        execute: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum RuntimeStateCommands {
+    #[command(about = "Pin a state against policy eviction")]
+    Pin {
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually apply the change")]
+        execute: bool,
+    },
+
+    #[command(about = "Remove a state's policy pin")]
+    Unpin {
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually apply the change")]
+        execute: bool,
+    },
+
+    #[command(about = "Promote a state to RAM or VRAM")]
+    Promote {
+        #[arg(value_enum, help = "Target memory tier")]
+        target: RuntimeMemoryTierArg,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually apply the change")]
+        execute: bool,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Allow an experimental backend adapter")]
+        allow_experimental: bool,
+    },
+
+    #[command(about = "Demote a state to RAM or disk")]
+    Demote {
+        #[arg(value_enum, help = "Target lower tier")]
+        target: RuntimeDemotionTierArg,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually apply the change")]
+        execute: bool,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Allow an experimental backend adapter")]
+        allow_experimental: bool,
+    },
+
+    #[command(about = "Evict one explicitly named state")]
+    Evict {
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually delete the state")]
+        execute: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeStateTierArg {
+    Vram,
+    Ram,
+    Disk,
+    External,
+}
+
+impl From<RuntimeStateTierArg> for StateTier {
+    fn from(value: RuntimeStateTierArg) -> Self {
+        match value {
+            RuntimeStateTierArg::Vram => Self::Vram,
+            RuntimeStateTierArg::Ram => Self::Ram,
+            RuntimeStateTierArg::Disk => Self::Disk,
+            RuntimeStateTierArg::External => Self::External,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeMemoryTierArg {
+    Vram,
+    Ram,
+}
+
+impl From<RuntimeMemoryTierArg> for StateTier {
+    fn from(value: RuntimeMemoryTierArg) -> Self {
+        match value {
+            RuntimeMemoryTierArg::Vram => Self::Vram,
+            RuntimeMemoryTierArg::Ram => Self::Ram,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeDemotionTierArg {
+    Ram,
+    Disk,
+}
+
+impl From<RuntimeDemotionTierArg> for StateTier {
+    fn from(value: RuntimeDemotionTierArg) -> Self {
+        match value {
+            RuntimeDemotionTierArg::Ram => Self::Ram,
+            RuntimeDemotionTierArg::Disk => Self::Disk,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1518,6 +1714,59 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Commands::Runtime {
+            url,
+            api_key,
+            timeout_seconds,
+            command,
+        } => tokio::task::spawn_blocking(move || -> Result<()> {
+            let client = WerkProtocolClient::new(&url, api_key)?
+                .with_timeout(Duration::from_secs(timeout_seconds));
+            match command {
+                RuntimeCommands::Info => print_runtime_json(&client.info()?),
+                RuntimeCommands::Capabilities => print_runtime_json(&client.capabilities()?),
+                RuntimeCommands::Memory => print_runtime_json(&client.memory_status()?),
+                RuntimeCommands::States {
+                    model,
+                    tier,
+                    limit,
+                    cursor,
+                } => print_runtime_json(&client.list_states(&StateListFilter {
+                    model_id: model,
+                    tier: tier.map(Into::into),
+                    limit,
+                    cursor,
+                })?),
+                RuntimeCommands::State { id, command } => {
+                    let request = runtime_state_action_request(command);
+                    print_runtime_json(&client.state_action(&id, &request)?)
+                }
+                RuntimeCommands::Prune {
+                    ids,
+                    model,
+                    tier,
+                    older_than_unix_ms,
+                    all,
+                    confirm_all,
+                    execute,
+                } => {
+                    let selector = runtime_prune_selector(
+                        ids,
+                        model,
+                        tier,
+                        older_than_unix_ms,
+                        all,
+                        confirm_all,
+                    )?;
+                    print_runtime_json(&client.prune_states(&PruneStatesRequest {
+                        selector,
+                        dry_run: !execute,
+                    })?)
+                }
+            }
+        })
+        .await
+        .context("runtime-control client task failed")?,
         Commands::Import { path, name } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.import_path(&path, &name)?;
@@ -3891,6 +4140,7 @@ fn should_print_startup_banner_for(
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
+        | Commands::Runtime { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
         | Commands::Inspect { .. }
@@ -3917,6 +4167,7 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
+        | Commands::Runtime { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
         | Commands::Inspect { .. }
@@ -7476,13 +7727,11 @@ impl AutoBackend {
 
     fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
         let key = backend_label(backend);
-        if let Some(backend) = self
+        let mut backends = self
             .backends
             .lock()
-            .map_err(|_| anyhow!("auto backend cache mutex poisoned"))?
-            .get(key)
-            .cloned()
-        {
+            .map_err(|_| anyhow!("auto backend cache mutex poisoned"))?;
+        if let Some(backend) = backends.get(key).cloned() {
             return Ok(backend);
         }
 
@@ -7492,15 +7741,28 @@ impl AutoBackend {
             self.runtime_options.clone(),
             self.selection_options,
         )?;
-        self.backends
-            .lock()
-            .map_err(|_| anyhow!("auto backend cache mutex poisoned"))?
-            .insert(key, backend.clone());
+        backends.insert(key, backend.clone());
         Ok(backend)
     }
 }
 
 impl GenerationBackend for AutoBackend {
+    fn runtime_control_adapter_for(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for_request(manifest, false)
+    }
+
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.backend_for_request(manifest, has_images)?
+            .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for(manifest)?.prepare(manifest)
     }
@@ -7590,13 +7852,11 @@ impl GgufPreferredBackend {
 
     fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
         let key = backend_label(backend);
-        if let Some(backend) = self
+        let mut backends = self
             .backends
             .lock()
-            .map_err(|_| anyhow!("backend cache mutex poisoned"))?
-            .get(key)
-            .cloned()
-        {
+            .map_err(|_| anyhow!("backend cache mutex poisoned"))?;
+        if let Some(backend) = backends.get(key).cloned() {
             return Ok(backend);
         }
 
@@ -7606,15 +7866,28 @@ impl GgufPreferredBackend {
             self.runtime_options.clone(),
             self.selection_options,
         )?;
-        self.backends
-            .lock()
-            .map_err(|_| anyhow!("backend cache mutex poisoned"))?
-            .insert(key, backend.clone());
+        backends.insert(key, backend.clone());
         Ok(backend)
     }
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn runtime_control_adapter_for(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for_request(manifest, false)
+    }
+
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.backend_for_request(manifest, has_images)?
+            .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for(manifest)?.prepare(manifest)
     }
@@ -7712,6 +7985,22 @@ fn manifest_requires_mlx_vlm(manifest: &ModelManifest) -> bool {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn runtime_control_adapter_for(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for_request(manifest, false)
+    }
+
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.backend_for_request(manifest, has_images)
+            .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for_request(manifest, false).prepare(manifest)
     }
@@ -7824,13 +8113,11 @@ impl VllmPreferredBackend {
             );
         }
         let key = backend_label(backend);
-        if let Some(backend) = self
+        let mut backends = self
             .backends
             .lock()
-            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?
-            .get(key)
-            .cloned()
-        {
+            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?;
+        if let Some(backend) = backends.get(key).cloned() {
             return Ok(backend);
         }
 
@@ -7839,15 +8126,28 @@ impl VllmPreferredBackend {
             BackendChoice::VllmRocm => Arc::new(VllmBackend::new_rocm(self.store.clone())),
             _ => unreachable!("validated above"),
         };
-        self.backends
-            .lock()
-            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?
-            .insert(key, concrete.clone());
+        backends.insert(key, concrete.clone());
         Ok(concrete)
     }
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn runtime_control_adapter_for(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for_request(manifest, false)
+    }
+
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.backend_for_request(manifest, has_images)?
+            .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for_request(manifest, false)?.prepare(manifest)
     }
@@ -9554,6 +9854,91 @@ fn format_temp_list(entries: &[PathBuf]) -> String {
         .join("\n")
 }
 
+fn print_runtime_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn runtime_state_action_request(command: RuntimeStateCommands) -> StateActionRequest {
+    match command {
+        RuntimeStateCommands::Pin { execute } => StateActionRequest {
+            action: StateAction::Pin,
+            target_tier: None,
+            dry_run: !execute,
+            allow_experimental: false,
+        },
+        RuntimeStateCommands::Unpin { execute } => StateActionRequest {
+            action: StateAction::Unpin,
+            target_tier: None,
+            dry_run: !execute,
+            allow_experimental: false,
+        },
+        RuntimeStateCommands::Promote {
+            target,
+            execute,
+            allow_experimental,
+        } => StateActionRequest {
+            action: StateAction::Promote,
+            target_tier: Some(target.into()),
+            dry_run: !execute,
+            allow_experimental,
+        },
+        RuntimeStateCommands::Demote {
+            target,
+            execute,
+            allow_experimental,
+        } => StateActionRequest {
+            action: StateAction::Demote,
+            target_tier: Some(target.into()),
+            dry_run: !execute,
+            allow_experimental,
+        },
+        RuntimeStateCommands::Evict { execute } => StateActionRequest {
+            action: StateAction::Evict,
+            target_tier: None,
+            dry_run: !execute,
+            allow_experimental: false,
+        },
+    }
+}
+
+fn runtime_prune_selector(
+    ids: Vec<String>,
+    model: Option<String>,
+    tier: Option<RuntimeStateTierArg>,
+    older_than_unix_ms: Option<u64>,
+    all: bool,
+    confirm_all: bool,
+) -> Result<StateSelector> {
+    let has_filter = model.is_some() || tier.is_some() || older_than_unix_ms.is_some();
+    let selector_count = usize::from(!ids.is_empty()) + usize::from(has_filter) + usize::from(all);
+    if selector_count != 1 {
+        bail!(
+            "runtime prune requires exactly one selector: --id, a model/tier/time filter, or --all --confirm-all"
+        );
+    }
+    if !ids.is_empty() {
+        if confirm_all {
+            bail!("--confirm-all is valid only with --all");
+        }
+        return Ok(StateSelector::Ids { ids });
+    }
+    if all {
+        if !confirm_all {
+            bail!("--all requires --confirm-all; no states were selected");
+        }
+        return Ok(StateSelector::All { confirm: true });
+    }
+    if confirm_all {
+        bail!("--confirm-all is valid only with --all");
+    }
+    Ok(StateSelector::Filter {
+        model_id: model,
+        tier: tier.map(Into::into),
+        older_than_unix_ms,
+    })
+}
+
 fn format_bytes_per_second(bytes_per_second: f64) -> String {
     format_bytes_f64(bytes_per_second.max(0.0))
 }
@@ -10253,6 +10638,120 @@ mod tests {
             ),
             "Purged 2 temporary entries."
         );
+    }
+
+    #[test]
+    fn parses_runtime_status_and_persistence_controls() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "runtime",
+            "--url",
+            "http://127.0.0.1:12000",
+            "states",
+            "--model",
+            "org/model",
+            "--tier",
+            "disk",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Runtime {
+                url,
+                api_key,
+                timeout_seconds,
+                command:
+                    RuntimeCommands::States {
+                        model,
+                        tier,
+                        limit,
+                        cursor,
+                    },
+            } => {
+                assert_eq!(url, "http://127.0.0.1:12000");
+                assert!(api_key.is_none());
+                assert_eq!(timeout_seconds, DEFAULT_RUNTIME_CONTROL_TIMEOUT_SECONDS);
+                assert_eq!(model.as_deref(), Some("org/model"));
+                assert_eq!(tier, Some(RuntimeStateTierArg::Disk));
+                assert_eq!(limit, Some(25));
+                assert!(cursor.is_none());
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "runtime",
+            "state",
+            "st_example",
+            "promote",
+            "vram",
+            "--execute",
+            "--allow-experimental",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime {
+                command: RuntimeCommands::State {
+                    command: RuntimeStateCommands::Promote {
+                        target: RuntimeMemoryTierArg::Vram,
+                        execute: true,
+                        allow_experimental: true,
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["werk", "runtime", "--timeout-seconds", "75", "info"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime {
+                timeout_seconds: 75,
+                command: RuntimeCommands::Info,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["werk", "runtime", "--timeout-seconds", "0", "info",]).is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_prune_requires_one_explicit_selector_and_defaults_to_preview() {
+        assert!(runtime_prune_selector(Vec::new(), None, None, None, false, false).is_err());
+        assert!(
+            runtime_prune_selector(
+                vec!["st_one".to_string()],
+                Some("model".to_string()),
+                None,
+                None,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert!(runtime_prune_selector(Vec::new(), None, None, None, true, false).is_err());
+        assert_eq!(
+            runtime_prune_selector(Vec::new(), None, None, None, true, true).unwrap(),
+            StateSelector::All { confirm: true }
+        );
+
+        let cli = Cli::try_parse_from(["werk", "runtime", "prune", "--id", "st_one"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Runtime {
+                command: RuntimeCommands::Prune { ids, execute, .. },
+                ..
+            } => {
+                assert_eq!(ids, vec!["st_one"]);
+                assert!(!execute);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
     }
 
     #[test]
@@ -11789,6 +12288,14 @@ mod tests {
         }
 
         impl GenerationBackend for RecordingMlxBackend {
+            fn runtime_control_adapter(
+                &self,
+            ) -> Arc<dyn crate::runtime_control::BackendRuntimeAdapter> {
+                Arc::new(crate::runtime_control::UnsupportedRuntimeAdapter::new(
+                    self.label,
+                ))
+            }
+
             fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
                 self.calls.lock().unwrap().push("prepare");
                 Ok(())
@@ -11867,6 +12374,22 @@ mod tests {
             .metadata
             .tasks
             .push(InferenceTask::ImageUnderstanding);
+        assert_eq!(
+            backend
+                .runtime_control_adapter_for(&text_manifest)
+                .unwrap()
+                .descriptor()
+                .backend,
+            "mlx-lm"
+        );
+        assert_eq!(
+            backend
+                .runtime_control_adapter_for(&vision_manifest)
+                .unwrap()
+                .descriptor()
+                .backend,
+            "mlx-vlm"
+        );
         let text_request = GenerateRequest {
             prompt: "hello".to_string(),
             messages: Vec::new(),

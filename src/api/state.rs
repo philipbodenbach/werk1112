@@ -6,12 +6,17 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use tokio::sync::Semaphore;
 
 use crate::{
     backend::{ChatGenerationSession, GenerationBackend},
     inference_service::{InferenceService, JobManager},
     model_store::{ModelManifest, ModelStore},
     openai::ChatTemplateOptions,
+    runtime_control::{
+        LocalWerkControl, PrincipalDeriver, RoutedRuntimeAdapter, RuntimeRoutedGenerationBackend,
+    },
+    werk_protocol::{ProtocolError, ProtocolErrorCode, WerkControl},
 };
 
 use super::{
@@ -19,6 +24,8 @@ use super::{
     cors::CorsOrigin,
     response::{auth_error, constant_time_eq},
 };
+
+const MAX_PRINCIPAL_DERIVATIONS: usize = 8;
 
 pub type PromptOptionsResolver = Arc<
     dyn Fn(&ModelStore, &ModelManifest, bool) -> anyhow::Result<ChatTemplateOptions<'static>>
@@ -30,12 +37,15 @@ pub type PromptOptionsResolver = Arc<
 pub struct ApiState {
     pub(super) store: Arc<ModelStore>,
     pub(super) backend: Arc<dyn GenerationBackend>,
+    pub(super) werk_control: Arc<dyn WerkControl>,
     pub(super) default_model: Option<String>,
     pub(super) default_image_model: Option<String>,
     pub(super) chat_context_size: usize,
     prompt_options_resolver: Option<PromptOptionsResolver>,
     chat_sessions: Arc<Mutex<HashMap<String, Arc<dyn ChatGenerationSession>>>>,
     api_keys: Arc<Vec<String>>,
+    principal_deriver: PrincipalDeriver,
+    principal_derivation_gate: Arc<Semaphore>,
     cors_origins: Arc<Vec<CorsOrigin>>,
     pub(super) automatic1111: Arc<Automatic1111State>,
     pub(super) verbose: bool,
@@ -80,15 +90,25 @@ impl ApiState {
     ) -> Self {
         let inference_service = Arc::new(InferenceService::new(store.clone()));
         let job_manager = Arc::new(JobManager::new(inference_service.as_ref().clone()));
+        let runtime_adapter = Arc::new(RoutedRuntimeAdapter::new(backend.clone()));
+        let backend: Arc<dyn GenerationBackend> = Arc::new(RuntimeRoutedGenerationBackend::new(
+            backend,
+            runtime_adapter.clone(),
+        ));
+        let local_control = LocalWerkControl::new(store.clone(), runtime_adapter);
+        let principal_deriver = local_control.principal_deriver();
         Self {
             store: Arc::new(store),
             backend,
+            werk_control: Arc::new(local_control),
             default_model,
             default_image_model: None,
             chat_context_size: 4096,
             prompt_options_resolver,
             chat_sessions: Arc::new(Mutex::new(HashMap::new())),
             api_keys: Arc::new(Vec::new()),
+            principal_deriver,
+            principal_derivation_gate: Arc::new(Semaphore::new(MAX_PRINCIPAL_DERIVATIONS)),
             cors_origins: Arc::new(Vec::new()),
             automatic1111: Arc::new(Automatic1111State::default()),
             verbose,
@@ -99,6 +119,13 @@ impl ApiState {
 
     pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Self {
         self.api_keys = Arc::new(api_keys);
+        self
+    }
+
+    /// Replaces the local Werk control implementation. Primarily useful for
+    /// transport contract tests and embedders with their own control service.
+    pub fn with_werk_control(mut self, werk_control: Arc<dyn WerkControl>) -> Self {
+        self.werk_control = werk_control;
         self
     }
 
@@ -177,11 +204,70 @@ impl ApiState {
     }
 
     pub(super) fn api_key_matches(&self, token: &str) -> bool {
-        !token.is_empty()
-            && self
-                .api_keys
-                .iter()
-                .any(|key| constant_time_eq(key.as_bytes(), token.as_bytes()))
+        if token.is_empty() {
+            return false;
+        }
+        let mut matched = false;
+        for key in self.api_keys.iter() {
+            // Evaluate every configured key so the position of a match does
+            // not determine how many comparisons authentication performs.
+            matched |= constant_time_eq(key.as_bytes(), token.as_bytes());
+        }
+        matched
+    }
+
+    /// Authenticates a Werk Protocol request and returns only its opaque
+    /// storage namespace. Credentials never cross into the control service.
+    pub(super) async fn werk_principal(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<String, ProtocolError> {
+        if self.api_keys.is_empty() {
+            return Ok("local".to_string());
+        }
+
+        if let Some(token) = headers.get("x-api-key") {
+            let token = token.to_str().map_err(|_| unauthorized())?;
+            let token = token.trim();
+            if self.api_key_matches(token) {
+                return self.derive_principal(token.to_string()).await;
+            }
+            if headers.get(header::AUTHORIZATION).is_none() {
+                return Err(unauthorized());
+            }
+        }
+
+        let header_value = headers
+            .get(header::AUTHORIZATION)
+            .ok_or_else(unauthorized)?
+            .to_str()
+            .map_err(|_| unauthorized())?;
+        let (scheme, token) = header_value.split_once(' ').ok_or_else(unauthorized)?;
+        let token = token.trim();
+        if !scheme.eq_ignore_ascii_case("bearer")
+            || token.is_empty()
+            || !self.api_key_matches(token)
+        {
+            return Err(unauthorized());
+        }
+        self.derive_principal(token.to_string()).await
+    }
+
+    async fn derive_principal(&self, credential: String) -> Result<String, ProtocolError> {
+        let permit = self
+            .principal_derivation_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| principal_unavailable())?;
+        let deriver = self.principal_deriver.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            deriver.derive(&credential)
+        })
+        .await
+        .map_err(|_| principal_unavailable())?
+        .map_err(|_| principal_unavailable())
     }
 
     pub(super) fn prompt_options(
@@ -227,4 +313,19 @@ impl ApiState {
             .insert(key, session.clone());
         Ok(Some(session))
     }
+}
+
+fn unauthorized() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::Unauthorized,
+        "authentication credentials are missing or invalid",
+    )
+}
+
+fn principal_unavailable() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::Unavailable,
+        "secure principal derivation is unavailable",
+    )
+    .retryable(true)
 }

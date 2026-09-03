@@ -24,7 +24,11 @@ use crate::{
     capabilities::InferenceTask,
     inference::{TaskReadiness, TaskReadinessStatus},
     model_store::{ModelFormat, ModelManifest, ModelStore},
+    runtime_control::BackendRuntimeAdapter,
 };
+
+mod runtime_control;
+use self::runtime_control::VllmRuntimeControlAdapter;
 
 const DEFAULT_HEALTH_TIMEOUT_SECONDS: u64 = 300;
 const DGX_SPARK_HEALTH_TIMEOUT_SECONDS: u64 = 900;
@@ -93,6 +97,8 @@ struct VllmProcess {
     pid: Option<u32>,
     log_tail: Arc<Mutex<VecDeque<String>>>,
     accelerator: VllmAccelerator,
+    runtime_version: String,
+    runtime_instance_id: String,
 }
 
 struct VllmChatSession {
@@ -384,6 +390,10 @@ impl VllmBackend {
 }
 
 impl GenerationBackend for VllmBackend {
+    fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
+        Arc::new(VllmRuntimeControlAdapter::new(self.clone()))
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.cached_server(manifest).map(|_| ())
     }
@@ -579,11 +589,16 @@ impl VllmProcess {
                 pid: None,
                 log_tail,
                 accelerator,
+                runtime_version: "unreported".to_string(),
+                runtime_instance_id: new_runtime_instance_id()?,
             };
             return Ok(process);
         }
 
         eprintln!("Using vLLM {} backend", accelerator.display_name());
+        let runtime_version = vllm_version(&command)
+            .and_then(|version| sanitize_runtime_version(&version))
+            .unwrap_or_else(|| "unknown".to_string());
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         let args = vllm_server_args(&command, model_dir, &manifest.id, port);
@@ -624,6 +639,8 @@ impl VllmProcess {
             pid: Some(pid),
             log_tail,
             accelerator,
+            runtime_version,
+            runtime_instance_id: new_runtime_instance_id()?,
         };
         process.wait_until_ready()?;
         Ok(process)
@@ -2497,6 +2514,29 @@ fn command_failure_detail(prefix: &str, output: &std::process::Output) -> String
 
 fn compact_error(reason: &str) -> String {
     reason.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn new_runtime_instance_id() -> Result<String> {
+    let mut random = [0_u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|_| anyhow!("secure vLLM process identity generation is unavailable"))?;
+    Ok(format!(
+        "vp_{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn sanitize_runtime_version(version: &str) -> Option<String> {
+    let version = version.trim();
+    (!version.is_empty()
+        && version.len() <= 128
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+')))
+    .then(|| version.to_string())
 }
 
 fn vllm_version(command: &VllmCommand) -> Option<String> {

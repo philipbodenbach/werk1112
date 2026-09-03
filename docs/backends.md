@@ -7,6 +7,11 @@ present, and one model may have several eligible runtime candidates.
 This page documents the current implementation. “Installer exists” does not
 mean “every model and accelerator combination is verified.”
 
+Inference eligibility is separate from runtime-state control. The exact
+prefix-state, persistence, memory, prefill/decode and expert-residency statuses
+for each active adapter are in the
+[runtime-control capability matrix](concepts/runtime-persistence-and-memory.md#current-production-capability-matrix).
+
 ## Three separate questions
 
 Backend troubleshooting is easier when these questions are kept separate:

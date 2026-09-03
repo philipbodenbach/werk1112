@@ -15,11 +15,12 @@ of truth.
 
 Current surface:
 
-- 21 unique paths
-- 23 method/path operations
+- 31 unique paths
+- 33 method/path operations
 - JSON requests except raw output downloads
 - server-sent events only for chat streaming
 - persisted asynchronous jobs for video, generated audio and the native job API
+- a separate, versioned Werk Protocol 1.0 runtime-control surface
 
 ## Base URL
 
@@ -53,6 +54,7 @@ with <code>--allow-unauthenticated</code>.
 | OpenAI-compatible subset | Common OpenAI request and response shapes are implemented, but only documented fields are supported. |
 | OpenAI-inspired | The path or general purpose resembles OpenAI, but Werk adds or changes request/response behavior. |
 | Werk-native | The route exposes Werk tasks, routing, estimates, plans, jobs or outputs directly. |
+| Werk Protocol 1.0 | Versioned runtime-control envelope with typed capability, state, memory and prefill/decode semantics. |
 | Comfy alias | A compatibility path used by ComfyUI hosted nodes. |
 | A1111 subset | A deliberately small AUTOMATIC1111-compatible surface. |
 
@@ -85,6 +87,26 @@ Do not infer compatibility with an entire upstream API from the path prefix.
 | A1111 subset | GET | <code>/sdapi/v1/options</code> | Current compatibility model selection |
 | A1111 subset | POST | <code>/sdapi/v1/options</code> | Update compatibility model selection |
 | A1111 subset | GET | <code>/sdapi/v1/progress</code> | Coarse idle/active state |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/info</code> | Version, active backend and protocol limits |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/capabilities</code> | Truthful runtime capability statuses |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/memory</code> | Live host/accelerator telemetry and managed accounting |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/states</code> | Principal-scoped runtime-state page |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/states/{id}/actions</code> | Dry-run or explicit state action |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/states/prune</code> | Explicitly selected state-prune summary |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/experts</code> | Capability-gated expert metadata page |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/experts/actions</code> | Capability-gated explicit expert action |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/prefill</code> | Capability-gated prefill and opaque handoff |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/decode</code> | Single-use handoff decode |
+
+The `/werk/v1` routes are additive and do not replace or reinterpret any
+existing `/v1`, `/proxy/openai` or `/sdapi/v1` route. Their complete envelopes,
+DTOs, limits, errors and examples are in the
+[Werk Protocol 1.0 reference](reference/werk-protocol-v1.md). Architecture and
+the exact production-backend capability matrix are in
+[Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md).
+Protocol clients should send `Accept: application/json` and
+`X-Werk-Protocol-Version: 1.0`. Responses declare the same protocol version,
+disable caching and MIME sniffing, and vary on `Accept`.
 
 ## Authentication
 
@@ -107,7 +129,11 @@ A1111 routes additionally accept HTTP Basic authentication with username
 
 Authentication properties:
 
-- keys currently have equal permissions; there are no scopes or tenants;
+- keys currently have equal inference permissions; there are no configurable
+  authorization scopes;
+- Werk Protocol runtime state is nevertheless partitioned by a keyed opaque
+  principal derived from the accepted API key, so different keys cannot list
+  or reuse each other's state;
 - no built-in rate limiting is implemented;
 - the server does not terminate TLS;
 - remote deployments should use a TLS reverse proxy;
@@ -133,6 +159,10 @@ The following JSON routes default to 128 MiB and can be configured up to
 Other JSON routes retain Axum's smaller default, approximately 2 MiB. The
 larger chat limit permits inline vision data URLs but remains a bound on the
 complete JSON body, not just the decoded image.
+
+Werk Protocol mutation, expert, prefill and decode routes have their own fixed
+1 MiB body limit. They additionally enforce the smaller typed limits returned
+by <code>GET /werk/v1/info</code>.
 
 Base64 expands binary data by roughly one third. Prefer server-local paths when
 the client and server intentionally share a trusted filesystem.
@@ -843,7 +873,7 @@ There is no output deletion endpoint today.
 
 ## Error response
 
-Most Werk routes use:
+Most established `/v1`, proxy and compatibility routes use:
 
 ~~~json
 {
@@ -879,6 +909,16 @@ Current caveats:
 - model-load/backend errors are often reported as 400;
 - A1111 compatibility routes use their own error shape.
 
+Werk Protocol routes do not use this legacy error object. Every `/werk/v1`
+failure retains the protocol version and opaque request ID and returns a typed
+code, public message and retryability flag. HTTP status mapping includes 409
+for incompatible state, 406 with `incompatible_protocol` for an incompatible
+version or JSON representation, 410 for an expired/consumed handoff, 428 when
+an experimental operation lacks opt-in, 429 for bounded resource exhaustion,
+501 for an unsupported adapter operation and 503 for a temporarily unavailable
+prerequisite. See [Werk Protocol errors](reference/werk-protocol-v1.md#errors)
+for the complete mapping.
+
 ## AUTOMATIC1111 subset
 
 The supported compatibility routes are:
@@ -911,8 +951,8 @@ preview image when the backend has no progress callback.
 
 ## Security and privacy considerations
 
-The current diagnostic contracts are intentionally transparent but can contain
-sensitive information:
+The established inference diagnostic contracts are intentionally transparent
+but can contain sensitive information:
 
 - direct responses include the effective request and absolute server output
   paths inside <code>werk</code>;
@@ -920,7 +960,16 @@ sensitive information:
 - inline Base64 input is therefore persisted in job JSON;
 - prompts, negative prompts and server-local input paths can be persisted;
 - job records have no independent retention or deletion API;
-- all API keys currently have equal access.
+- all API keys currently have equal access to those legacy inference and
+  diagnostic routes.
+
+Werk Protocol runtime state has a narrower public summary. It does not expose
+raw credentials, prompts, backend handles, external cache keys or snapshot
+paths. Each accepted API key maps through HMAC-SHA-256 to a separate opaque
+state namespace and prompt-fingerprint scope. Handoffs are random,
+principal-bound, single-use secrets and responses carry `Cache-Control:
+no-store`. These protections do not turn plain HTTP into a secure remote
+transport.
 
 Do not expose Werk directly to an untrusted network. Use TLS termination,
 access controls and a trusted reverse proxy. Prefer dedicated store roots for

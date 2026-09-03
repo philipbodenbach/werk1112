@@ -129,6 +129,108 @@ Models, artifacts, managed outputs, jobs, authentication data, backends, files
 at the store root and output paths outside the store are persistent boundaries
 and are not touched by temporary-file purging.
 
+## Runtime control
+
+`werk runtime` is a quiet, pretty-JSON client for the versioned `/werk/v1`
+control plane of an already-running server. Begin with discovery:
+
+```bash
+werk runtime info
+werk runtime capabilities
+werk runtime memory
+```
+
+For another trusted HTTP endpoint, put the connection options before the
+runtime subcommand:
+
+```bash
+export WERK_API_KEY="replace-with-generated-key"
+werk runtime --url http://werk-host:11434 capabilities
+werk runtime --timeout-seconds 75 info
+```
+
+`--url` defaults to `http://127.0.0.1:11434`, must contain an explicit port and
+currently accepts only plain `http://` with no path or embedded credentials.
+`--api-key` overrides the `WERK_API_KEY` default, but the environment variable
+avoids placing a key directly in shell history. The bundled client does not
+follow redirects or provide TLS; use it only over loopback or a trusted private
+hop. `--timeout-seconds` is a total per-request deadline, defaults to 30 and
+accepts values from 1 through 86400; like `--url` and `--api-key`, it must
+appear before the runtime subcommand.
+
+The active store belongs to the server. A client-side global `--model-home`
+does not redirect remote runtime state; start the server with the intended
+`WERK_HOME`/`--model-home` instead.
+
+### List states
+
+```bash
+werk runtime states
+werk runtime states --model my-model --tier disk --limit 50
+werk runtime states --cursor OPAQUE_CURSOR
+```
+
+Filters are optional. Tier is `vram`, `ram`, `disk` or `external`; limit is 1
+through 100. The JSON result contains opaque state IDs and an optional next
+cursor. It never prints a backend handle, snapshot path, prompt or API key.
+
+### Control one state
+
+Every mutation previews by default. Repeat it with `--execute` only after
+checking the JSON response:
+
+```bash
+werk runtime state st_OPAQUE_ID pin
+werk runtime state st_OPAQUE_ID pin --execute
+werk runtime state st_OPAQUE_ID unpin --execute
+werk runtime state st_OPAQUE_ID evict --execute
+
+werk runtime state st_OPAQUE_ID promote ram --allow-experimental
+werk runtime state st_OPAQUE_ID promote ram --allow-experimental --execute
+werk runtime state st_OPAQUE_ID demote disk --allow-experimental --execute
+```
+
+Promotion targets are `ram` or `vram`; demotion targets are `ram` or `disk`.
+The requested direction must be valid for the state's current tier. Supplying
+`--allow-experimental` acknowledges the backend capability status for that one
+request; it does not enable experimental behavior globally.
+
+### Prune selected states
+
+Prune also defaults to preview and requires exactly one selector form:
+
+```bash
+# One or more exact IDs
+werk runtime prune --id st_FIRST --id st_SECOND
+werk runtime prune --id st_FIRST --execute
+
+# A non-empty model/tier/time filter
+werk runtime prune \
+  --model my-model \
+  --tier disk \
+  --older-than-unix-ms 1788444000000
+
+# Every state visible to this authenticated principal
+werk runtime prune --all --confirm-all
+werk runtime prune --all --confirm-all --execute
+```
+
+`--all` is rejected without `--confirm-all`; `--confirm-all` is invalid for
+the ID and filter forms. `--execute` changes `dry_run` from true to false.
+Pruning affects only the selected runtime states. It does not purge temporary
+files and cannot remove models, artifacts, outputs, jobs, authentication data,
+backend installations or external paths.
+
+The CLI currently exposes info, capabilities, memory and state maintenance.
+Prefill/decode and expert contracts are HTTP/SDK surfaces; the ComfyUI package
+provides typed prefill/decode nodes plus capability-gated expert telemetry and
+dry-run-first expert-control nodes. The nodes do not imply production backend
+support. See the
+[Werk Protocol 1.0 reference](werk-protocol-v1.md), the
+[runtime architecture and capability matrix](../concepts/runtime-persistence-and-memory.md),
+and the
+[ComfyUI custom-node guide](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/README.md#runtime-persistence-experts-and-split-prefilldecode).
+
 ## Authentication
 
 Hugging Face credentials:

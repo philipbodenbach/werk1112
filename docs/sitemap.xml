@@ -13,6 +13,9 @@
     <loc>https://philipbodenbach.github.io/werk1112/api.html</loc>
   </url>
   <url>
+    <loc>https://philipbodenbach.github.io/werk1112/concepts/runtime-persistence-and-memory.html</loc>
+  </url>
+  <url>
     <loc>https://philipbodenbach.github.io/werk1112/backends.html</loc>
   </url>
   <url>
@@ -23,6 +26,9 @@
   </url>
   <url>
     <loc>https://philipbodenbach.github.io/werk1112/reference/cli.html</loc>
+  </url>
+  <url>
+    <loc>https://philipbodenbach.github.io/werk1112/reference/werk-protocol-v1.html</loc>
   </url>
   <url>
     <loc>https://philipbodenbach.github.io/werk1112/reference/environment-variables.html</loc>

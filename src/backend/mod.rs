@@ -1138,6 +1138,44 @@ pub trait ChatGenerationSession: Send + Sync {
 }
 
 pub trait GenerationBackend: Send + Sync {
+    /// Returns the runtime-control adapter owned by this generation backend.
+    ///
+    /// Backends that do not expose operational persistence, memory, expert,
+    /// or prefill/decode controls get an explicit unsupported adapter. This
+    /// keeps capability reporting truthful while allowing concrete backends
+    /// to share their existing process and model state with the control plane.
+    fn runtime_control_adapter(
+        &self,
+    ) -> std::sync::Arc<dyn crate::runtime_control::BackendRuntimeAdapter> {
+        std::sync::Arc::new(crate::runtime_control::UnsupportedRuntimeAdapter::new(
+            "generation-backend",
+        ))
+    }
+
+    /// Resolves the concrete runtime-control adapter for a model.
+    ///
+    /// Routing backends override this hook and delegate to the concrete
+    /// backend selected for `manifest`. The default preserves direct backend
+    /// implementations and their existing adapter API.
+    fn runtime_control_adapter_for(
+        &self,
+        _manifest: &ModelManifest,
+    ) -> Result<std::sync::Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        Ok(self.runtime_control_adapter())
+    }
+
+    /// Resolves the concrete runtime-control adapter for the same modality
+    /// choice as a generation request. Model routers whose selection changes
+    /// for image-bearing requests override this; direct backends inherit the
+    /// manifest-only implementation.
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        _has_images: bool,
+    ) -> Result<std::sync::Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for(manifest)
+    }
+
     fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
         Ok(())
     }

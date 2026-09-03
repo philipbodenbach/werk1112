@@ -731,15 +731,41 @@ impl ModelStore {
 
     pub fn get(&self, id: &str) -> Result<ModelManifest> {
         self.ensure()?;
+        self.get_existing(id)
+    }
+
+    /// Looks up an installed model without creating or otherwise changing the
+    /// model store. Read-only control-plane operations and dry runs use this
+    /// path so an absent custom WERK_HOME remains absent.
+    pub(crate) fn get_existing(&self, id: &str) -> Result<ModelManifest> {
         let direct = self.model_dir(id).join(MANIFEST_FILE);
         if direct.is_file() {
             return read_manifest(&direct);
         }
 
-        self.list()?
-            .into_iter()
-            .find(|manifest| manifest.id == id)
-            .ok_or_else(|| anyhow!("model '{id}' is not installed"))
+        let models = self.models_dir();
+        let entries = match fs::read_dir(&models) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow!("model '{id}' is not installed"));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read model store {}", models.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry
+                .with_context(|| format!("failed to enumerate model store {}", models.display()))?;
+            let manifest_path = entry.path().join(MANIFEST_FILE);
+            if manifest_path.is_file() {
+                let manifest = read_manifest(&manifest_path)?;
+                if manifest.id == id {
+                    return Ok(manifest);
+                }
+            }
+        }
+        Err(anyhow!("model '{id}' is not installed"))
     }
 
     pub fn remove(&self, id: &str) -> Result<ModelManifest> {
@@ -4453,6 +4479,19 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_model_lookup_leaves_an_absent_store_absent() {
+        let root = test_dir("read-only-model-lookup");
+        let home = root.join("missing-store");
+        let store = ModelStore::resolve(Some(home.clone())).unwrap();
+
+        let error = store.get_existing("not-installed").unwrap_err();
+
+        assert!(error.to_string().contains("not installed"));
+        assert!(!home.exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn list_tmp_returns_sorted_direct_entries_without_creating_or_mutating() {

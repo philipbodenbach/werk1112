@@ -17,6 +17,8 @@ The browser-friendly index is published as the
 | Install and run a first command | [Getting started](getting-started.md) |
 | Look up CLI commands and semantics | [CLI reference](reference/cli.md) |
 | Understand every HTTP route | [HTTP API](api.md) |
+| Implement a runtime-control client | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |
+| Review runtime persistence, memory and backend boundaries | [Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md) |
 | Install or select a backend | [Backends](backends.md) |
 | Run Werk and Nemotron on NVIDIA DGX Spark | [DGX Spark](integrations/dgx-spark.md) |
 | Run Werk on AMD Strix Halo | [AMD Strix Halo](integrations/strix-halo.md) |
@@ -53,8 +55,9 @@ model works on every accelerator.
 
 [api.md](api.md) documents:
 
-- all 21 paths and 23 method/path operations
-- OpenAI-compatible, OpenAI-inspired, Werk-native, Comfy and A1111 surfaces
+- all 31 paths and 33 method/path operations
+- OpenAI-compatible, OpenAI-inspired, Werk-native, Werk Protocol 1.0, Comfy
+  and A1111 surfaces
 - authentication, CORS, content types and body limits
 - chat, image, video, audio and generic-job request contracts
 - task-to-endpoint coverage
@@ -68,6 +71,15 @@ model works on every accelerator.
 controls, model lifecycle, authentication, estimation, diagnostics, artifacts,
 text/media inference and serving semantics. The installed `--help` output is
 authoritative for exact flags.
+
+### Runtime control
+
+[reference/werk-protocol-v1.md](reference/werk-protocol-v1.md) defines the
+versioned `/werk/v1` HTTP/JSON envelopes, routes, DTOs, errors, limits and the
+bounded Rust client. [concepts/runtime-persistence-and-memory.md](concepts/runtime-persistence-and-memory.md)
+documents the transport-neutral service, opaque backend adapters, state-store
+crash safety, memory reservations, prefill/decode handoffs and the truthful
+production-backend capability matrix.
 
 ### Backends
 

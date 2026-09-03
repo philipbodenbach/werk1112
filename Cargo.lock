@@ -2682,6 +2682,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6696,7 +6706,9 @@ dependencies = [
  "clap",
  "crc32fast",
  "cudarc 0.19.8",
+ "fs2",
  "getrandom 0.2.17",
+ "hmac",
  "indicatif",
  "libc",
  "llama_cpp",
@@ -6704,6 +6716,7 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+ "sha2",
  "tokenizers 0.21.4",
  "tokio",
  "tokio-stream",
