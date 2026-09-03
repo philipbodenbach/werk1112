@@ -207,6 +207,6 @@ packages or download missing weights during inference.
 - [Backends, routing and platform support](../backends.md)
 - [Media inference](../media-inference.md)
 
-Implementation source: [`src/model_store.rs`](../../src/model_store.rs),
-[`src/capabilities`](../../src/capabilities), and
-[`src/cli.rs`](../../src/cli.rs).
+Implementation source: [`src/model_store.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/model_store.rs),
+[`src/capabilities`](https://github.com/philipbodenbach/werk1112/tree/main/src/capabilities), and
+[`src/cli.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/cli.rs).

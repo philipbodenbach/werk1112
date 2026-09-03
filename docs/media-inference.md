@@ -1,6 +1,6 @@
 # Werk1112 media inference
 
-[Documentation home](README.md) · [HTTP API](api.md) ·
+[Documentation home](documentation.md) · [HTTP API](api.md) ·
 [Backends and platform support](backends.md)
 
 Werk1112 is an inference router, not a workflow engine. A request names one

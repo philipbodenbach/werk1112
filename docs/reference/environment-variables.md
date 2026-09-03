@@ -156,12 +156,12 @@ target-specific `CC_*`/`CXX_*` settings are documented in the
 
 ## Source of truth
 
-- CLI-bound settings: [`src/cli.rs`](../../src/cli.rs)
-- serving and retention: [`src/api/router.rs`](../../src/api/router.rs) and
-  [`src/inference_service`](../../src/inference_service)
-- backend discovery: [`src/backend`](../../src/backend)
-- media companion: [`src/media_companion.rs`](../../src/media_companion.rs) and
-  [`runtime/werk_media_companion.py`](../../runtime/werk_media_companion.py)
-- store and authentication: [`src/model_store.rs`](../../src/model_store.rs)
-- installers: [`scripts`](../../scripts)
-- ComfyUI defaults: [`utils/comfyUI/config.py`](../../utils/comfyUI/config.py)
+- CLI-bound settings: [`src/cli.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/cli.rs)
+- serving and retention: [`src/api/router.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/api/router.rs) and
+  [`src/inference_service`](https://github.com/philipbodenbach/werk1112/tree/main/src/inference_service)
+- backend discovery: [`src/backend`](https://github.com/philipbodenbach/werk1112/tree/main/src/backend)
+- media companion: [`src/media_companion.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/media_companion.rs) and
+  [`runtime/werk_media_companion.py`](https://github.com/philipbodenbach/werk1112/blob/main/runtime/werk_media_companion.py)
+- store and authentication: [`src/model_store.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/model_store.rs)
+- installers: [`scripts`](https://github.com/philipbodenbach/werk1112/tree/main/scripts)
+- ComfyUI defaults: [`utils/comfyUI/config.py`](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/config.py)

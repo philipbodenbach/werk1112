@@ -6,6 +6,9 @@ reviewed with the code and describes the current repository state.
 The project README remains intentionally short. Detailed contracts, support
 matrices and operational behavior belong here.
 
+The browser-friendly index is published as the
+[GitHub Pages documentation](https://philipbodenbach.github.io/werk1112/documentation.html).
+
 ## Start here
 
 | Need | Page |

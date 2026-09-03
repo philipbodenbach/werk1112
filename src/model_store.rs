@@ -29,6 +29,12 @@ pub struct ModelStore {
     home: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TempPurgeSummary {
+    pub entries: usize,
+    pub bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HuggingFaceAuthStatus {
     pub source: Option<String>,
@@ -338,8 +344,138 @@ impl ModelStore {
         self.home.join("models")
     }
 
-    fn tmp_dir(&self) -> PathBuf {
+    pub(crate) fn tmp_dir(&self) -> PathBuf {
         self.home.join("tmp")
+    }
+
+    pub(crate) fn list_tmp(&self) -> Result<Vec<PathBuf>> {
+        let tmp = self.tmp_dir();
+        let metadata = match fs::symlink_metadata(&tmp) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect temporary root {}", tmp.display())
+                });
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "refusing to list temporary root {} because it is a symlink",
+                tmp.display()
+            );
+        }
+        if !metadata.is_dir() {
+            bail!(
+                "refusing to list temporary root {} because it is not a directory",
+                tmp.display()
+            );
+        }
+
+        let read_dir = fs::read_dir(&tmp)
+            .with_context(|| format!("failed to enumerate temporary root {}", tmp.display()))?;
+        let mut entries = Vec::new();
+        for entry in read_dir {
+            let entry = entry
+                .with_context(|| format!("failed to enumerate temporary root {}", tmp.display()))?;
+            entries.push(entry.path());
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
+    pub(crate) fn purge_tmp(&self, dry_run: bool) -> Result<TempPurgeSummary> {
+        let tmp = self.tmp_dir();
+        let metadata = match fs::symlink_metadata(&tmp) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if dry_run {
+                    return Ok(TempPurgeSummary {
+                        entries: 0,
+                        bytes: Some(0),
+                    });
+                }
+                fs::create_dir_all(&tmp).with_context(|| {
+                    format!(
+                        "failed to create temporary root {} (completed entries: 0)",
+                        tmp.display()
+                    )
+                })?;
+                fs::symlink_metadata(&tmp).with_context(|| {
+                    format!(
+                        "failed to inspect temporary root {} (completed entries: 0)",
+                        tmp.display()
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect temporary root {} (completed entries: 0)",
+                        tmp.display()
+                    )
+                });
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "refusing to purge temporary root {} because it is a symlink (completed entries: 0)",
+                tmp.display()
+            );
+        }
+        if !metadata.is_dir() {
+            bail!(
+                "refusing to purge temporary root {} because it is not a directory (completed entries: 0)",
+                tmp.display()
+            );
+        }
+
+        let mut entries = Vec::new();
+        let read_dir = fs::read_dir(&tmp).with_context(|| {
+            format!(
+                "failed to enumerate temporary root {} (completed entries: 0)",
+                tmp.display()
+            )
+        })?;
+        for entry in read_dir {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to enumerate temporary root {} (completed entries: 0)",
+                    tmp.display()
+                )
+            })?;
+            entries.push(entry.path());
+        }
+        entries.sort();
+
+        let bytes = entries
+            .iter()
+            .try_fold(0u64, |total, path| {
+                temp_entry_size(path).map(|bytes| total.saturating_add(bytes))
+            })
+            .ok();
+        let summary = TempPurgeSummary {
+            entries: entries.len(),
+            bytes,
+        };
+        if dry_run {
+            return Ok(summary);
+        }
+
+        for (completed, path) in entries.into_iter().enumerate() {
+            let result = fs::symlink_metadata(&path)
+                .and_then(|metadata| remove_temp_entry(&path, &metadata));
+            result.with_context(|| {
+                format!(
+                    "failed to remove temporary entry {} after completely removing {completed} of {} entries; temporary purge is incomplete",
+                    path.display(), summary.entries
+                )
+            })?;
+        }
+
+        Ok(summary)
     }
 
     pub fn model_dir(&self, id: &str) -> PathBuf {
@@ -1438,6 +1574,50 @@ fn dir_size(path: &Path) -> Result<u64> {
         bytes = bytes.saturating_add(dir_size(&entry.path())?);
     }
     Ok(bytes)
+}
+
+fn temp_entry_size(path: &Path) -> Result<u64> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut bytes = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        bytes = bytes.saturating_add(temp_entry_size(&entry.path())?);
+    }
+    Ok(bytes)
+}
+
+fn remove_temp_entry(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        return fs::remove_dir_all(path);
+    }
+    if file_type.is_symlink() {
+        return remove_temp_symlink(path, &file_type);
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(not(windows))]
+fn remove_temp_symlink(path: &Path, _file_type: &fs::FileType) -> std::io::Result<()> {
+    fs::remove_file(path)
+}
+
+#[cfg(windows)]
+fn remove_temp_symlink(path: &Path, file_type: &fs::FileType) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+
+    if file_type.is_symlink_dir() {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn default_lfs_include_file(root: &Path) -> Result<Option<String>> {
@@ -4273,6 +4453,280 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_tmp_returns_sorted_direct_entries_without_creating_or_mutating() {
+        let root = test_dir("temp-list-direct-entries");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+
+        assert!(store.list_tmp().unwrap().is_empty());
+        assert!(!store.home().exists());
+
+        let tmp = store.tmp_dir();
+        fs::create_dir_all(&tmp).unwrap();
+        assert!(store.list_tmp().unwrap().is_empty());
+
+        fs::create_dir_all(tmp.join("nested")).unwrap();
+        fs::write(tmp.join("z-last.tmp"), b"last").unwrap();
+        fs::write(tmp.join(".hidden.tmp"), b"hidden").unwrap();
+        fs::write(tmp.join("nested/not-a-direct-entry"), b"nested").unwrap();
+
+        assert_eq!(
+            store.list_tmp().unwrap(),
+            vec![
+                tmp.join(".hidden.tmp"),
+                tmp.join("nested"),
+                tmp.join("z-last.tmp"),
+            ]
+        );
+        assert_eq!(
+            fs::read(tmp.join("nested/not-a-direct-entry")).unwrap(),
+            b"nested"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_tmp_removes_only_direct_temp_entries_and_preserves_store_data() {
+        let root = test_dir("temp-purge-preservation");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        let tmp = store.tmp_dir();
+        fs::create_dir_all(tmp.join("nested")).unwrap();
+        fs::create_dir_all(tmp.join("empty")).unwrap();
+        fs::write(tmp.join("loose.bin"), b"abc").unwrap();
+        fs::write(tmp.join("nested/data.bin"), b"12345").unwrap();
+
+        let mut sentinels = Vec::new();
+        for sibling in ["models", "artifacts", "outputs", "jobs", "auth", "backends"] {
+            let sentinel = store.home().join(sibling).join("keep");
+            fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+            fs::write(&sentinel, sibling.as_bytes()).unwrap();
+            sentinels.push(sentinel);
+        }
+        let home_sentinel = store.home().join("keep-at-home");
+        fs::write(&home_sentinel, b"home").unwrap();
+        sentinels.push(home_sentinel);
+        let external_sentinel = root.join("external-sibling/keep");
+        fs::create_dir_all(external_sentinel.parent().unwrap()).unwrap();
+        fs::write(&external_sentinel, b"external").unwrap();
+        sentinels.push(external_sentinel);
+
+        let summary = store.purge_tmp(false).unwrap();
+
+        assert_eq!(
+            summary,
+            TempPurgeSummary {
+                entries: 3,
+                bytes: Some(8),
+            }
+        );
+        assert!(tmp.is_dir());
+        assert!(fs::read_dir(&tmp).unwrap().next().is_none());
+        for sentinel in sentinels {
+            assert!(sentinel.is_file(), "{} was removed", sentinel.display());
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_tmp_dry_run_reports_contents_without_mutating_them() {
+        let root = test_dir("temp-purge-dry-run");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        let tmp = store.tmp_dir();
+        fs::create_dir_all(tmp.join("nested")).unwrap();
+        fs::write(tmp.join("loose.bin"), b"1234").unwrap();
+        fs::write(tmp.join("nested/data.bin"), b"567").unwrap();
+
+        let summary = store.purge_tmp(true).unwrap();
+
+        assert_eq!(
+            summary,
+            TempPurgeSummary {
+                entries: 2,
+                bytes: Some(7),
+            }
+        );
+        assert_eq!(fs::read(tmp.join("loose.bin")).unwrap(), b"1234");
+        assert_eq!(fs::read(tmp.join("nested/data.bin")).unwrap(), b"567");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_tmp_handles_missing_and_empty_roots_without_creating_store_siblings() {
+        let root = test_dir("temp-purge-missing-empty");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+
+        assert_eq!(
+            store.purge_tmp(true).unwrap(),
+            TempPurgeSummary {
+                entries: 0,
+                bytes: Some(0),
+            }
+        );
+        assert!(!store.home().exists());
+
+        assert_eq!(
+            store.purge_tmp(false).unwrap(),
+            TempPurgeSummary {
+                entries: 0,
+                bytes: Some(0),
+            }
+        );
+        assert!(store.tmp_dir().is_dir());
+        let home_entries = fs::read_dir(store.home())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(home_entries, vec![OsStr::new("tmp")]);
+
+        assert_eq!(
+            store.purge_tmp(false).unwrap(),
+            TempPurgeSummary {
+                entries: 0,
+                bytes: Some(0),
+            }
+        );
+        assert!(store.tmp_dir().is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_tmp_counts_abandoned_pull_trees_and_git_metadata() {
+        let root = test_dir("temp-purge-abandoned-pulls");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        let tmp = store.tmp_dir();
+        let pull = tmp.join("pull-model-123");
+        let import = tmp.join("pull-model-123-import");
+        fs::create_dir_all(pull.join(".git/objects")).unwrap();
+        fs::create_dir_all(import.join("nested")).unwrap();
+        fs::write(pull.join("weights.bin"), b"abc").unwrap();
+        fs::write(pull.join(".git/config"), b"gitdata").unwrap();
+        fs::write(pull.join(".git/objects/object"), b"12").unwrap();
+        fs::write(import.join("nested/model.bin"), b"12345").unwrap();
+
+        let expected = TempPurgeSummary {
+            entries: 2,
+            bytes: Some(17),
+        };
+        assert_eq!(store.purge_tmp(true).unwrap(), expected);
+        assert_eq!(store.purge_tmp(false).unwrap(), expected);
+        assert!(tmp.is_dir());
+        assert!(fs::read_dir(&tmp).unwrap().next().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_tmp_rejects_a_non_directory_root() {
+        let root = test_dir("temp-purge-file-root");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        fs::create_dir_all(store.home()).unwrap();
+        fs::write(store.tmp_dir(), b"not a directory").unwrap();
+
+        let error = store.list_tmp().unwrap_err().to_string();
+        assert!(error.contains(&store.tmp_dir().display().to_string()));
+        assert!(error.contains("not a directory"));
+
+        for dry_run in [true, false] {
+            let error = store.purge_tmp(dry_run).unwrap_err().to_string();
+            assert!(error.contains(&store.tmp_dir().display().to_string()));
+            assert!(error.contains("not a directory"));
+            assert!(error.contains("completed entries: 0"));
+        }
+        assert_eq!(fs::read(store.tmp_dir()).unwrap(), b"not a directory");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_tmp_unlinks_symlinks_without_following_external_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_dir("temp-purge-child-symlinks");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        let tmp = store.tmp_dir();
+        let external_dir = root.join("external-dir");
+        let external_file = root.join("external-file");
+        fs::create_dir_all(&external_dir).unwrap();
+        fs::write(external_dir.join("keep"), b"external directory data").unwrap();
+        fs::write(&external_file, b"external file data").unwrap();
+        fs::create_dir_all(tmp.join("nested")).unwrap();
+        fs::write(tmp.join("nested/local"), b"abc").unwrap();
+        symlink(root.join("missing-target"), tmp.join("broken-link")).unwrap();
+        symlink(&external_dir, tmp.join("direct-link")).unwrap();
+        symlink(&external_file, tmp.join("nested/file-link")).unwrap();
+
+        assert_eq!(
+            store.list_tmp().unwrap(),
+            vec![
+                tmp.join("broken-link"),
+                tmp.join("direct-link"),
+                tmp.join("nested"),
+            ]
+        );
+        assert_eq!(
+            fs::read(external_dir.join("keep")).unwrap(),
+            b"external directory data"
+        );
+        assert_eq!(fs::read(&external_file).unwrap(), b"external file data");
+
+        let summary = store.purge_tmp(false).unwrap();
+
+        assert_eq!(
+            summary,
+            TempPurgeSummary {
+                entries: 3,
+                bytes: Some(3),
+            }
+        );
+        assert!(fs::read_dir(&tmp).unwrap().next().is_none());
+        assert_eq!(
+            fs::read(external_dir.join("keep")).unwrap(),
+            b"external directory data"
+        );
+        assert_eq!(fs::read(&external_file).unwrap(), b"external file data");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_tmp_rejects_a_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_dir("temp-purge-root-symlink");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        let external = root.join("external");
+        fs::create_dir_all(store.home()).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("keep"), b"safe").unwrap();
+        symlink(&external, store.tmp_dir()).unwrap();
+
+        let error = store.list_tmp().unwrap_err().to_string();
+        assert!(error.contains(&store.tmp_dir().display().to_string()));
+        assert!(error.contains("symlink"));
+
+        for dry_run in [true, false] {
+            let error = store.purge_tmp(dry_run).unwrap_err().to_string();
+            assert!(error.contains(&store.tmp_dir().display().to_string()));
+            assert!(error.contains("symlink"));
+            assert!(error.contains("completed entries: 0"));
+        }
+        assert_eq!(fs::read(external.join("keep")).unwrap(), b"safe");
+        assert!(
+            fs::symlink_metadata(store.tmp_dir())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn gguf_without_embedded_template_resolves_llama3_from_special_tokens() {

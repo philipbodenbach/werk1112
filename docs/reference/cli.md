@@ -104,6 +104,31 @@ environments, unrelated models and original import sources are separate.
 The directory layout and retention rules are documented in
 [Models, manifests and the store](../concepts/models-manifests-and-store.md).
 
+## Temporary files
+
+Print or list the temporary directory for the active Werk store, preview its
+cleanup or purge it:
+
+```bash
+werk temp path
+werk temp list
+werk temp purge --dry-run
+werk temp purge
+```
+
+These commands resolve the same active `WERK_HOME` as the rest of the CLI,
+including a global `--model-home PATH` override. `temp list` prints each direct
+child path in sorted order, including hidden entries, without creating or
+changing the temporary directory. It does not recursively expand directories or
+follow child symlinks. Purging removes every child of that store's `tmp`
+directory, including any concurrently active temporary work, but preserves the
+`tmp` directory itself. The `--dry-run` form reports the planned cleanup without
+changing the filesystem.
+
+Models, artifacts, managed outputs, jobs, authentication data, backends, files
+at the store root and output paths outside the store are persistent boundaries
+and are not touched by temporary-file purging.
+
 ## Authentication
 
 Hugging Face credentials:
