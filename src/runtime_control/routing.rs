@@ -347,6 +347,7 @@ impl RoutedRuntimeAdapter {
             .map(|(_, adapter)| adapter)
     }
 
+    #[allow(dead_code)]
     fn record_state(
         &self,
         state: &BackendState,

@@ -422,7 +422,7 @@ fn burn_cuda_feature_check() -> BackendDoctorCheck {
         BackendDoctorCheck {
             name: "Burn CUDA feature".to_string(),
             ok: false,
-            detail: "not compiled. Rebuild with: cargo install --path . --locked --force --features burn-cuda".to_string(),
+            detail: "not compiled. Rebuild with: cargo +stable install --path . --locked --force --features burn-cuda".to_string(),
         }
     }
 }
@@ -937,7 +937,7 @@ fn catch_unwind_without_panic_output<T>(
 #[cfg(not(feature = "burn-cuda"))]
 fn burn_cuda_status() -> Result<RuntimeOk> {
     bail!(
-        "This Werk binary was built without Burn CUDA support. Rebuild with: cargo install --path . --locked --force --features burn-cuda. Burn CUDA requires native CUDA and NCCL system libraries."
+        "This Werk binary was built without Burn CUDA support. Rebuild with: cargo +stable install --path . --locked --force --features burn-cuda. Burn CUDA requires native CUDA and NCCL system libraries."
     )
 }
 
@@ -963,7 +963,7 @@ fn burn_cpu_status() -> Result<RuntimeOk> {
 #[cfg(not(feature = "burn-cpu"))]
 fn burn_cpu_status() -> Result<RuntimeOk> {
     bail!(
-        "This Werk binary was built without Burn CPU support. Rebuild with: cargo install --path . --locked --force --features burn-cpu"
+        "This Werk binary was built without Burn CPU support. Rebuild with: cargo +stable install --path . --locked --force --features burn-cpu"
     )
 }
 

@@ -1,6 +1,11 @@
 //! Single-node runtime persistence and memory-management implementation.
 
 mod backend;
+// The policy engine is intentionally retained as a tested building block for
+// adapters that expose expert residency. Production adapters currently use
+// only its shared validation helpers and truthfully report expert control as
+// unsupported, so the remaining policy surface is dormant by design.
+#[allow(dead_code)]
 mod experts;
 mod handoff;
 mod local;

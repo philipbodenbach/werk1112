@@ -9500,7 +9500,7 @@ fn candle_cuda_unavailable_message() -> String {
     if cfg!(feature = "candle-cuda") {
         "CUDA backend requested for safetensors model, but Candle CUDA is unavailable. Check the NVIDIA driver/CUDA runtime, or use: werk --backend auto / --backend cpu.".to_string()
     } else {
-        "CUDA backend requested for safetensors model. This Werk binary was built without Candle CUDA support. Rebuild with: cargo install --path . --locked --force --features cuda. Or use: werk --backend auto / --backend cpu.".to_string()
+        "CUDA backend requested for safetensors model. This Werk binary was built without Candle CUDA support. Rebuild with: cargo +stable install --path . --locked --force --features cuda. Or use: werk --backend auto / --backend cpu.".to_string()
     }
 }
 
@@ -9508,7 +9508,7 @@ fn candle_cuda_rejection_reason() -> String {
     if cfg!(feature = "candle-cuda") {
         "Candle CUDA is unavailable".to_string()
     } else {
-        "This Werk binary was built without Candle CUDA support. Rebuild with: cargo install --path . --locked --force --features cuda".to_string()
+        "This Werk binary was built without Candle CUDA support. Rebuild with: cargo +stable install --path . --locked --force --features cuda".to_string()
     }
 }
 

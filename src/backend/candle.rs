@@ -184,7 +184,7 @@ fn select_cuda_device() -> Result<Device> {
 #[cfg(not(feature = "candle-cuda"))]
 fn select_cuda_device() -> Result<Device> {
     bail!(
-        "This Werk binary was built without Candle CUDA support. Rebuild with: cargo install --path . --locked --force --features cuda"
+        "This Werk binary was built without Candle CUDA support. Rebuild with: cargo +stable install --path . --locked --force --features cuda"
     )
 }
 

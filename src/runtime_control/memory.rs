@@ -59,6 +59,7 @@ pub(crate) struct PressureThresholds {
 }
 
 impl PressureThresholds {
+    #[allow(dead_code)]
     pub(crate) fn new(
         soft_basis_points: u16,
         hard_basis_points: u16,
@@ -91,18 +92,22 @@ impl PressureThresholds {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn soft_basis_points(self) -> u16 {
         self.soft_basis_points
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn hard_basis_points(self) -> u16 {
         self.hard_basis_points
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn emergency_basis_points(self) -> u16 {
         self.emergency_basis_points
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn hysteresis_basis_points(self) -> u16 {
         self.hysteresis_basis_points
     }
@@ -263,10 +268,12 @@ impl MemoryManagerConfig {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn thresholds(&self) -> PressureThresholds {
         self.thresholds
     }
 
+    #[allow(dead_code)]
     pub(crate) fn topology(&self) -> MemoryTopology {
         self.topology
     }
@@ -709,6 +716,7 @@ impl MemoryManager {
         Ok(reservation)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn reserve_promotion(
         &self,
         allocation_id: AllocationId,
@@ -854,6 +862,7 @@ impl MemoryManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn plan_pressure_actions(
         &self,
         tier: MemoryTier,
@@ -873,6 +882,7 @@ impl MemoryManager {
     /// pressure is still normal or soft. The requested bytes are included in
     /// the projected utilization so the retry cannot depend on crossing a
     /// pressure threshold first.
+    #[allow(dead_code)]
     pub(crate) fn plan_for_reservation(
         &self,
         tier: MemoryTier,
@@ -1443,6 +1453,7 @@ enum ReservationBinding {
         pinned: bool,
         demotion_target: Option<MemoryTier>,
     },
+    #[allow(dead_code)]
     Promotion {
         allocation_id: AllocationId,
         source: MemoryTier,
@@ -1469,10 +1480,12 @@ impl fmt::Debug for MemoryReservation {
 }
 
 impl MemoryReservation {
+    #[allow(dead_code)]
     pub(crate) const fn tier(&self) -> MemoryTier {
         self.tier
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -1519,6 +1532,7 @@ impl MemoryReservation {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn commit_promotion(mut self) -> Result<(), MemoryError> {
         let ReservationBinding::Promotion {
             allocation_id,
@@ -1594,6 +1608,7 @@ impl fmt::Debug for PressureActionPermit {
 }
 
 impl PressureActionPermit {
+    #[allow(dead_code)]
     pub(crate) fn action(&self) -> &PressureAction {
         &self.action
     }

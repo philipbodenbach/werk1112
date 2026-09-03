@@ -288,6 +288,7 @@ def test_runtime_states_uses_only_versioned_discovery_and_filter(
     client = fake_protocol.instances[-1]
     assert client.calls == [
         ("capabilities",),
+        ("info",),
         (
             "states",
             {
@@ -302,6 +303,27 @@ def test_runtime_states_uses_only_versioned_discovery_and_filter(
     assert ids == "state_1"
     assert cursor == "cursor_2"
     assert count == 1
+
+
+def test_runtime_states_enforces_the_advertised_page_bound(
+    fake_protocol, connection, monkeypatch
+):
+    limited_info = {
+        **fake_protocol.info_response,
+        "limits": {
+            **fake_protocol.info_response["limits"],
+            "max_page_size": 10,
+        },
+    }
+    monkeypatch.setattr(fake_protocol, "info_response", limited_info)
+    with pytest.raises(ValueError, match="state page limit of at most 10"):
+        WerkRuntimeStatesNode().list_states(
+            connection, "", "all", 11, "", 0
+        )
+    assert fake_protocol.instances[-1].calls == [
+        ("capabilities",),
+        ("info",),
+    ]
 
 
 def test_state_control_quotes_id_and_sends_explicit_safety_fields(
@@ -324,9 +346,38 @@ def test_state_control_quotes_id_and_sends_explicit_safety_fields(
     assert json.loads(result)["pinned"] is True
     assert changed is True and dry_run is False
     assert "changed" in summary
-    with pytest.raises(ValueError, match="explicit target_tier"):
+    with pytest.raises(ValueError, match="ram or disk"):
         WerkStateControlNode().control(
             connection, "state", "demote", "unchanged", True, False
+        )
+
+
+@pytest.mark.parametrize(
+    ("action", "target", "message"),
+    [
+        ("promote", "disk", "vram or ram"),
+        ("promote", "unchanged", "vram or ram"),
+        ("demote", "vram", "ram or disk"),
+        ("demote", "unchanged", "ram or disk"),
+        ("pin", "ram", "only valid for promote and demote"),
+        ("unpin", "disk", "only valid for promote and demote"),
+        ("evict", "vram", "only valid for promote and demote"),
+    ],
+)
+def test_state_control_rejects_invalid_action_tier_combinations(
+    fake_protocol, connection, action, target, message
+):
+    with pytest.raises(ValueError, match=message):
+        WerkStateControlNode().control(
+            connection, "state", action, target, True, False
+        )
+    assert fake_protocol.instances == []
+
+
+def test_state_control_requires_boolean_safety_switches(connection):
+    with pytest.raises(TypeError, match="must be booleans"):
+        WerkStateControlNode().control(
+            connection, "state", "pin", "unchanged", "false", False
         )
 
 

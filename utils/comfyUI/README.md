@@ -144,10 +144,13 @@ is not required by these HTTP-backed Werk nodes.
   `required` reuse; an optional TTL; and pinning. A TTL of zero means omitted,
   so the server retains authority over its default.
 - **WERK Runtime States** lists the caller's visible prefix/runtime states with
-  optional model, tier, page-size, and cursor filters.
+  optional model, tier, page-size, and cursor filters. Every listed object is
+  the complete public state summary for inspecting status, tier, size, age,
+  expiry, pinning, backend, and reusability. The node enforces the page bound
+  advertised by the connected server.
 - **WERK State Control** pins, unpins, promotes, demotes, or evicts one explicit
-  state. Dry-run is enabled by default, and promote/demote require a target
-  tier.
+  state. Dry-run is enabled by default. Promotion accepts only `ram`/`vram`,
+  demotion only `ram`/`disk`, and other actions reject a target tier.
 - **WERK State Prune** removes states through an explicit ID list, a constrained
   filter, or a separately confirmed `all` selector. It defaults to dry-run.
 - **WERK Memory Status** reports host and accelerator capacity, availability,

@@ -22,6 +22,8 @@ PERSISTENCE_MODES = ("auto", "ephemeral", "memory", "disk")
 REUSE_MODES = ("prefer", "disabled", "required")
 STATE_TIERS = ("vram", "ram", "disk", "external")
 STATE_ACTIONS = ("pin", "unpin", "promote", "demote", "evict")
+PROMOTION_TIERS = ("vram", "ram")
+DEMOTION_TIERS = ("ram", "disk")
 EXPERT_TIERS = ("vram", "ram", "external")
 EXPERT_ACTIONS = ("prefetch", "pin", "unpin", "evict")
 MAX_LOCAL_STATE_IDS = 4096
@@ -386,14 +388,21 @@ class WerkRuntimeStatesNode:
         del refresh_token
         client = _client(connection)
         _capabilities(client)
+        info = client.info()
         selected_tier = str(tier).strip().lower()
         if selected_tier not in ("all", *STATE_TIERS):
             raise ValueError("tier has an unknown value")
+        page_limit = _safe_int(limit, "limit", minimum=1)
+        maximum = info["limits"]["max_page_size"]
+        if page_limit > maximum:
+            raise ValueError(
+                f"the server accepts a state page limit of at most {maximum}"
+            )
         payload = client.states(
             {
                 "model_id": str(model_id).strip() or None,
                 "tier": None if selected_tier == "all" else selected_tier,
-                "limit": _safe_int(limit, "limit", minimum=1),
+                "limit": page_limit,
                 "cursor": str(cursor).strip() or None,
             }
         )
@@ -415,7 +424,7 @@ class WerkStateControlNode:
                 "state_id": ("STRING", {"default": ""}),
                 "action": (list(STATE_ACTIONS), {"default": "pin"}),
                 "target_tier": (
-                    ["unchanged", *STATE_TIERS],
+                    ["unchanged", *PROMOTION_TIERS, "disk"],
                     {"default": "unchanged"},
                 ),
                 "dry_run": ("BOOLEAN", {"default": True}),
@@ -438,15 +447,21 @@ class WerkStateControlNode:
         dry_run: bool,
         allow_experimental: bool,
     ):
+        if not isinstance(dry_run, bool) or not isinstance(allow_experimental, bool):
+            raise TypeError("dry_run and allow_experimental must be booleans")
         state_id = _nonempty(state_id, "state_id")
         selected_action = str(action).strip().lower()
         if selected_action not in STATE_ACTIONS:
             raise ValueError("action has an unknown value")
         selected_tier = str(target_tier).strip().lower()
-        if selected_tier not in ("unchanged", *STATE_TIERS):
+        if selected_tier not in ("unchanged", *PROMOTION_TIERS, "disk"):
             raise ValueError("target_tier has an unknown value")
-        if selected_action in {"promote", "demote"} and selected_tier == "unchanged":
-            raise ValueError("promote and demote require an explicit target_tier")
+        if selected_action == "promote" and selected_tier not in PROMOTION_TIERS:
+            raise ValueError("promote requires an explicit vram or ram target_tier")
+        if selected_action == "demote" and selected_tier not in DEMOTION_TIERS:
+            raise ValueError("demote requires an explicit ram or disk target_tier")
+        if selected_action not in {"promote", "demote"} and selected_tier != "unchanged":
+            raise ValueError("target_tier is only valid for promote and demote")
         client = _client(connection)
         _capabilities(client)
         request: dict[str, Any] = {
