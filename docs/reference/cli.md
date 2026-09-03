@@ -197,7 +197,8 @@ request; it does not enable experimental behavior globally.
 
 ### Prune selected states
 
-Prune also defaults to preview and requires exactly one selector form:
+Prune also defaults to preview and requires exactly one selector form.
+`purge` is a visible alias with identical safety semantics:
 
 ```bash
 # One or more exact IDs
@@ -220,6 +221,29 @@ the ID and filter forms. `--execute` changes `dry_run` from true to false.
 Pruning affects only the selected runtime states. It does not purge temporary
 files and cannot remove models, artifacts, outputs, jobs, authentication data,
 backend installations or external paths.
+
+To clear every runtime state visible to the current authenticated principal,
+preview and then execute the explicit all-selector:
+
+```bash
+werk runtime purge --all --confirm-all
+werk runtime purge --all --confirm-all --execute
+```
+
+This is the normal recovery path when persisted state is no longer useful.
+With multiple API keys, each key has a separate opaque namespace and can purge
+only its own states. Handoff values cannot be listed: they are intentionally
+short-lived, single-use secrets held only in server memory.
+
+If the running process or its backend is too unhealthy to complete that
+operation, stop `werk serve` first. As a local administrator, move the exact
+active server store's `runtime-state/v1` directory to a separately named backup
+and restart Werk. Moving it instead of deleting it keeps recovery possible;
+Werk recreates an empty catalog. Do not move the surrounding store or
+`auth/runtime-namespace.key`, and never do this while the server is running.
+This offline recovery clears disk state for every principal in that store;
+models, artifacts, outputs, jobs, credentials, backends and `tmp` are siblings
+and remain untouched.
 
 The CLI currently exposes info, capabilities, memory and state maintenance.
 Prefill/decode and expert contracts are HTTP/SDK surfaces; the ComfyUI package

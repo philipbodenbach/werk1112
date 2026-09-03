@@ -5511,6 +5511,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prune_release_failure_returns_an_error_and_restores_unreleased_states() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let test = TestControl::new(Arc::new(PruneReleaseAdapter {
+            inner: FakeAdapter::new(),
+            attempts: attempts.clone(),
+            fail_on_attempt: Some(1),
+        }));
+        let expired_at = now_unix_ms().saturating_sub(1);
+        {
+            let mut states = test.control.inner.volatile_states.lock().unwrap();
+            states.insert(
+                ("p_alice".to_string(), "st_expired".to_string()),
+                volatile_state(&test, "p_alice", "st_expired", Some(expired_at)),
+            );
+            states.insert(
+                ("p_alice".to_string(), "st_live".to_string()),
+                volatile_state(&test, "p_alice", "st_live", None),
+            );
+        }
+
+        let error = test
+            .control
+            .prune_states(
+                ControlContext::new("p_alice", "req_prune_release_failure"),
+                PruneStatesRequest {
+                    selector: StateSelector::All { confirm: true },
+                    dry_run: false,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ProtocolErrorCode::Unavailable);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let states = test.control.inner.volatile_states.lock().unwrap();
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key(&("p_alice".to_string(), "st_expired".to_string())));
+        assert!(states.contains_key(&("p_alice".to_string(), "st_live".to_string())));
+    }
+
     #[test]
     fn volatile_state_limits_are_principal_scoped_and_never_evict_silently() {
         let test = TestControl::new(Arc::new(FakeAdapter::new()));

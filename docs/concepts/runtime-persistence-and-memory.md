@@ -192,6 +192,11 @@ performs that cleanup.
 Runtime-state pruning touches only the selected runtime-state catalog. It does
 not remove models, optimized artifacts, outputs, jobs, authentication files,
 backend installations, the temporary directory or external output paths.
+The ordinary full reset is still an explicit, principal-scoped prune with a
+dry-run preview. If a broken server process cannot perform it, an administrator
+must stop the server before moving `runtime-state/v1` aside as a recoverable
+offline reset; replacing the namespace key or deleting the surrounding store
+is neither required nor safe.
 
 ## Principal and prompt isolation
 

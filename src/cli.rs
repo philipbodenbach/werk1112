@@ -977,7 +977,10 @@ pub enum RuntimeCommands {
         command: RuntimeStateCommands,
     },
 
-    #[command(about = "Prune explicitly selected inference states; dry-run by default")]
+    #[command(
+        about = "Prune explicitly selected inference states; dry-run by default",
+        visible_alias = "purge"
+    )]
     Prune {
         #[arg(long = "id", action = ArgAction::Append, help = "Exact state ID; repeat as needed")]
         ids: Vec<String>,
@@ -10752,6 +10755,21 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+
+        let alias =
+            Cli::try_parse_from(["werk", "runtime", "purge", "--all", "--confirm-all"]).unwrap();
+        assert!(matches!(
+            alias.command,
+            Some(Commands::Runtime {
+                command: RuntimeCommands::Prune {
+                    all: true,
+                    confirm_all: true,
+                    execute: false,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
