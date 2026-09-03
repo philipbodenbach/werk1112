@@ -75,7 +75,10 @@ use crate::{
     capabilities::{InferenceTask, RepositoryLayout},
     inference::{ParameterSupportStatus, TaskReadiness},
     model_store::{ModelFormat, ModelManifest},
-    openai::ChatMessage,
+    openai::{
+        ChatCompletionTool, ChatCompletionToolCall, ChatCompletionToolCallDelta, ChatMessage,
+        ToolChoice,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1057,6 +1060,23 @@ pub struct GenerateRequest {
     pub stream_granularity: StreamGranularity,
     pub verbose: bool,
     pub debug: bool,
+    pub tool_config: Option<ToolCallingConfig>,
+}
+
+impl GenerateRequest {
+    pub fn requires_tool_calling(&self) -> bool {
+        self.tool_config.is_some() || self.messages.iter().any(ChatMessage::uses_tool_calling)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolCallingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ChatCompletionTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1068,11 +1088,22 @@ pub enum StreamGranularity {
 #[derive(Debug, Clone)]
 pub struct GenerateResponse {
     pub text: String,
+    /// Exact assistant payload returned by an OpenAI-compatible backend.
+    ///
+    /// Legacy text backends leave this unset and the API returns `text` as a
+    /// non-null assistant content string.
+    pub assistant_message: Option<GeneratedAssistantMessage>,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub finish_reason: String,
     pub timings: GenerationTimings,
     pub backend_diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedAssistantMessage {
+    pub content: Option<String>,
+    pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1120,6 +1151,7 @@ pub struct LlamaRuntimeOptions {
 #[derive(Debug, Clone)]
 pub enum GenerateStreamEvent {
     TextChunk(String),
+    ToolCallDelta(Vec<ChatCompletionToolCallDelta>),
     Done {
         finish_reason: String,
         prompt_tokens: usize,
@@ -1174,6 +1206,15 @@ pub trait GenerationBackend: Send + Sync {
         _has_images: bool,
     ) -> Result<std::sync::Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
         self.runtime_control_adapter_for(manifest)
+    }
+
+    /// Reports whether this configured backend can preserve OpenAI tool-call
+    /// requests and responses for the selected model and modality.
+    ///
+    /// The default is deliberately false so adapters never silently discard
+    /// tool definitions, choices, calls, or continuation messages.
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        false
     }
 
     fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {

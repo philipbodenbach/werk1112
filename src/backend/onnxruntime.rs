@@ -551,6 +551,7 @@ impl OnnxRuntimeBackend {
             .unwrap_or(f64::NAN);
         Ok(GenerateResponse {
             text,
+            assistant_message: None,
             prompt_tokens,
             completion_tokens,
             finish_reason: value
@@ -677,6 +678,7 @@ impl OnnxRuntimeBackend {
         }
         Ok(GenerateResponse {
             text,
+            assistant_message: None,
             prompt_tokens,
             completion_tokens,
             finish_reason: value

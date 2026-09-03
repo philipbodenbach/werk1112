@@ -542,6 +542,10 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
             .map_err(anyhow::Error::new)
     }
 
+    fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
+        self.backend.supports_tool_calling(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> anyhow::Result<()> {
         let selected = self.runtime.adapter_for_model(manifest).ok();
         self.backend.prepare(manifest)?;
@@ -1457,6 +1461,7 @@ mod tests {
         ) -> anyhow::Result<GenerateResponse> {
             Ok(GenerateResponse {
                 text: "generated".to_string(),
+                assistant_message: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 finish_reason: "stop".to_string(),
@@ -1509,6 +1514,7 @@ mod tests {
             stream_granularity: crate::backend::StreamGranularity::Token,
             verbose: false,
             debug: false,
+            tool_config: None,
         }
     }
 

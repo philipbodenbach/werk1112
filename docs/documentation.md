@@ -21,6 +21,7 @@ and describe the current repository state.
 | Integrate runtime state, memory or prefill/decode | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |
 | Understand persistence safety and backend support | [Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md) |
 | Install or select an inference runtime | [Backends](backends.md) |
+| Configure vLLM arguments or OpenAI tool calling | [vLLM launch and tools](backends.md#vllm-launch-arguments-and-tool-calling) |
 | Run image, video or audio inference | [Media inference](media-inference.md) |
 
 ## Models and configuration

@@ -35,6 +35,7 @@ impl GenerationBackend for TestGenerationBackend {
     ) -> anyhow::Result<GenerateResponse> {
         Ok(GenerateResponse {
             text: String::new(),
+            assistant_message: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             finish_reason: "stop".to_string(),

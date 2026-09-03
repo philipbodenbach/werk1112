@@ -1354,6 +1354,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 stream_granularity: StreamGranularity::Chunk,
                 verbose,
                 debug,
+                tool_config: None,
             };
             let activity = ActivitySpec::chat();
             let response = with_activity(
@@ -3030,6 +3031,8 @@ fn vision_user_message(text: &str, image_urls: &[String]) -> ChatMessage {
         role: "user".to_string(),
         content: Some(content),
         name: None,
+        tool_calls: None,
+        tool_call_id: None,
     }
 }
 
@@ -6431,6 +6434,7 @@ async fn chat_loop(
             stream_granularity,
             verbose,
             debug,
+            tool_config: None,
         };
 
         print!("assistant> ");
@@ -6476,6 +6480,15 @@ async fn chat_loop(
                         last_flush = Instant::now();
                     }
                     assistant.push_str(&chunk);
+                }
+                Ok(GenerateStreamEvent::ToolCallDelta(tool_calls)) => {
+                    pending_spinner.clear()?;
+                    if debug {
+                        eprintln!(
+                            "\n[werk chat] received {} unexpected tool-call delta(s)",
+                            tool_calls.len()
+                        );
+                    }
                 }
                 Ok(GenerateStreamEvent::Done {
                     finish_reason: response_finish_reason,
@@ -6528,6 +6541,8 @@ async fn chat_loop(
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text(assistant)),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             });
         }
     }
@@ -6872,6 +6887,8 @@ fn bench_model(
             role: "user".to_string(),
             content: Some(MessageContent::Text(prompt.clone())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }],
     );
     let choices = benchmark_choices(backend_choice, &manifest, compare);
@@ -6973,6 +6990,8 @@ fn run_benchmark_choice(
                 role: "user".to_string(),
                 content: Some(MessageContent::Text(prompt.to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             }],
             image_urls: Vec::new(),
             max_tokens,
@@ -6983,6 +7002,7 @@ fn run_benchmark_choice(
             stream_granularity: StreamGranularity::Chunk,
             verbose: false,
             debug,
+            tool_config: None,
         };
         let response = if let Some(session) = session.as_ref() {
             session.generate(request)?
@@ -7718,11 +7738,21 @@ impl AutoBackend {
         manifest: &ModelManifest,
         has_images: bool,
     ) -> Result<Arc<dyn GenerationBackend>> {
-        let selected = selected_backend_for_request(
+        self.backend_for_capabilities(manifest, has_images, false)
+    }
+
+    fn backend_for_capabilities(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        tool_calling: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        let selected = selected_backend_for_request_with_tools(
             &self.store,
             BackendChoice::Auto,
             manifest,
             has_images,
+            tool_calling,
             self.selection_options,
         )?;
         self.cached_backend(selected)
@@ -7750,6 +7780,11 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
+        self.backend_for_capabilities(manifest, has_images, true)
+            .is_ok_and(|backend| backend.supports_tool_calling(manifest, has_images))
+    }
+
     fn runtime_control_adapter_for(
         &self,
         manifest: &ModelManifest,
@@ -7794,8 +7829,12 @@ impl GenerationBackend for AutoBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
-            .generate(manifest, request)
+        self.backend_for_capabilities(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .generate(manifest, request)
     }
 
     fn generate_stream(
@@ -7803,7 +7842,11 @@ impl GenerationBackend for AutoBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+        match self.backend_for_capabilities(
+            &manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        ) {
             Ok(backend) => backend.generate_stream(manifest, request),
             Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
         }
@@ -7837,17 +7880,27 @@ impl GgufPreferredBackend {
         manifest: &ModelManifest,
         has_images: bool,
     ) -> Result<Arc<dyn GenerationBackend>> {
+        self.backend_for_capabilities(manifest, has_images, false)
+    }
+
+    fn backend_for_capabilities(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        tool_calling: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
         let requested = match (self.gguf_backend, self.fallback_backend) {
             (BackendChoice::LlamaServer(llama), BackendChoice::Candle(candle)) => {
                 BackendChoice::GgufPreferred { llama, candle }
             }
             _ => self.gguf_backend,
         };
-        let selected = selected_backend_for_request(
+        let selected = selected_backend_for_request_with_tools(
             &self.store,
             requested,
             manifest,
             has_images,
+            tool_calling,
             self.selection_options,
         )?;
         self.cached_backend(selected)
@@ -7875,6 +7928,11 @@ impl GgufPreferredBackend {
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
+        self.backend_for_capabilities(manifest, has_images, true)
+            .is_ok_and(|backend| backend.supports_tool_calling(manifest, has_images))
+    }
+
     fn runtime_control_adapter_for(
         &self,
         manifest: &ModelManifest,
@@ -7931,8 +7989,12 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
-            .generate(manifest, request)
+        self.backend_for_capabilities(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .generate(manifest, request)
     }
 
     fn generate_stream(
@@ -7940,7 +8002,11 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+        match self.backend_for_capabilities(
+            &manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        ) {
             Ok(backend) => backend.generate_stream(manifest, request),
             Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
         }
@@ -8135,6 +8201,13 @@ impl VllmPreferredBackend {
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        // This router contains only vLLM-family adapters. Report protocol
+        // capability independently of runtime readiness so malformed launch
+        // arguments and startup/request failures reach the caller verbatim.
+        true
+    }
+
     fn runtime_control_adapter_for(
         &self,
         manifest: &ModelManifest,
@@ -8791,13 +8864,31 @@ fn selected_backend_for_request(
     has_images: bool,
     selection_options: SelectionOptions,
 ) -> Result<BackendChoice> {
+    selected_backend_for_request_with_tools(
+        store,
+        backend,
+        manifest,
+        has_images,
+        false,
+        selection_options,
+    )
+}
+
+fn selected_backend_for_request_with_tools(
+    store: &ModelStore,
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    has_images: bool,
+    tool_calling: bool,
+    selection_options: SelectionOptions,
+) -> Result<BackendChoice> {
     if has_images && !manifest.supports_task(InferenceTask::ImageUnderstanding) {
         bail!(
             "model '{}' does not advertise image-understanding; select a vision-language model",
             manifest.id
         );
     }
-    let capabilities = request_capabilities(has_images);
+    let capabilities = request_capabilities(has_images).with_tool_calling(tool_calling);
     match backend {
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
@@ -9046,12 +9137,8 @@ fn runtime_unavailability_reason(
     selection_options: SelectionOptions,
 ) -> Option<String> {
     match runtime_id {
-        RuntimeId::VllmCuda => VllmBackend::probe(store)
-            .err()
-            .map(|_| VllmBackend::cuda_unavailable_reason(store)),
-        RuntimeId::VllmRocm => VllmBackend::probe_rocm(store)
-            .err()
-            .map(|_| VllmBackend::rocm_unavailable_reason(store)),
+        RuntimeId::VllmCuda => vllm_probe_unavailability_reason(VllmBackend::probe(store)),
+        RuntimeId::VllmRocm => vllm_probe_unavailability_reason(VllmBackend::probe_rocm(store)),
         _ => backend_unavailability_reason_for_request(
             store,
             backend,
@@ -9060,6 +9147,10 @@ fn runtime_unavailability_reason(
             selection_options,
         ),
     }
+}
+
+fn vllm_probe_unavailability_reason(probe: Result<String>) -> Option<String> {
+    probe.err().map(|error| error.to_string())
 }
 
 fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
@@ -10529,6 +10620,16 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn vllm_args_are_not_a_backend_selection_input() {
+        let cli = Cli::try_parse_from(["werk", "serve"]).unwrap();
+        assert_eq!(cli.backend, BackendArg::Auto);
+        assert!(matches!(
+            backend_arg_to_choice(cli.backend),
+            BackendChoice::Auto
+        ));
     }
 
     #[test]
@@ -12023,6 +12124,80 @@ mod tests {
     }
 
     #[test]
+    fn explicit_vllm_planner_preserves_probe_configuration_errors() {
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let probe_error =
+            "invalid WERK_VLLM_ARGS POSIX-style shell-word list: missing closing quote";
+        let captured = vllm_probe_unavailability_reason(Err(anyhow!(probe_error))).unwrap();
+        assert_eq!(captured, probe_error);
+
+        let availability = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: false,
+                reason: Some(captured),
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::CandleCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+        let plan = plan_runtime(
+            &manifest,
+            RequestedBackend::Vllm,
+            RequestCapabilities::text(false),
+            &availability,
+        );
+
+        assert!(plan.selected.is_none());
+        assert!(plan.candidates.iter().any(|candidate| {
+            candidate.runtime_id == RuntimeId::VllmCuda && candidate.reason.contains(probe_error)
+        }));
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| candidate.runtime_id != RuntimeId::CandleCuda)
+        );
+    }
+
+    #[test]
+    fn explicit_vllm_reports_tool_capability_even_when_runtime_is_unavailable() {
+        let store = test_store("explicit-vllm-tool-capability");
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let backend = VllmPreferredBackend::new(store.clone(), SelectionOptions::default());
+
+        assert!(backend.supports_tool_calling(&manifest, false));
+        let error = backend
+            .generate(
+                &manifest,
+                GenerateRequest {
+                    prompt: "use the tool".to_string(),
+                    messages: Vec::new(),
+                    image_urls: Vec::new(),
+                    max_tokens: 8,
+                    temperature: None,
+                    top_p: None,
+                    stop: Vec::new(),
+                    seed: None,
+                    stream_granularity: StreamGranularity::Chunk,
+                    verbose: false,
+                    debug: false,
+                    tool_config: Some(crate::backend::ToolCallingConfig {
+                        tools: Some(Vec::new()),
+                        tool_choice: None,
+                        parallel_tool_calls: None,
+                    }),
+                },
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("vLLM CUDA"), "{message}");
+        assert!(!message.contains("Candle CUDA:"), "{message}");
+        assert!(!message.contains("unsupported_tool_calling"), "{message}");
+    }
+
+    #[test]
     fn explicit_onnx_selection_never_falls_back_to_candle() {
         let store = test_store("explicit-onnx-missing");
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
@@ -12354,6 +12529,7 @@ mod tests {
                 self.calls.lock().unwrap().push("generate");
                 Ok(crate::backend::GenerateResponse {
                     text: self.label.to_string(),
+                    assistant_message: None,
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     finish_reason: "stop".to_string(),
@@ -12420,6 +12596,7 @@ mod tests {
             stream_granularity: StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
         let mut vision_request = text_request.clone();
         vision_request.image_urls = vec!["data:image/png;base64,AAAA".to_string()];
@@ -12544,6 +12721,7 @@ mod tests {
                 self.calls.lock().unwrap().push("generate");
                 Ok(crate::backend::GenerateResponse {
                     text: self.label.to_string(),
+                    assistant_message: None,
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     finish_reason: "stop".to_string(),
@@ -12600,6 +12778,7 @@ mod tests {
             stream_granularity: StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
         let mut image_request = text_request.clone();
         image_request.image_urls = vec!["data:image/png;base64,AAAA".to_string()];
@@ -12988,6 +13167,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -13014,6 +13195,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -13041,6 +13224,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -13067,6 +13252,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -13087,6 +13274,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -13109,6 +13298,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -13131,6 +13322,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -13153,6 +13346,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("first".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let request_messages = request_messages_for_turn(
             &mut history,
@@ -13160,6 +13355,8 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("second".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             true,
         );
@@ -13182,11 +13379,15 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("first".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text("answer".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
         let request_messages = request_messages_for_turn(
@@ -13195,6 +13396,8 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("second".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             false,
         );

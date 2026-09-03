@@ -623,6 +623,7 @@ mod imp {
             );
             Ok(GenerateResponse {
                 text,
+                assistant_message: None,
                 prompt_tokens: prompt_tokens_evaluated,
                 completion_tokens,
                 finish_reason,

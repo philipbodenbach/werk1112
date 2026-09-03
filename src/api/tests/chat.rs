@@ -1,8 +1,150 @@
 use super::support::*;
+use crate::{
+    backend::GeneratedAssistantMessage,
+    openai::{
+        ChatCompletionFunctionCall, ChatCompletionFunctionCallDelta, ChatCompletionToolCall,
+        ChatCompletionToolCallDelta,
+    },
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone)]
 struct VisionRecordingBackend {
     request: Arc<std::sync::Mutex<Option<GenerateRequest>>>,
+}
+
+#[derive(Clone)]
+struct ToolCallingBackend {
+    calls: Arc<AtomicUsize>,
+    session_calls: Arc<AtomicUsize>,
+    request: Arc<std::sync::Mutex<Option<GenerateRequest>>>,
+}
+
+impl GenerationBackend for ToolCallingBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
+    fn start_chat_session(
+        &self,
+        _manifest: &ModelManifest,
+        _seed: Option<u64>,
+    ) -> anyhow::Result<Option<Box<dyn crate::backend::ChatGenerationSession>>> {
+        self.session_calls.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("tool requests must bypass the text chat-session cache")
+    }
+
+    fn generate(
+        &self,
+        _manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.request.lock().unwrap() = Some(request);
+        Ok(GenerateResponse {
+            text: String::new(),
+            assistant_message: Some(GeneratedAssistantMessage {
+                content: None,
+                tool_calls: Some(vec![ChatCompletionToolCall {
+                    id: "call_next".to_string(),
+                    kind: "function".to_string(),
+                    function: ChatCompletionFunctionCall {
+                        name: "get_weather".to_string(),
+                        arguments: r#"{"city":"Hamburg"}"#.to_string(),
+                    },
+                }]),
+            }),
+            prompt_tokens: 17,
+            completion_tokens: 8,
+            finish_reason: "tool_calls".to_string(),
+            timings: GenerationTimings::default(),
+            backend_diagnostics: Vec::new(),
+        })
+    }
+
+    fn generate_stream(
+        &self,
+        _manifest: ModelManifest,
+        request: GenerateRequest,
+    ) -> GenerateStream {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.request.lock().unwrap() = Some(request);
+        let events = vec![
+            Ok(GenerateStreamEvent::ToolCallDelta(vec![
+                ChatCompletionToolCallDelta {
+                    index: 0,
+                    id: Some("call_weather".to_string()),
+                    kind: Some("function".to_string()),
+                    function: Some(ChatCompletionFunctionCallDelta {
+                        name: Some("get_weather".to_string()),
+                        arguments: Some(r#"{"city":"#.to_string()),
+                    }),
+                },
+                ChatCompletionToolCallDelta {
+                    index: 1,
+                    id: Some("call_time".to_string()),
+                    kind: Some("function".to_string()),
+                    function: Some(ChatCompletionFunctionCallDelta {
+                        name: Some("get_time".to_string()),
+                        arguments: Some(r#"{"zone":"#.to_string()),
+                    }),
+                },
+            ])),
+            Ok(GenerateStreamEvent::ToolCallDelta(vec![
+                ChatCompletionToolCallDelta {
+                    index: 0,
+                    id: None,
+                    kind: None,
+                    function: Some(ChatCompletionFunctionCallDelta {
+                        name: None,
+                        arguments: Some(r#"Berlin"}"#.to_string()),
+                    }),
+                },
+                ChatCompletionToolCallDelta {
+                    index: 1,
+                    id: None,
+                    kind: None,
+                    function: Some(ChatCompletionFunctionCallDelta {
+                        name: None,
+                        arguments: Some(r#"Europe/Berlin"}"#.to_string()),
+                    }),
+                },
+            ])),
+            Ok(GenerateStreamEvent::Done {
+                finish_reason: "tool_calls".to_string(),
+                prompt_tokens: 12,
+                completion_tokens: 9,
+                timings: GenerationTimings::default(),
+                backend_diagnostics: Vec::new(),
+            }),
+        ];
+        Box::pin(tokio_stream::iter(events))
+    }
+}
+
+#[derive(Clone)]
+struct UnsupportedToolBackend {
+    calls: Arc<AtomicUsize>,
+}
+
+impl GenerationBackend for UnsupportedToolBackend {
+    fn generate(
+        &self,
+        _manifest: &ModelManifest,
+        _request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("unsupported backend must not be called")
+    }
+
+    fn generate_stream(
+        &self,
+        _manifest: ModelManifest,
+        _request: GenerateRequest,
+    ) -> GenerateStream {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(tokio_stream::empty())
+    }
 }
 
 impl GenerationBackend for VisionRecordingBackend {
@@ -22,6 +164,7 @@ impl GenerationBackend for VisionRecordingBackend {
         *self.request.lock().unwrap() = Some(request);
         Ok(GenerateResponse {
             text: "visual inspection complete".to_string(),
+            assistant_message: None,
             prompt_tokens: 32,
             completion_tokens: 3,
             finish_reason: "stop".to_string(),
@@ -126,6 +269,243 @@ async fn models_and_chat_routes_use_openai_shapes() {
     assert!(stream.contains("\"object\":\"chat.completion.chunk\""));
     assert!(stream.contains("\"content\":\"hello\""));
     assert!(stream.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn tool_calling_nonstream_preserves_request_history_and_nullable_response() {
+    let store = test_store();
+    install_tool_chat_model(&store);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let session_calls = Arc::new(AtomicUsize::new(0));
+    let recorded = Arc::new(std::sync::Mutex::new(None));
+    let app = router(ApiState::new(
+        store,
+        Arc::new(ToolCallingBackend {
+            calls: calls.clone(),
+            session_calls: session_calls.clone(),
+            request: recorded.clone(),
+        }),
+    ));
+    let payload = json!({
+        "model": "tool-model",
+        "messages": [
+            {"role": "user", "content": "Continue the lookup"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_previous",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "{\"city\":\"Berlin\"}"
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_previous",
+                "content": "{\"temperature_c\":21}"
+            }
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        }],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "get_weather"}
+        },
+        "parallel_tool_calls": false
+    });
+
+    let response = post_json(&app, "/v1/chat/completions", payload.clone(), None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["choices"][0]["message"]["content"], Value::Null);
+    assert_eq!(
+        value["choices"][0]["message"]["tool_calls"][0],
+        json!({
+            "id": "call_next",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Hamburg\"}"
+            }
+        })
+    );
+    assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+
+    let request = recorded.lock().unwrap().clone().unwrap();
+    assert!(request.requires_tool_calling());
+    assert_eq!(request.messages.len(), 3);
+    assert!(request.messages[1].content.is_none());
+    assert_eq!(
+        request.messages[1].tool_calls.as_ref().unwrap()[0]
+            .function
+            .arguments,
+        r#"{"city":"Berlin"}"#
+    );
+    assert_eq!(
+        request.messages[2].tool_call_id.as_deref(),
+        Some("call_previous")
+    );
+    let config = serde_json::to_value(request.tool_config.as_ref().unwrap()).unwrap();
+    assert_eq!(config["tools"], payload["tools"]);
+    assert_eq!(config["tool_choice"], payload["tool_choice"]);
+    assert_eq!(config["parallel_tool_calls"], false);
+}
+
+#[tokio::test]
+async fn tool_calling_stream_preserves_indexes_fragments_finish_and_done() {
+    let store = test_store();
+    install_tool_chat_model(&store);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let session_calls = Arc::new(AtomicUsize::new(0));
+    let app = router(ApiState::new(
+        store,
+        Arc::new(ToolCallingBackend {
+            calls: calls.clone(),
+            session_calls: session_calls.clone(),
+            request: Arc::new(std::sync::Mutex::new(None)),
+        }),
+    ));
+
+    let response = post_json(
+        &app,
+        "/v1/chat/completions",
+        json!({
+            "model": "tool-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Weather and time?"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}}
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true
+        }),
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stream = String::from_utf8(bytes.to_vec()).unwrap();
+    let data = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect::<Vec<_>>();
+    assert_eq!(data.last().copied(), Some("[DONE]"));
+    let chunks = data[..data.len() - 1]
+        .iter()
+        .map(|value| serde_json::from_str::<Value>(value).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(
+        chunks[1]["choices"][0]["delta"]["tool_calls"][0]["index"],
+        0
+    );
+    assert_eq!(
+        chunks[1]["choices"][0]["delta"]["tool_calls"][1]["index"],
+        1
+    );
+    assert_eq!(
+        chunks[1]["choices"][0]["delta"]["tool_calls"][0]["id"],
+        "call_weather"
+    );
+    assert_eq!(
+        chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+        r#"{"city":"#
+    );
+    assert_eq!(
+        chunks[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+        r#"Berlin"}"#
+    );
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn unsupported_backend_rejects_tool_calling_before_backend_execution() {
+    let store = test_store();
+    install_tool_chat_model(&store);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = router(ApiState::new(
+        store,
+        Arc::new(UnsupportedToolBackend {
+            calls: calls.clone(),
+        }),
+    ));
+
+    let response = post_json(
+        &app,
+        "/v1/chat/completions",
+        json!({
+            "model": "tool-model",
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}}
+            }]
+        }),
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value = response_json(response).await;
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert_eq!(value["error"]["code"], "unsupported_tool_calling");
+    assert_eq!(value["error"]["param"], "tools");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--backend vllm")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+fn install_tool_chat_model(store: &ModelStore) {
+    let manifest = ModelManifest {
+        id: "tool-model".to_string(),
+        source: ModelSource::LocalPath {
+            path: "test".to_string(),
+        },
+        format: ModelFormat::Unknown,
+        architecture: None,
+        tokenizer_path: None,
+        config_path: None,
+        model_path: None,
+        backend: "mock".to_string(),
+        created_unix: 1,
+        files: Vec::new(),
+        artifacts: Vec::new(),
+        metadata: Default::default(),
+    };
+    fs::create_dir_all(store.model_dir("tool-model")).unwrap();
+    fs::write(
+        store
+            .model_dir("tool-model")
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]

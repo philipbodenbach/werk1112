@@ -34,6 +34,7 @@ pub struct RequestCapabilities {
     pub image_input: bool,
     pub embeddings: bool,
     pub streaming: bool,
+    pub tool_calling: bool,
     pub task: Option<InferenceTask>,
     pub input_modality: Option<InputModality>,
     pub output_modality: Option<OutputModality>,
@@ -46,6 +47,7 @@ impl RequestCapabilities {
             image_input: false,
             embeddings: false,
             streaming,
+            tool_calling: false,
             task: None,
             input_modality: None,
             output_modality: None,
@@ -57,6 +59,11 @@ impl RequestCapabilities {
             image_input,
             ..Self::text(streaming)
         }
+    }
+
+    pub fn with_tool_calling(mut self, tool_calling: bool) -> Self {
+        self.tool_calling = tool_calling;
+        self
     }
 
     pub fn for_task(task: InferenceTask) -> Self {
@@ -74,6 +81,7 @@ impl RequestCapabilities {
                 InferenceTask::TextEmbedding | InferenceTask::AudioEmbedding
             ),
             streaming,
+            tool_calling: false,
             task: Some(task),
             input_modality: task.required_input_modalities().first().copied(),
             output_modality: Some(task.output_modality()),
@@ -643,6 +651,9 @@ fn rejection_reason(
     availability: Option<&RuntimeAvailability>,
 ) -> Option<String> {
     let descriptor = runtime_descriptor(runtime_id);
+    if request_capabilities.tool_calling && descriptor.runtime != BackendRuntime::Vllm {
+        return Some("runtime does not support OpenAI tool calling".to_string());
+    }
     if let Some(task) = request_capabilities.task {
         if !manifest.supports_task(task) {
             return Some(format!("model does not advertise support for task {task}"));
@@ -846,6 +857,59 @@ mod tests {
     use super::*;
     use crate::capabilities::{InferenceTask, RepositoryLayout};
     use crate::model_store::{ModelManifest, ModelSource};
+
+    #[test]
+    fn tool_calling_capability_never_falls_back_from_vllm() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let tool_request = RequestCapabilities::text(true).with_tool_calling(true);
+        let unavailable_vllm = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: false,
+                reason: Some("vLLM unavailable".to_string()),
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::CandleCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+
+        let rejected = plan_runtime(
+            &manifest,
+            RequestedBackend::Cuda,
+            tool_request,
+            &unavailable_vllm,
+        );
+        assert!(rejected.selected.is_none());
+        assert!(rejected.candidates.iter().any(|decision| {
+            decision.runtime_id == RuntimeId::CandleCuda
+                && decision
+                    .reason
+                    .contains("does not support OpenAI tool calling")
+        }));
+
+        let available_vllm = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: true,
+                reason: None,
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::CandleCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+        let selected = select_runtime(
+            &manifest,
+            RequestedBackend::Cuda,
+            tool_request,
+            &available_vllm,
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::VllmCuda);
+    }
 
     #[test]
     fn gguf_auto_prefers_llama_server_before_candle() {

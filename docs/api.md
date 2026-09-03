@@ -389,6 +389,9 @@ Accepted top-level fields:
 | <code>max_completion_tokens</code> | No | integer | Wins over max_tokens |
 | <code>stop</code> | No | string or string array | Added to model/template stops |
 | <code>seed</code> | No | integer | Backend dependent |
+| <code>tools</code> | No | array | OpenAI function-tool definitions; supported by the vLLM adapter |
+| <code>tool_choice</code> | No | string or object | <code>none</code>, <code>auto</code>, <code>required</code>, or a named function selection |
+| <code>parallel_tool_calls</code> | No | boolean | Forwarded unchanged to vLLM |
 
 The response-token default is 256 when neither field is present. Werk does not
 silently clamp an explicit response budget; the selected model context and
@@ -410,6 +413,31 @@ and vLLM forward that multipart structure to their chat endpoints; the current
 MLX-VLM subprocess accepts the image list but does not preserve arbitrary
 interleaving or `detail`. A hint such as `detail: "high"` does not guarantee an
 identical resolution policy across model processors.
+
+Tool-capable messages use the standard OpenAI chat shapes. An assistant
+message can have `content: null` and a `tool_calls` array. Each call contains
+an ID, `type: "function"`, a function name and `arguments` encoded as a JSON
+string. A following message uses `role: "tool"`, the matching `tool_call_id`
+and its result in `content`. Text, ordered multimodal content arrays and null
+content retain their existing representations.
+
+Each `tools` item contains `type: "function"` and a `function` object with a
+name, optional description, arbitrary JSON Schema in `parameters` and optional
+`strict`. A named tool choice has this form:
+
+~~~json
+{"type":"function","function":{"name":"get_weather"}}
+~~~
+
+Werk forwards these request fields and tool-message fields unchanged through
+the local and remote vLLM chat transports. It does not execute tools, hardcode
+a parser or automatically enable vLLM's automatic tool choice. vLLM generally
+requires `--enable-auto-tool-choice` for `tool_choice: "auto"`. Parser names and
+required server flags vary by model and vLLM version; Werk does not validate,
+replace or rewrite an arbitrary parser name. Configure these values where vLLM
+is launched. Other chat adapters return HTTP 400 with error code
+`unsupported_tool_calling`, rather than ignoring the fields. With
+`--backend auto`, tool support is a required routing capability.
 
 Image input additionally requires a model manifest that advertises
 <code>image-understanding</code> and an eligible vision runtime. Current routes
@@ -454,6 +482,60 @@ curl -fsS http://127.0.0.1:11434/v1/chat/completions \
   }'
 ~~~
 
+Tool-call example for a vLLM-backed Werk server:
+
+~~~bash
+curl -fsS http://127.0.0.1:11434/v1/chat/completions \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-coder",
+    "messages": [{"role": "user", "content": "What is the weather in Berlin?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+~~~
+
+A compatible model/runtime can return a choice like this. The value of
+`function.arguments` is intentionally a string containing JSON:
+
+~~~json
+{
+  "index": 0,
+  "message": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [{
+      "id": "call_weather_1",
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "arguments": "{\"location\":\"Berlin\"}"
+      }
+    }]
+  },
+  "finish_reason": "tool_calls"
+}
+~~~
+
+After executing the function, send the prior assistant message back unchanged
+and append its result:
+
+~~~json
+{"role":"tool","tool_call_id":"call_weather_1","content":"{\"temperature_c\":18}"}
+~~~
+
 With <code>--backend auto</code>, image input participates in server-side
 runtime selection. <code>backend</code>, <code>accelerator</code> and Werk media
 <code>routing</code> are not chat request fields; constrain the backend when
@@ -461,7 +543,6 @@ starting Werk when an exact route is required.
 
 Not implemented:
 
-- tools and tool calls
 - structured <code>response_format</code>
 - audio or video content
 - choice count <code>n</code>
@@ -478,11 +559,17 @@ With <code>stream: true</code>, the response content type is
 <code>text/event-stream</code>. The event sequence is:
 
 1. assistant-role chunk;
-2. one or more content chunks;
+2. zero or more content and/or tool-call delta chunks;
 3. finish chunk;
 4. literal <code>data: [DONE]</code>.
 
 Output chunks are buffered text pieces rather than necessarily one token each.
+Tool-call deltas preserve each call's `index`, optional ID and type, partial
+function name and partial argument string. Multiple calls and the upstream
+finish reason remain distinct; tool arguments are not concatenated into
+assistant content. Clients must assemble partial fields by call index as they
+would for an OpenAI chat stream.
+
 If generation fails after the HTTP stream starts, the failure is emitted as an
 error event inside the already successful HTTP response.
 

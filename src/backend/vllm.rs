@@ -2,7 +2,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -16,14 +18,15 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     BackendDoctorCheck, ChatGenerationSession, GenerateRequest, GenerateResponse, GenerateStream,
-    GenerateStreamEvent, GenerationBackend, GenerationTimings, SelectedRocmDeviceStatus,
-    current_host_is_strix_halo, current_selected_rocm_device_is_strix_halo,
-    current_selected_rocm_device_status,
+    GenerateStreamEvent, GeneratedAssistantMessage, GenerationBackend, GenerationTimings,
+    SelectedRocmDeviceStatus, current_host_is_strix_halo,
+    current_selected_rocm_device_is_strix_halo, current_selected_rocm_device_status,
 };
 use crate::{
     capabilities::InferenceTask,
     inference::{TaskReadiness, TaskReadinessStatus},
     model_store::{ModelFormat, ModelManifest, ModelStore},
+    openai::{ChatCompletionToolCall, ChatCompletionToolCallDelta},
     runtime_control::BackendRuntimeAdapter,
 };
 
@@ -60,6 +63,8 @@ pub struct VllmBackend {
     store: ModelStore,
     accelerator: VllmAccelerator,
     servers: Arc<Mutex<HashMap<String, Arc<VllmProcess>>>>,
+    #[cfg(test)]
+    test_server: Option<Arc<VllmProcess>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +201,9 @@ pub enum VllmCommand {
 #[derive(Default)]
 struct VllmCompletion {
     text: String,
+    assistant_content: Option<Option<String>>,
+    tool_calls: Option<Vec<ChatCompletionToolCall>>,
+    saw_tool_call_delta: bool,
     saw_reasoning_content: bool,
     prompt_tokens: usize,
     completion_tokens: usize,
@@ -203,6 +211,18 @@ struct VllmCompletion {
     decode_seconds: f64,
     first_token_seconds: f64,
     finish_reason: String,
+}
+
+impl VllmCompletion {
+    fn assistant_message(&self) -> GeneratedAssistantMessage {
+        GeneratedAssistantMessage {
+            content: self
+                .assistant_content
+                .clone()
+                .unwrap_or_else(|| Some(self.text.clone())),
+            tool_calls: self.tool_calls.clone(),
+        }
+    }
 }
 
 impl VllmBackend {
@@ -219,6 +239,39 @@ impl VllmBackend {
             store,
             accelerator,
             servers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            test_server: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_mock_http_server(
+        store: ModelStore,
+        url: String,
+        model_name: String,
+    ) -> Self {
+        let model_dir = store.model_dir(&model_name);
+        let server = VllmProcess {
+            child: None,
+            command_label: "mock remote vLLM OpenAI server".to_string(),
+            discovery_source: "test HTTP server".to_string(),
+            args: Vec::new(),
+            model_dir,
+            model_name,
+            model_name_source: "test served model",
+            is_nemotron: false,
+            url,
+            pid: None,
+            log_tail: Arc::new(Mutex::new(VecDeque::new())),
+            accelerator: VllmAccelerator::Cuda,
+            runtime_version: "test".to_string(),
+            runtime_instance_id: "vllm-test-instance".to_string(),
+        };
+        Self {
+            store,
+            accelerator: VllmAccelerator::Cuda,
+            servers: Arc::new(Mutex::new(HashMap::new())),
+            test_server: Some(Arc::new(server)),
         }
     }
 
@@ -230,6 +283,8 @@ impl VllmBackend {
         let Some(command) = discovery.command.as_ref() else {
             bail!("{}", missing_vllm_message(&discovery));
         };
+        let configured_args = configured_vllm_args()?;
+        validate_vllm_args_target(command, &configured_args)?;
         ensure_vllm_platform_eligible(command)?;
         vllm_cuda_capability(command)?;
         match command {
@@ -254,6 +309,8 @@ impl VllmBackend {
             .command
             .as_ref()
             .context("vLLM discovery had no command")?;
+        let configured_args = configured_vllm_args()?;
+        validate_vllm_args_target(command, &configured_args)?;
         ensure_vllm_platform_eligible(command)?;
         let detail = vllm_rocm_capability(command)?;
         Ok(format!("vLLM ROCm ({detail})"))
@@ -320,7 +377,16 @@ impl VllmBackend {
             bail!("vLLM backend supports HF safetensors model directories only");
         }
 
+        #[cfg(test)]
+        if let Some(server) = &self.test_server {
+            return Ok((server.clone(), true, 0.0));
+        }
+
         let discovery = discover_vllm(&self.store);
+        let configured_args = configured_vllm_args()?;
+        if let Some(command) = discovery.command.as_ref() {
+            validate_vllm_args_target(command, &configured_args)?;
+        }
         // A remote vLLM server owns and loads its weights. The installed Werk
         // manifest is still required for routing, but its local repository may
         // intentionally contain metadata only (common when Werk runs beside a
@@ -330,7 +396,7 @@ impl VllmBackend {
             &manifest.id,
             &model_dir,
             &discovery,
-            &VllmCacheEnvironment::current(),
+            &VllmCacheEnvironment::current(&configured_args),
         );
         if let Some(server) = self
             .servers
@@ -350,6 +416,7 @@ impl VllmBackend {
             &model_dir,
             discovery,
             self.accelerator,
+            configured_args,
         )?);
         let load_seconds = started.elapsed().as_secs_f64();
         self.servers
@@ -371,8 +438,10 @@ impl VllmBackend {
         let (server, reused, load_seconds) = self.cached_server(manifest)?;
         server.print_debug(&request, reused);
         let completion = server.complete(&request, tx)?;
+        let assistant_message = completion.assistant_message();
         Ok(GenerateResponse {
             text: completion.text,
+            assistant_message: Some(assistant_message),
             prompt_tokens: completion.prompt_tokens,
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
@@ -390,6 +459,10 @@ impl VllmBackend {
 }
 
 impl GenerationBackend for VllmBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         Arc::new(VllmRuntimeControlAdapter::new(self.clone()))
     }
@@ -496,8 +569,10 @@ impl ChatGenerationSession for VllmChatSession {
         let total_started = Instant::now();
         self.server.print_debug(&request, true);
         let completion = self.server.complete(&request, None)?;
+        let assistant_message = completion.assistant_message();
         Ok(GenerateResponse {
             text: completion.text,
+            assistant_message: Some(assistant_message),
             prompt_tokens: completion.prompt_tokens,
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
@@ -522,20 +597,24 @@ impl ChatGenerationSession for VllmChatSession {
             server.print_debug(&request, true);
             let result = validate_vllm_image_request(architecture.as_deref(), &request)
                 .and_then(|()| server.complete(&request, Some(tx.clone())))
-                .map(|completion| GenerateResponse {
-                    text: completion.text,
-                    prompt_tokens: completion.prompt_tokens,
-                    completion_tokens: completion.completion_tokens,
-                    finish_reason: completion.finish_reason,
-                    timings: GenerationTimings {
-                        load_seconds: 0.0,
-                        warmup_seconds: 0.0,
-                        first_token_seconds: completion.first_token_seconds,
-                        prompt_seconds: completion.prompt_seconds,
-                        decode_seconds: completion.decode_seconds,
-                        total_seconds: total_started.elapsed().as_secs_f64(),
-                    },
-                    backend_diagnostics: Vec::new(),
+                .map(|completion| {
+                    let assistant_message = completion.assistant_message();
+                    GenerateResponse {
+                        text: completion.text,
+                        assistant_message: Some(assistant_message),
+                        prompt_tokens: completion.prompt_tokens,
+                        completion_tokens: completion.completion_tokens,
+                        finish_reason: completion.finish_reason,
+                        timings: GenerationTimings {
+                            load_seconds: 0.0,
+                            warmup_seconds: 0.0,
+                            first_token_seconds: completion.first_token_seconds,
+                            prompt_seconds: completion.prompt_seconds,
+                            decode_seconds: completion.decode_seconds,
+                            total_seconds: total_started.elapsed().as_secs_f64(),
+                        },
+                        backend_diagnostics: Vec::new(),
+                    }
                 });
             send_stream_result(tx, result);
         });
@@ -550,6 +629,7 @@ impl VllmProcess {
         model_dir: &Path,
         discovery: VllmDiscovery,
         accelerator: VllmAccelerator,
+        configured_args: ConfiguredVllmArgs,
     ) -> Result<Self> {
         let discovery = if discovery.command.is_some() {
             discovery
@@ -560,6 +640,7 @@ impl VllmProcess {
             .command
             .clone()
             .context("vLLM discovery had no command")?;
+        validate_vllm_args_target(&command, &configured_args)?;
         match accelerator {
             VllmAccelerator::Cuda => vllm_cuda_capability(&command)?,
             VllmAccelerator::Rocm => vllm_rocm_capability(&command)?,
@@ -601,9 +682,15 @@ impl VllmProcess {
             .unwrap_or_else(|| "unknown".to_string());
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
-        let args = vllm_server_args(&command, model_dir, &manifest.id, port);
-        let mut child_command = Command::new(command.executable());
-        child_command.args(&args);
+        let launch = vllm_launch_command(
+            &command,
+            model_dir,
+            &manifest.id,
+            port,
+            &configured_args.args,
+        )?;
+        let mut child_command = Command::new(&launch.program);
+        child_command.args(&launch.args);
         if env_true("WERK_VLLM_LOG") {
             child_command
                 .stdout(Stdio::inherit())
@@ -614,7 +701,7 @@ impl VllmProcess {
         let mut child = child_command.spawn().with_context(|| {
             format!(
                 "failed to start vLLM server using {}",
-                command.executable().display()
+                launch.program.display()
             )
         })?;
         if !env_true("WERK_VLLM_LOG") {
@@ -630,7 +717,7 @@ impl VllmProcess {
             child: Some(Mutex::new(child)),
             command_label: command.display(),
             discovery_source: discovery.source,
-            args,
+            args: launch.args,
             model_dir: model_dir.to_path_buf(),
             model_name: manifest.id.clone(),
             model_name_source: "Werk model ID / local --served-model-name",
@@ -652,34 +739,64 @@ impl VllmProcess {
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<VllmCompletion> {
         let started = Instant::now();
-        let body = chat_completion_body(&self.model_name, request);
+        let streaming = tx.is_some();
+        let body = chat_completion_body(&self.model_name, request, streaming);
         let mut stream = post_json(&self.url, "/v1/chat/completions", &body)?;
         let mut completion = VllmCompletion {
             finish_reason: "length".to_string(),
             ..Default::default()
         };
-        let mut sse = SseAccumulator::default();
 
-        stream_body(&mut stream, |bytes| {
-            sse.push(bytes, |event| {
-                if event == "[DONE]" {
-                    return Ok(());
-                }
-                let value: Value = serde_json::from_str(event)
-                    .with_context(|| format!("invalid vLLM SSE event: {event}"))?;
-                update_completion_from_event(&mut completion, &value);
-                if let Some(chunk) = delta_content(&value)
-                    && !chunk.is_empty()
-                {
-                    if completion.first_token_seconds <= 0.0 {
-                        completion.first_token_seconds = started.elapsed().as_secs_f64();
+        if streaming {
+            let mut sse = SseAccumulator::default();
+            stream_body(&mut stream, |bytes| {
+                sse.push(bytes, |event| {
+                    if event == "[DONE]" {
+                        return Ok(());
                     }
-                    completion.text.push_str(&chunk);
-                    send_text_chunk(&tx, chunk)?;
-                }
+                    let value: Value = serde_json::from_str(event)
+                        .with_context(|| format!("invalid vLLM SSE event: {event}"))?;
+                    update_completion_from_event(&mut completion, &value);
+                    if let Some(chunk) = delta_content(&value) {
+                        if completion.first_token_seconds <= 0.0 && !chunk.is_empty() {
+                            completion.first_token_seconds = started.elapsed().as_secs_f64();
+                        }
+                        completion.text.push_str(&chunk);
+                        append_assistant_content(&mut completion.assistant_content, &chunk);
+                        if !chunk.is_empty() {
+                            send_text_chunk(&tx, chunk)?;
+                        }
+                    }
+                    if let Some(tool_calls) = delta_tool_calls(&value)? {
+                        completion.saw_tool_call_delta = true;
+                        if completion.first_token_seconds <= 0.0 {
+                            completion.first_token_seconds = started.elapsed().as_secs_f64();
+                        }
+                        send_tool_call_delta(&tx, tool_calls)?;
+                    }
+                    Ok(())
+                })
+            })?;
+        } else {
+            let mut response_body = Vec::new();
+            stream_body(&mut stream, |bytes| {
+                response_body.extend_from_slice(bytes);
                 Ok(())
-            })
-        })?;
+            })?;
+            let value: Value = serde_json::from_slice(&response_body)
+                .context("vLLM returned an invalid non-streaming chat completion")?;
+            update_completion_from_event(&mut completion, &value);
+            update_completion_from_message(&mut completion, &value)?;
+            if (!completion.text.is_empty()
+                || completion
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty()))
+                && completion.first_token_seconds <= 0.0
+            {
+                completion.first_token_seconds = started.elapsed().as_secs_f64();
+            }
+        }
 
         ensure_vllm_visible_completion(&completion)?;
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
@@ -899,10 +1016,22 @@ struct VllmCacheEnvironment {
     python: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConfiguredVllmArgs {
+    raw: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VllmLaunchCommand {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
 impl VllmCacheEnvironment {
-    fn current() -> Self {
+    fn current(configured_args: &ConfiguredVllmArgs) -> Self {
         Self {
-            args: env::var("WERK_VLLM_ARGS").unwrap_or_default(),
+            args: configured_args.raw.clone(),
             served_model: env::var("WERK_VLLM_MODEL").unwrap_or_default(),
             host: env::var("WERK_VLLM_HOST").unwrap_or_default(),
             port: env::var("WERK_VLLM_PORT").unwrap_or_default(),
@@ -938,12 +1067,15 @@ impl SseAccumulator {
     }
 }
 
-fn vllm_server_args(
+fn vllm_launch_command(
     command: &VllmCommand,
     model_dir: &Path,
     model_name: &str,
     port: u16,
-) -> Vec<String> {
+    extra_args: &[String],
+) -> Result<VllmLaunchCommand> {
+    validate_vllm_extra_args(extra_args)?;
+
     let mut args = match command {
         VllmCommand::Python(_) => vec![
             "-m".to_string(),
@@ -952,7 +1084,9 @@ fn vllm_server_args(
             model_dir.display().to_string(),
         ],
         VllmCommand::Executable(_) => vec!["serve".to_string(), model_dir.display().to_string()],
-        VllmCommand::Remote { .. } => Vec::new(),
+        VllmCommand::Remote { .. } => {
+            bail!("cannot construct a local vLLM launch command for a remote vLLM server")
+        }
     };
     args.extend([
         "--host".to_string(),
@@ -962,10 +1096,11 @@ fn vllm_server_args(
         "--served-model-name".to_string(),
         model_name.to_string(),
     ]);
-    if let Ok(extra) = env::var("WERK_VLLM_ARGS") {
-        args.extend(split_args(&extra));
-    }
-    args
+    args.extend_from_slice(extra_args);
+    Ok(VllmLaunchCommand {
+        program: command.executable(),
+        args,
+    })
 }
 
 fn configured_vllm_model() -> Result<Option<String>> {
@@ -1270,7 +1405,7 @@ fn vllm_server_cache_key(
     )
 }
 
-fn chat_completion_body(model_name: &str, request: &GenerateRequest) -> Value {
+fn chat_completion_body(model_name: &str, request: &GenerateRequest, stream: bool) -> Value {
     let messages = if request.messages.is_empty() {
         json!([{
             "role": "user",
@@ -1283,9 +1418,11 @@ fn chat_completion_body(model_name: &str, request: &GenerateRequest) -> Value {
         "model": model_name,
         "messages": messages,
         "max_tokens": request.max_tokens,
-        "stream": true,
-        "stream_options": {"include_usage": true},
+        "stream": stream,
     });
+    if stream {
+        body["stream_options"] = json!({"include_usage": true});
+    }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
     }
@@ -1297,6 +1434,17 @@ fn chat_completion_body(model_name: &str, request: &GenerateRequest) -> Value {
     }
     if let Some(seed) = request.seed {
         body["seed"] = json!(seed);
+    }
+    if let Some(tool_config) = &request.tool_config {
+        if let Some(tools) = &tool_config.tools {
+            body["tools"] = json!(tools);
+        }
+        if let Some(tool_choice) = &tool_config.tool_choice {
+            body["tool_choice"] = json!(tool_choice);
+        }
+        if let Some(parallel_tool_calls) = tool_config.parallel_tool_calls {
+            body["parallel_tool_calls"] = json!(parallel_tool_calls);
+        }
     }
     body
 }
@@ -1347,6 +1495,69 @@ fn update_completion_from_event(completion: &mut VllmCompletion, value: &Value) 
     }
 }
 
+fn update_completion_from_message(completion: &mut VllmCompletion, value: &Value) -> Result<()> {
+    let choice = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .context("vLLM non-streaming response has no completion choice")?;
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .context("vLLM non-streaming response has no assistant message")?;
+
+    completion.assistant_content = match message.get("content") {
+        Some(Value::Null) => Some(None),
+        Some(Value::String(content)) => {
+            completion.text.clone_from(content);
+            Some(Some(content.clone()))
+        }
+        Some(_) => bail!("vLLM assistant message content must be a string or null"),
+        None => None,
+    };
+    completion.tool_calls = match message.get("tool_calls") {
+        Some(Value::Null) | None => None,
+        Some(tool_calls) => Some(
+            serde_json::from_value(tool_calls.clone())
+                .context("vLLM returned invalid assistant message.tool_calls")?,
+        ),
+    };
+    if completion.assistant_content.is_none()
+        && completion
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| !tool_calls.is_empty())
+    {
+        completion.assistant_content = Some(None);
+    }
+    Ok(())
+}
+
+fn append_assistant_content(content: &mut Option<Option<String>>, chunk: &str) {
+    match content {
+        Some(Some(current)) => current.push_str(chunk),
+        _ => *content = Some(Some(chunk.to_string())),
+    }
+}
+
+fn delta_tool_calls(value: &Value) -> Result<Option<Vec<ChatCompletionToolCallDelta>>> {
+    let Some(tool_calls) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("tool_calls"))
+    else {
+        return Ok(None);
+    };
+    if tool_calls.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(tool_calls.clone())
+        .map(Some)
+        .context("vLLM returned invalid delta.tool_calls")
+}
+
 fn delta_has_reasoning_content(value: &Value) -> bool {
     let Some(delta) = value
         .get("choices")
@@ -1366,7 +1577,12 @@ fn delta_has_reasoning_content(value: &Value) -> bool {
 }
 
 fn ensure_vllm_visible_completion(completion: &VllmCompletion) -> Result<()> {
-    if completion.text.trim().is_empty() && completion.saw_reasoning_content {
+    let has_tool_calls = completion.saw_tool_call_delta
+        || completion
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+    if completion.text.trim().is_empty() && completion.saw_reasoning_content && !has_tool_calls {
         bail!(
             "vLLM generated hidden reasoning but no visible answer content; increase max tokens so the model can finish its answer, or disable the configured reasoning parser/mode when hidden reasoning is not wanted"
         );
@@ -2916,43 +3132,86 @@ fn send_text_chunk(
     Ok(())
 }
 
-fn split_args(input: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escape = false;
-    for ch in input.chars() {
-        if escape {
-            current.push(ch);
-            escape = false;
-            continue;
-        }
-        if ch == '\\' {
-            escape = true;
-            continue;
-        }
-        if let Some(active) = quote {
-            if ch == active {
-                quote = None;
-            } else {
-                current.push(ch);
+fn send_tool_call_delta(
+    tx: &Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+    tool_calls: Vec<ChatCompletionToolCallDelta>,
+) -> Result<()> {
+    if let Some(tx) = tx {
+        tx.blocking_send(Ok(GenerateStreamEvent::ToolCallDelta(tool_calls)))
+            .map_err(|err| anyhow!("stream receiver closed: {err}"))?;
+    }
+    Ok(())
+}
+
+const WERK_OWNED_VLLM_ARGS: &[&str] = &["--model", "--host", "--port", "--served-model-name"];
+
+fn configured_vllm_args() -> Result<ConfiguredVllmArgs> {
+    configured_vllm_args_from(env::var_os("WERK_VLLM_ARGS"))
+}
+
+fn configured_vllm_args_from(value: Option<std::ffi::OsString>) -> Result<ConfiguredVllmArgs> {
+    let Some(value) = value else {
+        return Ok(ConfiguredVllmArgs::default());
+    };
+    let raw = value.into_string().map_err(|_| {
+        anyhow!("WERK_VLLM_ARGS must be valid UTF-8; non-UTF-8 values are not supported")
+    })?;
+    let args = parse_vllm_args(OsStr::new(&raw))?;
+    Ok(ConfiguredVllmArgs { raw, args })
+}
+
+/// Parses `WERK_VLLM_ARGS` as a POSIX-style shell-word list, not a shell command.
+///
+/// `shell_words` only separates words: it does not run a shell or perform
+/// command, variable, tilde, or glob expansion.
+fn parse_vllm_args(input: &OsStr) -> Result<Vec<String>> {
+    let input = input.to_str().ok_or_else(|| {
+        anyhow!("WERK_VLLM_ARGS must be valid UTF-8; non-UTF-8 values are not supported")
+    })?;
+    let trailing_backslashes = input
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    if trailing_backslashes % 2 == 1 {
+        bail!(
+            "invalid WERK_VLLM_ARGS POSIX-style shell-word list: trailing backslash is not allowed"
+        );
+    }
+    let args = shell_words::split(input)
+        .map_err(|error| anyhow!("invalid WERK_VLLM_ARGS POSIX-style shell-word list: {error}"))?;
+    validate_vllm_extra_args(&args)?;
+    Ok(args)
+}
+
+fn validate_vllm_extra_args(args: &[String]) -> Result<()> {
+    for argument in args {
+        for reserved in WERK_OWNED_VLLM_ARGS {
+            if argument == reserved
+                || argument
+                    .strip_prefix(reserved)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+            {
+                bail!(
+                    "WERK_VLLM_ARGS cannot set {reserved}: this server argument is controlled by Werk and must be configured through Werk itself"
+                );
             }
-            continue;
-        }
-        if ch == '\'' || ch == '"' {
-            quote = Some(ch);
-        } else if ch.is_whitespace() {
-            if !current.is_empty() {
-                args.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(ch);
         }
     }
-    if !current.is_empty() {
-        args.push(current);
+    Ok(())
+}
+
+fn validate_vllm_args_target(
+    command: &VllmCommand,
+    configured_args: &ConfiguredVllmArgs,
+) -> Result<()> {
+    if matches!(command, VllmCommand::Remote { .. }) && !configured_args.raw.is_empty() {
+        bail!(
+            "WERK_VLLM_ARGS only applies when Werk starts a local vLLM process; configure process arguments on the remote vLLM server"
+        );
     }
-    args
+    Ok(())
 }
 
 fn run_command(command: &mut Command, context: &str) -> Result<()> {
@@ -3050,8 +3309,11 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ToolCallingConfig;
     use crate::model_store::ModelSource;
-    use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
+    use crate::openai::{
+        ChatCompletionRequest, ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent,
+    };
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -3065,6 +3327,8 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("hello".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             }],
             image_urls: Vec::new(),
             max_tokens: 32,
@@ -3075,12 +3339,16 @@ mod tests {
             stream_granularity: super::super::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
-        let body = chat_completion_body("model", &request);
+        let body = chat_completion_body("model", &request, true);
         assert_eq!(body["model"], "model");
         assert_eq!(body["messages"][0]["content"], "hello");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
     }
 
     #[test]
@@ -3121,6 +3389,8 @@ mod tests {
                 role: "system".to_string(),
                 content: Some(MessageContent::Text("Inspect carefully.".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
@@ -3152,6 +3422,8 @@ mod tests {
                     },
                 ])),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
         let request = GenerateRequest {
@@ -3169,10 +3441,11 @@ mod tests {
             stream_granularity: super::super::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
 
         validate_vllm_image_request(Some("qwen3_vl"), &request).unwrap();
-        let body = chat_completion_body("vlm", &request);
+        let body = chat_completion_body("vlm", &request, true);
         assert_eq!(
             body["messages"][0],
             serde_json::to_value(&messages[0]).unwrap()
@@ -3203,6 +3476,8 @@ mod tests {
                     image_url: Some(ImageUrlSpec::Url("file:///tmp/private.png".to_string())),
                 }])),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             }],
             image_urls: vec!["file:///tmp/private.png".to_string()],
             max_tokens: 16,
@@ -3213,6 +3488,7 @@ mod tests {
             stream_granularity: super::super::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
 
         let error = validate_vllm_image_request(Some("qwen3_vl"), &request)
@@ -3231,6 +3507,8 @@ mod tests {
                 image_url: Some(ImageUrlSpec::Url("image.png".to_string())),
             }])),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         };
         let mut request = GenerateRequest {
             prompt: "inspect".to_string(),
@@ -3244,6 +3522,7 @@ mod tests {
             stream_granularity: super::super::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
 
         let error = validate_vllm_image_request(Some("qwen3"), &request).unwrap_err();
@@ -3276,6 +3555,182 @@ mod tests {
         update_completion_from_event(&mut completion, &value);
         assert_eq!(completion.prompt_tokens, 4);
         assert_eq!(completion.completion_tokens, 2);
+    }
+
+    #[test]
+    fn vllm_body_forwards_tool_configuration_and_history_without_rewriting() {
+        let public_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "ignored",
+            "messages": [
+                {"role": "user", "content": "What is the weather?"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Berlin\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_123",
+                    "content": "{\"temperature\":21}"
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": ["string", "null"]}},
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false
+        }))
+        .unwrap();
+        let request = GenerateRequest {
+            prompt: "ignored".to_string(),
+            messages: public_request.messages,
+            image_urls: Vec::new(),
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            seed: None,
+            stream_granularity: super::super::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+            tool_config: Some(ToolCallingConfig {
+                tools: public_request.tools,
+                tool_choice: public_request.tool_choice,
+                parallel_tool_calls: public_request.parallel_tool_calls,
+            }),
+        };
+
+        let body = chat_completion_body("served-model", &request, false);
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["city"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Berlin\"}"
+        );
+        assert!(body["messages"][1]["content"].is_null());
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_123");
+    }
+
+    #[test]
+    fn vllm_non_streaming_tool_response_preserves_null_content_and_call() {
+        let value = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Berlin\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 19, "completion_tokens": 7}
+        });
+        let mut completion = VllmCompletion::default();
+        update_completion_from_event(&mut completion, &value);
+        update_completion_from_message(&mut completion, &value).unwrap();
+
+        let assistant = completion.assistant_message();
+        assert_eq!(assistant.content, None);
+        let calls = assistant.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_123");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, "{\"city\":\"Berlin\"}");
+        assert_eq!(completion.finish_reason, "tool_calls");
+        assert_eq!(completion.prompt_tokens, 19);
+        assert_eq!(completion.completion_tokens, 7);
+        ensure_vllm_visible_completion(&completion).unwrap();
+    }
+
+    #[test]
+    fn vllm_streaming_tool_deltas_preserve_indexes_and_partial_strings() {
+        let initial = json!({
+            "choices": [{
+                "delta": {"tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_weather",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": ""}
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_time",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": ""}
+                    }
+                ]},
+                "finish_reason": null
+            }]
+        });
+        let fragments = json!({
+            "choices": [{
+                "delta": {"tool_calls": [
+                    {"index": 0, "function": {"name": "", "arguments": "{\"city\""}},
+                    {"index": 1, "function": {"arguments": "{\"zone\":\"UTC\"}"}}
+                ]},
+                "finish_reason": null
+            }]
+        });
+
+        let initial_calls = delta_tool_calls(&initial).unwrap().unwrap();
+        assert_eq!(initial_calls.len(), 2);
+        assert_eq!(initial_calls[0].index, 0);
+        assert_eq!(initial_calls[0].id.as_deref(), Some("call_weather"));
+        assert_eq!(
+            initial_calls[0]
+                .function
+                .as_ref()
+                .and_then(|function| function.arguments.as_deref()),
+            Some("")
+        );
+        let partial_calls = delta_tool_calls(&fragments).unwrap().unwrap();
+        assert_eq!(partial_calls[0].index, 0);
+        assert_eq!(
+            partial_calls[0]
+                .function
+                .as_ref()
+                .and_then(|function| function.name.as_deref()),
+            Some("")
+        );
+        assert_eq!(
+            partial_calls[0]
+                .function
+                .as_ref()
+                .and_then(|function| function.arguments.as_deref()),
+            Some("{\"city\"")
+        );
+        assert_eq!(partial_calls[1].index, 1);
+        assert_eq!(delta_content(&fragments), None);
     }
 
     #[test]
@@ -3481,22 +3936,275 @@ mod tests {
     #[test]
     fn vllm_args_keep_logical_served_model_name() {
         let model_dir = PathBuf::from("/tmp/werk-model/files");
-        let args = vllm_server_args(
+        let launch = vllm_launch_command(
             &VllmCommand::Python(PathBuf::from("/usr/bin/python3")),
             &model_dir,
             "Qwen/Qwen3-4B",
             12345,
-        );
-        let model_arg = args
+            &[],
+        )
+        .unwrap();
+        let model_arg = launch
+            .args
             .windows(2)
             .find(|pair| pair[0] == "--model")
             .map(|pair| pair[1].as_str());
-        let served_name = args
+        let served_name = launch
+            .args
             .windows(2)
             .find(|pair| pair[0] == "--served-model-name")
             .map(|pair| pair[1].as_str());
         assert_eq!(model_arg, Some("/tmp/werk-model/files"));
         assert_eq!(served_name, Some("Qwen/Qwen3-4B"));
+    }
+
+    #[test]
+    fn vllm_args_parse_separate_and_equals_forms() {
+        assert_eq!(
+            parse_vllm_args(OsStr::new("--max-num-seqs 16")).unwrap(),
+            vec!["--max-num-seqs", "16"]
+        );
+        assert_eq!(
+            parse_vllm_args(OsStr::new("--max-num-seqs=16")).unwrap(),
+            vec!["--max-num-seqs=16"]
+        );
+    }
+
+    #[test]
+    fn vllm_args_preserve_json_and_quoted_spaces() {
+        assert_eq!(
+            parse_vllm_args(OsStr::new(
+                r#"--speculative-config '{"method":"mtp","num_speculative_tokens":1}' --label "two words""#,
+            ))
+            .unwrap(),
+            vec![
+                "--speculative-config",
+                r#"{"method":"mtp","num_speculative_tokens":1}"#,
+                "--label",
+                "two words",
+            ]
+        );
+    }
+
+    #[test]
+    fn vllm_args_preserve_explicitly_empty_words() {
+        assert_eq!(
+            parse_vllm_args(OsStr::new(r#"--double "" --single ''"#)).unwrap(),
+            vec!["--double", "", "--single", ""]
+        );
+    }
+
+    #[test]
+    fn vllm_args_treat_backslashes_literally_inside_single_quotes() {
+        assert_eq!(
+            parse_vllm_args(OsStr::new(r"--value 'left\right'")).unwrap(),
+            vec!["--value", r"left\right"]
+        );
+    }
+
+    #[test]
+    fn vllm_args_preserve_repeated_flags_and_order() {
+        assert_eq!(
+            parse_vllm_args(OsStr::new("--include first --other middle --include last")).unwrap(),
+            vec![
+                "--include",
+                "first",
+                "--other",
+                "middle",
+                "--include",
+                "last"
+            ]
+        );
+    }
+
+    #[test]
+    fn vllm_args_reject_malformed_shell_words() {
+        for malformed in [
+            "--value 'unclosed",
+            "--value \"unclosed",
+            "--value trailing\\",
+        ] {
+            let error = parse_vllm_args(OsStr::new(malformed))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid WERK_VLLM_ARGS"), "{error}");
+            assert!(error.contains("POSIX-style shell-word list"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vllm_args_reject_non_utf8_environment_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error =
+            configured_vllm_args_from(Some(std::ffi::OsString::from_vec(b"--value \xff".to_vec())))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("WERK_VLLM_ARGS must be valid UTF-8"));
+    }
+
+    #[test]
+    fn vllm_args_reject_every_werk_owned_flag_in_separate_form() {
+        for reserved in WERK_OWNED_VLLM_ARGS {
+            let error = parse_vllm_args(OsStr::new(&format!("{reserved} user-value")))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reserved), "{error}");
+            assert!(error.contains("controlled by Werk"), "{error}");
+        }
+    }
+
+    #[test]
+    fn vllm_args_reject_every_werk_owned_flag_in_equals_form() {
+        for reserved in WERK_OWNED_VLLM_ARGS {
+            let error = parse_vllm_args(OsStr::new(&format!("{reserved}=user-value")))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reserved), "{error}");
+            assert!(error.contains("controlled by Werk"), "{error}");
+        }
+    }
+
+    #[test]
+    fn remote_vllm_rejects_local_process_args() {
+        let args = parse_vllm_args(OsStr::new("--max-num-seqs 16")).unwrap();
+        let configured_args = ConfiguredVllmArgs {
+            raw: "--max-num-seqs 16".to_string(),
+            args,
+        };
+        let error = validate_vllm_args_target(
+            &VllmCommand::Remote {
+                host: "vllm.internal".to_string(),
+                port: 8000,
+            },
+            &configured_args,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("only applies when Werk starts a local vLLM process"));
+        assert!(error.contains("remote vLLM server"));
+    }
+
+    #[test]
+    fn remote_vllm_rejects_nonempty_whitespace_only_args_value() {
+        let configured_args = configured_vllm_args_from(Some("   ".into())).unwrap();
+        assert!(configured_args.args.is_empty());
+
+        let error = validate_vllm_args_target(
+            &VllmCommand::Remote {
+                host: "vllm.internal".to_string(),
+                port: 8000,
+            },
+            &configured_args,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("only applies when Werk starts a local vLLM process"));
+    }
+
+    #[test]
+    fn vllm_args_do_not_expand_shell_syntax() {
+        assert_eq!(
+            parse_vllm_args(OsStr::new(
+                r#"--variable '$WERK_SECRET' --command '$(touch /tmp/never)' --glob '*.safetensors'"#,
+            ))
+            .unwrap(),
+            vec![
+                "--variable",
+                "$WERK_SECRET",
+                "--command",
+                "$(touch /tmp/never)",
+                "--glob",
+                "*.safetensors",
+            ]
+        );
+    }
+
+    #[test]
+    fn vllm_python_launch_argv_preserves_advanced_flags_exactly() {
+        let extra = parse_vllm_args(OsStr::new(
+            r#"--quantization compressed-tensors --kv-cache-dtype fp8 --speculative-config '{"method":"mtp","num_speculative_tokens":1}' --enable-auto-tool-choice --tool-call-parser qwen3_coder --max-num-seqs 16"#,
+        ))
+        .unwrap();
+        let launch = vllm_launch_command(
+            &VllmCommand::Python(PathBuf::from("/opt/vllm/bin/python")),
+            Path::new("/srv/werk1112/models/qwen/files"),
+            "Qwen-Test",
+            43127,
+            &extra,
+        )
+        .unwrap();
+
+        assert_eq!(launch.program, PathBuf::from("/opt/vllm/bin/python"));
+        assert_eq!(
+            launch.args,
+            vec![
+                "-m",
+                "vllm.entrypoints.openai.api_server",
+                "--model",
+                "/srv/werk1112/models/qwen/files",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "43127",
+                "--served-model-name",
+                "Qwen-Test",
+                "--quantization",
+                "compressed-tensors",
+                "--kv-cache-dtype",
+                "fp8",
+                "--speculative-config",
+                r#"{"method":"mtp","num_speculative_tokens":1}"#,
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_coder",
+                "--max-num-seqs",
+                "16",
+            ]
+        );
+    }
+
+    #[test]
+    fn vllm_executable_launch_argv_preserves_advanced_flags_exactly() {
+        let extra = parse_vllm_args(OsStr::new(
+            r#"--quantization compressed-tensors --kv-cache-dtype fp8 --speculative-config '{"method":"mtp","num_speculative_tokens":1}' --enable-auto-tool-choice --tool-call-parser qwen3_coder --max-num-seqs 16"#,
+        ))
+        .unwrap();
+        let launch = vllm_launch_command(
+            &VllmCommand::Executable(PathBuf::from("/opt/vllm/bin/vllm")),
+            Path::new("/srv/werk1112/models/qwen/files"),
+            "Qwen-Test",
+            43127,
+            &extra,
+        )
+        .unwrap();
+
+        assert_eq!(launch.program, PathBuf::from("/opt/vllm/bin/vllm"));
+        assert_eq!(
+            launch.args,
+            vec![
+                "serve",
+                "/srv/werk1112/models/qwen/files",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "43127",
+                "--served-model-name",
+                "Qwen-Test",
+                "--quantization",
+                "compressed-tensors",
+                "--kv-cache-dtype",
+                "fp8",
+                "--speculative-config",
+                r#"{"method":"mtp","num_speculative_tokens":1}"#,
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_coder",
+                "--max-num-seqs",
+                "16",
+            ]
+        );
     }
 
     #[test]

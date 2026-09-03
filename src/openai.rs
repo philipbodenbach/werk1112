@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::model_store::{ModelManifest, ModelSource};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     #[serde(default)]
     pub model: Option<String>,
@@ -21,6 +22,12 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopSpec>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ChatCompletionTool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl ChatCompletionRequest {
@@ -37,6 +44,13 @@ impl ChatCompletionRequest {
             Some(StopSpec::Many(stops)) => stops.clone(),
         }
     }
+
+    pub fn requires_tool_calling(&self) -> bool {
+        self.tools.is_some()
+            || self.tool_choice.is_some()
+            || self.parallel_tool_calls.is_some()
+            || self.messages.iter().any(ChatMessage::uses_tool_calling)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -44,8 +58,106 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<MessageContent>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn uses_tool_calling(&self) -> bool {
+        self.role.eq_ignore_ascii_case("tool")
+            || self.tool_calls.is_some()
+            || self.tool_call_id.is_some()
+    }
+}
+
+/// An OpenAI-compatible tool made available to the model.
+///
+/// Werk currently accepts the standard `function` tool type. Keeping the type
+/// as a string lets the selected backend report version-specific validation
+/// without Werk rewriting the request.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ChatCompletionTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatCompletionToolFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ChatCompletionToolFunction {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+/// The standard OpenAI tool choice: `none`, `auto`, `required`, or a named
+/// function selector.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Named(NamedToolChoice),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoiceMode {
+    None,
+    Auto,
+    Required,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NamedToolChoice {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: NamedToolChoiceFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NamedToolChoiceFunction {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChatCompletionToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatCompletionFunctionCall,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChatCompletionFunctionCall {
+    pub name: String,
+    /// JSON encoded as a string, as required by the OpenAI chat protocol.
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChatCompletionToolCallDelta {
+    pub index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<ChatCompletionFunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChatCompletionFunctionCallDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -114,7 +226,7 @@ pub struct ImageUrlPart {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum StopSpec {
     One(String),
@@ -654,7 +766,9 @@ pub struct ChatCompletionChoice {
 #[derive(Debug, Clone, Serialize)]
 pub struct AssistantMessage {
     pub role: &'static str,
-    pub content: String,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -729,6 +843,93 @@ mod tests {
     }
 
     #[test]
+    fn tool_calling_contract_preserves_schema_choice_and_continuation_messages() {
+        let value = serde_json::json!({
+            "model": "qwen-tool-model",
+            "messages": [
+                {"role": "user", "content": "What is the weather?"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_weather_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Berlin\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather_1",
+                    "content": "{\"temperature_c\":21}"
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Fetch current weather",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {"type": "null"}
+                                ]
+                            }
+                        },
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "get_weather"}
+            },
+            "parallel_tool_calls": false
+        });
+
+        let request: ChatCompletionRequest = serde_json::from_value(value.clone()).unwrap();
+
+        assert!(request.requires_tool_calling());
+        assert_eq!(
+            request.messages[1].tool_calls.as_ref().unwrap()[0]
+                .function
+                .arguments,
+            r#"{"city":"Berlin"}"#
+        );
+        assert_eq!(
+            request.messages[2].tool_call_id.as_deref(),
+            Some("call_weather_1")
+        );
+        assert_eq!(
+            serde_json::to_value(request.tools.as_ref().unwrap()).unwrap(),
+            value["tools"]
+        );
+        assert_eq!(
+            serde_json::to_value(request.tool_choice.as_ref().unwrap()).unwrap(),
+            value["tool_choice"]
+        );
+        assert_eq!(request.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
+    fn tool_choice_accepts_all_standard_string_modes() {
+        for mode in ["none", "auto", "required"] {
+            let choice: ToolChoice = serde_json::from_value(serde_json::json!(mode)).unwrap();
+            assert_eq!(
+                serde_json::to_value(choice).unwrap(),
+                serde_json::json!(mode)
+            );
+        }
+    }
+
+    #[test]
     fn explicit_completion_budget_is_not_silently_capped() {
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "Hello"}],
@@ -772,6 +973,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         let prompt = messages_to_prompt_for_model_with_template(
@@ -826,11 +1029,15 @@ mod tests {
                     role: "system".to_string(),
                     content: Some(MessageContent::Text("Be accurate.".to_string())),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
                     content: Some(MessageContent::Text("Write one sentence.".to_string())),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
         );
@@ -866,11 +1073,15 @@ mod tests {
                     role: "system".to_string(),
                     content: Some(MessageContent::Text("Be accurate.".to_string())),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
                     content: Some(MessageContent::Text("Write one sentence.".to_string())),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
         );
@@ -913,6 +1124,8 @@ mod tests {
                         "write a sentence about Rust.".to_string(),
                     )),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 ChatMessage {
                     role: "assistant".to_string(),
@@ -920,6 +1133,8 @@ mod tests {
                         "Rust is a systems programming language.".to_string(),
                     )),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
@@ -927,6 +1142,8 @@ mod tests {
                         "write a sentence about Rust.".to_string(),
                     )),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
         );
@@ -972,16 +1189,22 @@ mod tests {
                     role: "user".to_string(),
                     content: Some(MessageContent::Text("Say one fact.".to_string())),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 ChatMessage {
                     role: "assistant".to_string(),
                     content: Some(MessageContent::Text("Rust has ownership.".to_string())),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
                     content: Some(MessageContent::Text("Say one fact.".to_string())),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
         );

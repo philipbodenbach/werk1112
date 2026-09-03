@@ -995,6 +995,8 @@ fn prompt_smoke(manifest: &ModelManifest, tokenizer: &Tokenizer) -> Result<Strin
             role: "user".to_string(),
             content: Some(MessageContent::Text("Say ok.".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }],
     )
     .prompt;

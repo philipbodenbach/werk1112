@@ -86,6 +86,69 @@ werk video generate VIDEO_MODEL \
   --verbose --debug
 ~~~
 
+## vLLM launch arguments and tool calling
+
+`WERK_VLLM_ARGS` supplies advanced arguments only to a vLLM process that Werk
+starts locally. It uses POSIX shell-word quoting to construct a direct process
+argument vector; it is not evaluated by a shell. Command substitution,
+environment-variable expansion, tilde expansion and globbing therefore never
+occur. Malformed quoting, a trailing unescaped backslash and non-UTF-8 values
+fail before process creation.
+
+For example, after importing or pulling a compatible model as
+`qwen3-coder`, a local launch can be configured as follows. The global backend
+option belongs before the `serve` subcommand:
+
+~~~bash
+export WERK_API_KEY="replace-with-generated-key"
+export WERK_VLLM_ARGS="--quantization compressed-tensors --kv-cache-dtype fp8 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":1}' --enable-auto-tool-choice --tool-call-parser qwen3_coder --max-num-seqs 16"
+
+werk --backend vllm serve --model qwen3-coder
+~~~
+
+The exact parser name and flags are examples for a compatible vLLM/model
+combination, not Werk defaults. Verify them against the installed vLLM version
+and the selected model. vLLM generally requires `--enable-auto-tool-choice`
+when `tool_choice` is `auto`, together with a compatible tool-call parser. Werk
+does not validate, replace or rewrite arbitrary parser names, and does not add
+that enable flag automatically.
+
+Conceptually, Werk's effective local child argv is one of these forms, with a
+resolved model directory and an internally selected loopback port:
+
+~~~text
+$WERK_VLLM_PYTHON -m vllm.entrypoints.openai.api_server --model RESOLVED_MODEL_DIR --host 127.0.0.1 --port INTERNAL_PORT --served-model-name qwen3-coder [WERK_VLLM_ARGS...]
+vllm serve RESOLVED_MODEL_DIR --host 127.0.0.1 --port INTERNAL_PORT --served-model-name qwen3-coder [WERK_VLLM_ARGS...]
+~~~
+
+Werk owns `--model`, `--host`, `--port` and `--served-model-name`. Supplying
+any of them in separate or `--flag=value` form through `WERK_VLLM_ARGS` is an
+error. Repeated non-reserved flags, JSON values, embedded spaces and quoted
+empty arguments remain distinct argv elements and retain their order.
+
+For an already running remote vLLM endpoint, configure these process arguments
+where that server is launched. A nonempty `WERK_VLLM_ARGS` is rejected when
+Werk uses `WERK_VLLM_HOST` and `WERK_VLLM_PORT`; it is never silently ignored.
+
+`POST /v1/chat/completions` supports OpenAI function-tool requests through the
+vLLM adapter, for both Werk-started and remote vLLM servers. Werk forwards the
+tool definitions, `tool_choice`, `parallel_tool_calls`, assistant tool calls and
+tool-result messages to vLLM without translating their contents. It likewise
+preserves structured tool calls in normal and streaming responses. Werk does
+not execute tools or select a vLLM tool parser for the operator.
+
+Other production chat adapters explicitly reject a request that requires tool
+calling with HTTP 400 and error code `unsupported_tool_calling`. Automatic
+routing treats tool calling as a required backend capability and cannot send
+such a request to an incompatible runtime. An explicit `--backend vllm` route
+is strict and never falls back to a non-vLLM backend. Merely setting
+`WERK_VLLM_ARGS` does not activate or prefer vLLM.
+
+These guarantees cover Werk's argv construction and HTTP transport. Actual
+tool-call quality, model support, vLLM-version compatibility, quantization,
+speculative decoding and accelerator compatibility still require a live
+runtime test before relying on a combination in production.
+
 ## Vision-language routing
 
 An image attached to `werk run`, `werk chat` or

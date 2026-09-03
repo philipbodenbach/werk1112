@@ -867,6 +867,7 @@ impl LlamaCppBackend {
         let decode_seconds = decode_started.elapsed().as_secs_f64();
         Ok(GenerateResponse {
             text,
+            assistant_message: None,
             prompt_tokens: prompt_token_count,
             completion_tokens,
             finish_reason,
@@ -964,6 +965,7 @@ impl LlamaCppChatState {
         let decode_seconds = decode_started.elapsed().as_secs_f64();
         Ok(GenerateResponse {
             text,
+            assistant_message: None,
             prompt_tokens: prompt_token_count,
             completion_tokens,
             finish_reason,
@@ -2111,6 +2113,7 @@ fn external_response(
         prompt_tokens,
         completion_tokens,
         text,
+        assistant_message: None,
         finish_reason,
         timings: GenerationTimings {
             load_seconds,
@@ -2172,6 +2175,7 @@ fn transformers_response(
         prompt_tokens,
         completion_tokens,
         text,
+        assistant_message: None,
         finish_reason,
         timings: GenerationTimings {
             load_seconds,
@@ -3402,6 +3406,7 @@ ValueError: Model type chatglm not supported."#;
             stream_granularity: StreamGranularity::Token,
             verbose: false,
             debug: false,
+            tool_config: None,
         }
     }
 

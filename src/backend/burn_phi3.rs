@@ -262,6 +262,7 @@ impl<B: Backend> Phi3Generator<B> {
 
         Ok(GenerateResponse {
             text: generated_text,
+            assistant_message: None,
             prompt_tokens,
             completion_tokens: generated.len(),
             finish_reason,

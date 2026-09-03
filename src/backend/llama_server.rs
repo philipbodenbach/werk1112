@@ -291,6 +291,7 @@ impl LlamaServerBackend {
         let completion = server.complete(&request, tx)?;
         Ok(GenerateResponse {
             text: completion.text,
+            assistant_message: None,
             prompt_tokens: completion.prompt_tokens,
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
@@ -397,6 +398,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
         let completion = self.server.complete(&request, None)?;
         Ok(GenerateResponse {
             text: completion.text,
+            assistant_message: None,
             prompt_tokens: completion.prompt_tokens,
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
@@ -422,6 +424,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                 .complete(&request, Some(tx.clone()))
                 .map(|completion| GenerateResponse {
                     text: completion.text,
+                    assistant_message: None,
                     prompt_tokens: completion.prompt_tokens,
                     completion_tokens: completion.completion_tokens,
                     finish_reason: completion.finish_reason,
@@ -3093,6 +3096,8 @@ Agent 3
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("hello".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             }],
             image_urls: Vec::new(),
             max_tokens: 32,
@@ -3103,6 +3108,7 @@ Agent 3
             stream_granularity: crate::backend::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
 
         let body = chat_completion_body(&request);
@@ -3146,6 +3152,8 @@ Agent 3
                     },
                 ])),
                 name: Some("visual-check".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             image_urls: vec![
                 "data:image/png;base64,AAAA".to_string(),
@@ -3159,6 +3167,7 @@ Agent 3
             stream_granularity: crate::backend::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
 
         let body = chat_completion_body(&request);
@@ -3194,6 +3203,7 @@ Agent 3
             stream_granularity: crate::backend::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
 
         let error = validate_llama_image_sources(&request)
@@ -3210,6 +3220,8 @@ Agent 3
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("Inspect this image".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             }],
             image_urls: vec!["https://example.test/layout.png".to_string()],
             max_tokens: 64,
@@ -3220,6 +3232,7 @@ Agent 3
             stream_granularity: crate::backend::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
 
         let messages = llama_chat_messages(&request);
@@ -3570,6 +3583,7 @@ Agent 3
             stream_granularity: crate::backend::StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
 
         finalize_completion_stats(&mut completion, &request, 0.5);

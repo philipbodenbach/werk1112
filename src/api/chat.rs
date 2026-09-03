@@ -12,7 +12,10 @@ use std::convert::Infallible;
 use tokio_stream::{StreamExt, once};
 
 use crate::{
-    backend::{GenerateRequest, GenerateResponse, GenerateStreamEvent, StreamGranularity},
+    backend::{
+        GenerateRequest, GenerateResponse, GenerateStreamEvent, GeneratedAssistantMessage,
+        StreamGranularity, ToolCallingConfig,
+    },
     capabilities::InferenceTask,
     model_store::{ModelManifest, unix_ts},
     openai::{
@@ -22,7 +25,10 @@ use crate::{
     },
 };
 
-use super::{response::api_error, state::ApiState};
+use super::{
+    response::{api_error, api_error_with_code},
+    state::ApiState,
+};
 
 const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
 
@@ -150,6 +156,20 @@ pub(super) async fn chat_completions_handler(
     }
 
     let image_urls = image_urls_from_messages(&request.messages);
+    let requires_tool_calling = request.requires_tool_calling();
+    if requires_tool_calling
+        && !state
+            .backend
+            .supports_tool_calling(&manifest, !image_urls.is_empty())
+    {
+        return api_error_with_code(
+            StatusCode::BAD_REQUEST,
+            "the configured backend does not support OpenAI tool calling; use --backend vllm"
+                .to_string(),
+            Some(tool_calling_parameter(&request).to_string()),
+            Some("unsupported_tool_calling".to_string()),
+        );
+    }
     let stream = request.stream.unwrap_or(false);
     state.log_verbose(format!(
         "[werk serve] POST /v1/chat/completions model={} stream={} messages={} images={} max_tokens={}",
@@ -171,9 +191,21 @@ pub(super) async fn chat_completions_handler(
     };
     let prompt =
         messages_to_prompt_for_model_with_template(&manifest, &request.messages, prompt_options);
-    let generation_messages = generation_messages_for_prompt(&prompt, request.messages.clone());
+    let generation_messages = if requires_tool_calling {
+        request.messages.clone()
+    } else {
+        generation_messages_for_prompt(&prompt, request.messages.clone())
+    };
     let mut stop = prompt.stop;
     stop.extend(request.stop_strings());
+    let tool_config = (request.tools.is_some()
+        || request.tool_choice.is_some()
+        || request.parallel_tool_calls.is_some())
+    .then_some(ToolCallingConfig {
+        tools: request.tools,
+        tool_choice: request.tool_choice,
+        parallel_tool_calls: request.parallel_tool_calls,
+    });
 
     let generate_request = GenerateRequest {
         prompt: prompt.prompt,
@@ -187,12 +219,25 @@ pub(super) async fn chat_completions_handler(
         stream_granularity: StreamGranularity::Chunk,
         verbose: state.verbose,
         debug: false,
+        tool_config,
     };
 
     if stream {
         stream_chat_response(state, manifest, generate_request)
     } else {
         complete_chat_response(state, manifest, generate_request).await
+    }
+}
+
+fn tool_calling_parameter(request: &ChatCompletionRequest) -> &'static str {
+    if request.tools.is_some() {
+        "tools"
+    } else if request.tool_choice.is_some() {
+        "tool_choice"
+    } else if request.parallel_tool_calls.is_some() {
+        "parallel_tool_calls"
+    } else {
+        "messages"
     }
 }
 
@@ -316,7 +361,8 @@ async fn complete_chat_response(
     // cannot account for modality. Image requests use the request-aware backend path directly;
     // persistent backends still retain their model/server and may reuse their own prefix cache.
     let has_images = !generate_request.image_urls.is_empty();
-    let chat_session = match if has_images {
+    let requires_tool_calling = generate_request.requires_tool_calling();
+    let chat_session = match if has_images || requires_tool_calling {
         Ok(None)
     } else {
         state.chat_session(&manifest, generate_request.seed)
@@ -395,7 +441,8 @@ fn stream_chat_response(
     let body_model_for_log = model.clone();
     let verbose = state.verbose;
     let has_images = !generate_request.image_urls.is_empty();
-    let body_stream = match if has_images {
+    let requires_tool_calling = generate_request.requires_tool_calling();
+    let body_stream = match if has_images || requires_tool_calling {
         Ok(None)
     } else {
         state.chat_session(&manifest, generate_request.seed)
@@ -414,6 +461,17 @@ fn stream_chat_response(
                     "choices": [{
                         "index": 0,
                         "delta": {"content": text},
+                        "finish_reason": null
+                        }]
+                    }),
+                Ok(GenerateStreamEvent::ToolCallDelta(tool_calls)) => json!({
+                    "id": body_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": body_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": tool_calls},
                         "finish_reason": null
                     }]
                 }),
@@ -512,6 +570,15 @@ fn log_backend_diagnostics(diagnostics: &[String]) {
 
 fn to_chat_completion(model: String, response: GenerateResponse) -> ChatCompletionResponse {
     let created = unix_ts();
+    let GeneratedAssistantMessage {
+        content,
+        tool_calls,
+    } = response
+        .assistant_message
+        .unwrap_or(GeneratedAssistantMessage {
+            content: Some(response.text),
+            tool_calls: None,
+        });
     ChatCompletionResponse {
         id: format!("chatcmpl-{created}"),
         object: "chat.completion",
@@ -521,7 +588,8 @@ fn to_chat_completion(model: String, response: GenerateResponse) -> ChatCompleti
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                content: response.text,
+                content,
+                tool_calls,
             },
             finish_reason: response.finish_reason,
         }],

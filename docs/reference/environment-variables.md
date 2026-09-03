@@ -104,7 +104,7 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_VLLM_HOST` + `WERK_VLLM_PORT` | Together explicitly select a remote vLLM endpoint before local discovery. Werk waits for its `/v1/models` readiness within the health timeout. |
 | `WERK_VLLM_MODEL` | Served model ID for a remote vLLM endpoint. When omitted, Werk accepts an exact Werk-model-ID match or the endpoint's only advertised model; ambiguous endpoints fail instead of guessing. |
 | `WERK_VLLM_PYTHON` | Python interpreter for a local vLLM installation. |
-| `WERK_VLLM_ARGS` | Additional whitespace-split local vLLM arguments. |
+| `WERK_VLLM_ARGS` | Additional arguments for a Werk-started local vLLM server, parsed as a POSIX shell-word list and appended to its direct process argv. |
 | `WERK_VLLM_HEALTH_TIMEOUT_SECONDS` | Positive cold-start readiness timeout for a Werk-supervised local server or explicitly configured remote endpoint. The default is 300 seconds, or 900 seconds on detected DGX Spark and AMD Strix Halo; this does not change request/inference timeouts. |
 | `WERK_VLLM_LOG` | Truthy value enables child-runtime logging. |
 | `WERK_VLLM_ACCELERATOR=rocm` or `WERK_VLLM_ROCM=1` | Declares that a remote vLLM endpoint is ROCm-backed. This does not verify the remote server. |
@@ -119,6 +119,20 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_TRANSFORMERS_PYTHON` | Python interpreter containing PyTorch and Transformers for the compatibility backend. |
 | `WERK_TRANSFORMERS_DEVICE` | Device override; `auto` chooses CUDA, then MPS, then CPU. |
 | `WERK_TRANSFORMERS_DTYPE` | `auto`, `float32`/`fp32`/`f32`, `bfloat16`/`bf16`, or `float16`/`fp16`/`f16`/`half`. |
+
+`WERK_VLLM_ARGS` is a list of arguments, not a shell command. Quoting and
+backslash escaping follow POSIX shell-word rules, including quoted empty
+arguments, but Werk never starts a shell and performs no command, environment,
+tilde or glob expansion. Repeated flags and argument order are preserved. A
+malformed list, a trailing unescaped backslash or a non-UTF-8 environment value
+fails before a vLLM process is started.
+
+Werk owns `--model`, `--host`, `--port` and `--served-model-name`; both
+`--flag value` and `--flag=value` attempts to set one of these through
+`WERK_VLLM_ARGS` are rejected. The variable applies only when Werk starts a
+local vLLM process. A nonempty value together with `WERK_VLLM_HOST` and
+`WERK_VLLM_PORT` is an error: configure launch flags on that remote server and
+leave `WERK_VLLM_ARGS` unset or empty in the Werk process.
 
 `WERK_VLLM_ARGS` can configure facilities owned by vLLM itself. Werk reports
 `runtime.state.prefix_cache` as `externally_managed` with only the

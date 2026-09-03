@@ -428,6 +428,7 @@ fn generate_with_loaded_model(
 
     Ok(GenerateResponse {
         text: generated_text,
+        assistant_message: None,
         prompt_tokens,
         completion_tokens: generated.len(),
         finish_reason,

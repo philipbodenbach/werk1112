@@ -102,10 +102,11 @@ that boundary. Werk's current remote-vLLM client does not add a vLLM API key.
 Reasoning and tool parsers are server configuration. Werk reports a diagnostic
 hint for Nemotron, but does not invent a parser because the correct parser and
 flags depend on the exact checkpoint and vLLM image. The current Werk vLLM
-adapter returns assistant `content`; it does not expose structured reasoning
-or tool-call deltas. If a request exhausts its token budget in hidden reasoning
-without assistant text, Werk reports that condition instead of returning an
-empty successful completion.
+adapter preserves OpenAI assistant tool calls and indexed tool-call deltas, but
+does not expose a separate structured-reasoning field. If a request exhausts
+its token budget in hidden reasoning without assistant content or tool calls,
+Werk reports that condition instead of returning an empty successful
+completion.
 
 ## Explicit local vLLM environment
 
