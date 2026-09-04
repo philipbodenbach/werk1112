@@ -29,7 +29,7 @@ The default destination is `$HOME/.local/bin`. Select a release or destination
 with environment variables:
 
 ```bash
-WERK_VERSION=1.4.0 \
+WERK_VERSION=1.5.0 \
 WERK_INSTALL_DIR="$HOME/bin" \
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/philipbodenbach/werk1112/main/scripts/install.sh)"
 ```
@@ -45,7 +45,7 @@ The default Windows destination is
 update before invoking the installer:
 
 ```powershell
-$env:WERK_VERSION = "1.4.0"
+$env:WERK_VERSION = "1.5.0"
 $env:WERK_INSTALL_DIR = "$HOME\bin"
 $env:WERK_ADD_TO_PATH = "1"
 irm https://raw.githubusercontent.com/philipbodenbach/werk1112/main/scripts/install.ps1 | iex
