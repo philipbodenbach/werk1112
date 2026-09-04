@@ -407,6 +407,55 @@ through `--api-key`, `WERK_API_KEY`, `--api-keys` or the default key file.
 Browser CORS is disabled by default. Add exact trusted origins with repeatable
 `--cors-origin`; wildcard and opaque `null` origins are rejected.
 
+Enable server-side persistence defaults for Werk Protocol Prefill requests:
+
+```bash
+werk serve --model chat-model --persistence
+```
+
+`--persistence` supplies `auto` retention, `prefer` reuse, no TTL and no pinning
+when a `POST /werk/v1/prefill` request omits its top-level `policy` member. It
+also supplies `allow_experimental: true` when that member is omitted. For a
+local vLLM process started by this server, it defaults vLLM's native automatic
+prefix cache on. Werk verifies that the installed vLLM help advertises the
+generated flag before starting the process. A remote vLLM endpoint remains
+externally managed and receives no generated launch argument.
+
+The defaults can be selected individually; any granular option implies
+`--persistence`:
+
+```bash
+werk serve --model chat-model \
+  --persistence-mode disk \
+  --persistence-reuse prefer \
+  --persistence-ttl-seconds 3600 \
+  --persistence-pin
+```
+
+Persistence mode is `ephemeral`, `memory`, `disk` or `auto`; reuse is
+`disabled`, `prefer` or `required`; TTL is 1 through 2592000 seconds. If the
+request contains `policy`, that complete object wins, including protocol
+defaults for fields omitted inside it. An explicitly supplied
+`allow_experimental` value also wins, including `false`.
+
+For a local vLLM launch, `--persistence-reuse disabled` defaults native prefix
+caching off. An explicit `--enable-prefix-caching` or
+`--no-enable-prefix-caching` in `WERK_VLLM_ARGS` wins over the generated
+default. These backend-native cache entries remain opaque: they are not named
+Werk state and cannot be listed, moved, persisted or pruned by Werk.
+
+Apart from that local-vLLM default, these flags affect only omitted fields on
+`/werk/v1/prefill`. They do not redirect OpenAI-compatible `/v1` or media
+requests through Prefill, add semantic output caching, or enable cross-restart
+restore. Exact model/pipeline residency is already automatic in supported
+Werk-owned in-process and resident-worker paths. Current named state/prefill
+support is experimental and limited to a functionally validated, Werk-managed
+llama-server process for the exact installed GGUF model. The backend owns the
+opaque runtime state; Werk owns its policy, lifecycle, accounting and
+compatibility checks. Inspect `werk runtime capabilities` before relying on it.
+The separate model-, pipeline-, and backend-owned reuse paths are listed in the
+[execution lifetime and reuse matrix](../concepts/runtime-persistence-and-memory.md#execution-lifetime-and-reuse-matrix).
+
 The route inventory and request contracts are documented in the
 [HTTP API reference](../api.md).
 

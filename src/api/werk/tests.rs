@@ -5,11 +5,13 @@ use crate::{
         GenerationTimings,
     },
     model_store::{ModelManifest, ModelStore},
+    runtime_control::ServerPersistenceConfig,
     werk_protocol::{
         BoxControlFuture, CapabilitiesResponse, DecodeResponse, ExpertActionResponse,
-        ExpertListResponse, MemoryStatusResponse, MemoryTierStatus, PrefillResponse, PressureLevel,
-        ProtocolLimits, ProtocolResult, PruneStatesResponse, RuntimeInfo, StateActionResponse,
-        StateListResponse, WerkControl,
+        ExpertListResponse, MemoryStatusResponse, MemoryTierStatus, PersistenceMode,
+        PersistencePolicy, PrefillResponse, PressureLevel, ProtocolLimits, ProtocolResult,
+        PruneStatesResponse, ReuseMode, RuntimeInfo, StateActionResponse, StateListResponse,
+        WerkControl,
     },
 };
 use axum::{
@@ -63,6 +65,8 @@ impl GenerationBackend for TestGenerationBackend {
 #[derive(Clone, Default)]
 struct FakeControl {
     principals: Arc<Mutex<Vec<String>>>,
+    prefill_requests: Arc<Mutex<Vec<PrefillRequest>>>,
+    decode_requests: Arc<Mutex<Vec<DecodeRequest>>>,
     info_error: Option<ProtocolError>,
 }
 
@@ -178,8 +182,12 @@ impl WerkControl for FakeControl {
     fn prefill(
         &self,
         _context: ControlContext,
-        _request: PrefillRequest,
+        request: PrefillRequest,
     ) -> BoxControlFuture<'_, PrefillResponse> {
+        self.prefill_requests
+            .lock()
+            .expect("prefill request recorder")
+            .push(request);
         ready(Err(ProtocolError::new(
             ProtocolErrorCode::Unsupported,
             "prefill is unsupported",
@@ -189,8 +197,12 @@ impl WerkControl for FakeControl {
     fn decode(
         &self,
         _context: ControlContext,
-        _request: DecodeRequest,
+        request: DecodeRequest,
     ) -> BoxControlFuture<'_, DecodeResponse> {
+        self.decode_requests
+            .lock()
+            .expect("decode request recorder")
+            .push(request);
         ready(Err(ProtocolError::new(
             ProtocolErrorCode::Unsupported,
             "decode is unsupported",
@@ -203,9 +215,18 @@ fn ready<T: Send + 'static>(result: ProtocolResult<T>) -> BoxControlFuture<'stat
 }
 
 fn app(control: FakeControl, api_keys: Vec<String>) -> Router {
+    app_with_persistence(control, api_keys, ServerPersistenceConfig::default())
+}
+
+fn app_with_persistence(
+    control: FakeControl,
+    api_keys: Vec<String>,
+    persistence: ServerPersistenceConfig,
+) -> Router {
     super::super::router::router(
         ApiState::new(test_store(), Arc::new(TestGenerationBackend))
             .with_werk_control(Arc::new(control))
+            .with_server_persistence(persistence)
             .with_api_keys(api_keys),
     )
 }
@@ -394,6 +415,173 @@ async fn all_control_routes_dispatch_and_use_typed_errors() {
     }
 }
 
+fn enabled_server_persistence() -> ServerPersistenceConfig {
+    ServerPersistenceConfig::enabled(PersistencePolicy {
+        mode: PersistenceMode::Disk,
+        reuse: ReuseMode::Required,
+        ttl_seconds: Some(900),
+        pin: true,
+    })
+}
+
+#[tokio::test]
+async fn server_persistence_defaults_only_omitted_prefill_members() {
+    let control = FakeControl::default();
+    let requests = control.prefill_requests.clone();
+    let app = app_with_persistence(control, Vec::new(), enabled_server_persistence());
+
+    let omitted = request(
+        &app,
+        Method::POST,
+        "/werk/v1/prefill",
+        Some(json!({"model_id":"model","input":{"type":"text","text":"omitted"}}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(omitted.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let explicit = request(
+        &app,
+        Method::POST,
+        "/werk/v1/prefill",
+        Some(
+            json!({
+                "model_id":"model",
+                "input":{"type":"text","text":"explicit"},
+                "policy":{"mode":"memory"},
+                "allow_experimental":false
+            })
+            .to_string(),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(explicit.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let empty_policy = request(
+        &app,
+        Method::POST,
+        "/werk/v1/prefill",
+        Some(
+            json!({
+                "model_id":"model",
+                "input":{"type":"text","text":"empty policy"},
+                "policy":{}
+            })
+            .to_string(),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(empty_policy.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let requests = requests.lock().expect("prefill request recorder");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].policy, *enabled_server_persistence().defaults());
+    assert!(requests[0].allow_experimental);
+
+    assert_eq!(requests[1].policy.mode, PersistenceMode::Memory);
+    assert_eq!(requests[1].policy.reuse, ReuseMode::Prefer);
+    assert_eq!(requests[1].policy.ttl_seconds, None);
+    assert!(!requests[1].policy.pin);
+    assert!(!requests[1].allow_experimental);
+
+    assert_eq!(requests[2].policy, PersistencePolicy::default());
+    assert!(requests[2].allow_experimental);
+}
+
+#[tokio::test]
+async fn disabled_server_persistence_preserves_protocol_prefill_defaults() {
+    let control = FakeControl::default();
+    let requests = control.prefill_requests.clone();
+    let app = app(control, Vec::new());
+
+    let response = request(
+        &app,
+        Method::POST,
+        "/werk/v1/prefill",
+        Some(json!({"model_id":"model","input":{"type":"text","text":"x"}}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let requests = requests.lock().expect("prefill request recorder");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].policy, PersistencePolicy::default());
+    assert!(!requests[0].allow_experimental);
+}
+
+#[tokio::test]
+async fn server_persistence_does_not_modify_decode_or_legacy_routes() {
+    let control = FakeControl::default();
+    let prefill_requests = control.prefill_requests.clone();
+    let decode_requests = control.decode_requests.clone();
+    let app = app_with_persistence(control, Vec::new(), enabled_server_persistence());
+
+    let decode = request(
+        &app,
+        Method::POST,
+        "/werk/v1/decode",
+        Some(
+            json!({
+                "handoff":"opaque",
+                "max_tokens":1,
+                "temperature":null,
+                "top_p":null,
+                "seed":null
+            })
+            .to_string(),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(decode.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let legacy = request(&app, Method::GET, "/v1/models", None, None).await;
+    assert_eq!(legacy.status(), StatusCode::OK);
+    assert!(
+        prefill_requests
+            .lock()
+            .expect("prefill request recorder")
+            .is_empty()
+    );
+    let decode_requests = decode_requests.lock().expect("decode request recorder");
+    assert_eq!(decode_requests.len(), 1);
+    assert!(!decode_requests[0].allow_experimental);
+}
+
+#[tokio::test]
+async fn prefill_presence_tracking_keeps_wire_validation_strict() {
+    let control = FakeControl::default();
+    let requests = control.prefill_requests.clone();
+    let app = app_with_persistence(control, Vec::new(), enabled_server_persistence());
+    let invalid_bodies = [
+        r#"{"model_id":"model","input":{"type":"text","text":"x"},"policy":null}"#,
+        r#"{"model_id":"model","input":{"type":"text","text":"x"},"allow_experimental":null}"#,
+        r#"{"model_id":"model","input":{"type":"text","text":"x"},"policy":{},"policy":{}}"#,
+        r#"{"model_id":"model","input":{"type":"text","text":"x"},"unknown":true}"#,
+    ];
+
+    for body in invalid_bodies {
+        let response = request(
+            &app,
+            Method::POST,
+            "/werk/v1/prefill",
+            Some(body.to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert!(
+        requests
+            .lock()
+            .expect("prefill request recorder")
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn authentication_derives_distinct_opaque_principals() {
     let control = FakeControl::default();
@@ -456,7 +644,6 @@ async fn oversized_and_internal_errors_are_safe_json_envelopes() {
 
     let app = app(
         FakeControl {
-            principals: Arc::default(),
             info_error: Some(
                 ProtocolError::new(
                     ProtocolErrorCode::Internal,
@@ -464,6 +651,7 @@ async fn oversized_and_internal_errors_are_safe_json_envelopes() {
                 )
                 .with_details(json!({"path":"/home/person/private"})),
             ),
+            ..FakeControl::default()
         },
         Vec::new(),
     );
@@ -481,7 +669,6 @@ async fn oversized_and_internal_errors_are_safe_json_envelopes() {
 async fn incompatible_state_exposes_only_allow_listed_mismatch_fields() {
     let valid_app = app(
         FakeControl {
-            principals: Arc::default(),
             info_error: Some(
                 ProtocolError::new(
                     ProtocolErrorCode::IncompatibleState,
@@ -491,6 +678,7 @@ async fn incompatible_state_exposes_only_allow_listed_mismatch_fields() {
                     "mismatch_fields": ["backend", "kv_dtype"]
                 })),
             ),
+            ..FakeControl::default()
         },
         Vec::new(),
     );
@@ -504,7 +692,6 @@ async fn incompatible_state_exposes_only_allow_listed_mismatch_fields() {
 
     let invalid_app = app(
         FakeControl {
-            principals: Arc::default(),
             info_error: Some(
                 ProtocolError::new(
                     ProtocolErrorCode::IncompatibleState,
@@ -514,6 +701,7 @@ async fn incompatible_state_exposes_only_allow_listed_mismatch_fields() {
                     "mismatch_fields": ["backend", "/private/path"]
                 })),
             ),
+            ..FakeControl::default()
         },
         Vec::new(),
     );

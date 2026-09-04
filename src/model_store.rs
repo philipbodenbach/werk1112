@@ -7,13 +7,14 @@ use candle_core::quantized::gguf_file::{self, Value as GgufValue};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, VecDeque},
     env,
     ffi::OsStr,
-    fs,
+    fmt, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
@@ -237,6 +238,42 @@ pub struct ModelManifest {
 impl ModelManifest {
     pub fn supports_task(&self, task: InferenceTask) -> bool {
         self.metadata.tasks.contains(&task)
+    }
+}
+
+/// Stable, opaque identity for the exact manifest backing a resident runtime.
+///
+/// File entries are canonicalized before hashing because their order in a
+/// manifest has no bearing on the model bytes. Keeping the digest opaque also
+/// prevents cache diagnostics from exposing source paths or checksums.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ModelRuntimeIdentity([u8; 32]);
+
+impl ModelRuntimeIdentity {
+    pub(crate) fn from_manifest(manifest: &ModelManifest) -> Result<Self> {
+        let mut canonical = manifest.clone();
+        canonical.files.sort_by(|left, right| {
+            (&left.path, left.size, &left.checksum).cmp(&(&right.path, right.size, &right.checksum))
+        });
+        let bytes = serde_json::to_vec(&canonical)
+            .context("failed to identify the model manifest for runtime caching")?;
+        Ok(Self(Sha256::digest(bytes).into()))
+    }
+}
+
+impl fmt::Display for ModelRuntimeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("sha256:")?;
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ModelRuntimeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ModelRuntimeIdentity(<redacted>)")
     }
 }
 
@@ -4479,6 +4516,80 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_identity_manifest() -> ModelManifest {
+        ModelManifest {
+            id: "identity-model".to_string(),
+            source: ModelSource::LocalPath {
+                path: "/private/source/model".to_string(),
+            },
+            format: ModelFormat::SafeTensors,
+            architecture: Some("qwen3".to_string()),
+            tokenizer_path: Some("tokenizer.json".to_string()),
+            config_path: Some("config.json".to_string()),
+            model_path: Some("model.safetensors".to_string()),
+            backend: "test".to_string(),
+            created_unix: 1,
+            files: vec![
+                ModelFile {
+                    path: "model.safetensors".to_string(),
+                    size: 42,
+                    checksum: "sha256:model-secret".to_string(),
+                },
+                ModelFile {
+                    path: "config.json".to_string(),
+                    size: 7,
+                    checksum: "sha256:config-secret".to_string(),
+                },
+            ],
+            artifacts: Vec::new(),
+            metadata: ModelMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn runtime_identity_is_file_order_independent_and_sensitive_to_runtime_inputs() {
+        let manifest = runtime_identity_manifest();
+        let identity = ModelRuntimeIdentity::from_manifest(&manifest).unwrap();
+
+        let mut reordered = manifest.clone();
+        reordered.files.reverse();
+        assert_eq!(
+            ModelRuntimeIdentity::from_manifest(&reordered).unwrap(),
+            identity
+        );
+
+        let mut changed_checksum = manifest.clone();
+        changed_checksum.files[0].checksum = "sha256:replacement".to_string();
+        assert_ne!(
+            ModelRuntimeIdentity::from_manifest(&changed_checksum).unwrap(),
+            identity
+        );
+
+        let mut changed_architecture = manifest.clone();
+        changed_architecture.architecture = Some("qwen2".to_string());
+        assert_ne!(
+            ModelRuntimeIdentity::from_manifest(&changed_architecture).unwrap(),
+            identity
+        );
+
+        let mut changed_path = manifest;
+        changed_path.model_path = Some("replacement.safetensors".to_string());
+        assert_ne!(
+            ModelRuntimeIdentity::from_manifest(&changed_path).unwrap(),
+            identity
+        );
+    }
+
+    #[test]
+    fn runtime_identity_debug_is_redacted() {
+        let identity = ModelRuntimeIdentity::from_manifest(&runtime_identity_manifest()).unwrap();
+        let debug = format!("{identity:?}");
+
+        assert_eq!(debug, "ModelRuntimeIdentity(<redacted>)");
+        assert!(!debug.contains("/private/source/model"));
+        assert!(!debug.contains("model-secret"));
+    }
 
     #[test]
     fn read_only_model_lookup_leaves_an_absent_store_absent() {

@@ -673,6 +673,27 @@ def test_prefill_builds_typed_policy_and_never_serializes_handoff(
     )
 
 
+def test_prefill_omits_an_unconnected_policy_for_server_defaults(
+    fake_protocol, connection
+):
+    WerkPrefillNode().prefill(
+        connection,
+        "model",
+        "text",
+        "hello",
+        "[]",
+        True,
+    )
+    assert fake_protocol.instances[-1].calls[-1] == (
+        "prefill",
+        {
+            "model_id": "model",
+            "input": {"type": "text", "text": "hello"},
+            "allow_experimental": True,
+        },
+    )
+
+
 def test_prefill_and_decode_fail_closed_on_capabilities(
     fake_protocol, connection
 ):

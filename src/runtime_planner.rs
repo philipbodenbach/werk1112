@@ -1194,8 +1194,8 @@ mod tests {
 
     #[test]
     fn explicit_burn_request_has_no_candle_fallback_candidates() {
-        let manifest = manifest(ModelFormat::SafeTensors, Some("unknown"));
-        let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Burn);
+        let supported = manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let candidates = runtime_candidate_ids(&supported, RequestedBackend::Burn);
         if cfg!(feature = "burn-cuda") && cfg!(any(windows, target_os = "linux")) {
             assert_eq!(candidates, vec![RuntimeId::BurnCuda]);
         } else if cfg!(feature = "burn-cpu") {
@@ -1203,6 +1203,9 @@ mod tests {
         } else {
             assert!(candidates.is_empty());
         }
+
+        let unsupported = manifest(ModelFormat::SafeTensors, Some("unknown"));
+        assert!(runtime_candidate_ids(&unsupported, RequestedBackend::Burn).is_empty());
     }
 
     #[test]

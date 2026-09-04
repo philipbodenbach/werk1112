@@ -7,7 +7,10 @@
 
 use super::{VllmBackend, VllmProcess};
 use crate::{
-    runtime_control::{BackendRuntimeAdapter, BackendRuntimeDescriptor, UnsupportedRuntimeAdapter},
+    runtime_control::{
+        BackendRuntimeAdapter, BackendRuntimeDescriptor, ModelResidencyStatus,
+        UnsupportedRuntimeAdapter, model_residency_capability,
+    },
     werk_protocol::{Capability, CapabilityStatus},
 };
 use std::sync::Arc;
@@ -30,10 +33,16 @@ impl BackendRuntimeAdapter for VllmRuntimeControlAdapter {
     fn descriptor(&self) -> BackendRuntimeDescriptor {
         let Ok(servers) = self.backend.servers.lock() else {
             let mut descriptor = self.fallback.descriptor();
-            descriptor.capabilities = vec![prefix_cache_capability(
-                CapabilityStatus::Unavailable,
-                "vLLM runtime metadata is unavailable because its process registry could not be read",
-            )];
+            descriptor.capabilities = vec![
+                model_residency_capability(
+                    ModelResidencyStatus::Unavailable,
+                    "vLLM model-residency metadata is unavailable because its process registry could not be read",
+                ),
+                prefix_cache_capability(
+                    CapabilityStatus::Unavailable,
+                    "vLLM runtime metadata is unavailable because its process registry could not be read",
+                ),
+            ];
             return descriptor;
         };
         let processes = servers
@@ -62,8 +71,41 @@ impl BackendRuntimeAdapter for VllmRuntimeControlAdapter {
             // No vLLM state handle is issued by this adapter. A multi-process
             // label is therefore metadata, never a portable process identity.
             instance_id: instance_id.unwrap_or_else(|| "vllm-metadata-only".to_string()),
-            capabilities: vec![prefix_cache_capability(status, detail)],
+            capabilities: vec![
+                active_model_residency_capability(&processes),
+                prefix_cache_capability(status, detail),
+            ],
         }
+    }
+}
+
+fn active_model_residency_capability(processes: &[Arc<VllmProcess>]) -> Capability {
+    if processes.is_empty() {
+        return model_residency_capability(
+            ModelResidencyStatus::Unavailable,
+            "no active vLLM process is available to verify model residency",
+        );
+    }
+
+    let local = processes
+        .iter()
+        .filter(|process| process.child.is_some())
+        .count();
+    if local == processes.len() {
+        model_residency_capability(
+            ModelResidencyStatus::Supported,
+            "Werk owns and reuses the active local vLLM model processes",
+        )
+    } else if local == 0 {
+        model_residency_capability(
+            ModelResidencyStatus::ExternallyManaged,
+            "the configured remote vLLM service owns model residency",
+        )
+    } else {
+        model_residency_capability(
+            ModelResidencyStatus::ExternallyManaged,
+            "model residency spans Werk-owned local and externally managed remote vLLM processes",
+        )
     }
 }
 
@@ -162,6 +204,7 @@ fn single_runtime_value(
 mod tests {
     use super::*;
     use crate::model_store::ModelStore;
+    use crate::runtime_control::MODEL_RESIDENCY_CAPABILITY;
     use std::{
         fs,
         path::PathBuf,
@@ -231,5 +274,13 @@ mod tests {
             .unwrap();
         assert_eq!(capability.status, CapabilityStatus::Unavailable);
         assert!(capability.operations.is_empty());
+
+        let residency = descriptor
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == MODEL_RESIDENCY_CAPABILITY)
+            .unwrap();
+        assert_eq!(residency.status, CapabilityStatus::Unavailable);
+        assert!(residency.operations.is_empty());
     }
 }

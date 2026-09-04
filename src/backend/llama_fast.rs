@@ -14,7 +14,10 @@ mod imp {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
-    use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
+    use crate::model_store::{ModelFormat, ModelManifest, ModelRuntimeIdentity, ModelStore};
+    use crate::runtime_control::{
+        BackendRuntimeAdapter, ModelResidencyStatus, StaticRuntimeAdapter,
+    };
 
     use crate::backend::{
         ChatGenerationSession, GenerateRequest, GenerateResponse, GenerateStream,
@@ -206,9 +209,9 @@ mod imp {
                 .as_deref()
                 .context("GGUF manifest has no model_path")?;
             let params = session_params(self.mode, None, &self.runtime_options);
+            let model_identity = ModelRuntimeIdentity::from_manifest(manifest)?;
             let cache_key = format!(
-                "{}:{model_path}:{}:gpu_layers={}:main_gpu={}",
-                manifest.id,
+                "{model_identity}:{}:gpu_layers={}:main_gpu={}",
                 label(self.mode),
                 params.gpu_layers,
                 params.main_gpu
@@ -289,6 +292,28 @@ mod imp {
     }
 
     impl GenerationBackend for LlamaFastBackend {
+        fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
+            let (status, detail) = if compiled(self.mode) {
+                (
+                    ModelResidencyStatus::Supported,
+                    format!(
+                        "Werk keeps exact llama.cpp legacy {} model weights resident in its in-process cache",
+                        display_name(self.mode)
+                    ),
+                )
+            } else {
+                (
+                    ModelResidencyStatus::Unavailable,
+                    unavailable_message(self.mode),
+                )
+            };
+            Arc::new(
+                StaticRuntimeAdapter::new(label(self.mode))
+                    .with_accelerator_family(display_name(self.mode).to_ascii_lowercase())
+                    .with_model_residency(status, detail),
+            )
+        }
+
         fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
             self.cached_model(manifest).map(|_| ())
         }
@@ -1235,12 +1260,16 @@ mod imp {
 #[cfg(not(feature = "llama-fast"))]
 mod imp {
     use anyhow::{Result, bail};
+    use std::sync::Arc;
 
     use crate::backend::{
         GenerateRequest, GenerateResponse, GenerateStream, GenerationBackend, LlamaCppMode,
         LlamaRuntimeOptions,
     };
     use crate::model_store::{ModelManifest, ModelStore};
+    use crate::runtime_control::{
+        BackendRuntimeAdapter, ModelResidencyStatus, StaticRuntimeAdapter,
+    };
 
     #[derive(Clone)]
     pub struct LlamaFastBackend {
@@ -1326,6 +1355,17 @@ mod imp {
     }
 
     impl GenerationBackend for LlamaFastBackend {
+        fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
+            Arc::new(
+                StaticRuntimeAdapter::new(unavailable_backend_label(self.mode))
+                    .with_accelerator_family(unavailable_accelerator(self.mode))
+                    .with_model_residency(
+                        ModelResidencyStatus::Unavailable,
+                        unavailable_message(self.mode),
+                    ),
+            )
+        }
+
         fn generate(
             &self,
             _manifest: &ModelManifest,
@@ -1362,6 +1402,26 @@ mod imp {
             LlamaCppMode::Cpu => {
                 "llama.cpp legacy FFI CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()
             }
+        }
+    }
+
+    fn unavailable_backend_label(mode: LlamaCppMode) -> &'static str {
+        match mode {
+            LlamaCppMode::Cuda => "llama-legacy-cuda",
+            LlamaCppMode::Rocm => "llama-legacy-rocm",
+            LlamaCppMode::Vulkan => "llama-legacy-vulkan",
+            LlamaCppMode::Metal => "llama-legacy-metal",
+            LlamaCppMode::Cpu => "llama-legacy-cpu",
+        }
+    }
+
+    fn unavailable_accelerator(mode: LlamaCppMode) -> &'static str {
+        match mode {
+            LlamaCppMode::Cuda => "cuda",
+            LlamaCppMode::Rocm => "rocm",
+            LlamaCppMode::Vulkan => "vulkan",
+            LlamaCppMode::Metal => "metal",
+            LlamaCppMode::Cpu => "cpu",
         }
     }
 }

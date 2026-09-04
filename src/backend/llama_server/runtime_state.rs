@@ -10,12 +10,12 @@ use super::{
 };
 use crate::{
     backend::{LlamaCppMode, LlamaRuntimeOptions},
-    model_store::{ModelFormat, ModelManifest, ModelStore},
+    model_store::{ModelFormat, ModelManifest, ModelRuntimeIdentity, ModelStore},
     runtime_control::{
         BackendDecodeOptions, BackendDecodeRequest, BackendDecodeResult,
         BackendPersistedStateResolution, BackendPersistedStateScope, BackendPrefillRequest,
         BackendPrefillResult, BackendRuntimeAdapter, BackendRuntimeDescriptor, BackendSnapshot,
-        BackendState, validate_compatibility,
+        BackendState, ModelResidencyStatus, model_residency_capability, validate_compatibility,
     },
     werk_protocol::{
         Capability, CapabilityStatus, CompatibilityEnvelope, ContextCompatibility, PersistenceMode,
@@ -168,6 +168,9 @@ impl LlamaRuntimeStateAdapter {
                 "llama.cpp runtime state is available only for GGUF models",
             ));
         }
+        let model_identity = ModelRuntimeIdentity::from_manifest(manifest).map_err(|_| {
+            protocol_internal("llama.cpp runtime could not identify the requested model manifest")
+        })?;
         let servers = self
             .backend
             .servers
@@ -175,7 +178,7 @@ impl LlamaRuntimeStateAdapter {
             .map_err(|_| protocol_internal("llama.cpp runtime registry is unavailable"))?;
         let mut candidates = servers
             .values()
-            .filter(|server| server.model_id == manifest.id)
+            .filter(|server| server.model_identity == model_identity)
             .cloned()
             .collect::<Vec<_>>();
         drop(servers);
@@ -312,7 +315,11 @@ impl BackendRuntimeAdapter for LlamaRuntimeStateAdapter {
             adapter_version: env!("CARGO_PKG_VERSION").to_string(),
             accelerator_family: llama_accelerator_family(self.backend.mode).to_string(),
             instance_id,
-            capabilities: llama_state_capabilities(true, ""),
+            capabilities: llama_runtime_capabilities(
+                llama_state_capabilities(true, ""),
+                ModelResidencyStatus::Supported,
+                "Werk keeps this exact llama.cpp model process resident and enables automatic prompt-cache reuse",
+            ),
         }
     }
 
@@ -867,6 +874,16 @@ fn unavailable_llama_descriptor(
     instance_id: String,
     reason: &str,
 ) -> BackendRuntimeDescriptor {
+    let residency_status = if identity.is_some() {
+        ModelResidencyStatus::Supported
+    } else {
+        ModelResidencyStatus::Unavailable
+    };
+    let residency_detail = if identity.is_some() {
+        "Werk can keep an exact llama.cpp model process resident; named state remains unavailable until the running process passes functional validation"
+    } else {
+        "llama.cpp model residency is unavailable because no compatible managed runtime was discovered"
+    };
     BackendRuntimeDescriptor {
         backend: label(mode).to_string(),
         backend_version: identity
@@ -875,8 +892,24 @@ fn unavailable_llama_descriptor(
         adapter_version: env!("CARGO_PKG_VERSION").to_string(),
         accelerator_family: llama_accelerator_family(mode).to_string(),
         instance_id,
-        capabilities: llama_state_capabilities(false, reason),
+        capabilities: llama_runtime_capabilities(
+            llama_state_capabilities(false, reason),
+            residency_status,
+            residency_detail,
+        ),
     }
+}
+
+fn llama_runtime_capabilities(
+    mut capabilities: Vec<Capability>,
+    residency_status: ModelResidencyStatus,
+    residency_detail: &str,
+) -> Vec<Capability> {
+    capabilities.push(model_residency_capability(
+        residency_status,
+        residency_detail,
+    ));
+    capabilities
 }
 
 fn llama_state_capabilities(validated: bool, unavailable_reason: &str) -> Vec<Capability> {
@@ -2152,6 +2185,7 @@ fn last_toggle_value(args: &[String], positive: &str, negative: &str, default: b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_store::{ModelMetadata, ModelSource};
     use crate::werk_protocol::ProtocolMessage;
     use std::{
         collections::VecDeque,
@@ -2938,11 +2972,28 @@ mod tests {
         Ok(filename)
     }
 
+    const TEST_PROCESS_CHILD_ENV: &str = "WERK_INTERNAL_LLAMA_TEST_PROCESS_CHILD";
+    const TEST_PROCESS_CHILD_NAME: &str =
+        "backend::llama_server::runtime_state::tests::test_process_child_waits_for_parent_stdin";
+
+    #[test]
+    fn test_process_child_waits_for_parent_stdin() {
+        if std::env::var_os(TEST_PROCESS_CHILD_ENV).is_none() {
+            return;
+        }
+        let mut input = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut input)
+            .expect("test process child reads parent stdin");
+    }
+
     fn test_process(url: String, snapshot_dir: PathBuf) -> LlamaServerProcess {
         let executable = std::env::current_exe().unwrap();
         let child = Command::new(&executable)
-            .arg("--list")
-            .stdin(Stdio::null())
+            .arg(TEST_PROCESS_CHILD_NAME)
+            .arg("--exact")
+            .env(TEST_PROCESS_CHILD_ENV, "1")
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -2955,6 +3006,23 @@ mod tests {
             model_path: PathBuf::from("model.gguf"),
             projector_path: None,
             model_id: "test-model".to_string(),
+            model_identity: ModelRuntimeIdentity::from_manifest(&ModelManifest {
+                id: "test-model".to_string(),
+                source: ModelSource::LocalPath {
+                    path: "test".to_string(),
+                },
+                format: ModelFormat::Gguf,
+                architecture: Some("llama".to_string()),
+                tokenizer_path: None,
+                config_path: None,
+                model_path: Some("model.gguf".to_string()),
+                backend: "llama-server".to_string(),
+                created_unix: 1,
+                files: Vec::new(),
+                artifacts: Vec::new(),
+                metadata: ModelMetadata::default(),
+            })
+            .unwrap(),
             url,
             pid: std::process::id(),
             mode: LlamaCppMode::Cpu,

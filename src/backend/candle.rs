@@ -32,13 +32,16 @@ use super::{
     GenerateRequest, GenerateResponse, GenerateStream, GenerateStreamEvent, GenerationBackend,
     GenerationTimings, StreamGranularity,
 };
-use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
+use crate::{
+    model_store::{ModelFormat, ModelManifest, ModelRuntimeIdentity, ModelStore},
+    runtime_control::{BackendRuntimeAdapter, ModelResidencyStatus, StaticRuntimeAdapter},
+};
 
 #[derive(Clone)]
 pub struct CandleBackend {
     store: ModelStore,
     device: Device,
-    cache: Arc<Mutex<HashMap<String, Arc<Mutex<CachedModel>>>>>,
+    cache: Arc<Mutex<HashMap<ModelRuntimeIdentity, Arc<Mutex<CachedModel>>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +77,7 @@ impl CandleBackend {
     }
 
     fn cached_model(&self, manifest: &ModelManifest) -> Result<(Arc<Mutex<CachedModel>>, f64)> {
-        let cache_key = cache_key(manifest);
+        let cache_key = ModelRuntimeIdentity::from_manifest(manifest)?;
         if let Some(cached) = self
             .cache
             .lock()
@@ -111,6 +114,21 @@ pub fn probe_device(mode: CandleDeviceMode) -> Result<String> {
 }
 
 impl GenerationBackend for CandleBackend {
+    fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
+        Arc::new(
+            StaticRuntimeAdapter::new(
+                candle_backend_name(&self.device)
+                    .to_ascii_lowercase()
+                    .replace(' ', "-"),
+            )
+            .with_accelerator_family(candle_accelerator_family(&self.device))
+            .with_model_residency(
+                ModelResidencyStatus::Supported,
+                "Werk keeps exact Candle model weights resident in its in-process cache",
+            ),
+        )
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.cached_model(manifest).map(|_| ())
     }
@@ -196,6 +214,14 @@ fn candle_backend_name(device: &Device) -> &'static str {
     }
 }
 
+fn candle_accelerator_family(device: &Device) -> &'static str {
+    match device {
+        Device::Cpu => "cpu",
+        Device::Cuda(_) => "cuda",
+        Device::Metal(_) => "metal",
+    }
+}
+
 type TokenCallback = Box<dyn FnMut(String) + Send>;
 
 fn generate_with_candle(
@@ -227,17 +253,6 @@ fn generate_with_candle(
     response.timings.load_seconds = load_seconds;
     response.timings.total_seconds = started.elapsed().as_secs_f64();
     Ok(response)
-}
-
-fn cache_key(manifest: &ModelManifest) -> String {
-    format!(
-        "{}:{:?}:{}:{}:{}",
-        manifest.id,
-        manifest.format,
-        manifest.model_path.as_deref().unwrap_or_default(),
-        manifest.tokenizer_path.as_deref().unwrap_or_default(),
-        manifest.config_path.as_deref().unwrap_or_default()
-    )
 }
 
 fn load_tokenizer(store: &ModelStore, manifest: &ModelManifest) -> Result<Tokenizer> {
@@ -1217,6 +1232,31 @@ fn should_flush_chunk(buffer: &str, latest_piece: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{runtime_control::MODEL_RESIDENCY_CAPABILITY, werk_protocol::CapabilityStatus};
+
+    #[test]
+    fn cpu_backend_reports_model_residency_without_named_state() {
+        let store = ModelStore::resolve(Some(
+            std::env::temp_dir().join(format!("werk-candle-residency-{}", std::process::id())),
+        ))
+        .unwrap();
+        let backend = CandleBackend::new_with_device(store, CandleDeviceMode::Cpu).unwrap();
+        let descriptor = backend.runtime_control_adapter().descriptor();
+        let residency = descriptor
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == MODEL_RESIDENCY_CAPABILITY)
+            .unwrap();
+
+        assert_eq!(residency.status, CapabilityStatus::Supported);
+        assert_eq!(residency.operations, ["automatic_reuse"]);
+        assert!(
+            descriptor
+                .capabilities
+                .iter()
+                .all(|capability| !capability.id.starts_with("runtime.state."))
+        );
+    }
 
     #[test]
     fn stop_guard_holds_partial_stop_prefix() {

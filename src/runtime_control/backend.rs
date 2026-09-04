@@ -11,6 +11,8 @@ const MAX_COMPATIBILITY_FIELD_BYTES: usize = 512;
 const MAX_COMPATIBILITY_MULTIMODAL_PROCESSORS: usize = 64;
 const MAX_BACKEND_CAPABILITIES: usize = 256;
 const MAX_CAPABILITY_OPERATIONS: usize = 64;
+pub const MODEL_RESIDENCY_CAPABILITY: &str = "runtime.model_residency";
+pub const AUTOMATIC_REUSE_OPERATION: &str = "automatic_reuse";
 // JSON can escape one input byte as six output bytes. Keeping the
 // conservative serialized upper bound below 4 MiB leaves ample room for the
 // protocol envelope and derived control-plane capabilities under the 8-MiB
@@ -27,6 +29,111 @@ pub struct BackendRuntimeDescriptor {
     /// handles are valid only while this exact instance remains alive.
     pub instance_id: String,
     pub capabilities: Vec<Capability>,
+}
+
+/// Truthful ownership status for automatic model or pipeline reuse.
+///
+/// Residency is deliberately separate from named prefix/KV state. Declaring
+/// it never enables prefill, decode, snapshots, restore, or state movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelResidencyStatus {
+    Supported,
+    ExternallyManaged,
+    Unavailable,
+    Unsupported,
+}
+
+impl ModelResidencyStatus {
+    fn capability_status(self) -> CapabilityStatus {
+        match self {
+            Self::Supported => CapabilityStatus::Supported,
+            Self::ExternallyManaged => CapabilityStatus::ExternallyManaged,
+            Self::Unavailable => CapabilityStatus::Unavailable,
+            Self::Unsupported => CapabilityStatus::Unsupported,
+        }
+    }
+
+    fn has_automatic_reuse(self) -> bool {
+        matches!(self, Self::Supported | Self::ExternallyManaged)
+    }
+}
+
+/// Builds the standard model-residency capability without implying any
+/// backend-owned prefix/KV-state operations.
+pub fn model_residency_capability(
+    status: ModelResidencyStatus,
+    detail: impl Into<String>,
+) -> Capability {
+    Capability {
+        id: MODEL_RESIDENCY_CAPABILITY.to_string(),
+        status: status.capability_status(),
+        detail: detail.into(),
+        operations: status
+            .has_automatic_reuse()
+            .then(|| vec![AUTOMATIC_REUSE_OPERATION.to_string()])
+            .unwrap_or_default(),
+    }
+}
+
+/// Static runtime metadata for backends that can describe residency but do
+/// not expose named runtime state.
+///
+/// The default descriptor is fail-closed. Callers opt into an exact residency
+/// status explicitly; all prefix/KV adapter methods retain their unsupported
+/// defaults.
+#[derive(Debug, Clone)]
+pub struct StaticRuntimeAdapter {
+    descriptor: BackendRuntimeDescriptor,
+}
+
+impl StaticRuntimeAdapter {
+    pub fn new(backend: impl Into<String>) -> Self {
+        Self {
+            descriptor: BackendRuntimeDescriptor {
+                backend: backend.into(),
+                backend_version: "unknown".to_string(),
+                adapter_version: env!("CARGO_PKG_VERSION").to_string(),
+                accelerator_family: "unknown".to_string(),
+                instance_id: "metadata-only".to_string(),
+                capabilities: Vec::new(),
+            },
+        }
+    }
+
+    pub fn with_backend_version(mut self, backend_version: impl Into<String>) -> Self {
+        self.descriptor.backend_version = backend_version.into();
+        self
+    }
+
+    pub fn with_accelerator_family(mut self, accelerator_family: impl Into<String>) -> Self {
+        self.descriptor.accelerator_family = accelerator_family.into();
+        self
+    }
+
+    pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.descriptor.instance_id = instance_id.into();
+        self
+    }
+
+    pub fn with_model_residency(
+        mut self,
+        status: ModelResidencyStatus,
+        detail: impl Into<String>,
+    ) -> Self {
+        self.descriptor
+            .capabilities
+            .retain(|capability| capability.id != MODEL_RESIDENCY_CAPABILITY);
+        self.descriptor
+            .capabilities
+            .push(model_residency_capability(status, detail));
+        self
+    }
+}
+
+impl BackendRuntimeAdapter for StaticRuntimeAdapter {
+    fn descriptor(&self) -> BackendRuntimeDescriptor {
+        self.descriptor.clone()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1279,4 +1386,125 @@ fn invalid_descriptor() -> ProtocolError {
         ProtocolErrorCode::Internal,
         "backend returned an invalid or ambiguous runtime descriptor",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_residency_statuses_are_exact_and_do_not_declare_state_operations() {
+        let cases = [
+            (
+                ModelResidencyStatus::Supported,
+                CapabilityStatus::Supported,
+                true,
+            ),
+            (
+                ModelResidencyStatus::ExternallyManaged,
+                CapabilityStatus::ExternallyManaged,
+                true,
+            ),
+            (
+                ModelResidencyStatus::Unavailable,
+                CapabilityStatus::Unavailable,
+                false,
+            ),
+            (
+                ModelResidencyStatus::Unsupported,
+                CapabilityStatus::Unsupported,
+                false,
+            ),
+        ];
+
+        for (residency, expected_status, operational) in cases {
+            let capability = model_residency_capability(residency, "exact test status");
+            assert_eq!(capability.id, MODEL_RESIDENCY_CAPABILITY);
+            assert_eq!(capability.status, expected_status);
+            assert_eq!(
+                capability.operations,
+                operational
+                    .then(|| vec![AUTOMATIC_REUSE_OPERATION.to_string()])
+                    .unwrap_or_default()
+            );
+            assert!(!capability.id.starts_with("runtime.state."));
+        }
+    }
+
+    #[test]
+    fn static_runtime_adapter_is_fail_closed_except_for_explicit_residency() {
+        let adapter = StaticRuntimeAdapter::new("precise-backend")
+            .with_backend_version("runtime-1")
+            .with_accelerator_family("cpu")
+            .with_instance_id("process-1")
+            .with_model_residency(
+                ModelResidencyStatus::Supported,
+                "model weights remain in this Werk-owned process",
+            );
+        let descriptor = adapter.descriptor();
+
+        assert_eq!(descriptor.backend, "precise-backend");
+        assert_eq!(descriptor.backend_version, "runtime-1");
+        assert_eq!(descriptor.accelerator_family, "cpu");
+        assert_eq!(descriptor.instance_id, "process-1");
+        assert_eq!(descriptor.capabilities.len(), 1);
+        assert_eq!(
+            descriptor.capabilities[0],
+            model_residency_capability(
+                ModelResidencyStatus::Supported,
+                "model weights remain in this Werk-owned process",
+            )
+        );
+        assert!(
+            adapter
+                .prefill(BackendPrefillRequest {
+                    model_id: "model".to_string(),
+                    input: PrefillInput::Text {
+                        text: "not retained".to_string(),
+                    },
+                    compatibility: CompatibilityEnvelope {
+                        model_fingerprint: "model".to_string(),
+                        tokenizer_fingerprint: "tokenizer".to_string(),
+                        prompt_fingerprint: "prompt".to_string(),
+                        chat_template_fingerprint: None,
+                        backend: "precise-backend".to_string(),
+                        backend_version: "runtime-1".to_string(),
+                        runtime_adapter_version: env!("CARGO_PKG_VERSION").to_string(),
+                        accelerator_family: "cpu".to_string(),
+                        tensor_dtype: "f32".to_string(),
+                        kv_dtype: "f32".to_string(),
+                        quantization: "none".to_string(),
+                        cache_layout: "none".to_string(),
+                        block_size: None,
+                        context: crate::werk_protocol::ContextCompatibility {
+                            context_size: 1,
+                            batch_size: None,
+                            rope_configuration_fingerprint: None,
+                        },
+                        multimodal_processor_fingerprints: Vec::new(),
+                        producer_protocol: crate::werk_protocol::ProtocolVersion::V1,
+                    },
+                    policy: PersistencePolicy::default(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn replacing_static_residency_status_does_not_duplicate_capabilities() {
+        let descriptor = StaticRuntimeAdapter::new("backend")
+            .with_model_residency(ModelResidencyStatus::Unavailable, "not started")
+            .with_model_residency(ModelResidencyStatus::ExternallyManaged, "remote-owned")
+            .descriptor();
+
+        assert_eq!(descriptor.capabilities.len(), 1);
+        assert_eq!(
+            descriptor.capabilities[0].status,
+            CapabilityStatus::ExternallyManaged
+        );
+        assert_eq!(
+            descriptor.capabilities[0].operations,
+            vec![AUTOMATIC_REUSE_OPERATION.to_string()]
+        );
+    }
 }

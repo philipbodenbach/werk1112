@@ -849,8 +849,7 @@ class WerkPrefillNode:
             input_payload = {"type": "messages", "messages": _parse_messages(messages_json)}
         else:
             raise ValueError("input_type has an unknown value")
-        selected_policy = policy or WerkPersistencePolicy()
-        if not isinstance(selected_policy, WerkPersistencePolicy):
+        if policy is not None and not isinstance(policy, WerkPersistencePolicy):
             raise TypeError("policy must be a WERK_PERSISTENCE_POLICY")
         client = _client(connection)
         capabilities = _capabilities(client)
@@ -866,14 +865,17 @@ class WerkPrefillNode:
             allow_experimental=bool(allow_experimental),
             allow_unavailable_probe=True,
         )
-        response = client.prefill(
-            {
-                "model_id": model,
-                "input": input_payload,
-                "policy": selected_policy.payload(),
-                "allow_experimental": bool(allow_experimental),
-            }
-        )
+        request = {
+            "model_id": model,
+            "input": input_payload,
+            "allow_experimental": bool(allow_experimental),
+        }
+        # An unconnected policy deliberately stays absent on the wire. This
+        # preserves the protocol defaults on older servers while allowing an
+        # explicitly configured Werk server to supply its own prefill policy.
+        if policy is not None:
+            request["policy"] = policy.payload()
+        response = client.prefill(request)
         handoff = WerkStateHandoff(response["handoff"])
         metadata = {
             key: response[key]

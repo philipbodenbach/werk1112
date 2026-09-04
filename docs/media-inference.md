@@ -453,28 +453,51 @@ a versioned JSON process protocol with:
 health  capabilities  probe-model  estimate  execute
 ```
 
-Under `werk serve`, media execution runs through one persistent, serialized
-worker. Lightweight health, model-probe, and estimate preflights use independent
-one-shot calls so concurrent requests do not fail behind a long generation.
-The worker performs lazy, local-only Diffusers/Transformers execution and
-caches one configured media model by default. Diffusers image/video/audio
-pipelines and Transformers audio pipelines or processor/model pairs share this
-same bound. The first compatible request is cold; subsequent requests with the
-same model and runtime configuration are warm. Prompt, seed, size, steps, and
-count are request-local and do not invalidate the cache. Model, task adapter,
-device, dtype, offload/tiling configuration, and LoRA changes may select a
-different entry and therefore cause a cold load. At the default cache size, the
-existing entry is evicted before a replacement is loaded.
+Under `werk serve`, generic media execution runs through one persistent,
+serialized worker. Managed Qwen3-TTS execution uses a second, separate resident
+worker so the generic and Qwen Python environments never share interpreter or
+model state. Lightweight health, model-probe, and estimate preflights use
+independent one-shot calls so concurrent requests do not fail behind a long
+generation. Werk retains bounded positive probe and estimate results in the
+Rust server process; an unavailable result or error is retried rather than
+being frozen in that cache. Preflight entries contain no model weights,
+pipeline state or generated output.
+
+Each execution worker performs lazy, local-only loading and owns its own bounded
+LRU. The generic worker's Diffusers image/video/audio pipelines and
+Transformers audio pipelines or processor/model pairs share one LRU; the Qwen
+worker has a separate Qwen model LRU. The first compatible request is cold;
+subsequent requests with the same model and runtime configuration are warm.
+Prompt, seed, size, steps, and count are request-local and do not invalidate the
+cache. Model, task adapter, device, dtype, offload/tiling configuration, and
+LoRA changes may select a different entry and therefore cause a cold load. At
+the default cache size, the existing entry in that worker is evicted before a
+replacement is loaded.
 
 `WERK_MEDIA_PIPELINE_CACHE_SIZE` controls the maximum number of resident
-media entries and defaults to `1`; `0` disables the model cache while the
-worker can remain persistent. Cached models retain VRAM and/or host RAM
-until eviction or server shutdown. Execution metadata exposes
+entries in each worker and defaults to `1` per worker; `0` disables both model
+caches while the workers can remain persistent. Running generic media and Qwen
+can therefore retain up to the configured count in each independent process.
+Cached models retain VRAM and/or host RAM until eviction or server shutdown.
+Execution metadata exposes
 `model_cache_hit` and `model_load_seconds` for warm/cold diagnostics. A worker
 crash or request timeout discards the process and cache, and the next request
 starts cold. The resident transport never replays the same `execute` frame;
 Werk's higher-level fallback policy may still try another accepted runtime
 candidate.
+
+This residency is active independently of `werk serve --persistence`. That
+flag supplies defaults for missing fields on Werk Protocol Prefill and,
+separately, the native APC default when Werk starts a local vLLM process. It
+does not turn media caches on, off or into named runtime state; remote vLLM is
+not configured by that flag.
+
+Do not infer the same execution lifetime for unrelated text/vision backends.
+The Werk-owned ONNX GenAI CPU fallback and Transformers worker have their own
+bounded model LRUs, while an opaque external ONNX runner and MLX/MLX-VLM
+commands remain one-shot. Their model-residency status never grants the named
+Prefill-state operations, which currently require a functionally validated
+managed llama-server process.
 
 The companion sets Hugging Face offline variables and passes
 `local_files_only=True`; it never installs a package or downloads model
@@ -594,8 +617,11 @@ default. `WERK_API_BODY_LIMIT_BYTES` can set a positive upload limit up to
 512 MiB for trusted deployments. Local-path inputs avoid Base64 expansion when
 the Werk server and selected runtime can read the same filesystem.
 
-Persisted states are `queued`, `loading`, `running`, `encoding`, `completed`,
-`failed`, and `cancelled`. `/v1/audio/speech` returns audio bytes directly;
+Persisted job states are `queued`, `loading`, `running`, `encoding`, `completed`,
+`failed`, and `cancelled`. These records preserve request lifecycle and result
+metadata; they do not persist a loaded model/pipeline or make an interrupted
+generation resumable. A nonterminal job found after restart is marked failed.
+`/v1/audio/speech` returns audio bytes directly;
 image endpoints default to self-contained Base64 JSON, transcription embeds its
 text, and an explicit URL response returns Werk metadata plus authenticated
 `/v1/outputs/{id}` URLs.

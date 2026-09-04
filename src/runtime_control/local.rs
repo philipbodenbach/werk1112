@@ -367,6 +367,7 @@ fn capabilities_for_descriptor(
     validate_runtime_descriptor(&descriptor)?;
     let mut capabilities = BTreeMap::<String, Capability>::new();
     let unsupported = [
+        "runtime.model_residency",
         "runtime.state.prefix_cache",
         "runtime.state.persistence",
         "runtime.state.restore",
@@ -460,17 +461,6 @@ fn capabilities_for_descriptor(
         },
     };
     capabilities.insert("runtime.memory.reservations".to_string(), reservations);
-    capabilities.insert(
-        "runtime.model_residency".to_string(),
-        Capability {
-            id: "runtime.model_residency".to_string(),
-            status: CapabilityStatus::MetadataOnly,
-            detail:
-                "Werk can report backend process reuse but does not expose it as prefix/KV state"
-                    .to_string(),
-            operations: vec!["read".to_string()],
-        },
-    );
     Ok(capabilities.into_values().collect())
 }
 
@@ -3308,8 +3298,9 @@ mod tests {
     use crate::{
         model_store::{ModelFormat, ModelManifest, ModelMetadata, ModelSource},
         runtime_control::{
-            BackendDecodeResult, BackendPersistedStateResolution, BackendPersistedStateScope,
-            BackendPrefillResult, BackendRuntimeDescriptor,
+            AUTOMATIC_REUSE_OPERATION, BackendDecodeResult, BackendPersistedStateResolution,
+            BackendPersistedStateScope, BackendPrefillResult, BackendRuntimeDescriptor,
+            MODEL_RESIDENCY_CAPABILITY, ModelResidencyStatus, StaticRuntimeAdapter,
         },
         werk_protocol::{CompatibilityEnvelope, ContextCompatibility, ProtocolMessage},
     };
@@ -4069,6 +4060,52 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn backend_model_residency_overrides_fallback_without_enabling_state_operations() {
+        let test = TestControl::new(Arc::new(
+            StaticRuntimeAdapter::new("resident-test-backend").with_model_residency(
+                ModelResidencyStatus::Supported,
+                "the backend keeps the model loaded between requests",
+            ),
+        ));
+
+        let capabilities = capabilities_for(&test.control.inner).unwrap();
+        let residency = capabilities
+            .iter()
+            .find(|capability| capability.id == MODEL_RESIDENCY_CAPABILITY)
+            .unwrap();
+        assert_eq!(residency.status, CapabilityStatus::Supported);
+        assert_eq!(
+            residency.operations,
+            vec![AUTOMATIC_REUSE_OPERATION.to_string()]
+        );
+
+        let state_capabilities = capabilities
+            .iter()
+            .filter(|capability| capability.id.starts_with("runtime.state."))
+            .collect::<Vec<_>>();
+        assert!(!state_capabilities.is_empty());
+        assert!(state_capabilities.iter().all(|capability| {
+            capability.status == CapabilityStatus::Unsupported && capability.operations.is_empty()
+        }));
+    }
+
+    #[test]
+    fn missing_backend_model_residency_is_fail_closed() {
+        let test = TestControl::new(Arc::new(StaticRuntimeAdapter::new(
+            "non-resident-test-backend",
+        )));
+
+        let capabilities = capabilities_for(&test.control.inner).unwrap();
+        let residency = capabilities
+            .iter()
+            .find(|capability| capability.id == MODEL_RESIDENCY_CAPABILITY)
+            .unwrap();
+        assert_eq!(residency.status, CapabilityStatus::Unsupported);
+        assert!(residency.operations.is_empty());
+        assert!(residency.detail.contains("non-resident-test-backend"));
     }
 
     fn prefill(policy: PersistenceMode) -> PrefillRequest {

@@ -25,7 +25,7 @@ use super::{
 use crate::{
     capabilities::InferenceTask,
     inference::{TaskReadiness, TaskReadinessStatus},
-    model_store::{ModelFormat, ModelManifest, ModelStore},
+    model_store::{ModelFormat, ModelManifest, ModelRuntimeIdentity, ModelStore},
     openai::{ChatCompletionToolCall, ChatCompletionToolCallDelta},
     runtime_control::BackendRuntimeAdapter,
 };
@@ -62,6 +62,7 @@ const LINUX_ARM64_MANAGED_VLLM_MESSAGE: &str = "Linux aarch64 detected without a
 pub struct VllmBackend {
     store: ModelStore,
     accelerator: VllmAccelerator,
+    automatic_prefix_caching: Option<bool>,
     servers: Arc<Mutex<HashMap<String, Arc<VllmProcess>>>>,
     #[cfg(test)]
     test_server: Option<Arc<VllmProcess>>,
@@ -238,10 +239,16 @@ impl VllmBackend {
         Self {
             store,
             accelerator,
+            automatic_prefix_caching: None,
             servers: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_server: None,
         }
+    }
+
+    pub(crate) fn with_automatic_prefix_caching(mut self, enabled: Option<bool>) -> Self {
+        self.automatic_prefix_caching = enabled;
+        self
     }
 
     #[cfg(test)]
@@ -270,6 +277,7 @@ impl VllmBackend {
         Self {
             store,
             accelerator: VllmAccelerator::Cuda,
+            automatic_prefix_caching: None,
             servers: Arc::new(Mutex::new(HashMap::new())),
             test_server: Some(Arc::new(server)),
         }
@@ -387,13 +395,19 @@ impl VllmBackend {
         if let Some(command) = discovery.command.as_ref() {
             validate_vllm_args_target(command, &configured_args)?;
         }
+        let configured_args = effective_vllm_args_for_target(
+            configured_args,
+            discovery.command.as_ref(),
+            self.automatic_prefix_caching,
+        );
         // A remote vLLM server owns and loads its weights. The installed Werk
         // manifest is still required for routing, but its local repository may
         // intentionally contain metadata only (common when Werk runs beside a
         // Spark container).
         let model_dir = resolve_vllm_model_dir_for_discovery(&self.store, manifest, &discovery)?;
+        let model_identity = ModelRuntimeIdentity::from_manifest(manifest)?;
         let key = vllm_server_cache_key(
-            &manifest.id,
+            &model_identity,
             &model_dir,
             &discovery,
             &VllmCacheEnvironment::current(&configured_args),
@@ -677,6 +691,7 @@ impl VllmProcess {
         }
 
         eprintln!("Using vLLM {} backend", accelerator.display_name());
+        validate_werk_managed_prefix_caching_arg(&command, &configured_args)?;
         let runtime_version = vllm_version(&command)
             .and_then(|version| sanitize_runtime_version(&version))
             .unwrap_or_else(|| "unknown".to_string());
@@ -1020,6 +1035,7 @@ struct VllmCacheEnvironment {
 struct ConfiguredVllmArgs {
     raw: String,
     args: Vec<String>,
+    werk_managed_prefix_caching: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1031,7 +1047,11 @@ struct VllmLaunchCommand {
 impl VllmCacheEnvironment {
     fn current(configured_args: &ConfiguredVllmArgs) -> Self {
         Self {
-            args: configured_args.raw.clone(),
+            // Cache against the argv Werk will actually pass to the process,
+            // including server defaults which did not originate in the
+            // environment variable.
+            args: serde_json::to_string(&configured_args.args)
+                .expect("serializing a string-only vLLM argv cannot fail"),
             served_model: env::var("WERK_VLLM_MODEL").unwrap_or_default(),
             host: env::var("WERK_VLLM_HOST").unwrap_or_default(),
             port: env::var("WERK_VLLM_PORT").unwrap_or_default(),
@@ -1387,14 +1407,14 @@ fn vllm_discovery_cache_identity(discovery: &VllmDiscovery) -> String {
 }
 
 fn vllm_server_cache_key(
-    model_id: &str,
+    model_identity: &ModelRuntimeIdentity,
     model_dir: &Path,
     discovery: &VllmDiscovery,
     environment: &VllmCacheEnvironment,
 ) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}:{}:{}",
-        model_id,
+        model_identity,
         model_dir.display(),
         environment.args,
         environment.served_model,
@@ -3144,6 +3164,8 @@ fn send_tool_call_delta(
 }
 
 const WERK_OWNED_VLLM_ARGS: &[&str] = &["--model", "--host", "--port", "--served-model-name"];
+const VLLM_ENABLE_PREFIX_CACHING_ARG: &str = "--enable-prefix-caching";
+const VLLM_DISABLE_PREFIX_CACHING_ARG: &str = "--no-enable-prefix-caching";
 
 fn configured_vllm_args() -> Result<ConfiguredVllmArgs> {
     configured_vllm_args_from(env::var_os("WERK_VLLM_ARGS"))
@@ -3157,7 +3179,116 @@ fn configured_vllm_args_from(value: Option<std::ffi::OsString>) -> Result<Config
         anyhow!("WERK_VLLM_ARGS must be valid UTF-8; non-UTF-8 values are not supported")
     })?;
     let args = parse_vllm_args(OsStr::new(&raw))?;
-    Ok(ConfiguredVllmArgs { raw, args })
+    Ok(ConfiguredVllmArgs {
+        raw,
+        args,
+        werk_managed_prefix_caching: None,
+    })
+}
+
+fn effective_vllm_args_for_target(
+    mut configured_args: ConfiguredVllmArgs,
+    command: Option<&VllmCommand>,
+    automatic_prefix_caching: Option<bool>,
+) -> ConfiguredVllmArgs {
+    let werk_starts_local_process = matches!(
+        command,
+        Some(VllmCommand::Python(_) | VllmCommand::Executable(_))
+    );
+    let user_selected_prefix_caching = configured_args.args.iter().any(|argument| {
+        vllm_argument_matches(argument, VLLM_ENABLE_PREFIX_CACHING_ARG)
+            || vllm_argument_matches(argument, VLLM_DISABLE_PREFIX_CACHING_ARG)
+    });
+
+    if werk_starts_local_process
+        && !user_selected_prefix_caching
+        && let Some(enabled) = automatic_prefix_caching
+    {
+        configured_args.args.push(
+            if enabled {
+                VLLM_ENABLE_PREFIX_CACHING_ARG
+            } else {
+                VLLM_DISABLE_PREFIX_CACHING_ARG
+            }
+            .to_string(),
+        );
+        configured_args.werk_managed_prefix_caching = Some(enabled);
+    }
+    configured_args
+}
+
+fn validate_werk_managed_prefix_caching_arg(
+    command: &VllmCommand,
+    configured_args: &ConfiguredVllmArgs,
+) -> Result<()> {
+    let Some(enabled) = configured_args.werk_managed_prefix_caching else {
+        return Ok(());
+    };
+    let flag = if enabled {
+        VLLM_ENABLE_PREFIX_CACHING_ARG
+    } else {
+        VLLM_DISABLE_PREFIX_CACHING_ARG
+    };
+    let mut help = match command {
+        VllmCommand::Python(path) => {
+            let mut command = Command::new(path);
+            command
+                .arg("-m")
+                .arg("vllm.entrypoints.openai.api_server")
+                .arg("--help");
+            command
+        }
+        VllmCommand::Executable(path) => {
+            let mut command = Command::new(path);
+            command.arg("serve").arg("--help");
+            command
+        }
+        VllmCommand::Remote { .. } => return Ok(()),
+    };
+    let output = help
+        .output()
+        .with_context(|| format!("failed to inspect vLLM support for {flag}"))?;
+    if !output.status.success() {
+        bail!(
+            "could not verify vLLM support for {flag}: {}",
+            command_failure_detail("server help failed", &output)
+        );
+    }
+    if !vllm_help_contains_arg(&output.stdout, &output.stderr, flag) {
+        bail!(
+            "the installed vLLM runtime does not advertise {flag}; this flag was requested by Werk's serve persistence policy"
+        );
+    }
+    Ok(())
+}
+
+fn vllm_help_contains_arg(stdout: &[u8], stderr: &[u8], flag: &str) -> bool {
+    let flag = flag.as_bytes();
+    if flag.is_empty() {
+        return false;
+    }
+    [stdout, stderr].into_iter().any(|stream| {
+        stream
+            .windows(flag.len())
+            .enumerate()
+            .any(|(offset, candidate)| {
+                candidate == flag
+                    && (offset == 0 || !vllm_arg_name_byte(stream[offset - 1]))
+                    && (offset + flag.len() == stream.len()
+                        || !vllm_arg_name_byte(stream[offset + flag.len()]))
+            })
+    })
+}
+
+fn vllm_arg_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+}
+
+fn vllm_argument_matches(argument: &str, flag: &str) -> bool {
+    argument == flag
+        || argument
+            .strip_prefix(flag)
+            .is_some_and(|suffix| suffix.starts_with('='))
 }
 
 /// Parses `WERK_VLLM_ARGS` as a POSIX-style shell-word list, not a shell command.
@@ -3905,8 +4036,14 @@ mod tests {
             python: "/opt/vllm-a/bin/python".to_string(),
             ..Default::default()
         };
-        let base_key =
-            vllm_server_cache_key("nemotron", Path::new("/models/nemotron"), &remote_a, &base);
+        let manifest = test_manifest("nemotron", None, None);
+        let model_identity = ModelRuntimeIdentity::from_manifest(&manifest).unwrap();
+        let base_key = vllm_server_cache_key(
+            &model_identity,
+            Path::new("/models/nemotron"),
+            &remote_a,
+            &base,
+        );
         for changed in [
             VllmCacheEnvironment {
                 host: "spark-b".to_string(),
@@ -3924,7 +4061,7 @@ mod tests {
             assert_ne!(
                 base_key,
                 vllm_server_cache_key(
-                    "nemotron",
+                    &model_identity,
                     Path::new("/models/nemotron"),
                     &remote_a,
                     &changed,
@@ -3967,6 +4104,288 @@ mod tests {
         assert_eq!(
             parse_vllm_args(OsStr::new("--max-num-seqs=16")).unwrap(),
             vec!["--max-num-seqs=16"]
+        );
+    }
+
+    #[test]
+    fn local_vllm_prefix_caching_default_is_added_only_when_requested() {
+        let command = VllmCommand::Python(PathBuf::from("/opt/vllm/bin/python"));
+
+        let ordinary = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&command),
+            None,
+        );
+        assert!(ordinary.args.is_empty());
+
+        let persistent = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&command),
+            Some(true),
+        );
+        assert_eq!(persistent.args, [VLLM_ENABLE_PREFIX_CACHING_ARG]);
+        assert!(persistent.raw.is_empty());
+        assert_eq!(persistent.werk_managed_prefix_caching, Some(true));
+
+        let persistence_without_reuse = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&command),
+            Some(false),
+        );
+        assert_eq!(
+            persistence_without_reuse.args,
+            [VLLM_DISABLE_PREFIX_CACHING_ARG]
+        );
+        assert_eq!(
+            persistence_without_reuse.werk_managed_prefix_caching,
+            Some(false)
+        );
+
+        let tuned = effective_vllm_args_for_target(
+            configured_vllm_args_from(Some("--max-num-seqs 8".into())).unwrap(),
+            Some(&command),
+            Some(true),
+        );
+        assert_eq!(
+            tuned.args,
+            ["--max-num-seqs", "8", VLLM_ENABLE_PREFIX_CACHING_ARG]
+        );
+
+        let launch = vllm_launch_command(
+            &command,
+            Path::new("/models/qwen"),
+            "qwen",
+            43127,
+            &persistent.args,
+        )
+        .unwrap();
+        assert_eq!(
+            launch.args.last().map(String::as_str),
+            Some(VLLM_ENABLE_PREFIX_CACHING_ARG)
+        );
+
+        let cache_environment = VllmCacheEnvironment::current(&persistent);
+        assert_eq!(
+            cache_environment.args,
+            serde_json::to_string(&persistent.args).unwrap()
+        );
+        assert!(
+            cache_environment
+                .args
+                .contains(VLLM_ENABLE_PREFIX_CACHING_ARG)
+        );
+    }
+
+    #[test]
+    fn managed_prefix_cache_flag_requires_exact_installed_help_support() {
+        for (stdout, stderr) in [
+            (
+                b"options: --enable-prefix-caching".as_slice(),
+                b"".as_slice(),
+            ),
+            (b"[--enable-prefix-caching]".as_slice(), b"".as_slice()),
+            (b"--enable-prefix-caching=true".as_slice(), b"".as_slice()),
+            (
+                b"".as_slice(),
+                b"  --enable-prefix-caching, --other".as_slice(),
+            ),
+        ] {
+            assert!(vllm_help_contains_arg(
+                stdout,
+                stderr,
+                VLLM_ENABLE_PREFIX_CACHING_ARG
+            ));
+        }
+        assert!(vllm_help_contains_arg(
+            b"",
+            b"--no-enable-prefix-caching",
+            VLLM_DISABLE_PREFIX_CACHING_ARG
+        ));
+        assert!(!vllm_help_contains_arg(
+            b"--no-enable-prefix-caching-legacy",
+            b"",
+            VLLM_DISABLE_PREFIX_CACHING_ARG
+        ));
+
+        for false_positive in [
+            b"--enable-other-cache".as_slice(),
+            b"--enable-prefix-caching-extra".as_slice(),
+            b"prefix--enable-prefix-caching".as_slice(),
+            b"x--enable-prefix-caching-y".as_slice(),
+        ] {
+            assert!(!vllm_help_contains_arg(
+                false_positive,
+                b"",
+                VLLM_ENABLE_PREFIX_CACHING_ARG
+            ));
+        }
+        assert!(!vllm_help_contains_arg(b"anything", b"", ""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_prefix_cache_validation_probes_the_matching_local_entrypoint() {
+        let python = fake_python(
+            "prefix-help-python",
+            r#"if [ "$1" = "-m" ] && [ "$2" = "vllm.entrypoints.openai.api_server" ] && [ "$3" = "--help" ]; then
+    printf '%s\n' 'options: --enable-prefix-caching'
+    exit 0
+fi
+printf '%s\n' 'unexpected python arguments' >&2
+exit 9
+"#,
+        );
+        let python_command = VllmCommand::Python(python);
+        let configured = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&python_command),
+            Some(true),
+        );
+        validate_werk_managed_prefix_caching_arg(&python_command, &configured).unwrap();
+
+        let executable = fake_python(
+            "prefix-help-executable",
+            r#"if [ "$1" = "serve" ] && [ "$2" = "--help" ]; then
+    printf '%s\n' '--no-enable-prefix-caching' >&2
+    exit 0
+fi
+printf '%s\n' 'unexpected executable arguments' >&2
+exit 9
+"#,
+        );
+        let executable_command = VllmCommand::Executable(executable);
+        let configured = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&executable_command),
+            Some(false),
+        );
+        validate_werk_managed_prefix_caching_arg(&executable_command, &configured).unwrap();
+
+        let misleading = fake_python(
+            "prefix-help-misleading",
+            "printf '%s\\n' '--enable-prefix-caching-extra'\nexit 0\n",
+        );
+        let misleading_command = VllmCommand::Executable(misleading);
+        let configured = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&misleading_command),
+            Some(true),
+        );
+        let error = validate_werk_managed_prefix_caching_arg(&misleading_command, &configured)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not advertise --enable-prefix-caching"));
+    }
+
+    #[test]
+    fn explicit_vllm_prefix_caching_choices_override_the_serve_default() {
+        let command = VllmCommand::Executable(PathBuf::from("/opt/vllm/bin/vllm"));
+
+        let enabled =
+            configured_vllm_args_from(Some("--max-num-seqs 8 --enable-prefix-caching".into()))
+                .unwrap();
+        let enabled_args = enabled.args.clone();
+        let effective = effective_vllm_args_for_target(enabled, Some(&command), Some(false));
+        assert_eq!(effective.args, enabled_args);
+        assert_eq!(effective.werk_managed_prefix_caching, None);
+        assert!(validate_werk_managed_prefix_caching_arg(&command, &effective).is_ok());
+
+        let disabled =
+            configured_vllm_args_from(Some("--no-enable-prefix-caching --max-num-seqs 8".into()))
+                .unwrap();
+        let disabled_args = disabled.args.clone();
+        let effective = effective_vllm_args_for_target(disabled, Some(&command), Some(true));
+        assert_eq!(effective.args, disabled_args);
+        assert_eq!(effective.werk_managed_prefix_caching, None);
+        assert!(
+            effective
+                .args
+                .iter()
+                .any(|arg| arg == VLLM_DISABLE_PREFIX_CACHING_ARG)
+        );
+        assert!(
+            !effective
+                .args
+                .iter()
+                .any(|arg| arg == VLLM_ENABLE_PREFIX_CACHING_ARG)
+        );
+
+        let similar = configured_vllm_args_from(Some("--enable-prefix-caching-extra".into()))
+            .expect("syntactically valid user args");
+        let effective = effective_vllm_args_for_target(similar, Some(&command), Some(true));
+        assert_eq!(
+            effective.args,
+            [
+                "--enable-prefix-caching-extra",
+                VLLM_ENABLE_PREFIX_CACHING_ARG
+            ]
+        );
+        assert_eq!(effective.werk_managed_prefix_caching, Some(true));
+
+        let equals_form =
+            configured_vllm_args_from(Some("--no-enable-prefix-caching=true".into())).unwrap();
+        let effective = effective_vllm_args_for_target(equals_form, Some(&command), Some(true));
+        assert_eq!(effective.args, ["--no-enable-prefix-caching=true"]);
+        assert_eq!(effective.werk_managed_prefix_caching, None);
+    }
+
+    #[test]
+    fn remote_vllm_never_receives_werk_generated_prefix_caching_args() {
+        let remote = VllmCommand::Remote {
+            host: "vllm.internal".to_string(),
+            port: 8000,
+        };
+        let effective = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&remote),
+            Some(true),
+        );
+        assert!(effective.raw.is_empty());
+        assert!(effective.args.is_empty());
+        assert_eq!(effective.werk_managed_prefix_caching, None);
+        assert!(validate_vllm_args_target(&remote, &effective).is_ok());
+    }
+
+    #[test]
+    fn effective_vllm_prefix_caching_args_change_the_server_cache_key() {
+        let command = VllmCommand::Python(PathBuf::from("/opt/vllm/bin/python"));
+        let discovery = VllmDiscovery {
+            command: Some(command.clone()),
+            source: "test".to_string(),
+            attempts: Vec::new(),
+        };
+        let ordinary = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&command),
+            None,
+        );
+        let persistent = effective_vllm_args_for_target(
+            configured_vllm_args_from(None).unwrap(),
+            Some(&command),
+            Some(true),
+        );
+        let manifest = test_manifest("qwen", None, None);
+        let model_identity = ModelRuntimeIdentity::from_manifest(&manifest).unwrap();
+
+        assert_ne!(
+            vllm_server_cache_key(
+                &model_identity,
+                Path::new("/models/qwen"),
+                &discovery,
+                &VllmCacheEnvironment {
+                    args: serde_json::to_string(&ordinary.args).unwrap(),
+                    ..Default::default()
+                },
+            ),
+            vllm_server_cache_key(
+                &model_identity,
+                Path::new("/models/qwen"),
+                &discovery,
+                &VllmCacheEnvironment {
+                    args: serde_json::to_string(&persistent.args).unwrap(),
+                    ..Default::default()
+                },
+            )
         );
     }
 
@@ -4072,6 +4491,7 @@ mod tests {
         let configured_args = ConfiguredVllmArgs {
             raw: "--max-num-seqs 16".to_string(),
             args,
+            werk_managed_prefix_caching: None,
         };
         let error = validate_vllm_args_target(
             &VllmCommand::Remote {

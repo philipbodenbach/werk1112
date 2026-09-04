@@ -28,7 +28,7 @@ use super::{
 use crate::{
     capabilities::InferenceTask,
     inference::{TaskReadiness, TaskReadinessStatus},
-    model_store::{ModelFile, ModelFormat, ModelManifest, ModelStore},
+    model_store::{ModelFile, ModelFormat, ModelManifest, ModelRuntimeIdentity, ModelStore},
     runtime_control::BackendRuntimeAdapter,
 };
 
@@ -64,6 +64,7 @@ struct LlamaServerProcess {
     model_path: PathBuf,
     projector_path: Option<PathBuf>,
     model_id: String,
+    model_identity: ModelRuntimeIdentity,
     url: String,
     pid: u32,
     mode: LlamaCppMode,
@@ -229,10 +230,10 @@ impl LlamaServerBackend {
             .as_deref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<none>".to_string());
+        let model_identity = ModelRuntimeIdentity::from_manifest(manifest)?;
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
-            manifest.id,
-            absolute_model_path.display(),
+            "{}:{}:{}:{}:{}:{}:{}",
+            model_identity,
             projector_cache_key,
             label(self.mode),
             self.runtime_options.ctx_size.unwrap_or(DEFAULT_CTX_SIZE),
@@ -263,6 +264,7 @@ impl LlamaServerBackend {
             &self.store,
             self.mode,
             manifest,
+            model_identity,
             &absolute_model_path,
             projector_path.as_deref(),
             &self.runtime_options,
@@ -449,6 +451,7 @@ impl LlamaServerProcess {
         store: &ModelStore,
         mode: LlamaCppMode,
         manifest: &ModelManifest,
+        model_identity: ModelRuntimeIdentity,
         model_path: &Path,
         projector_path: Option<&Path>,
         runtime_options: &LlamaRuntimeOptions,
@@ -532,6 +535,7 @@ impl LlamaServerProcess {
             model_path: model_path.to_path_buf(),
             projector_path: projector_path.map(Path::to_path_buf),
             model_id: manifest.id.clone(),
+            model_identity,
             url,
             pid,
             mode,
@@ -938,6 +942,7 @@ fn chat_completion_body(request: &GenerateRequest) -> Value {
         "max_tokens": request.max_tokens,
         "stream": true,
         "stream_options": {"include_usage": true},
+        "cache_prompt": true,
     });
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
@@ -1766,9 +1771,38 @@ fn discover_llama_server_for_host(
     mode: LlamaCppMode,
     strict_strix_rocm_profile: bool,
 ) -> LlamaServerDiscovery {
+    let environment = LlamaServerDiscoveryEnvironment::capture(mode);
+    discover_llama_server_in_environment(store, mode, strict_strix_rocm_profile, &environment)
+}
+
+#[derive(Debug, Clone, Default)]
+struct LlamaServerDiscoveryEnvironment {
+    specific: Option<PathBuf>,
+    generic: Option<PathBuf>,
+    path_dirs: Vec<PathBuf>,
+}
+
+impl LlamaServerDiscoveryEnvironment {
+    fn capture(mode: LlamaCppMode) -> Self {
+        Self {
+            specific: env::var_os(mode_env_name(mode)).map(PathBuf::from),
+            generic: env::var_os("WERK_LLAMA_SERVER").map(PathBuf::from),
+            path_dirs: env::var_os("PATH")
+                .map(|value| env::split_paths(&value).collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn discover_llama_server_in_environment(
+    store: &ModelStore,
+    mode: LlamaCppMode,
+    strict_strix_rocm_profile: bool,
+    environment: &LlamaServerDiscoveryEnvironment,
+) -> LlamaServerDiscovery {
     let mut attempts = Vec::new();
     let specific_env = mode_env_name(mode);
-    if let Some(path) = env::var_os(specific_env).map(PathBuf::from) {
+    if let Some(path) = environment.specific.clone() {
         let exists = path.is_file();
         attempts.push(LlamaServerDiscoveryAttempt {
             label: specific_env.to_string(),
@@ -1813,14 +1847,14 @@ fn discover_llama_server_for_host(
             exists: false,
         });
 
-        let generic_path = env::var_os("WERK_LLAMA_SERVER").map(PathBuf::from);
+        let generic_path = environment.generic.clone();
         attempts.push(LlamaServerDiscoveryAttempt {
             label: "WERK_LLAMA_SERVER (not mode-specific for Strix Halo ROCm; use WERK_LLAMA_SERVER_ROCM)"
                 .to_string(),
             exists: generic_path.as_ref().is_some_and(|path| path.is_file()),
             path: generic_path,
         });
-        let path_server = find_in_path(default_executable_name());
+        let path_server = find_in_path_dirs(default_executable_name(), &environment.path_dirs);
         attempts.push(LlamaServerDiscoveryAttempt {
             label: format!(
                 "PATH: {} (not mode-verified for Strix Halo ROCm)",
@@ -1837,7 +1871,7 @@ fn discover_llama_server_for_host(
         };
     }
 
-    if let Some(path) = env::var_os("WERK_LLAMA_SERVER").map(PathBuf::from) {
+    if let Some(path) = environment.generic.clone() {
         let exists = path.is_file();
         attempts.push(LlamaServerDiscoveryAttempt {
             label: "WERK_LLAMA_SERVER".to_string(),
@@ -1860,7 +1894,7 @@ fn discover_llama_server_for_host(
         });
     }
 
-    if let Some(path) = find_in_path(default_executable_name()) {
+    if let Some(path) = find_in_path_dirs(default_executable_name(), &environment.path_dirs) {
         attempts.push(LlamaServerDiscoveryAttempt {
             label: format!("PATH: {}", default_executable_name()),
             path: Some(path.clone()),
@@ -2632,12 +2666,17 @@ fn install_target_name(mode: LlamaCppMode) -> &'static str {
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    let path_dirs = env::split_paths(&path_var).collect::<Vec<_>>();
+    find_in_path_dirs(name, &path_dirs)
+}
+
+fn find_in_path_dirs(name: &str, path_dirs: &[PathBuf]) -> Option<PathBuf> {
     let path = PathBuf::from(name);
     if path.components().count() > 1 && path.is_file() {
         return Some(path);
     }
-    let path_var = env::var_os("PATH")?;
-    for dir in env::split_paths(&path_var) {
+    for dir in path_dirs {
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
@@ -2808,43 +2847,7 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
-    use std::{
-        env,
-        ffi::OsString,
-        sync::{Mutex as StdMutex, OnceLock},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-
-    struct EnvGuard {
-        values: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn new(names: &[&'static str]) -> Self {
-            Self {
-                values: names
-                    .iter()
-                    .map(|name| (*name, env::var_os(name)))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in &self.values {
-                unsafe {
-                    if let Some(value) = value {
-                        env::set_var(name, value);
-                    } else {
-                        env::remove_var(name);
-                    }
-                }
-            }
-        }
-    }
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn managed_cache_path_uses_requested_backend_name() {
@@ -3120,6 +3123,7 @@ Agent 3
         assert_eq!(body["max_tokens"], 32);
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["cache_prompt"], true);
         assert_eq!(body["stop"][0], "stop");
     }
 
@@ -3318,8 +3322,6 @@ Agent 3
 
     #[test]
     fn discovery_precedence_specific_env_wins_over_generic_path_and_cache() {
-        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
-        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_CUDA", "WERK_LLAMA_SERVER", "PATH"]);
         let root = temp_root("specific-env");
         let specific = touch(root.join("specific").join(default_executable_name()));
         let generic = touch(root.join("generic").join(default_executable_name()));
@@ -3338,21 +3340,19 @@ Agent 3
         )
         .unwrap();
 
-        unsafe {
-            env::set_var("WERK_LLAMA_SERVER_CUDA", &specific);
-            env::set_var("WERK_LLAMA_SERVER", &generic);
-            env::set_var("PATH", &path_dir);
-        }
-
-        let discovery = discover_llama_server(&store, LlamaCppMode::Cuda);
+        let environment = LlamaServerDiscoveryEnvironment {
+            specific: Some(specific.clone()),
+            generic: Some(generic),
+            path_dirs: vec![path_dir],
+        };
+        let discovery =
+            discover_llama_server_in_environment(&store, LlamaCppMode::Cuda, false, &environment);
         assert_eq!(discovery.path.as_deref(), Some(specific.as_path()));
         assert_eq!(discovery.source, "env WERK_LLAMA_SERVER_CUDA");
     }
 
     #[test]
     fn discovery_precedence_generic_env_wins_over_path_and_cache() {
-        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
-        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_CUDA", "WERK_LLAMA_SERVER", "PATH"]);
         let root = temp_root("generic-env");
         let generic = touch(root.join("generic").join(default_executable_name()));
         let path_dir = root.join("path");
@@ -3370,21 +3370,19 @@ Agent 3
         )
         .unwrap();
 
-        unsafe {
-            env::remove_var("WERK_LLAMA_SERVER_CUDA");
-            env::set_var("WERK_LLAMA_SERVER", &generic);
-            env::set_var("PATH", &path_dir);
-        }
-
-        let discovery = discover_llama_server(&store, LlamaCppMode::Cuda);
+        let environment = LlamaServerDiscoveryEnvironment {
+            specific: None,
+            generic: Some(generic.clone()),
+            path_dirs: vec![path_dir],
+        };
+        let discovery =
+            discover_llama_server_in_environment(&store, LlamaCppMode::Cuda, false, &environment);
         assert_eq!(discovery.path.as_deref(), Some(generic.as_path()));
         assert_eq!(discovery.source, "env WERK_LLAMA_SERVER");
     }
 
     #[test]
     fn discovery_uses_managed_cache_after_env_and_path() {
-        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
-        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_CUDA", "WERK_LLAMA_SERVER", "PATH"]);
         let root = temp_root("managed-cache");
         let store = ModelStore::resolve(Some(root.join("werk-home"))).unwrap();
         let cache_server = touch(
@@ -3393,21 +3391,18 @@ Agent 3
                 .join("bin")
                 .join(default_executable_name()),
         );
-        unsafe {
-            env::remove_var("WERK_LLAMA_SERVER_CUDA");
-            env::remove_var("WERK_LLAMA_SERVER");
-            env::set_var("PATH", root.join("empty-path"));
-        }
-
-        let discovery = discover_llama_server(&store, LlamaCppMode::Cuda);
+        let discovery = discover_llama_server_in_environment(
+            &store,
+            LlamaCppMode::Cuda,
+            false,
+            &LlamaServerDiscoveryEnvironment::default(),
+        );
         assert_eq!(discovery.path.as_deref(), Some(cache_server.as_path()));
         assert_eq!(discovery.source, "managed cache");
     }
 
     #[test]
     fn strix_halo_rocm_managed_cache_wins_over_generic_env_and_path() {
-        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
-        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_ROCM", "WERK_LLAMA_SERVER", "PATH"]);
         let root = temp_root("strix-rocm-managed");
         let generic = touch(root.join("generic").join(default_executable_name()));
         let path_dir = root.join("path");
@@ -3419,38 +3414,37 @@ Agent 3
                 .join("bin")
                 .join(default_executable_name()),
         );
-        unsafe {
-            env::remove_var("WERK_LLAMA_SERVER_ROCM");
-            env::set_var("WERK_LLAMA_SERVER", &generic);
-            env::set_var("PATH", &path_dir);
-        }
-
-        let discovery = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        let environment = LlamaServerDiscoveryEnvironment {
+            specific: None,
+            generic: Some(generic),
+            path_dirs: vec![path_dir],
+        };
+        let discovery =
+            discover_llama_server_in_environment(&store, LlamaCppMode::Rocm, true, &environment);
         assert_eq!(discovery.path.as_deref(), Some(managed.as_path()));
         assert_eq!(discovery.source, "managed cache");
     }
 
     #[test]
     fn strix_halo_rocm_rejects_unverified_generic_servers_but_accepts_specific_env() {
-        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
-        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_ROCM", "WERK_LLAMA_SERVER", "PATH"]);
         let root = temp_root("strix-rocm-specific");
         let generic = touch(root.join("generic").join(default_executable_name()));
         let path_dir = root.join("path");
         let _path_server = touch(path_dir.join(default_executable_name()));
         let specific = touch(root.join("specific").join(default_executable_name()));
         let store = ModelStore::resolve(Some(root.join("werk-home"))).unwrap();
-        unsafe {
-            env::remove_var("WERK_LLAMA_SERVER_ROCM");
-            env::set_var("WERK_LLAMA_SERVER", &generic);
-            env::set_var("PATH", &path_dir);
-        }
-
-        let non_strix_device = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, false);
+        let mut environment = LlamaServerDiscoveryEnvironment {
+            specific: None,
+            generic: Some(generic.clone()),
+            path_dirs: vec![path_dir],
+        };
+        let non_strix_device =
+            discover_llama_server_in_environment(&store, LlamaCppMode::Rocm, false, &environment);
         assert_eq!(non_strix_device.path.as_deref(), Some(generic.as_path()));
         assert_eq!(non_strix_device.source, "env WERK_LLAMA_SERVER");
 
-        let rejected = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        let rejected =
+            discover_llama_server_in_environment(&store, LlamaCppMode::Rocm, true, &environment);
         assert_eq!(rejected.path, None);
         assert_eq!(rejected.source, "missing");
         assert!(
@@ -3466,27 +3460,24 @@ Agent 3
                 .any(|attempt| attempt.label.contains("not mode-verified"))
         );
 
-        unsafe {
-            env::set_var("WERK_LLAMA_SERVER_ROCM", &specific);
-        }
-        let accepted = discover_llama_server_for_host(&store, LlamaCppMode::Rocm, true);
+        environment.specific = Some(specific.clone());
+        let accepted =
+            discover_llama_server_in_environment(&store, LlamaCppMode::Rocm, true, &environment);
         assert_eq!(accepted.path.as_deref(), Some(specific.as_path()));
         assert_eq!(accepted.source, "env WERK_LLAMA_SERVER_ROCM");
     }
 
     #[test]
     fn missing_backend_error_contains_all_attempted_locations() {
-        let _lock = ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
-        let _guard = EnvGuard::new(&["WERK_LLAMA_SERVER_CUDA", "WERK_LLAMA_SERVER", "PATH"]);
         let root = temp_root("missing");
         let store = ModelStore::resolve(Some(root.join("werk-home"))).unwrap();
-        unsafe {
-            env::remove_var("WERK_LLAMA_SERVER_CUDA");
-            env::remove_var("WERK_LLAMA_SERVER");
-            env::set_var("PATH", root.join("empty-path"));
-        }
-
-        let message = LlamaServerBackend::missing_message(&store, LlamaCppMode::Cuda);
+        let discovery = discover_llama_server_in_environment(
+            &store,
+            LlamaCppMode::Cuda,
+            false,
+            &LlamaServerDiscoveryEnvironment::default(),
+        );
+        let message = missing_llama_server_message(&discovery);
         assert!(message.contains("No CUDA llama-server found."));
         assert!(message.contains("WERK_LLAMA_SERVER_CUDA"));
         assert!(message.contains("WERK_LLAMA_SERVER"));

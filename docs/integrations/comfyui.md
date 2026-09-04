@@ -101,6 +101,24 @@ turning route presence into a support claim. The list permits read-only
 explicitly opted-in `experimental` capability. Current production adapters
 remain truthfully unsupported.
 
+The ordinary image, video and audio nodes use Werk's media execution workers
+and their process-local model/pipeline LRUs. Vision Analyze uses the selected
+text or multimodal backend's normal `/v1/chat/completions` path. Neither path
+creates named Prefill state. Only the explicit Prefill and Decode runtime nodes
+use the opaque state-handoff protocol. `werk serve --persistence` supplies
+defaults omitted by Prefill requests and, for a local Werk-started vLLM process,
+supplies the native APC default unless explicit vLLM arguments override it. APC
+still is vLLM-owned and never becomes a named Werk state.
+
+The live `runtime.model_residency` capability describes loaded-weight or
+pipeline reuse only. Werk-owned in-process backends and resident Python workers
+can report `supported`; remote vLLM reports `externally_managed`; MLX/MLX-VLM
+and an opaque external ONNX runner remain one-shot and report no resident model
+cache. The embedded ONNX GenAI CPU fallback has its own bounded model/tokenizer
+LRU, but creates a new generator for every request. Restarting Werk makes
+locally owned model and pipeline caches cold; durable job records do not
+restore computation.
+
 The runtime-node client sends `Accept: application/json` and
 `X-Werk-Protocol-Version: 1.0`. It requires the versioned JSON envelope and
 checks an HTTP protocol-version response header against it when present. A

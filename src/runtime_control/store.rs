@@ -48,7 +48,7 @@ pub(crate) struct StateStoreLimits {
     pub max_namespace_entries: usize,
     pub max_quarantine_bytes: u64,
     pub max_quarantine_entries: usize,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub max_page_size: u16,
     pub max_operation_ids: usize,
 }
@@ -220,7 +220,7 @@ impl StateStore {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reconcile(&self, principal_id: &str) -> Result<u64, ProtocolError> {
         validate_principal_id(principal_id)?;
         let _process = self.process_gate.lock().map_err(|_| internal())?;
@@ -536,7 +536,7 @@ impl StateStore {
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn list(
         &self,
         principal_id: &str,
@@ -1553,12 +1553,12 @@ fn random_id(prefix: &str, bytes: usize) -> Result<String, ProtocolError> {
     Ok(format!("{prefix}{}", URL_SAFE_NO_PAD.encode(random)))
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_cursor(id: &str) -> String {
     URL_SAFE_NO_PAD.encode(id.as_bytes())
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn decode_cursor(cursor: &str) -> Result<String, ProtocolError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(cursor)

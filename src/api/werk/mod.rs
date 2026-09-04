@@ -10,13 +10,14 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::werk_protocol::{
     ControlContext, DecodeRequest, ExpertActionRequest, ExpertListFilter, PROTOCOL_VERSION_HEADER,
-    PrefillRequest, ProtocolEnvelope, ProtocolError, ProtocolErrorBody, ProtocolErrorCode,
-    ProtocolVersion, PruneStatesRequest, StateActionRequest, StateListFilter,
+    PersistencePolicy, PrefillInput, PrefillRequest, ProtocolEnvelope, ProtocolError,
+    ProtocolErrorBody, ProtocolErrorCode, ProtocolVersion, PruneStatesRequest, StateActionRequest,
+    StateListFilter,
 };
 
 use super::state::ApiState;
@@ -184,7 +185,7 @@ async fn expert_action_handler(
 async fn prefill_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    body: Result<Json<PrefillRequest>, JsonRejection>,
+    body: Result<Json<WirePrefillRequest>, JsonRejection>,
 ) -> Response {
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
@@ -194,9 +195,86 @@ async fn prefill_handler(
         Ok(body) => body,
         Err(rejection) => return json_rejection(request_id, rejection),
     };
+    let PrefillRequestWithPresence {
+        mut request,
+        policy_was_supplied,
+        experimental_decision_was_supplied,
+    } = request.into_request();
+    state.server_persistence.apply_prefill_defaults(
+        &mut request,
+        policy_was_supplied,
+        experimental_decision_was_supplied,
+    );
     match state.werk_control.prefill(context, request).await {
         Ok(data) => success(request_id, data),
         Err(error) => protocol_error(request_id, error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePrefillRequest {
+    model_id: String,
+    input: PrefillInput,
+    #[serde(default)]
+    policy: Supplied<PersistencePolicy>,
+    #[serde(default)]
+    allow_experimental: Supplied<bool>,
+}
+
+impl WirePrefillRequest {
+    fn into_request(self) -> PrefillRequestWithPresence {
+        let (policy, policy_was_supplied) = self.policy.into_value_or_default();
+        let (allow_experimental, experimental_decision_was_supplied) =
+            self.allow_experimental.into_value_or_default();
+        PrefillRequestWithPresence {
+            request: PrefillRequest {
+                model_id: self.model_id,
+                input: self.input,
+                policy,
+                allow_experimental,
+            },
+            policy_was_supplied,
+            experimental_decision_was_supplied,
+        }
+    }
+}
+
+struct PrefillRequestWithPresence {
+    request: PrefillRequest,
+    policy_was_supplied: bool,
+    experimental_decision_was_supplied: bool,
+}
+
+enum Supplied<T> {
+    Missing,
+    Value(T),
+}
+
+impl<T> Default for Supplied<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Supplied<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(Self::Value)
+    }
+}
+
+impl<T: Default> Supplied<T> {
+    fn into_value_or_default(self) -> (T, bool) {
+        match self {
+            Self::Missing => (T::default(), false),
+            Self::Value(value) => (value, true),
+        }
     }
 }
 

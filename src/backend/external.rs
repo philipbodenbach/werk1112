@@ -29,10 +29,13 @@ use super::{
 use crate::{
     capabilities::InferenceTask,
     inference::{TaskReadiness, TaskReadinessStatus},
-    model_store::{ModelFormat, ModelManifest, ModelStore},
+    media_companion::CompanionClient,
+    model_store::{ModelFormat, ModelManifest, ModelRuntimeIdentity, ModelStore},
+    runtime_control::{BackendRuntimeAdapter, ModelResidencyStatus, StaticRuntimeAdapter},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 #[cfg(feature = "llama-cpp")]
 use llama_cpp::{
@@ -50,15 +53,19 @@ const GEMMA4_UNIFIED_MODEL_TYPE: &str = "gemma4_unified";
 const GEMMA4_UNIFIED_MLX_COMPAT_DIR: &str = "mlx-gemma4-unified-text";
 const GEMMA4_UNIFIED_MLX_COMPAT_MODEL_FILE: &str = "werk_gemma4_unified_compat.py";
 const DEFAULT_MAX_MLX_VLM_IMAGE_BYTES: usize = 64 * 1024 * 1024;
-const TRANSFORMERS_COMPAT_STATS_PREFIX: &str = "WERK_TRANSFORMERS_STATS ";
-const TRANSFORMERS_COMPAT_OUTPUT_PREFIX: &str = "WERK_TRANSFORMERS_OUTPUT ";
 const TRANSFORMERS_COMPAT_PY: &str = r#"
 import argparse
+import contextlib
 import copy
+import gc
 import json
 import os
 import sys
 import time
+from collections import OrderedDict
+from types import SimpleNamespace
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -85,6 +92,9 @@ def parse_args():
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--model-key", default="")
+    parser.add_argument("--device", default="")
+    parser.add_argument("--dtype", default="")
     return parser.parse_args()
 
 
@@ -103,7 +113,9 @@ def message_text(content):
 
 
 def normalized_messages(args):
-    if args.messages_json:
+    if hasattr(args, "messages"):
+        raw_messages = args.messages
+    elif args.messages_json:
         try:
             raw_messages = json.loads(args.messages_json)
         except Exception:
@@ -123,8 +135,8 @@ def normalized_messages(args):
     return messages
 
 
-def choose_device():
-    requested = os.environ.get("WERK_TRANSFORMERS_DEVICE", "auto").strip().lower()
+def choose_device(configured=""):
+    requested = (configured or os.environ.get("WERK_TRANSFORMERS_DEVICE", "auto")).strip().lower()
     if requested and requested != "auto":
         return requested
     if torch.cuda.is_available():
@@ -134,8 +146,8 @@ def choose_device():
     return "cpu"
 
 
-def choose_dtype(device):
-    requested = os.environ.get("WERK_TRANSFORMERS_DTYPE", "auto").strip().lower()
+def choose_dtype(device, configured=""):
+    requested = (configured or os.environ.get("WERK_TRANSFORMERS_DTYPE", "auto")).strip().lower()
     if requested in ("float32", "fp32", "f32"):
         return torch.float32
     if requested in ("bfloat16", "bf16"):
@@ -159,7 +171,7 @@ def config_int(config, names):
     return None
 
 
-def normalize_transformers_config(config, max_new_tokens):
+def normalize_transformers_config(config, _max_new_tokens):
     max_length = config_int(
         config,
         (
@@ -172,7 +184,9 @@ def normalize_transformers_config(config, max_new_tokens):
         ),
     )
     if max_length is None:
-        max_length = max(2048, int(max_new_tokens) + 1024)
+        # Model construction must not depend on request generation settings:
+        # the same loaded model is intentionally reused across requests.
+        max_length = 32768
     if not hasattr(config, "max_length"):
         config.max_length = int(max_length)
     if not hasattr(config, "seq_length"):
@@ -297,20 +311,50 @@ TRANSFORMERS_OUTPUT_PREFIX = "WERK_TRANSFORMERS_OUTPUT "
 TRANSFORMERS_STATS_PREFIX = "WERK_TRANSFORMERS_STATS "
 
 
-def main():
-    args = parse_args()
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
+def model_cache_capacity():
+    raw = os.environ.get("WERK_TRANSFORMERS_MODEL_CACHE_SIZE", "1").strip()
+    try:
+        return max(0, min(8, int(raw)))
+    except Exception:
+        return 1
 
-    total_started = time.perf_counter()
-    device = choose_device()
-    dtype = choose_dtype(device)
 
+MODEL_CACHE = OrderedDict()
+
+
+def release_unused_device_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def load_cached_model(args, device, dtype):
+    dtype_name = str(dtype).replace("torch.", "")
+    cache_key = (args.model_key, device, dtype_name)
+    capacity = model_cache_capacity()
+    while len(MODEL_CACHE) > capacity:
+        _, evicted = MODEL_CACHE.popitem(last=False)
+        del evicted
+        release_unused_device_memory()
+
+    cached = MODEL_CACHE.pop(cache_key, None) if capacity else None
+    if cached is not None:
+        MODEL_CACHE[cache_key] = cached
+        return cached, True, 0.0
+
+    while capacity > 0 and len(MODEL_CACHE) >= capacity:
+        _, evicted = MODEL_CACHE.popitem(last=False)
+        del evicted
+        release_unused_device_memory()
+
+    load_started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     config = normalize_transformers_config(config, args.max_new_tokens)
     register_remote_model_compat(args.model, config)
-    load_started = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         config=config,
@@ -323,6 +367,30 @@ def main():
     model.eval()
     use_legacy_generation_cache(model)
     load_seconds = time.perf_counter() - load_started
+    entry = (tokenizer, model)
+
+    if capacity > 0:
+        MODEL_CACHE[cache_key] = entry
+        evicted_any = False
+        while len(MODEL_CACHE) > capacity:
+            _, evicted = MODEL_CACHE.popitem(last=False)
+            del evicted
+            evicted_any = True
+        if evicted_any:
+            release_unused_device_memory()
+    return entry, False, load_seconds
+
+
+def generate_result(args):
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+
+    total_started = time.perf_counter()
+    device = choose_device(getattr(args, "device", ""))
+    dtype = choose_dtype(device, getattr(args, "dtype", ""))
+    (tokenizer, model), model_cache_hit, load_seconds = load_cached_model(
+        args, device, dtype
+    )
 
     messages = normalized_messages(args)
     prompt_started = time.perf_counter()
@@ -362,9 +430,85 @@ def main():
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "finish_reason": finish_reason,
+        "model_cache_hit": model_cache_hit,
     }
-    print(TRANSFORMERS_STATS_PREFIX + json.dumps(stats), file=sys.stderr, flush=True)
-    output_text(text)
+    return {"ok": True, "text": text, "stats": stats}
+
+
+def resident_args(request):
+    if not isinstance(request, dict):
+        raise ValueError("request must be an object")
+    model = request.get("model")
+    model_key = request.get("model_key")
+    prompt = request.get("prompt")
+    if not isinstance(model, str) or not model:
+        raise ValueError("model is required")
+    if not isinstance(model_key, str) or not model_key:
+        raise ValueError("model_key is required")
+    if not isinstance(prompt, str):
+        raise ValueError("prompt is required")
+    return SimpleNamespace(
+        model=model,
+        model_key=model_key,
+        prompt=prompt,
+        messages=request.get("messages") or [],
+        stop=request.get("stop") or [],
+        max_new_tokens=int(request.get("max_new_tokens")),
+        temperature=request.get("temperature"),
+        top_p=request.get("top_p"),
+        seed=request.get("seed"),
+        device=str(request.get("device") or "auto"),
+        dtype=str(request.get("dtype") or "auto"),
+    )
+
+
+def safe_error(error):
+    return {
+        "ok": False,
+        "error": {
+            "code": "transformers_compat_failed",
+            "message": "Transformers compatibility request failed",
+            "detail": type(error).__name__,
+        },
+    }
+
+
+def serve():
+    protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
+    try:
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    except Exception:
+        pass
+    for line in sys.stdin.buffer:
+        try:
+            frame = json.loads(line)
+            request_id = frame.get("request_id")
+            if frame.get("transport_version") != 1 or not isinstance(request_id, int):
+                raise ValueError("invalid transport envelope")
+            if frame.get("operation") != "execute":
+                raise ValueError("unsupported operation")
+            with contextlib.redirect_stdout(sys.stderr):
+                response = generate_result(resident_args(frame.get("payload")))
+        except Exception as error:
+            response = safe_error(error)
+            request_id = locals().get("request_id")
+        envelope = {
+            "transport_version": 1,
+            "request_id": request_id,
+            "response": response,
+        }
+        protocol_out.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+        protocol_out.flush()
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        serve()
+        return
+    args = parse_args()
+    result = generate_result(args)
+    print(TRANSFORMERS_STATS_PREFIX + json.dumps(result["stats"]), file=sys.stderr, flush=True)
+    output_text(result["text"])
 
 
 if __name__ == "__main__":
@@ -630,7 +774,7 @@ fn create_mlx_vlm_image_temp_dir() -> Result<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct TransformersCompatBackend {
     store: ModelStore,
-    python: PathBuf,
+    client: CompanionClient,
 }
 
 impl LlamaCppMode {
@@ -700,6 +844,25 @@ impl LlamaCppMode {
     }
 }
 
+fn llama_cpp_accelerator_family(mode: LlamaCppMode) -> &'static str {
+    match mode {
+        LlamaCppMode::Cuda => "cuda",
+        LlamaCppMode::Rocm => "rocm",
+        LlamaCppMode::Vulkan => "vulkan",
+        LlamaCppMode::Metal => "metal",
+        LlamaCppMode::Cpu => "cpu",
+    }
+}
+
+#[cfg(any(feature = "llama-cpp", test))]
+fn llama_cpp_model_cache_key(manifest: &ModelManifest, mode: LlamaCppMode) -> Result<String> {
+    Ok(format!(
+        "{}:{}",
+        ModelRuntimeIdentity::from_manifest(manifest)?,
+        mode.label()
+    ))
+}
+
 #[cfg(feature = "llama-cpp")]
 impl LlamaCppBackend {
     pub fn new(store: ModelStore, mode: LlamaCppMode) -> Self {
@@ -729,7 +892,7 @@ impl LlamaCppBackend {
             .model_path
             .as_deref()
             .context("GGUF manifest has no model_path")?;
-        let cache_key = format!("{}:{model_path}:{}", manifest.id, self.mode.label());
+        let cache_key = llama_cpp_model_cache_key(manifest, self.mode)?;
 
         if let Some(model) = self
             .models
@@ -1022,6 +1185,28 @@ impl ChatGenerationSession for LlamaCppChatSession {
 
 #[cfg(feature = "llama-cpp")]
 impl GenerationBackend for LlamaCppBackend {
+    fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
+        let (status, detail) = if self.mode.compiled() {
+            (
+                ModelResidencyStatus::Supported,
+                format!(
+                    "Werk keeps exact in-process llama.cpp {} model weights and chat sessions resident",
+                    self.mode.display_name()
+                ),
+            )
+        } else {
+            (
+                ModelResidencyStatus::Unavailable,
+                self.mode.unavailable_message(),
+            )
+        };
+        Arc::new(
+            StaticRuntimeAdapter::new(self.mode.label())
+                .with_accelerator_family(llama_cpp_accelerator_family(self.mode))
+                .with_model_residency(status, detail),
+        )
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.cached_model(manifest).map(|_| ())
     }
@@ -1093,6 +1278,17 @@ impl LlamaCppBackend {
 
 #[cfg(not(feature = "llama-cpp"))]
 impl GenerationBackend for LlamaCppBackend {
+    fn runtime_control_adapter(&self) -> std::sync::Arc<dyn BackendRuntimeAdapter> {
+        std::sync::Arc::new(
+            StaticRuntimeAdapter::new(self.mode.label())
+                .with_accelerator_family(llama_cpp_accelerator_family(self.mode))
+                .with_model_residency(
+                    ModelResidencyStatus::Unavailable,
+                    self.mode.unavailable_message(),
+                ),
+        )
+    }
+
     fn generate(
         &self,
         _manifest: &ModelManifest,
@@ -1299,10 +1495,14 @@ impl MlxVlmBackend {
 
 impl TransformersCompatBackend {
     pub fn new(store: ModelStore) -> Self {
-        Self {
-            store,
-            python: backend_program("WERK_TRANSFORMERS_PYTHON", default_python()),
-        }
+        let python = backend_program("WERK_TRANSFORMERS_PYTHON", default_python());
+        let client = CompanionClient::from_embedded_python(
+            python.clone(),
+            TRANSFORMERS_COMPAT_PY,
+            "Werk embedded Transformers compatibility worker",
+        )
+        .with_resident_worker();
+        Self { store, client }
     }
 
     pub fn probe() -> Result<String> {
@@ -1333,7 +1533,7 @@ impl TransformersCompatBackend {
         "Transformers compatibility backend requires Python with torch and transformers installed; install with `python3 -m pip install torch transformers accelerate` or set WERK_TRANSFORMERS_PYTHON".to_string()
     }
 
-    fn command_for(&self, manifest: &ModelManifest, request: &GenerateRequest) -> Result<Command> {
+    fn request_for(&self, manifest: &ModelManifest, request: &GenerateRequest) -> Result<Value> {
         if manifest.format != ModelFormat::SafeTensors {
             bail!("Transformers compatibility backend supports Hugging Face safetensors models");
         }
@@ -1343,36 +1543,22 @@ impl TransformersCompatBackend {
             );
         }
         let model_dir = original_mlx_model_dir(&self.store, manifest)?;
-        let messages_json = serde_json::to_string(&request.messages)
-            .context("failed to serialize chat messages for Transformers backend")?;
-        let stop_json = serde_json::to_string(&request.stop)
-            .context("failed to serialize stop strings for Transformers backend")?;
-
-        let mut command = Command::new(&self.python);
-        command
-            .arg("-c")
-            .arg(TRANSFORMERS_COMPAT_PY)
-            .arg("--model")
-            .arg(&model_dir)
-            .arg("--prompt")
-            .arg(&request.prompt)
-            .arg("--messages-json")
-            .arg(messages_json)
-            .arg("--stop-json")
-            .arg(stop_json)
-            .arg("--max-new-tokens")
-            .arg(request.max_tokens.to_string())
-            .env("TOKENIZERS_PARALLELISM", "false");
-        if let Some(temperature) = request.temperature {
-            command.arg("--temperature").arg(format_float(temperature));
-        }
-        if let Some(top_p) = request.top_p {
-            command.arg("--top-p").arg(format_float(top_p));
-        }
-        if let Some(seed) = request.seed {
-            command.arg("--seed").arg(seed_u32(seed).to_string());
-        }
-        Ok(command)
+        let device = transformers_requested_setting("WERK_TRANSFORMERS_DEVICE");
+        let dtype = transformers_requested_setting("WERK_TRANSFORMERS_DTYPE");
+        let model_key = transformers_model_cache_key(manifest, &device, &dtype)?;
+        Ok(json!({
+            "model": model_dir,
+            "model_key": model_key,
+            "device": device,
+            "dtype": dtype,
+            "prompt": request.prompt,
+            "messages": request.messages,
+            "stop": request.stop,
+            "max_new_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "seed": request.seed.map(seed_u32),
+        }))
     }
 
     fn generate_inner(
@@ -1380,23 +1566,23 @@ impl TransformersCompatBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        let mut command = self.command_for(manifest, &request)?;
+        let worker_request = self.request_for(manifest, &request)?;
         let started = Instant::now();
-        let output = command
-            .output()
-            .with_context(|| format!("failed to execute {}", self.python.display()))?;
-        if !output.status.success() {
-            bail!(
-                "Transformers compatibility generation failed: {}",
-                transformers_output_failure_detail(&output)
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut text =
-            transformers_output_text(&stdout).unwrap_or_else(|| stdout.trim().to_string());
-        let stats = transformers_stats_from_stderr(&stderr);
+        let response = self
+            .client
+            .request("execute", &worker_request)
+            .context("Transformers compatibility resident worker failed")?;
+        let mut text = response
+            .get("text")
+            .and_then(Value::as_str)
+            .context("Transformers compatibility worker response has no text")?
+            .to_string();
+        let stats: Option<TransformersCompatStats> = response
+            .get("stats")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .context("Transformers compatibility worker returned invalid stats")?;
         let stop_reason = truncate_at_stop(&mut text, &request.stop);
         let finish_reason = if stop_reason == "stop" {
             stop_reason
@@ -1415,6 +1601,39 @@ impl TransformersCompatBackend {
             stats,
         ))
     }
+}
+
+fn transformers_requested_setting(name: &str) -> String {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "auto".to_string())
+}
+
+fn transformers_model_cache_capacity() -> usize {
+    env::var("WERK_TRANSFORMERS_MODEL_CACHE_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<isize>().ok())
+        .unwrap_or(1)
+        .clamp(0, 8) as usize
+}
+
+fn transformers_model_cache_key(
+    manifest: &ModelManifest,
+    device: &str,
+    dtype: &str,
+) -> Result<String> {
+    let manifest_identity = ModelRuntimeIdentity::from_manifest(manifest)?;
+    let identity = json!({
+        "schema": 1,
+        "manifest_identity": manifest_identity.to_string(),
+        "device": device,
+        "dtype": dtype,
+    });
+    let bytes = serde_json::to_vec(&identity)
+        .context("failed to encode Transformers model cache identity")?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
 fn original_mlx_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Result<PathBuf> {
@@ -1613,6 +1832,35 @@ fn link_or_copy_file(source: &Path, target: &Path) -> Result<()> {
 }
 
 impl GenerationBackend for TransformersCompatBackend {
+    fn runtime_control_adapter(&self) -> std::sync::Arc<dyn BackendRuntimeAdapter> {
+        let capacity = transformers_model_cache_capacity();
+        let (status, detail) = if capacity == 0 {
+            (
+                ModelResidencyStatus::Unsupported,
+                "Transformers model residency is disabled by WERK_TRANSFORMERS_MODEL_CACHE_SIZE=0"
+                    .to_string(),
+            )
+        } else if Self::probe().is_ok() {
+            (
+                ModelResidencyStatus::Supported,
+                format!(
+                    "Werk keeps up to {capacity} exact Transformers model pipeline(s) resident in its managed Python worker"
+                ),
+            )
+        } else {
+            (
+                ModelResidencyStatus::Unavailable,
+                "Transformers model residency is unavailable because the configured Python runtime cannot import torch and transformers"
+                    .to_string(),
+            )
+        };
+        std::sync::Arc::new(
+            StaticRuntimeAdapter::new("transformers-compat")
+                .with_accelerator_family(transformers_requested_setting("WERK_TRANSFORMERS_DEVICE"))
+                .with_model_residency(status, detail),
+        )
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         if manifest.format != ModelFormat::SafeTensors {
             bail!("Transformers compatibility backend supports Hugging Face safetensors models");
@@ -1661,6 +1909,17 @@ impl GenerationBackend for TransformersCompatBackend {
 }
 
 impl GenerationBackend for MlxBackend {
+    fn runtime_control_adapter(&self) -> std::sync::Arc<dyn BackendRuntimeAdapter> {
+        std::sync::Arc::new(
+            StaticRuntimeAdapter::new("mlx")
+                .with_accelerator_family("mlx")
+                .with_model_residency(
+                    ModelResidencyStatus::Unsupported,
+                    "the configured MLX command is a one-shot external CLI and exposes no validated resident-worker contract",
+                ),
+        )
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
             bail!("mlx backend supports MLX or Hugging Face-style safetensors model directories");
@@ -1720,6 +1979,17 @@ impl GenerationBackend for MlxBackend {
 }
 
 impl GenerationBackend for MlxVlmBackend {
+    fn runtime_control_adapter(&self) -> std::sync::Arc<dyn BackendRuntimeAdapter> {
+        std::sync::Arc::new(
+            StaticRuntimeAdapter::new("mlx-vlm")
+                .with_accelerator_family("mlx")
+                .with_model_residency(
+                    ModelResidencyStatus::Unsupported,
+                    "the configured MLX-VLM command is a one-shot external CLI and exposes no validated resident-worker contract",
+                ),
+        )
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
             bail!(
@@ -2169,6 +2439,12 @@ fn transformers_response(
         if let Some(dtype) = &stats.dtype {
             diagnostics.push(format!("dtype: {dtype}"));
         }
+        if let Some(model_cache_hit) = stats.model_cache_hit {
+            diagnostics.push(format!("model_cache_hit: {model_cache_hit}"));
+        }
+        if let Some(load_seconds) = stats.load_seconds {
+            diagnostics.push(format!("model_load_seconds: {load_seconds:.6}"));
+        }
     }
 
     GenerateResponse {
@@ -2215,50 +2491,11 @@ struct TransformersCompatStats {
     device: Option<String>,
     dtype: Option<String>,
     finish_reason: Option<String>,
+    model_cache_hit: Option<bool>,
 }
 
 pub fn is_transformers_compat_model(manifest: &ModelManifest) -> bool {
     manifest_text_matches(manifest, "chatglm")
-}
-
-fn transformers_output_text(stdout: &str) -> Option<String> {
-    stdout.lines().find_map(|line| {
-        let json = line.strip_prefix(TRANSFORMERS_COMPAT_OUTPUT_PREFIX)?;
-        serde_json::from_str::<Value>(json)
-            .ok()?
-            .get("text")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-    })
-}
-
-fn transformers_stats_from_stderr(stderr: &str) -> Option<TransformersCompatStats> {
-    stderr.lines().rev().find_map(|line| {
-        let json = line.strip_prefix(TRANSFORMERS_COMPAT_STATS_PREFIX)?;
-        serde_json::from_str(json).ok()
-    })
-}
-
-fn transformers_output_failure_detail(output: &Output) -> String {
-    let stderr = trim_output_tail(&String::from_utf8_lossy(&output.stderr));
-    let stdout = trim_output_tail(&String::from_utf8_lossy(&output.stdout));
-    let mut parts = vec![format!(
-        "process exited with {}",
-        mlx_status_detail(output.status)
-    )];
-    if !stderr.is_empty() {
-        parts.push(format!("stderr: {stderr}"));
-    }
-    if !stdout.is_empty() {
-        parts.push(format!("stdout: {stdout}"));
-    }
-    if likely_mlx_memory_failure(output.status, &stdout, &stderr) {
-        parts.push(
-            "possible memory pressure/OOM: try a smaller or quantized model, close other memory-heavy apps, or reduce --max-tokens"
-                .to_string(),
-        );
-    }
-    parts.join("; ")
 }
 
 fn duration_from_rate(tokens: usize, tokens_per_second: Option<f64>) -> Option<f64> {
@@ -2763,7 +3000,9 @@ fn trim_hidden_tag_prefix_suffix(visible: &mut String) {
 mod tests {
     use super::*;
     use crate::backend::StreamGranularity;
-    use crate::model_store::ModelSource;
+    use crate::model_store::{ModelFile, ModelSource};
+    use crate::runtime_control::MODEL_RESIDENCY_CAPABILITY;
+    use crate::werk_protocol::CapabilityStatus;
 
     #[test]
     fn stop_detection_uses_first_matching_stop() {
@@ -2786,19 +3025,108 @@ mod tests {
     }
 
     #[test]
-    fn transformers_compat_output_parser_reads_marked_text_and_stats() {
-        let stdout = "noise\nWERK_TRANSFORMERS_OUTPUT {\"text\":\"GLM answer\\nsecond line\"}\n";
-        let stderr = "warning\nWERK_TRANSFORMERS_STATS {\"prompt_tokens\":7,\"generation_tokens\":5,\"load_seconds\":1.5,\"prompt_seconds\":0.2,\"decode_seconds\":0.8,\"total_seconds\":2.5,\"device\":\"mps\",\"dtype\":\"float16\",\"finish_reason\":\"stop\"}\n";
+    fn transformers_compat_stats_include_residency_diagnostics() {
+        let stats: TransformersCompatStats = serde_json::from_value(json!({
+            "prompt_tokens": 7,
+            "generation_tokens": 5,
+            "load_seconds": 1.5,
+            "device": "mps",
+            "dtype": "float16",
+            "finish_reason": "stop",
+            "model_cache_hit": true
+        }))
+        .unwrap();
 
-        let text = transformers_output_text(stdout).unwrap();
-        let stats = transformers_stats_from_stderr(stderr).unwrap();
-
-        assert_eq!(text, "GLM answer\nsecond line");
         assert_eq!(stats.prompt_tokens, Some(7));
         assert_eq!(stats.generation_tokens, Some(5));
         assert_eq!(stats.device.as_deref(), Some("mps"));
         assert_eq!(stats.dtype.as_deref(), Some("float16"));
         assert_eq!(stats.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(stats.model_cache_hit, Some(true));
+    }
+
+    #[test]
+    fn transformers_cache_identity_excludes_generation_input_and_tracks_files() {
+        let store = test_store("transformers-cache-identity");
+        let mut manifest = test_manifest("THUDM/glm-4-9b-chat", "chatglm");
+        manifest.format = ModelFormat::SafeTensors;
+        manifest.files = vec![ModelFile {
+            path: "model.safetensors".to_string(),
+            size: 123,
+            checksum: "sha256:first".to_string(),
+        }];
+        fs::create_dir_all(store.model_dir(&manifest.id).join("files")).unwrap();
+        let backend = TransformersCompatBackend::new(store);
+        assert!(backend.client.has_resident_worker());
+        let first = backend
+            .request_for(&manifest, &test_request("secret first prompt"))
+            .unwrap();
+        let mut changed_request = test_request("different private prompt");
+        changed_request.max_tokens = 999;
+        changed_request.temperature = Some(0.75);
+        changed_request.seed = Some(42);
+        let second = backend.request_for(&manifest, &changed_request).unwrap();
+
+        assert_eq!(first["model_key"], second["model_key"]);
+        assert_ne!(first["prompt"], second["prompt"]);
+        assert!(
+            !first["model_key"]
+                .as_str()
+                .unwrap()
+                .contains("secret first prompt")
+        );
+
+        let mut changed_manifest = manifest.clone();
+        changed_manifest.files[0].checksum = "sha256:replacement".to_string();
+        assert_ne!(
+            transformers_model_cache_key(&manifest, "auto", "auto").unwrap(),
+            transformers_model_cache_key(&changed_manifest, "auto", "auto").unwrap()
+        );
+        assert_ne!(
+            transformers_model_cache_key(&manifest, "cpu", "float32").unwrap(),
+            transformers_model_cache_key(&manifest, "cuda", "float16").unwrap()
+        );
+    }
+
+    #[test]
+    fn llama_cpp_cache_identity_tracks_exact_model_files() {
+        let mut manifest = test_manifest("llama", "llama");
+        manifest.format = ModelFormat::Gguf;
+        manifest.files = vec![ModelFile {
+            path: "model.gguf".to_string(),
+            size: 123,
+            checksum: "sha256:first".to_string(),
+        }];
+        let first = llama_cpp_model_cache_key(&manifest, LlamaCppMode::Cpu).unwrap();
+
+        manifest.files[0].checksum = "sha256:replacement".to_string();
+        let replacement = llama_cpp_model_cache_key(&manifest, LlamaCppMode::Cpu).unwrap();
+
+        assert_ne!(first, replacement);
+        assert!(!first.contains("sha256:first"));
+    }
+
+    #[test]
+    fn one_shot_mlx_adapters_do_not_claim_model_or_named_state_reuse() {
+        for adapter in [
+            MlxBackend::new(test_store("mlx-residency")).runtime_control_adapter(),
+            MlxVlmBackend::new(test_store("mlx-vlm-residency")).runtime_control_adapter(),
+        ] {
+            let descriptor = adapter.descriptor();
+            let residency = descriptor
+                .capabilities
+                .iter()
+                .find(|capability| capability.id == MODEL_RESIDENCY_CAPABILITY)
+                .unwrap();
+            assert_eq!(residency.status, CapabilityStatus::Unsupported);
+            assert!(residency.operations.is_empty());
+            assert!(
+                descriptor
+                    .capabilities
+                    .iter()
+                    .all(|capability| !capability.id.starts_with("runtime.state."))
+            );
+        }
     }
 
     #[test]
@@ -2825,6 +3153,28 @@ mod tests {
         assert!(TRANSFORMERS_COMPAT_PY.contains("generation_config.cache_implementation = None"));
         assert!(TRANSFORMERS_COMPAT_PY.contains("dtype=dtype"));
         assert!(!TRANSFORMERS_COMPAT_PY.contains("torch_dtype=dtype"));
+        assert!(TRANSFORMERS_COMPAT_PY.contains("OrderedDict"));
+        assert!(TRANSFORMERS_COMPAT_PY.contains("WERK_TRANSFORMERS_MODEL_CACHE_SIZE\", \"1"));
+        assert!(TRANSFORMERS_COMPAT_PY.contains("model_cache_hit"));
+        assert!(TRANSFORMERS_COMPAT_PY.contains("frame.get(\"payload\")"));
+        let capacity = TRANSFORMERS_COMPAT_PY
+            .find("capacity = model_cache_capacity()")
+            .unwrap();
+        let shrink = TRANSFORMERS_COMPAT_PY
+            .find("while len(MODEL_CACHE) > capacity")
+            .unwrap();
+        let cached = TRANSFORMERS_COMPAT_PY
+            .find("cached = MODEL_CACHE.pop(cache_key, None) if capacity else None")
+            .unwrap();
+        assert!(capacity < shrink && shrink < cached);
+        assert!(
+            TRANSFORMERS_COMPAT_PY
+                .find("while capacity > 0 and len(MODEL_CACHE) >= capacity")
+                .unwrap()
+                < TRANSFORMERS_COMPAT_PY
+                    .find("load_started = time.perf_counter()")
+                    .unwrap()
+        );
     }
 
     #[test]

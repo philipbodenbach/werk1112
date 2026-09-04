@@ -1,6 +1,6 @@
 ---
 title: Werk Protocol 1.0 HTTP reference
-description: Versioned HTTP/JSON contract for Werk1112 runtime persistence, memory, expert discovery and prefill/decode.
+description: Versioned HTTP/JSON contract for Werk1112 runtime residency, persistence, memory, expert discovery and prefill/decode.
 ---
 
 # Werk Protocol 1.0 HTTP reference
@@ -137,8 +137,20 @@ Returns an array of:
 | `operations` | string array | Operation names scoped by this entry. The status remains authoritative; a listed operation can still be presently `unavailable`. |
 
 The [capability semantics and production matrix](../concepts/runtime-persistence-and-memory.md#capability-status-semantics)
-are normative for client behavior. `experimental` requires a request-level
-opt-in; no global switch enables it.
+are normative for client behavior. `experimental` requires an effective
+request-level opt-in. A client can send it explicitly; for Prefill only, a
+server started with `--persistence` can supply it when the member is absent.
+That server option does not opt other protocol operations in.
+
+`runtime.model_residency` is deliberately independent of every
+`runtime.state.*` capability. Its `automatic_reuse` operation reports that an
+exact model or pipeline can remain loaded between ordinary requests. It does
+not produce a `state_id` or handoff and does not promise prompt/KV reuse,
+durability, or cross-restart recovery. A local Werk-owned process or worker can
+report `supported`; a remote service can report `externally_managed`; a
+one-shot runner can report `unsupported`; and an adapter with a temporarily
+missing runtime or process prerequisite can report `unavailable`. The current
+backend-specific `detail` remains authoritative.
 
 For vLLM, `runtime.state.prefix_cache` is `externally_managed` with the sole
 operation `automatic_reuse` only when at least one active Werk-started process
@@ -147,6 +159,12 @@ enables APC without an effective disable flag. No process is `unavailable`;
 all-disabled is `unsupported`; remote, mixed or ambiguous evidence is
 `metadata_only`. None of those statuses makes the named-state, prune,
 persistence, handoff or decode-from-state endpoints operational.
+
+An active local vLLM process separately reports model residency as
+`supported`; an active remote endpoint reports it as `externally_managed`.
+`werk serve --persistence` may supply native APC arguments only when Werk
+starts vLLM locally and the operator has not explicitly selected an APC flag.
+It sends no launch setting to remote vLLM.
 
 ## Route inventory
 
@@ -401,6 +419,27 @@ Message input:
 `prefer` or `required`. The policy defaults to `auto`/`prefer`, no TTL and not
 pinned. TTL is 1 through `max_ttl_seconds`. Text or total message content is
 limited to 512 KiB; a message array contains 1 through 256 role/content items.
+
+By default, omitting the top-level `policy` member uses that protocol default,
+and omitting `allow_experimental` means `false`. A server started with
+`werk serve --persistence` can instead provide a policy and experimental opt-in
+for those two omitted members. The granular server options are
+`--persistence-mode`, `--persistence-reuse`,
+`--persistence-ttl-seconds` and `--persistence-pin`.
+
+Request intent has precedence. If `policy` is present, the entire request
+policy wins; this includes `{}`, whose missing inner fields receive the normal
+protocol defaults rather than the server's granular defaults. An explicitly
+supplied `allow_experimental` value also wins, including `false`. Server
+defaults do not change capability status or bypass backend validation.
+
+This behavior exists only at `POST /werk/v1/prefill`. It has no silent effect
+on OpenAI-compatible `/v1` routes, media inference, semantic output caching,
+whole-model persistence or cross-restart restore. Runtime state remains an
+opaque backend-owned value governed and compatibility-checked by Werk. Current
+named persistence and prefill/decode support is experimental and limited to a
+functionally validated Werk-managed llama-server process for the exact
+installed GGUF model; clients must still use capability discovery.
 
 Example `data`:
 

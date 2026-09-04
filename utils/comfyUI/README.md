@@ -94,6 +94,23 @@ For local unauthenticated development only:
 werk serve --image-model tiny-sd --allow-unauthenticated
 ```
 
+To provide default runtime-persistence policy for an unconnected **WERK
+Prefill** policy socket, start Werk with:
+
+```bash
+werk serve --persistence
+```
+
+The policy and experimental defaults supplied by this setting apply only to
+`/werk/v1/prefill`. Separately, when Werk starts local vLLM, the same setting
+supplies vLLM's native APC default unless `WERK_VLLM_ARGS` explicitly enables
+or disables it. Remote vLLM receives no generated launch argument. Neither
+effect enables or disables the independent model/pipeline residency used by
+normal image, video, audio or OpenAI-compatible `/v1` requests. Current named
+state support is the experimental, functionally validated managed
+llama-server path for an installed GGUF model, not a model-independent generic
+KV format.
+
 `--image-model` supplies the alias used by image compatibility endpoints; the
 Werk-native image, vision, video, and audio model nodes discover installed
 models and select one explicitly in the graph. They do not need server-wide
@@ -141,8 +158,10 @@ is not required by these HTTP-backed Werk nodes.
   fall back when an older server lacks it.
 - **WERK Persistence Policy** creates a typed `WERK_PERSISTENCE_POLICY` with
   `auto`, `ephemeral`, `memory`, or `disk` retention; `disabled`, `prefer`, or
-  `required` reuse; an optional TTL; and pinning. A TTL of zero means omitted,
-  so the server retains authority over its default.
+  `required` reuse; an optional TTL; and pinning. A TTL widget value of zero
+  omits `ttl_seconds` from the connected policy and therefore means no TTL; it
+  does not mean immediate expiry. Because the top-level policy is present, a
+  server-side granular TTL default does not replace it.
 - **WERK Runtime States** lists the caller's visible prefix/runtime states with
   optional model, tier, page-size, and cursor filters. Every listed object is
   the complete public state summary for inspecting status, tier, size, age,
@@ -254,6 +273,20 @@ WERK Connection.connection ----------+--> WERK Runtime Experts.connection
                                      +--> WERK Expert Control.connection
 WERK Runtime Experts.expert_ids ----------> WERK Expert Control.expert_ids
 ```
+
+The **WERK Persistence Policy** connection is optional. When it is unconnected,
+**WERK Prefill** omits the request's top-level `policy`, allowing defaults from
+`werk serve --persistence` and its granular persistence flags to apply. Without
+those server flags, the normal protocol default is `auto`/`prefer`, no TTL and
+not pinned. Connecting a policy makes that complete policy authoritative. In a
+connected policy, the TTL widget's `0` value omits `ttl_seconds` and means no
+TTL; it does not defer to `--persistence-ttl-seconds` and does not expire the
+state immediately.
+
+The **WERK Prefill** `allow_experimental` widget is also an explicit request
+decision: both `true` and `false` override the server default. Enable it
+deliberately for the current experimental managed llama-server path. Server
+defaults never bypass the capability checks described below.
 
 Prefill and decode are capability-gated. Experimental capabilities remain
 disabled unless the node's explicit opt-in is enabled. The only preflight
@@ -440,9 +473,12 @@ belong in `additional_audio_parameters_json`, using the live schema from
 
 All long audio operations are persisted jobs. The nodes poll the same terminal
 states as video and issue a best-effort `DELETE /v1/jobs/{id}` when ComfyUI is
-interrupted or the connection timeout expires. Audio outputs are downloaded
-with authentication and converted through PyAV. Source `AUDIO` is encoded as
-PCM16 WAV and embedded in the generic job request.
+interrupted or the connection timeout expires. A persisted job is only a
+request/status/result record: it does not persist a loaded model, media
+pipeline, text KV cache or resumable computation. Nonterminal jobs are marked
+failed after a Werk restart. Audio outputs are downloaded with authentication
+and converted through PyAV. Source `AUDIO` is encoded as PCM16 WAV and embedded
+in the generic job request.
 
 Video generation is asynchronous at the Werk API boundary. The generator polls
 states `queued`, `loading`, `running`, and `encoding`, and requests best-effort
@@ -465,19 +501,25 @@ submitting them to ComfyUI. Voice conversion demonstrates the prepared node
 contract only; the bundled companion currently advertises no executable
 generic adapter for it.
 
-When these nodes call `werk serve`, the bundled media execution worker stays
-running and serializes generation requests. Health, discovery, and estimation
-preflights remain independent of that queue. Its Diffusers image/video cache
-and Transformers audio cache share one resident entry by default: the first
-generation or analysis is a cold load, and later runs with the same
+When these nodes call `werk serve`, generic Diffusers/Transformers media and
+managed Qwen3-TTS use separate persistent, serialized execution workers. Each
+worker owns a separate LRU with one resident model/pipeline by default. Health,
+discovery, and estimation calls remain independent of the execution queues;
+Werk caches bounded positive probe and estimate results in Rust so repeated
+validated preflights avoid another one-shot Python import. Failures and
+unavailable results are not cached.
+
+The first generation or analysis is a cold load, and later runs with the same
 model/runtime configuration should be substantially faster to start. Changing
 prompt, seed, dimensions, steps, or count keeps the model warm. Changing model,
 task adapter, device, dtype, offload/tiling settings, or LoRAs may reload it;
-the previous entry is evicted before the new one is loaded at the default cache
-size. Set
+the previous entry in that worker is evicted before the new one is loaded at
+the default cache size. Set
 `WERK_MEDIA_PIPELINE_CACHE_SIZE=0` before starting Werk to disable pipeline
-caching, or set a larger non-negative entry count when system memory permits.
-Resident entries retain VRAM and/or RAM until eviction or Werk shuts down.
+caching in both workers, or set a larger non-negative per-worker entry count
+when system memory permits. If both worker types are used, each can retain up
+to that count. Resident entries retain VRAM and/or RAM until eviction or Werk
+shuts down.
 
 Werk metadata exposes `model_cache_hit` and `model_load_seconds` to distinguish
 warm and cold runs. A worker crash or inference timeout clears the resident
@@ -485,6 +527,23 @@ state, so the next run is cold. The resident transport never replays the same
 `execute` frame; Werk's higher-level fallback policy may still try another
 accepted runtime candidate. A legacy external media companion falls back to
 one-shot execution when it does not support the persistent protocol.
+
+These normal media nodes do not call `/werk/v1/prefill`; their resident model
+caches work whether or not `werk serve --persistence` is present. **WERK Vision
+Analyze** likewise calls `/v1/chat/completions`. A selected llama-server or
+local vLLM process can keep model weights and its own backend cache resident;
+remote vLLM owns that lifetime outside Werk. The embedded ONNX GenAI CPU
+fallback has a bounded model/tokenizer LRU but a fresh generator per request.
+An opaque external ONNX runner and MLX/MLX-VLM remain per-request subprocesses.
+None of those normal nodes creates a named Werk runtime state. Use the explicit
+**WERK Prefill** and **WERK Decode** nodes for that separate, capability-gated
+path.
+
+The Transformers compatibility and ONNX GenAI worker LRUs are controlled by
+`WERK_TRANSFORMERS_MODEL_CACHE_SIZE` and
+`WERK_ONNX_GENAI_MODEL_CACHE_SIZE`, respectively; each defaults to one exact
+model entry, and `0` disables that cache without making the external fallback
+paths resident.
 
 ### WERK Routing Config
 

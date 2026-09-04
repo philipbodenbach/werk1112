@@ -40,7 +40,20 @@ There is deliberately no environment variable for:
 - memory-pressure thresholds, reservation sizes or eviction policy;
 - handoff contents or lifetime;
 - cross-backend or cross-restart state reuse;
-- enabling experimental capabilities globally.
+- enabling experimental capabilities process-wide.
+
+`werk serve --persistence` and its granular persistence options are CLI-only
+defaults for missing top-level `policy` and `allow_experimental` members on
+`POST /werk/v1/prefill`. In addition, the effective reuse default controls the
+native prefix-cache flag generated for a local Werk-started vLLM process;
+explicit vLLM arguments win. Werk sends no generated flag to remote vLLM: its
+model lifetime is externally managed and its APC configuration remains opaque
+metadata. The options do not redirect ordinary `/v1` or media requests through
+Prefill.
+
+Independent same-process model/pipeline residency is automatic where supported
+and is described in the
+[execution-lifetime matrix](../concepts/runtime-persistence-and-memory.md#execution-lifetime-and-reuse-matrix).
 
 The current memory thresholds, bounded state catalog, principal isolation and
 dry-run-first maintenance rules are implementation safety policy. A backend
@@ -54,7 +67,7 @@ adapter. See [Runtime persistence and memory architecture](../concepts/runtime-p
 | `WERK_MEDIA_COMPANION` | Compatible standalone media-companion executable. This has priority over Python discovery. |
 | `WERK_MEDIA_PYTHON` | Python interpreter used for the bundled media adapter when no standalone companion is configured. |
 | `WERK_MEDIA_COMPANION_SCRIPT` | Explicit Python companion script. This is an advanced override of the adjacent/repository/embedded script discovery. |
-| `WERK_MEDIA_PIPELINE_CACHE_SIZE` | Number of loaded pipelines retained by the worker. Default: `1`; `0` disables pipeline caching without disabling the worker. |
+| `WERK_MEDIA_PIPELINE_CACHE_SIZE` | Number of loaded models/pipelines retained independently by each resident execution worker: one generic media LRU and, when used, one separate managed-Qwen LRU. Default per worker: `1`; `0` disables both model caches without disabling either worker. |
 | `WERK_MEDIA_DEBUG` | `1`, `true`, `yes`, or `on` enables traceback details for unexpected companion errors. |
 | `WERK_QWEN_TTS_PYTHON` | Explicit Python interpreter containing the compatible `qwen-tts==0.1.1` installation. It is checked before Werk's managed Qwen-TTS environment. |
 
@@ -62,6 +75,13 @@ During companion requests Werk forces Hugging Face, Transformers, Diffusers
 and Datasets offline modes, disables Hugging Face telemetry, and requests
 local-only loading. Those injected variables are an execution boundary, not a
 promise that an arbitrary third-party pipeline is offline-safe.
+
+Werk also keeps bounded, process-local positive probe and estimate caches so a
+successfully validated media configuration does not repeatedly pay the
+one-shot preflight cost. These contain capability/estimate data, not model
+weights or inference outputs; unavailable results and errors are not cached.
+Their safety bound is internal and is not controlled by
+`WERK_MEDIA_PIPELINE_CACHE_SIZE`.
 
 ## llama.cpp
 
@@ -112,13 +132,15 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_ONNX_RUNTIME` | Generic ONNX runner fallback. |
 | `WERK_ONNX_RUNTIME_BUNDLE_CUDA`, `WERK_ONNX_RUNTIME_BUNDLE_ROCM`, `WERK_ONNX_RUNTIME_BUNDLE_CPU` | Mode-specific local bundle used to provision a managed ONNX runner. |
 | `WERK_ONNX_RUNTIME_BUNDLE` | Generic ONNX bundle fallback. |
-| `WERK_ONNX_GENAI_PYTHON`, `WERK_ONNX_RUNTIME_PYTHON` | Python interpreter fallbacks for `onnxruntime_genai`, checked in that order. |
+| `WERK_ONNX_GENAI_PYTHON`, `WERK_ONNX_RUNTIME_PYTHON` | Python interpreter fallbacks for the CPU `onnxruntime_genai` path, checked in that order. |
+| `WERK_ONNX_GENAI_MODEL_CACHE_SIZE` | Exact ONNX GenAI model/tokenizer entries retained by the Werk-owned resident CPU-fallback worker. Default: `1`; values are clamped to `0..8`; `0` disables this model cache. It does not affect an opaque external ONNX runner. |
 | `WERK_ONNX_EXPORTER` | Executable used by `werk artifacts build` before `optimum-cli` or Python module discovery. |
 | `WERK_MLX_PYTHON`, `WERK_MLX_MODULE`, `WERK_MLX_GENERATE` | MLX-LM interpreter, module (default `mlx_lm.generate`), and executable fallback. |
 | `WERK_MLX_VLM_PYTHON`, `WERK_MLX_VLM_MODULE`, `WERK_MLX_VLM_GENERATE` | MLX-VLM equivalents; the default module is `mlx_vlm`. |
 | `WERK_TRANSFORMERS_PYTHON` | Python interpreter containing PyTorch and Transformers for the compatibility backend. |
 | `WERK_TRANSFORMERS_DEVICE` | Device override; `auto` chooses CUDA, then MPS, then CPU. |
 | `WERK_TRANSFORMERS_DTYPE` | `auto`, `float32`/`fp32`/`f32`, `bfloat16`/`bf16`, or `float16`/`fp16`/`f16`/`half`. |
+| `WERK_TRANSFORMERS_MODEL_CACHE_SIZE` | Exact model/tokenizer entries retained by the Werk-owned Transformers compatibility worker. Default: `1`; values are clamped to `0..8`; `0` disables model caching without disabling the worker. |
 
 `WERK_VLLM_ARGS` is a list of arguments, not a shell command. Quoting and
 backslash escaping follow POSIX shell-word rules, including quoted empty
@@ -145,8 +167,25 @@ the status is `unsupported`; remote, mixed or ambiguous evidence is
 APC, KV offload, LMCache or expert residency into a named, persistable or
 Werk-controlled state operation.
 
-`WERK_TRANSFORMERS_OUTPUT` and `WERK_TRANSFORMERS_STATS` are reserved line
-prefixes in Werk's subprocess protocol, not user configuration variables.
+When `werk serve --persistence` supplies the local-vLLM APC default, Werk adds
+`--enable-prefix-caching` only if `WERK_VLLM_ARGS` contains neither the enable
+nor disable form. `--persistence-reuse disabled` instead supplies
+`--no-enable-prefix-caching`. Werk checks the installed server's help for the
+generated flag and fails before model-server spawn if that exact runtime does
+not advertise it. User-supplied enable/disable arguments remain authoritative.
+
+The Transformers and ONNX GenAI cache sizes control process-local model
+residency only. Their generators, prompts and KV state remain request-local;
+restarting Werk or a worker makes the next request cold. With a usable runtime,
+a positive capacity permits `runtime.model_residency` to report `supported`;
+capacity `0` is reported as `unsupported`, and a missing interpreter/runtime is
+`unavailable`. The two variables do not affect the separate generic-media or
+managed-Qwen caches.
+
+No cache-size environment variable turns a one-shot execution path into a
+resident one. The configured MLX/MLX-VLM commands and opaque external ONNX
+runners remain per-request processes. Remote vLLM owns its own model lifetime
+and receives neither these settings nor Werk's generated local APC argument.
 
 ## Installer and uninstaller
 

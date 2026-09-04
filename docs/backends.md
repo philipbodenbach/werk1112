@@ -7,9 +7,9 @@ present, and one model may have several eligible runtime candidates.
 This page documents the current implementation. “Installer exists” does not
 mean “every model and accelerator combination is verified.”
 
-Inference eligibility is separate from runtime-state control. The exact
-prefix-state, persistence, memory, prefill/decode and expert-residency statuses
-for each active adapter are in the
+Inference eligibility is separate from runtime-state control. The exact model
+residency, prefix-state, persistence, memory, prefill/decode and
+expert-residency statuses for each active adapter are in the
 [runtime-control capability matrix](concepts/runtime-persistence-and-memory.md#current-production-capability-matrix).
 
 ## Three separate questions
@@ -23,6 +23,31 @@ Backend troubleshooting is easier when these questions are kept separate:
 A successful install answers only the first question. Model probing and
 planning answer most of the second. The first cold inference is still the
 definitive load and memory test.
+
+## Residency is not named Prefill state
+
+A faster second request can come from several different mechanisms. Capability
+`runtime.model_residency` with operation `automatic_reuse` means only that the
+selected backend can retain exact model weights or a media pipeline across
+requests. It never implies a reusable prompt, a KV snapshot, a `state_id`, or
+cross-restart restore.
+
+| Execution path | Model/pipeline lifetime | Prompt/KV reuse | Named `/werk/v1/prefill` state |
+| --- | --- | --- | --- |
+| Werk-managed `llama-server` | Child process and weights can remain resident while Werk runs. | llama.cpp owns its automatic prompt cache. | Experimental, and only after the exact live process passes Werk's functional state probe. |
+| In-process Candle, Burn and compiled llama.cpp adapters | Exact model entries remain in Werk-owned process caches where the concrete runtime is available. | Backend-specific; no generic cross-backend KV contract. | No. |
+| Local Werk-started vLLM | The exact vLLM model process is reused. | vLLM-owned APC. `werk serve --persistence` supplies `--enable-prefix-caching` unless explicit `WERK_VLLM_ARGS` wins. | No; Werk cannot name, snapshot, restore, move or prune APC entries. |
+| Remote vLLM | The remote operator owns process and model lifetime. | Opaque to Werk; the OpenAI endpoint does not prove its cache configuration. | No. |
+| Werk-owned Transformers or ONNX GenAI CPU-fallback worker | Exact model/tokenizer entries use independent bounded LRUs. | Generator, prompt and KV state are request-local. | No. |
+| External ONNX runner, MLX or MLX-VLM command | One process is invoked per request; Werk has no validated resident cache. | No declared cross-request reuse. | No. |
+| Generic media and managed Qwen workers | Separate bounded pipeline/model LRUs remain warm while their workers live. | Not a text KV-state contract. | No; durable media jobs are request/status/result records only. |
+
+`werk serve --persistence` has two deliberately narrow effects: it supplies
+defaults for omitted fields on `POST /werk/v1/prefill`, and it supplies the
+native APC default for a local Werk-started vLLM process. It does not activate
+automatic model residency, modify remote vLLM, make MLX or an external ONNX
+runner persistent, or route ordinary `/v1` and media calls through Prefill.
+Consult the live capability response before using optional runtime controls.
 
 ## Runtime selection
 
@@ -105,6 +130,18 @@ export WERK_VLLM_ARGS="--quantization compressed-tensors --kv-cache-dtype fp8 --
 
 werk --backend vllm serve --model qwen3-coder
 ~~~
+
+To let the server supply vLLM's native APC default as well as omitted Werk
+Prefill-policy defaults, add the serve option:
+
+~~~bash
+werk --backend vllm serve --model qwen3-coder --persistence
+~~~
+
+This adds `--enable-prefix-caching` only to a local process that Werk starts and
+only when `WERK_VLLM_ARGS` does not already select the enable or disable form.
+It is not a named-state implementation and does not configure a remote vLLM
+endpoint.
 
 The exact parser name and flags are examples for a compatible vLLM/model
 combination, not Werk defaults. Verify them against the installed vLLM version
@@ -401,6 +438,14 @@ WERK_QWEN_TTS_PYTHON=/absolute/path/to/python
 
 Discovery checks only the explicit interpreter and Werk's managed environment.
 It deliberately does not select an arbitrary qwen-tts package from PATH.
+
+While `werk serve` remains alive, Qwen-TTS execution uses its own resident,
+serialized companion process and bounded model LRU. It is separate from the
+generic media companion and its Diffusers/Transformers LRU;
+`WERK_MEDIA_PIPELINE_CACHE_SIZE` sets the capacity of each worker independently
+(default `1`). This is process-local model residency, not named Werk Prefill
+state or cross-restart persistence. Restarting Werk makes the next Qwen-TTS
+request cold.
 
 ### Qwen platform statement
 

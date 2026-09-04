@@ -85,7 +85,7 @@ impl HandoffRegistry {
         result
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn issue(&self, record: HandoffRecord) -> Result<String, ProtocolError> {
         self.reserve(&record.principal_id)?.issue(record)
     }
@@ -146,7 +146,7 @@ impl HandoffRegistry {
     }
 
     /// Handoffs are single-use: ownership is taken before backend decode.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn take(&self, principal_id: &str, token: &str) -> Result<HandoffRecord, ProtocolError> {
         if token.len() > 4096 || token.len() < 32 {
             return Err(expired());

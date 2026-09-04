@@ -3,7 +3,7 @@ use axum::{
     response::Response,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 use tokio::sync::Semaphore;
@@ -11,10 +11,11 @@ use tokio::sync::Semaphore;
 use crate::{
     backend::{ChatGenerationSession, GenerationBackend},
     inference_service::{InferenceService, JobManager},
-    model_store::{ModelManifest, ModelStore},
+    model_store::{ModelManifest, ModelRuntimeIdentity, ModelStore},
     openai::ChatTemplateOptions,
     runtime_control::{
         LocalWerkControl, PrincipalDeriver, RoutedRuntimeAdapter, RuntimeRoutedGenerationBackend,
+        ServerPersistenceConfig,
     },
     werk_protocol::{ProtocolError, ProtocolErrorCode, WerkControl},
 };
@@ -26,6 +27,55 @@ use super::{
 };
 
 const MAX_PRINCIPAL_DERIVATIONS: usize = 8;
+const MAX_CHAT_SESSIONS: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ChatSessionKey {
+    model: ModelRuntimeIdentity,
+    seed: Option<u64>,
+}
+
+#[derive(Default)]
+struct ChatSessionCache {
+    entries: HashMap<ChatSessionKey, Arc<dyn ChatGenerationSession>>,
+    recency: VecDeque<ChatSessionKey>,
+}
+
+impl ChatSessionCache {
+    fn get(&mut self, key: ChatSessionKey) -> Option<Arc<dyn ChatGenerationSession>> {
+        let session = self.entries.get(&key).cloned()?;
+        self.touch(key);
+        Some(session)
+    }
+
+    fn insert(
+        &mut self,
+        key: ChatSessionKey,
+        session: Arc<dyn ChatGenerationSession>,
+    ) -> Arc<dyn ChatGenerationSession> {
+        if let Some(existing) = self.entries.get(&key).cloned() {
+            self.touch(key);
+            return existing;
+        }
+
+        self.entries.insert(key, session.clone());
+        self.recency.push_back(key);
+        while self.entries.len() > MAX_CHAT_SESSIONS {
+            let Some(expired) = self.recency.pop_front() else {
+                break;
+            };
+            self.entries.remove(&expired);
+        }
+        session
+    }
+
+    fn touch(&mut self, key: ChatSessionKey) {
+        if let Some(index) = self.recency.iter().position(|candidate| *candidate == key) {
+            self.recency.remove(index);
+        }
+        self.recency.push_back(key);
+    }
+}
 
 pub type PromptOptionsResolver = Arc<
     dyn Fn(&ModelStore, &ModelManifest, bool) -> anyhow::Result<ChatTemplateOptions<'static>>
@@ -38,11 +88,12 @@ pub struct ApiState {
     pub(super) store: Arc<ModelStore>,
     pub(super) backend: Arc<dyn GenerationBackend>,
     pub(super) werk_control: Arc<dyn WerkControl>,
+    pub(super) server_persistence: ServerPersistenceConfig,
     pub(super) default_model: Option<String>,
     pub(super) default_image_model: Option<String>,
     pub(super) chat_context_size: usize,
     prompt_options_resolver: Option<PromptOptionsResolver>,
-    chat_sessions: Arc<Mutex<HashMap<String, Arc<dyn ChatGenerationSession>>>>,
+    chat_sessions: Arc<Mutex<ChatSessionCache>>,
     api_keys: Arc<Vec<String>>,
     principal_deriver: PrincipalDeriver,
     principal_derivation_gate: Arc<Semaphore>,
@@ -101,11 +152,12 @@ impl ApiState {
             store: Arc::new(store),
             backend,
             werk_control: Arc::new(local_control),
+            server_persistence: ServerPersistenceConfig::default(),
             default_model,
             default_image_model: None,
             chat_context_size: 4096,
             prompt_options_resolver,
-            chat_sessions: Arc::new(Mutex::new(HashMap::new())),
+            chat_sessions: Arc::new(Mutex::new(ChatSessionCache::default())),
             api_keys: Arc::new(Vec::new()),
             principal_deriver,
             principal_derivation_gate: Arc::new(Semaphore::new(MAX_PRINCIPAL_DERIVATIONS)),
@@ -126,6 +178,14 @@ impl ApiState {
     /// transport contract tests and embedders with their own control service.
     pub fn with_werk_control(mut self, werk_control: Arc<dyn WerkControl>) -> Self {
         self.werk_control = werk_control;
+        self
+    }
+
+    pub(crate) fn with_server_persistence(
+        mut self,
+        server_persistence: ServerPersistenceConfig,
+    ) -> Self {
+        self.server_persistence = server_persistence;
         self
     }
 
@@ -292,13 +352,15 @@ impl ApiState {
         manifest: &ModelManifest,
         seed: Option<u64>,
     ) -> anyhow::Result<Option<Arc<dyn ChatGenerationSession>>> {
-        let key = format!("{}:{seed:?}", manifest.id);
+        let key = ChatSessionKey {
+            model: ModelRuntimeIdentity::from_manifest(manifest)?,
+            seed,
+        };
         if let Some(session) = self
             .chat_sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("chat session cache mutex poisoned"))?
-            .get(&key)
-            .cloned()
+            .get(key)
         {
             return Ok(Some(session));
         }
@@ -307,10 +369,11 @@ impl ApiState {
             return Ok(None);
         };
         let session: Arc<dyn ChatGenerationSession> = Arc::from(session);
-        self.chat_sessions
+        let session = self
+            .chat_sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("chat session cache mutex poisoned"))?
-            .insert(key, session.clone());
+            .insert(key, session);
         Ok(Some(session))
     }
 }
@@ -328,4 +391,138 @@ fn principal_unavailable() -> ProtocolError {
         "secure principal derivation is unavailable",
     )
     .retryable(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        backend::{
+            GenerateRequest, GenerateResponse, GenerateStream, GenerationBackend, GenerationTimings,
+        },
+        model_store::{ModelFile, ModelFormat, ModelMetadata, ModelSource},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestChatSession;
+
+    impl ChatGenerationSession for TestChatSession {
+        fn generate(&self, _request: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            unreachable!("chat-session cache tests do not generate tokens")
+        }
+
+        fn generate_stream(&self, _request: GenerateRequest) -> GenerateStream {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    struct SessionBackend {
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl GenerationBackend for SessionBackend {
+        fn start_chat_session(
+            &self,
+            _manifest: &ModelManifest,
+            _seed: Option<u64>,
+        ) -> anyhow::Result<Option<Box<dyn ChatGenerationSession>>> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Box::new(TestChatSession)))
+        }
+
+        fn generate(
+            &self,
+            _manifest: &ModelManifest,
+            _request: GenerateRequest,
+        ) -> anyhow::Result<GenerateResponse> {
+            Ok(GenerateResponse {
+                text: String::new(),
+                assistant_message: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: "stop".to_string(),
+                timings: GenerationTimings::default(),
+                backend_diagnostics: Vec::new(),
+            })
+        }
+
+        fn generate_stream(
+            &self,
+            _manifest: ModelManifest,
+            _request: GenerateRequest,
+        ) -> GenerateStream {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    fn manifest(id: impl Into<String>) -> ModelManifest {
+        ModelManifest {
+            id: id.into(),
+            source: ModelSource::LocalPath {
+                path: "test".to_string(),
+            },
+            format: ModelFormat::SafeTensors,
+            architecture: Some("qwen3".to_string()),
+            tokenizer_path: Some("tokenizer.json".to_string()),
+            config_path: Some("config.json".to_string()),
+            model_path: Some("model.safetensors".to_string()),
+            backend: "test".to_string(),
+            created_unix: 1,
+            files: vec![ModelFile {
+                path: "model.safetensors".to_string(),
+                size: 42,
+                checksum: "sha256:original".to_string(),
+            }],
+            artifacts: Vec::new(),
+            metadata: ModelMetadata::default(),
+        }
+    }
+
+    fn state(starts: Arc<AtomicUsize>) -> ApiState {
+        let store = ModelStore::resolve(Some(
+            std::env::temp_dir().join(format!("werk1112-api-session-cache-{}", std::process::id())),
+        ))
+        .unwrap();
+        ApiState::new(store, Arc::new(SessionBackend { starts }))
+    }
+
+    #[test]
+    fn chat_session_cache_uses_exact_manifest_identity() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let state = state(starts.clone());
+        let original = manifest("same-id");
+
+        state.chat_session(&original, Some(7)).unwrap().unwrap();
+        state.chat_session(&original, Some(7)).unwrap().unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        let mut replacement = original;
+        replacement.files[0].checksum = "sha256:replacement".to_string();
+        state.chat_session(&replacement, Some(7)).unwrap().unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn chat_session_cache_is_lru_bounded() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let state = state(starts.clone());
+
+        for index in 0..=MAX_CHAT_SESSIONS {
+            state
+                .chat_session(&manifest(format!("model-{index}")), Some(1))
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            state.chat_sessions.lock().unwrap().entries.len(),
+            MAX_CHAT_SESSIONS
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), MAX_CHAT_SESSIONS + 1);
+
+        state
+            .chat_session(&manifest("model-0"), Some(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), MAX_CHAT_SESSIONS + 2);
+    }
 }

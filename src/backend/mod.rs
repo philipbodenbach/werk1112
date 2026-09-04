@@ -290,6 +290,7 @@ const MLX_FORMATS: &[ModelFormat] = &[ModelFormat::Mlx, ModelFormat::SafeTensors
 const MEDIA_FORMATS: &[ModelFormat] = &[ModelFormat::SafeTensors, ModelFormat::PyTorch];
 
 const ANY_ARCH: &[&str] = &[];
+const BURN_ARCHES: &[&str] = &["phi3"];
 const VLLM_ARCHES: &[&str] = &[
     "llama",
     "qwen2",
@@ -456,7 +457,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Burn,
         display_name: "Burn CUDA",
         supported_formats: SAFETENSORS_FORMATS,
-        supported_architectures: ANY_ARCH,
+        supported_architectures: BURN_ARCHES,
         supported_tasks: TEXT_GENERATION_TASKS,
         supported_layouts: TRANSFORMERS_LAYOUTS,
         accelerators: &[BackendAccelerator::Cuda],
@@ -475,7 +476,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Burn,
         display_name: "Burn CPU",
         supported_formats: SAFETENSORS_FORMATS,
-        supported_architectures: ANY_ARCH,
+        supported_architectures: BURN_ARCHES,
         supported_tasks: TEXT_GENERATION_TASKS,
         supported_layouts: TRANSFORMERS_LAYOUTS,
         accelerators: &[BackendAccelerator::Cpu],

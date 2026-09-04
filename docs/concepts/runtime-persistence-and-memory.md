@@ -45,7 +45,7 @@ reported status has one exact meaning:
 | `supported` | Operational through the active Werk adapter without an experimental opt-in. |
 | `unsupported` | The active adapter does not implement the operation. Retrying without changing the backend will not help. |
 | `unavailable` | The contract exists, but a runtime, process, probe or telemetry prerequisite is missing now. |
-| `experimental` | Implemented but accepted only when the request explicitly sets `allow_experimental: true`. |
+| `experimental` | Implemented but accepted only when the effective request has `allow_experimental: true`; Prefill can receive this from an explicit request or an enabled server default. |
 | `externally_managed` | The backend or another component owns the behavior; Werk may report it but refuses to present it as a Werk-controlled mutation. |
 | `metadata_only` | Informational reporting only. It does not imply a state handle or control operation. |
 
@@ -59,18 +59,18 @@ Statuses below describe the production adapters in this repository. Host and
 accelerator telemetry depend on what the running host can sample, so those
 cells show both truthful outcomes.
 
-| Capability ID(s) | Functionally validated llama.cpp process | llama.cpp before/after a failed probe | vLLM | Other production backends |
-| --- | --- | --- | --- | --- |
-| `runtime.memory.telemetry.host` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` |
-| `runtime.memory.telemetry.accelerator` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` |
-| `runtime.memory.reservations` | `unavailable` | `unavailable` | `unavailable` | `unavailable` |
-| `runtime.model_residency` | `metadata_only` | `metadata_only` | `metadata_only` | `metadata_only` |
-| `runtime.state.prefix_cache` | `experimental` | `unavailable` | `externally_managed` only when every active process is local and explicitly enables APC; otherwise `unavailable`, `metadata_only`, or `unsupported` as detailed below | `unsupported` |
-| `runtime.state.persistence`, `runtime.state.restore`, `runtime.state.tier.disk` | `experimental` | `unavailable` | `unsupported` | `unsupported` |
-| `runtime.state.restore.cross_restart` | `unavailable` | `unavailable` | Not advertised; no Werk adapter | Not advertised; no Werk adapter |
-| `runtime.state.tier.ram`, `runtime.state.tier.vram` | `unsupported` | `unsupported` | `unsupported` | `unsupported` |
-| `runtime.pd.prefill`, `runtime.pd.decode`, `runtime.pd.handoff` | `experimental` | `unavailable` | `unsupported` | `unsupported` |
-| `runtime.experts.residency` | `unsupported` | `unsupported` | `unsupported` | `unsupported` |
+| Capability ID(s) | Functionally validated llama.cpp process | llama.cpp before/after a failed state probe | local vLLM | remote vLLM | Other production backends |
+| --- | --- | --- | --- | --- | --- |
+| `runtime.memory.telemetry.host` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` |
+| `runtime.memory.telemetry.accelerator` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` | `supported` or `unavailable` |
+| `runtime.memory.reservations` | `unavailable` | `unavailable` | `unavailable` | `unavailable` | `unavailable` |
+| `runtime.model_residency` | `supported` | `supported` when a compatible managed runtime is available; otherwise `unavailable` | `supported` with an active Werk-owned process; otherwise `unavailable` | `externally_managed` with an active endpoint | `supported`, `unavailable`, or `unsupported` according to the concrete adapter and runtime described below |
+| `runtime.state.prefix_cache` | `experimental` | `unavailable` | `externally_managed` only when every active process explicitly enables APC; otherwise `unavailable`, `metadata_only`, or `unsupported` | `metadata_only` because the OpenAI endpoint does not expose an introspection/control contract | `unsupported` |
+| `runtime.state.persistence`, `runtime.state.restore`, `runtime.state.tier.disk` | `experimental` | `unavailable` | `unsupported` | `unsupported` | `unsupported` |
+| `runtime.state.restore.cross_restart` | `unavailable` | `unavailable` | Not advertised; no Werk adapter | Not advertised; no Werk adapter | Not advertised; no Werk adapter |
+| `runtime.state.tier.ram`, `runtime.state.tier.vram` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | `unsupported` |
+| `runtime.pd.prefill`, `runtime.pd.decode`, `runtime.pd.handoff` | `experimental` | `unavailable` | `unsupported` | `unsupported` | `unsupported` |
+| `runtime.experts.residency` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | `unsupported` |
 
 For vLLM, `runtime.state.prefix_cache` describes backend-owned automatic reuse,
 not a Werk state handle. With no active process it is `unavailable`. It is
@@ -81,8 +81,49 @@ process, and every active process's effective arguments contain the exact
 active process explicitly disables APC it is `unsupported`; remote,
 mixed or ambiguous effective arguments are `metadata_only`. Even in the
 `externally_managed` case, Werk cannot name, persist, move, prune or hand off a
-vLLM cache entry. KV offload, LMCache and expert controls remain outside the
+vLLM cache entry. With `werk serve --persistence`, Werk adds the native APC
+flag to a local vLLM launch unless `WERK_VLLM_ARGS` explicitly enables or
+disables it. `--persistence-reuse disabled` instead adds the native disable
+flag. Werk verifies that the installed server help advertises a generated flag
+before spawning it. KV offload, LMCache and expert controls remain outside the
 adapter and are not inferred from APC.
+
+### Execution lifetime and reuse matrix
+
+The runtime-control capabilities above are only one kind of persistence. The
+following matrix separates four mechanisms that otherwise look similar during
+a warm benchmark:
+
+| Execution path | Execution lifetime | Model or pipeline residency | Automatic prefix/KV reuse | Named Werk state (`/werk/v1/prefill`) | Durable JobRecord |
+| --- | --- | --- | --- | --- | --- |
+| Werk-managed `llama-server` | One child server is reused for an exact manifest/runtime key while `werk serve` remains alive. Replacing model files under the same ID selects a new process. | Yes; weights stay in the child process. | `cache_prompt: true` is sent on completion and OpenAI chat/vision paths; exact reuse remains llama.cpp-owned. | Experimental only after the exact live process passes the functional state probe. Snapshots are usable only by that process generation. | No for ordinary chat/vision requests. |
+| Local vLLM | One Werk-started server process is reused for its exact manifest/runtime/argv key. | Yes; weights stay in the vLLM process. | Backend-owned APC when effective arguments enable `--enable-prefix-caching`; `werk serve --persistence` supplies that default unless explicitly overridden. | No. Werk cannot name, snapshot, restore, move or prune APC entries. | No for ordinary chat/vision requests. |
+| Remote vLLM | The separately operated endpoint owns its lifetime; it may outlive Werk. | Endpoint-owned, not guaranteed or controlled by Werk. | Endpoint-owned and opaque to Werk; remote configuration is reported as metadata, not as a controllable cache. | No. | No for ordinary chat/vision requests. |
+| In-process llama.cpp high-level and legacy FFI | Rust backend objects and chat sessions live inside one `werk serve` process. | Yes; model weights and the server chat-session LRU use an exact, checksum-sensitive manifest identity. | A same-process text chat session can retain and trim its KV context for a shared prefix. Image and tool-calling requests bypass that Werk chat-session cache. | No. | No. |
+| Candle | In-process Rust backend lives for the `werk serve` process. | Yes; loaded weights are keyed by exact, checksum-sensitive manifest identity. | No cross-request KV reuse; the model KV cache is cleared before each generation. | No. | No. |
+| Burn (currently Phi-3) | In-process Rust backend lives for the `werk serve` process. | Yes; one prepared model is cached by exact, checksum-sensitive manifest identity. | No cross-request prefix/KV contract. | No. | No. |
+| ONNX Runtime external runner | The configured opaque runner is invoked per request. | No; the runner exposes no validated residency protocol. | No. | No. | No. |
+| ONNX Runtime Python GenAI fallback | One serialized Werk-owned Python worker is reused for CPU execution. | Yes; exact model and tokenizer entries use a bounded LRU, default capacity `1`. | No; each request gets a new generator and prompt state. | No. | No. |
+| Transformers compatibility | One serialized Werk-owned Python worker is reused. | Yes; exact model/tokenizer entries use a bounded LRU, default capacity `1`. | Only generation-local cache; prompts and generator state are not shared across requests. | No. | No. |
+| MLX / MLX-VLM | The configured command or Python module is invoked per request. | No Werk resident model cache; the subprocess reloads. | No cross-request prefix/KV reuse. | No. | No. |
+| Generic media companion | One serialized resident execution worker is reused while `werk serve` lives. | Yes; a bounded Diffusers/Transformers LRU, default capacity `1`. | Not applicable; this is model/pipeline residency, not a text KV cache. | No. | Yes on job-backed media routes; direct routes remain synchronous. |
+| Managed Qwen3-TTS media | A separate serialized resident Qwen execution worker is reused while `werk serve` lives. | Yes; a separate bounded Qwen LRU, also default capacity `1`. | Not applicable. | No. | Yes when speech is requested asynchronously, as the ComfyUI node does. |
+
+All entries in the residency columns are process-local. A Werk or owned backend
+restart makes the next inference cold. A remote vLLM service can remain alive
+across a Werk restart, but that is external service lifetime rather than Werk
+persistence. `WERK_MEDIA_PIPELINE_CACHE_SIZE` applies independently to the
+generic and managed-Qwen worker, so using both can retain up to that many
+entries in each process. Transformers and ONNX Python GenAI have independent
+LRUs controlled by `WERK_TRANSFORMERS_MODEL_CACHE_SIZE` and
+`WERK_ONNX_GENAI_MODEL_CACHE_SIZE` respectively.
+
+Job records are different again. A job-backed route stores the request, status
+and eventual result under `WERK_HOME/jobs`, but does not serialize a loaded
+model, pipeline, KV cache or resumable computation. Terminal records survive a
+restart; a nonterminal record found during startup is marked failed instead of
+being resumed. Job durability therefore provides polling and diagnostics, not
+inference acceleration or runtime-state reuse.
 
 ### llama.cpp's experimental boundary
 
@@ -131,6 +172,49 @@ cannot make an invalid process-generation handle portable.
 State summaries expose opaque IDs, model/backend identity, tier, status,
 logical byte size when known, timestamps, pinning and reusability. They do not
 expose backend handles, cache keys, snapshot paths, prompts or credentials.
+
+### Server-side Prefill defaults
+
+The server can provide persistence policy defaults for clients that omit them:
+
+~~~bash
+werk serve --model my-gguf-model --persistence
+~~~
+
+This means `auto` retention, `prefer` reuse, no TTL and no pinning. It also
+supplies the experimental opt-in when `allow_experimental` is omitted. For a
+local vLLM selected by this server, it additionally defaults the native
+automatic prefix cache on. Model/pipeline residency in Werk-owned in-process
+backends and resident workers is automatic and does not require this flag.
+Granular controls select a different default policy, and any one of them
+implies `--persistence`:
+
+~~~bash
+werk serve --model my-gguf-model \
+  --persistence-mode disk \
+  --persistence-reuse prefer \
+  --persistence-ttl-seconds 3600 \
+  --persistence-pin
+~~~
+
+The modes are `ephemeral`, `memory`, `disk` and `auto`; reuse is `disabled`,
+`prefer` or `required`; TTL is bounded to 1 through 2592000 seconds. These are
+defaults only for absent top-level members of `POST /werk/v1/prefill`. A
+present `policy` object owns the complete request policy, and a present
+`allow_experimental` Boolean owns the opt-in decision. Explicit `false` is
+never promoted to `true` by server configuration.
+
+For local vLLM, `--persistence-reuse disabled` defaults the native prefix cache
+off; an explicit enable or disable in `WERK_VLLM_ARGS` wins. Remote vLLM stays
+externally managed and receives no generated process argument.
+
+This switch does not create a generic Werk KV format or make one-shot external
+commands persistent. Today the positive named-state path is experimental and
+requires a functionally validated Werk-managed llama-server process for the
+exact installed GGUF model. The adapter owns the opaque state; Werk owns the
+policy, lifecycle, accounting and compatibility envelope around it. OpenAI
+`/v1` and media inference are not redirected through Prefill, semantic output
+caching is not introduced, and cross-restart restore remains unavailable.
 
 ### Compatibility envelope
 
@@ -301,7 +385,8 @@ the value is not exposed as a `STRING` or JSON output. See the
    isolated local development process.
 2. Read runtime info and capabilities; do not assume a backend feature from
    its name.
-3. Treat `experimental` as unavailable unless the user deliberately opts in.
+3. Treat `experimental` as unavailable unless the user deliberately opts in,
+   either in the request or through the Prefill-only server default.
 4. Preview every state mutation, then repeat it with the explicit execute flag
    or `dry_run: false` only after checking the selector/result.
 5. Expect handoffs and same-process states to expire when the server or backend

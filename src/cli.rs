@@ -76,19 +76,21 @@ use crate::{
         MessageContent, PromptSpec, image_urls_from_messages, messages_to_prompt_for_model,
         messages_to_prompt_for_model_with_template,
     },
+    runtime_control::ServerPersistenceConfig,
     runtime_planner::{
         RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
         plan_runtime, runtime_candidate_ids, select_runtime,
     },
     werk_protocol::{
-        PruneStatesRequest, StateAction, StateActionRequest, StateListFilter, StateSelector,
-        StateTier, WerkProtocolClient,
+        PersistenceMode, PersistencePolicy, PruneStatesRequest, ReuseMode, StateAction,
+        StateActionRequest, StateListFilter, StateSelector, StateTier, WerkProtocolClient,
     },
 };
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
 const DEFAULT_RUNTIME_CONTROL_TIMEOUT_SECONDS: u64 = 30;
+const MAX_PERSISTENCE_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const CHAT_CONTEXT_SAFETY_TOKENS: usize = 64;
 const DEFAULT_MAX_VISION_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
@@ -426,6 +428,105 @@ impl From<DeviceArg> for CandleDeviceMode {
     }
 }
 
+#[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
+pub struct ServePersistenceArgs {
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Enable persistence defaults for /werk/v1/prefill and automatic prefix caching for local Werk-managed vLLM; remote vLLM remains externally managed"
+    )]
+    pub persistence: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Default prefill persistence mode when policy is omitted; implies --persistence"
+    )]
+    pub persistence_mode: Option<ServePersistenceModeArg>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Default prefill reuse policy when policy is omitted; disabled also disables the managed local-vLLM prefix-cache default; implies --persistence"
+    )]
+    pub persistence_reuse: Option<ServePersistenceReuseArg>,
+
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..=MAX_PERSISTENCE_TTL_SECONDS),
+        help = "Default prefill state TTL in seconds when policy is omitted; implies --persistence"
+    )]
+    pub persistence_ttl_seconds: Option<u64>,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Pin prefill state by default when policy is omitted; implies --persistence"
+    )]
+    pub persistence_pin: bool,
+}
+
+impl ServePersistenceArgs {
+    fn server_config(&self) -> ServerPersistenceConfig {
+        let enabled = self.persistence
+            || self.persistence_mode.is_some()
+            || self.persistence_reuse.is_some()
+            || self.persistence_ttl_seconds.is_some()
+            || self.persistence_pin;
+        if !enabled {
+            return ServerPersistenceConfig::default();
+        }
+        ServerPersistenceConfig::enabled(PersistencePolicy {
+            mode: self
+                .persistence_mode
+                .map(Into::into)
+                .unwrap_or(PersistenceMode::Auto),
+            reuse: self
+                .persistence_reuse
+                .map(Into::into)
+                .unwrap_or(ReuseMode::Prefer),
+            ttl_seconds: self.persistence_ttl_seconds,
+            pin: self.persistence_pin,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServePersistenceModeArg {
+    Ephemeral,
+    Memory,
+    Disk,
+    Auto,
+}
+
+impl From<ServePersistenceModeArg> for PersistenceMode {
+    fn from(value: ServePersistenceModeArg) -> Self {
+        match value {
+            ServePersistenceModeArg::Ephemeral => Self::Ephemeral,
+            ServePersistenceModeArg::Memory => Self::Memory,
+            ServePersistenceModeArg::Disk => Self::Disk,
+            ServePersistenceModeArg::Auto => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServePersistenceReuseArg {
+    Disabled,
+    Prefer,
+    Required,
+}
+
+impl From<ServePersistenceReuseArg> for ReuseMode {
+    fn from(value: ServePersistenceReuseArg) -> Self {
+        match value {
+            ServePersistenceReuseArg::Disabled => Self::Disabled,
+            ServePersistenceReuseArg::Prefer => Self::Prefer,
+            ServePersistenceReuseArg::Required => Self::Required,
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
@@ -481,6 +582,9 @@ pub enum Commands {
 
         #[arg(long, help = "Print HTTP request and generation logs")]
         verbose: bool,
+
+        #[command(flatten)]
+        persistence: ServePersistenceArgs,
     },
 
     #[command(
@@ -1195,6 +1299,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         allow_unauthenticated: false,
         cors_origins: Vec::new(),
         verbose: false,
+        persistence: ServePersistenceArgs::default(),
     });
     let selection_options =
         selection_options.with_backend_install_output(command_backend_install_verbose(&command));
@@ -1214,6 +1319,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             allow_unauthenticated,
             cors_origins,
             verbose,
+            persistence,
         } => {
             let store = ModelStore::resolve(model_home)?;
             store.ensure()?;
@@ -1221,6 +1327,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let ip: IpAddr = host.parse()?;
             let addr = SocketAddr::new(ip, port);
+            let server_persistence = persistence.server_config();
+            let vllm_automatic_prefix_caching = server_persistence
+                .is_enabled()
+                .then(|| server_persistence.defaults().reuse != ReuseMode::Disabled);
+            let selection_options =
+                selection_options.with_vllm_automatic_prefix_caching(vllm_automatic_prefix_caching);
             let backend = build_generation_backend(
                 store.clone(),
                 backend_choice,
@@ -1271,6 +1383,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 println!("Default image model available: {image_model}");
             }
+            let server_persistence_summary = format_server_persistence_config(&server_persistence);
             let api_state = ApiState::new_with_default_model_prompt_options_and_verbose(
                 store,
                 backend,
@@ -1278,10 +1391,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(prompt_options_resolver),
                 verbose,
             )
+            .with_server_persistence(server_persistence)
             .with_default_image_model(image_model)
             .with_chat_context_size(llama_options.ctx_size)
             .with_api_keys(api_keys)
             .with_cors_origins(cors_origins);
+            if let Some(summary) = server_persistence_summary {
+                println!("{summary}");
+            }
             serve(addr, api_state).await
         }
         Commands::Run {
@@ -7667,6 +7784,7 @@ enum BackendChoice {
 struct SelectionOptions {
     provision_missing_backends: bool,
     verbose_backend_installs: bool,
+    vllm_automatic_prefix_caching: Option<bool>,
 }
 
 impl SelectionOptions {
@@ -7675,12 +7793,20 @@ impl SelectionOptions {
         Self {
             provision_missing_backends: !no_auto_install && (auto_install || default_provision),
             verbose_backend_installs: false,
+            vllm_automatic_prefix_caching: None,
         }
     }
 
     fn with_backend_install_output(self, verbose: bool) -> Self {
         Self {
             verbose_backend_installs: verbose,
+            ..self
+        }
+    }
+
+    fn with_vllm_automatic_prefix_caching(self, enabled: Option<bool>) -> Self {
+        Self {
+            vllm_automatic_prefix_caching: enabled,
             ..self
         }
     }
@@ -8191,8 +8317,16 @@ impl VllmPreferredBackend {
         }
 
         let concrete: Arc<dyn GenerationBackend> = match backend {
-            BackendChoice::Vllm => Arc::new(VllmBackend::new(self.store.clone())),
-            BackendChoice::VllmRocm => Arc::new(VllmBackend::new_rocm(self.store.clone())),
+            BackendChoice::Vllm => Arc::new(
+                VllmBackend::new(self.store.clone()).with_automatic_prefix_caching(
+                    self.selection_options.vllm_automatic_prefix_caching,
+                ),
+            ),
+            BackendChoice::VllmRocm => Arc::new(
+                VllmBackend::new_rocm(self.store.clone()).with_automatic_prefix_caching(
+                    self.selection_options.vllm_automatic_prefix_caching,
+                ),
+            ),
             _ => unreachable!("validated above"),
         };
         backends.insert(key, concrete.clone());
@@ -8412,8 +8546,14 @@ fn build_concrete_backend(
         BackendChoice::MlxVlm => Ok(Arc::new(MlxVlmBackend::new(store))),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
         BackendChoice::TransformersCompat => Ok(Arc::new(TransformersCompatBackend::new(store))),
-        BackendChoice::Vllm => Ok(Arc::new(VllmBackend::new(store))),
-        BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new_rocm(store))),
+        BackendChoice::Vllm => Ok(Arc::new(
+            VllmBackend::new(store)
+                .with_automatic_prefix_caching(selection_options.vllm_automatic_prefix_caching),
+        )),
+        BackendChoice::VllmRocm => Ok(Arc::new(
+            VllmBackend::new_rocm(store)
+                .with_automatic_prefix_caching(selection_options.vllm_automatic_prefix_caching),
+        )),
     }
 }
 
@@ -9948,6 +10088,43 @@ fn format_temp_list(entries: &[PathBuf]) -> String {
         .join("\n")
 }
 
+fn format_server_persistence_config(config: &ServerPersistenceConfig) -> Option<String> {
+    if !config.is_enabled() {
+        return None;
+    }
+
+    let defaults = config.defaults();
+    let mode = match defaults.mode {
+        PersistenceMode::Ephemeral => "ephemeral",
+        PersistenceMode::Memory => "memory",
+        PersistenceMode::Disk => "disk",
+        PersistenceMode::Auto => "auto",
+    };
+    let reuse = match defaults.reuse {
+        ReuseMode::Disabled => "disabled",
+        ReuseMode::Prefer => "prefer",
+        ReuseMode::Required => "required",
+    };
+    let vllm_prefix_cache = if defaults.reuse == ReuseMode::Disabled {
+        "disabled"
+    } else {
+        "enabled"
+    };
+    let ttl = defaults
+        .ttl_seconds
+        .map(|seconds| seconds.to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    Some(format!(
+        "Werk persistence enabled: prefill defaults mode={mode} reuse={reuse} \
+         ttl_seconds={ttl} pin={}; automatic model/pipeline residency remains active on \
+         supported Werk-managed runtimes; local vLLM automatic prefix caching defaults to \
+         {vllm_prefix_cache} unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM \
+         remains externally managed.",
+        defaults.pin
+    ))
+}
+
 fn print_runtime_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -10064,6 +10241,7 @@ mod tests {
     };
     use crate::inference_service::OutputMetadata;
     use crate::model_store::{ModelFile, ModelSource};
+    use clap::CommandFactory;
     use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -10156,6 +10334,7 @@ mod tests {
                 allow_unauthenticated,
                 cors_origins,
                 verbose,
+                persistence,
             } => {
                 assert_eq!(host, "0.0.0.0");
                 assert_eq!(port, 8080);
@@ -10166,6 +10345,7 @@ mod tests {
                 assert!(!allow_unauthenticated);
                 assert!(cors_origins.is_empty());
                 assert!(!verbose);
+                assert_eq!(persistence, ServePersistenceArgs::default());
             }
             command => panic!("unexpected command: {command:?}"),
         }
@@ -10620,6 +10800,140 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    fn parse_serve_persistence(args: &[&str]) -> ServePersistenceArgs {
+        let mut argv = vec!["werk", "serve"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)
+            .expect("serve persistence arguments")
+            .command
+        {
+            Some(Commands::Serve { persistence, .. }) => persistence,
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_server_persistence_options_and_granular_options_imply_enablement() {
+        let umbrella = parse_serve_persistence(&["--persistence"]);
+        let config = umbrella.server_config();
+        assert!(config.is_enabled());
+        assert_eq!(config.defaults(), &PersistencePolicy::default());
+
+        let granular = parse_serve_persistence(&[
+            "--persistence-mode",
+            "disk",
+            "--persistence-reuse",
+            "required",
+            "--persistence-ttl-seconds",
+            "900",
+            "--persistence-pin",
+        ]);
+        assert!(!granular.persistence);
+        let config = granular.server_config();
+        assert!(config.is_enabled());
+        assert_eq!(config.defaults().mode, PersistenceMode::Disk);
+        assert_eq!(config.defaults().reuse, ReuseMode::Required);
+        assert_eq!(config.defaults().ttl_seconds, Some(900));
+        assert!(config.defaults().pin);
+
+        for args in [
+            &["--persistence-mode", "memory"][..],
+            &["--persistence-reuse", "disabled"][..],
+            &["--persistence-ttl-seconds", "60"][..],
+            &["--persistence-pin"][..],
+        ] {
+            assert!(parse_serve_persistence(args).server_config().is_enabled());
+        }
+
+        assert!(Cli::try_parse_from(["werk", "serve", "--persistence-ttl-seconds", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["werk", "serve", "--persistence-ttl-seconds", "2592001"]).is_err()
+        );
+    }
+
+    #[test]
+    fn serve_help_and_startup_summary_state_persistence_scope() {
+        let mut command = Cli::command();
+        let serve = command
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand");
+        let help = serve.render_long_help().to_string();
+        assert!(help.contains("persistence defaults for /werk/v1/prefill"));
+        assert!(help.contains("automatic prefix caching for local Werk-managed vLLM"));
+        assert!(help.contains("remote vLLM remains externally managed"));
+        assert!(help.contains("policy is omitted; implies --persistence"));
+        assert!(help.contains("disabled also disables the managed local-vLLM prefix-cache"));
+
+        assert_eq!(
+            format_server_persistence_config(&ServerPersistenceConfig::default()),
+            None
+        );
+        let config = parse_serve_persistence(&[
+            "--persistence-mode",
+            "disk",
+            "--persistence-reuse",
+            "required",
+            "--persistence-ttl-seconds",
+            "900",
+            "--persistence-pin",
+        ])
+        .server_config();
+        assert_eq!(
+            format_server_persistence_config(&config).as_deref(),
+            Some(
+                "Werk persistence enabled: prefill defaults mode=disk reuse=required \
+                 ttl_seconds=900 pin=true; automatic model/pipeline residency remains active on \
+                 supported Werk-managed runtimes; local vLLM automatic prefix caching defaults to \
+                 enabled unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM \
+                 remains externally managed."
+            )
+        );
+
+        let disabled =
+            parse_serve_persistence(&["--persistence-reuse", "disabled"]).server_config();
+        assert!(
+            format_server_persistence_config(&disabled)
+                .unwrap()
+                .contains("local vLLM automatic prefix caching defaults to disabled")
+        );
+    }
+
+    #[test]
+    fn only_enabled_serve_persistence_requests_vllm_automatic_prefix_caching() {
+        let base = SelectionOptions::from_cli(BackendArg::Vllm, false, false);
+        assert_eq!(base.vllm_automatic_prefix_caching, None);
+
+        let disabled = parse_serve_persistence(&[]).server_config();
+        let disabled_default = disabled
+            .is_enabled()
+            .then(|| disabled.defaults().reuse != ReuseMode::Disabled);
+        assert_eq!(
+            base.with_vllm_automatic_prefix_caching(disabled_default)
+                .vllm_automatic_prefix_caching,
+            None
+        );
+
+        let enabled = parse_serve_persistence(&["--persistence"]).server_config();
+        let enabled_default = enabled
+            .is_enabled()
+            .then(|| enabled.defaults().reuse != ReuseMode::Disabled);
+        assert_eq!(
+            base.with_vllm_automatic_prefix_caching(enabled_default)
+                .vllm_automatic_prefix_caching,
+            Some(true)
+        );
+
+        let no_reuse =
+            parse_serve_persistence(&["--persistence-reuse", "disabled"]).server_config();
+        assert_eq!(
+            base.with_vllm_automatic_prefix_caching(Some(
+                no_reuse.defaults().reuse != ReuseMode::Disabled
+            ))
+            .vllm_automatic_prefix_caching,
+            Some(false)
+        );
     }
 
     #[test]
@@ -12819,6 +13133,7 @@ mod tests {
             allow_unauthenticated: false,
             cors_origins: Vec::new(),
             verbose: false,
+            persistence: ServePersistenceArgs::default(),
         };
         assert!(should_print_startup_banner_for(&serve, true, true));
         assert!(!should_print_startup_banner_for(&serve, false, true));

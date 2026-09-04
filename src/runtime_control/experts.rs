@@ -126,12 +126,14 @@ pub(crate) trait ExpertClock: Send + Sync {
 }
 
 #[derive(Debug)]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct SystemExpertClock {
     started: Instant,
     unix_at_start_millis: u64,
 }
 
 impl SystemExpertClock {
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn new() -> Self {
         let unix_at_start_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -236,6 +238,7 @@ impl ExpertPolicyAction {
         }
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn target_tier(&self) -> Option<ExpertTier> {
         match self {
             Self::Move { to, .. } => Some(*to),
@@ -487,6 +490,7 @@ impl ExpertResidencyManager {
         })
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn with_system_clock(
         config: ExpertResidencyConfig,
     ) -> Result<Self, ExpertResidencyError> {

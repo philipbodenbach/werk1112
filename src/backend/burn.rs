@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     env, fs,
     path::PathBuf,
     process::Command,
@@ -19,9 +20,12 @@ use super::{
     GenerationBackend,
 };
 use crate::{
-    model_store::{ModelFormat, ModelManifest, ModelStore},
+    model_store::{ModelFormat, ModelManifest, ModelRuntimeIdentity, ModelStore},
     openai::{ChatMessage, MessageContent, messages_to_prompt_for_model},
+    runtime_control::{BackendRuntimeAdapter, ModelResidencyStatus, StaticRuntimeAdapter},
 };
+
+const BURN_MODEL_CACHE_CAPACITY: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BurnMode {
@@ -49,7 +53,7 @@ impl BurnMode {
 pub struct BurnBackend {
     store: ModelStore,
     mode: BurnMode,
-    cache: Arc<Mutex<Option<BurnPreparedModel>>>,
+    cache: Arc<Mutex<HashMap<ModelRuntimeIdentity, BurnPreparedModel>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +92,7 @@ impl BurnBackend {
         Self {
             store,
             mode,
-            cache: Arc::new(Mutex::new(None)),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -331,20 +335,22 @@ impl BurnBackend {
     }
 
     fn ensure_model(&self, manifest: &ModelManifest) -> Result<()> {
-        if self
+        let key = ModelRuntimeIdentity::from_manifest(manifest)?;
+        let mut cache = self
             .cache
             .lock()
-            .map_err(|_| anyhow!("Burn model cache mutex poisoned"))?
-            .is_some()
-        {
+            .map_err(|_| anyhow!("Burn model cache mutex poisoned"))?;
+        if cache.contains_key(&key) {
             return Ok(());
         }
 
+        // Burn's prepared runtime owns heavyweight model/device state. Keep a
+        // single exact entry and release it before loading a replacement so a
+        // normal model switch cannot retain every model used by the server.
+        cache.clear();
         let model = self.prepare_model(manifest)?;
-        *self
-            .cache
-            .lock()
-            .map_err(|_| anyhow!("Burn model cache mutex poisoned"))? = Some(model);
+        cache.insert(key, model);
+        debug_assert!(cache.len() <= BURN_MODEL_CACHE_CAPACITY);
         Ok(())
     }
 
@@ -353,14 +359,20 @@ impl BurnBackend {
         manifest: &ModelManifest,
         f: impl FnOnce(&mut BurnPreparedModel) -> Result<T>,
     ) -> Result<T> {
-        self.ensure_model(manifest)?;
+        let key = ModelRuntimeIdentity::from_manifest(manifest)?;
         let mut guard = self
             .cache
             .lock()
             .map_err(|_| anyhow!("Burn model cache mutex poisoned"))?;
+        if !guard.contains_key(&key) {
+            guard.clear();
+            let model = self.prepare_model(manifest)?;
+            guard.insert(key, model);
+        }
+        debug_assert!(guard.len() <= BURN_MODEL_CACHE_CAPACITY);
         let model = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("Burn model cache was unexpectedly empty"))?;
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("Burn model cache lost the selected model"))?;
         f(model)
     }
 
@@ -716,6 +728,33 @@ impl BurnMode {
 }
 
 impl GenerationBackend for BurnBackend {
+    fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
+        let runtime = Self::runtime_status(self.mode);
+        let (status, detail) = if runtime.available {
+            (
+                ModelResidencyStatus::Supported,
+                format!(
+                    "Werk keeps one exact {} model resident in its bounded in-process cache",
+                    self.mode.display()
+                ),
+            )
+        } else {
+            (
+                ModelResidencyStatus::Unavailable,
+                format!(
+                    "{} model residency is unavailable: {}",
+                    self.mode.display(),
+                    runtime.detail
+                ),
+            )
+        };
+        Arc::new(
+            StaticRuntimeAdapter::new(self.mode.label())
+                .with_accelerator_family(self.mode.accelerator_label().to_ascii_lowercase())
+                .with_model_residency(status, detail),
+        )
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.ensure_model(manifest)?;
         eprintln!("Using {} backend", self.mode.display());
@@ -1055,7 +1094,39 @@ fn burn_phi3_probe(_store: &ModelStore, _manifest: &ModelManifest) -> Result<Str
 
 #[cfg(test)]
 mod tests {
-    use super::burn_architecture_enabled;
+    use super::{BurnBackend, BurnMode, GenerationBackend, burn_architecture_enabled};
+    use crate::{
+        model_store::{
+            ModelFile, ModelFormat, ModelManifest, ModelMetadata, ModelRuntimeIdentity,
+            ModelSource, ModelStore,
+        },
+        runtime_control::MODEL_RESIDENCY_CAPABILITY,
+        werk_protocol::CapabilityStatus,
+    };
+    use std::collections::HashMap;
+
+    fn manifest(id: &str, checksum: &str) -> ModelManifest {
+        ModelManifest {
+            id: id.to_string(),
+            source: ModelSource::LocalPath {
+                path: format!("/{id}"),
+            },
+            format: ModelFormat::SafeTensors,
+            architecture: Some("phi3".to_string()),
+            tokenizer_path: Some("tokenizer.json".to_string()),
+            config_path: Some("config.json".to_string()),
+            model_path: None,
+            backend: "burn".to_string(),
+            created_unix: 0,
+            files: vec![ModelFile {
+                path: "model.safetensors".to_string(),
+                size: 123,
+                checksum: checksum.to_string(),
+            }],
+            artifacts: Vec::new(),
+            metadata: ModelMetadata::default(),
+        }
+    }
 
     #[test]
     fn only_phi3_is_enabled_for_burn_generation() {
@@ -1063,5 +1134,66 @@ mod tests {
         for architecture in ["qwen2", "gemma", "gemma2", "mistral", "llama"] {
             assert!(!burn_architecture_enabled(architecture));
         }
+    }
+
+    #[test]
+    fn residency_capability_matches_compiled_cpu_runtime() {
+        let store = ModelStore::resolve(Some(
+            std::env::temp_dir().join(format!("werk-burn-residency-{}", std::process::id())),
+        ))
+        .unwrap();
+        let backend = BurnBackend::new(store, BurnMode::Cpu);
+        let descriptor = backend.runtime_control_adapter().descriptor();
+        let residency = descriptor
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == MODEL_RESIDENCY_CAPABILITY)
+            .unwrap();
+        let expected = if BurnBackend::runtime_status(BurnMode::Cpu).available {
+            CapabilityStatus::Supported
+        } else {
+            CapabilityStatus::Unavailable
+        };
+
+        assert_eq!(residency.status, expected);
+        assert_eq!(
+            residency.operations.is_empty(),
+            expected != CapabilityStatus::Supported
+        );
+        assert!(
+            descriptor
+                .capabilities
+                .iter()
+                .all(|capability| !capability.id.starts_with("runtime.state."))
+        );
+    }
+
+    #[test]
+    fn model_cache_selects_exact_model_identity_and_reuses_it() {
+        let first = manifest("first", "sha256:first");
+        let second = manifest("second", "sha256:second");
+        let first_key = ModelRuntimeIdentity::from_manifest(&first).unwrap();
+        let second_key = ModelRuntimeIdentity::from_manifest(&second).unwrap();
+        let mut cache = HashMap::new();
+        cache.insert(first_key, "first-runtime");
+        cache.insert(second_key, "second-runtime");
+
+        assert_eq!(
+            cache.get(&ModelRuntimeIdentity::from_manifest(&first).unwrap()),
+            Some(&"first-runtime")
+        );
+        assert_eq!(
+            cache.get(&ModelRuntimeIdentity::from_manifest(&second).unwrap()),
+            Some(&"second-runtime")
+        );
+        assert_eq!(
+            ModelRuntimeIdentity::from_manifest(&first).unwrap(),
+            first_key
+        );
+
+        let changed_files = manifest("first", "sha256:replacement");
+        let changed_key = ModelRuntimeIdentity::from_manifest(&changed_files).unwrap();
+        assert_ne!(changed_key, first_key);
+        assert!(!cache.contains_key(&changed_key));
     }
 }
