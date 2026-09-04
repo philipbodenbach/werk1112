@@ -7,6 +7,15 @@ use axum::{
 use crate::openai::{ErrorObject, ErrorResponse};
 
 pub(super) fn api_error(status: StatusCode, message: String, param: Option<String>) -> Response {
+    api_error_with_code(status, message, param, None)
+}
+
+pub(super) fn api_error_with_code(
+    status: StatusCode,
+    message: String,
+    param: Option<String>,
+    code: Option<String>,
+) -> Response {
     (
         status,
         Json(ErrorResponse {
@@ -14,7 +23,7 @@ pub(super) fn api_error(status: StatusCode, message: String, param: Option<Strin
                 message,
                 kind: "invalid_request_error".to_string(),
                 param,
-                code: None,
+                code,
             },
         }),
     )

@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
-    fs,
+    collections::{BTreeMap, VecDeque},
+    fmt, fs,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -27,12 +29,88 @@ use crate::{
     model_store::{ModelManifest, ModelStore},
 };
 
+const COMPANION_PREFLIGHT_CACHE_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CompanionPreflightCacheKey([u8; 32]);
+
+struct BoundedPositiveCache<T> {
+    capacity: usize,
+    inner: Mutex<BoundedPositiveCacheInner<T>>,
+}
+
+struct BoundedPositiveCacheInner<T> {
+    entries: BTreeMap<CompanionPreflightCacheKey, T>,
+    recency: VecDeque<CompanionPreflightCacheKey>,
+}
+
+impl<T> BoundedPositiveCache<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            inner: Mutex::new(BoundedPositiveCacheInner {
+                entries: BTreeMap::new(),
+                recency: VecDeque::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BoundedPositiveCacheInner<T>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn get(&self, key: &CompanionPreflightCacheKey) -> Option<T>
+    where
+        T: Clone,
+    {
+        let mut inner = self.lock();
+        let value = inner.entries.get(key)?.clone();
+        inner.recency.retain(|candidate| candidate != key);
+        inner.recency.push_back(*key);
+        Some(value)
+    }
+
+    fn insert(&self, key: CompanionPreflightCacheKey, value: T) {
+        if self.capacity == 0 {
+            return;
+        }
+        let mut inner = self.lock();
+        inner.recency.retain(|candidate| candidate != &key);
+        inner.entries.insert(key, value);
+        inner.recency.push_back(key);
+        while inner.entries.len() > self.capacity {
+            let Some(expired) = inner.recency.pop_front() else {
+                break;
+            };
+            inner.entries.remove(&expired);
+        }
+    }
+}
+
+impl<T> fmt::Debug for BoundedPositiveCache<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Values and digests are deliberately omitted: companion responses
+        // may contain host-specific details, and cache key material includes
+        // model/configuration identity before it is irreversibly hashed.
+        formatter
+            .debug_struct("BoundedPositiveCache")
+            .field("capacity", &self.capacity)
+            .field("entries", &self.lock().entries.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompanionMediaBackend {
     client: std::result::Result<CompanionClient, String>,
     health_cache: Arc<OnceLock<CompanionHealth>>,
     qwen_client_cache: Arc<OnceLock<CompanionClient>>,
     qwen_health_cache: Arc<OnceLock<CompanionHealth>>,
+    availability_cache: Arc<BoundedPositiveCache<()>>,
+    probe_cache: Arc<BoundedPositiveCache<BackendProbe>>,
+    estimate_cache: Arc<BoundedPositiveCache<WorkloadEstimate>>,
 }
 
 impl CompanionMediaBackend {
@@ -44,6 +122,15 @@ impl CompanionMediaBackend {
             health_cache: Arc::new(OnceLock::new()),
             qwen_client_cache: Arc::new(OnceLock::new()),
             qwen_health_cache: Arc::new(OnceLock::new()),
+            availability_cache: Arc::new(BoundedPositiveCache::new(
+                COMPANION_PREFLIGHT_CACHE_CAPACITY,
+            )),
+            probe_cache: Arc::new(BoundedPositiveCache::new(
+                COMPANION_PREFLIGHT_CACHE_CAPACITY,
+            )),
+            estimate_cache: Arc::new(BoundedPositiveCache::new(
+                COMPANION_PREFLIGHT_CACHE_CAPACITY,
+            )),
         }
     }
 
@@ -53,6 +140,15 @@ impl CompanionMediaBackend {
             health_cache: Arc::new(OnceLock::new()),
             qwen_client_cache: Arc::new(OnceLock::new()),
             qwen_health_cache: Arc::new(OnceLock::new()),
+            availability_cache: Arc::new(BoundedPositiveCache::new(
+                COMPANION_PREFLIGHT_CACHE_CAPACITY,
+            )),
+            probe_cache: Arc::new(BoundedPositiveCache::new(
+                COMPANION_PREFLIGHT_CACHE_CAPACITY,
+            )),
+            estimate_cache: Arc::new(BoundedPositiveCache::new(
+                COMPANION_PREFLIGHT_CACHE_CAPACITY,
+            )),
         }
     }
 
@@ -73,7 +169,9 @@ impl CompanionMediaBackend {
         // OnceLock would make `werk backend install qwen-tts` ineffective until
         // the Werk process is restarted.
         let python = require_qwen_tts_python(store).map_err(|error| error.to_string())?;
-        let client = CompanionClient::from_python(python).map_err(|error| error.to_string())?;
+        let client = CompanionClient::from_python(python)
+            .map(CompanionClient::with_resident_worker)
+            .map_err(|error| error.to_string())?;
         Ok((self.qwen_client_cache.get_or_init(|| client).clone(), true))
     }
 
@@ -97,10 +195,47 @@ impl CompanionMediaBackend {
             .clone()
             .without_resident_worker()
             .health()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("{error:#}"))?;
         let _ = cache.set(health.clone());
         Ok(health)
     }
+
+    fn cached_health(&self, qwen_tts: bool) -> Option<CompanionHealth> {
+        if qwen_tts {
+            self.qwen_health_cache.get()
+        } else {
+            self.health_cache.get()
+        }
+        .cloned()
+    }
+}
+
+fn companion_preflight_cache_key<T: Serialize>(
+    operation: &str,
+    client: &CompanionClient,
+    health: Option<&CompanionHealth>,
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    task: InferenceTask,
+    configuration: &T,
+) -> Option<CompanionPreflightCacheKey> {
+    // Cache entries retain only this digest. Paths and configuration values
+    // exist solely in the temporary serialization below; prompts, input
+    // payloads, and credentials are never supplied by either caller.
+    let material = serde_json::to_vec(&json!({
+        "version": 1,
+        "operation": operation,
+        "client": client.launcher_description(),
+        "health": health,
+        "model_path": companion_model_path(store, manifest),
+        "manifest": manifest,
+        "task": task,
+        "configuration": configuration,
+    }))
+    .ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(material);
+    Some(CompanionPreflightCacheKey(hasher.finalize().into()))
 }
 
 impl Default for CompanionMediaBackend {
@@ -257,6 +392,38 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                 };
             }
         };
+        let mut cache_schema_paths = schema_paths.to_vec();
+        cache_schema_paths.sort_unstable();
+        let cache_configuration = json!({
+            "schema_paths": cache_schema_paths,
+            "configured_accelerator": configured_media_accelerator(),
+            "detected_accelerator": detected_accelerator(),
+            "qwen_tts": qwen_tts,
+        });
+        let availability_key = companion_preflight_cache_key(
+            "availability",
+            &client,
+            Some(&health),
+            store,
+            manifest,
+            task,
+            &json!({"qwen_tts": qwen_tts}),
+        );
+        let cache_key = companion_preflight_cache_key(
+            "probe",
+            &client,
+            Some(&health),
+            store,
+            manifest,
+            task,
+            &cache_configuration,
+        );
+        if let Some(probe) = cache_key.as_ref().and_then(|key| self.probe_cache.get(key)) {
+            if let Some(availability_key) = availability_key {
+                self.availability_cache.insert(availability_key, ());
+            }
+            return probe;
+        }
         let probe_request = json!({
             "model_path": companion_model_path(store, manifest),
             "task": companion_wire_task(task).to_string(),
@@ -303,7 +470,7 @@ impl MediaInferenceBackend for CompanionMediaBackend {
             }
         }
         let parameter_support = companion_parameter_support(schema_paths, Some(&health));
-        BackendProbe {
+        let probe = BackendProbe {
             available,
             detail: detail.clone(),
             candidates: companion_candidates_for_model(
@@ -316,7 +483,18 @@ impl MediaInferenceBackend for CompanionMediaBackend {
             ),
             parameter_support,
             readiness: Some(readiness),
+        };
+        if probe.available
+            && let Some(cache_key) = cache_key
+        {
+            self.probe_cache.insert(cache_key, probe.clone());
         }
+        if probe.available
+            && let Some(availability_key) = availability_key
+        {
+            self.availability_cache.insert(availability_key, ());
+        }
+        probe
     }
 
     fn execute(
@@ -383,12 +561,55 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         manifest: &ModelManifest,
         request: &EffectiveInferenceRequest,
     ) -> Result<Option<WorkloadEstimate>> {
-        let (client, _) = match self.client_for_manifest(store, manifest) {
+        let (client, qwen_tts) = match self.client_for_manifest(store, manifest) {
             Ok(client) => client,
             Err(_) => return Ok(None),
         };
         let mut parameters = request.values_only();
         apply_companion_task_parameters(request.task, &mut parameters);
+        let workload_parameters = companion_estimate_cache_parameters(&parameters);
+        let cache_configuration = json!({
+            "workload_parameters": workload_parameters,
+            "explicit_parameters": &request.explicit_parameters,
+            "parameter_policy": request.parameter_policy,
+            // The companion's parameter guard treats prompt presence as an
+            // explicit adapter input for selected tasks. Contents are never
+            // part of cache identity.
+            "prompt_present": request.prompt.is_some(),
+            "negative_prompt_present": request.negative_prompt.is_some(),
+            "qwen_tts": qwen_tts,
+        });
+        let health = self.cached_health(qwen_tts);
+        let availability_key = companion_preflight_cache_key(
+            "availability",
+            &client,
+            health.as_ref(),
+            store,
+            manifest,
+            request.task,
+            &json!({"qwen_tts": qwen_tts}),
+        );
+        let model_is_available = availability_key
+            .as_ref()
+            .and_then(|key| self.availability_cache.get(key))
+            .is_some();
+        let cache_key = companion_preflight_cache_key(
+            "estimate",
+            &client,
+            health.as_ref(),
+            store,
+            manifest,
+            request.task,
+            &cache_configuration,
+        );
+        if model_is_available {
+            if let Some(estimate) = cache_key
+                .as_ref()
+                .and_then(|key| self.estimate_cache.get(key))
+            {
+                return Ok(Some(estimate));
+            }
+        }
         let companion_request = json!({
             "protocol_version": 1,
             "model_path": companion_model_path(store, manifest),
@@ -416,6 +637,9 @@ impl MediaInferenceBackend for CompanionMediaBackend {
         }
         let estimate: WorkloadEstimate = serde_json::from_value(value)
             .context("invalid media companion workload estimate response")?;
+        if model_is_available && let Some(cache_key) = cache_key {
+            self.estimate_cache.insert(cache_key, estimate.clone());
+        }
         Ok(Some(estimate))
     }
 }
@@ -438,6 +662,44 @@ fn apply_companion_task_parameters(
             ParameterValue::String("translate".to_string()),
         );
     }
+}
+
+fn companion_estimate_cache_parameters(
+    parameters: &BTreeMap<String, ParameterValue>,
+) -> BTreeMap<String, ParameterValue> {
+    parameters
+        .iter()
+        .filter(|(path, _)| {
+            let leaf = path.rsplit('.').next().unwrap_or(path);
+            matches!(
+                leaf,
+                "batch_size"
+                    | "num_images"
+                    | "num_videos"
+                    | "num_variations"
+                    | "variations"
+                    | "precision"
+                    | "attention_backend"
+                    | "width"
+                    | "height"
+                    | "steps"
+                    | "frames"
+                    | "num_frames"
+                    | "fps"
+                    | "window_size"
+                    | "bitrate"
+                    | "duration"
+                    | "sample_rate"
+                    | "channels"
+                    | "stems"
+                    | "bit_depth"
+                    | "_werk_enable_cpu_offload"
+                    | "_werk_enable_sequential_offload"
+                    | "_werk_enable_component_offload"
+            )
+        })
+        .map(|(path, value)| (path.clone(), value.clone()))
+        .collect()
 }
 
 fn companion_model_path(store: &ModelStore, manifest: &ModelManifest) -> PathBuf {
@@ -1027,6 +1289,7 @@ mod tests {
     use super::*;
     use crate::{
         backend::managed_qwen_tts_python,
+        inference::{ParameterPolicy, ResolvedParameter},
         media_companion::CompanionAccelerator,
         model_store::{ModelFormat, ModelMetadata, ModelSource},
     };
@@ -1083,6 +1346,63 @@ mod tests {
         }
     }
 
+    fn media_manifest(id: &str, task: InferenceTask) -> ModelManifest {
+        ModelManifest {
+            id: id.to_string(),
+            source: ModelSource::LocalPath {
+                path: id.to_string(),
+            },
+            format: ModelFormat::SafeTensors,
+            architecture: Some("test-media".to_string()),
+            tokenizer_path: None,
+            config_path: Some("files/config.json".to_string()),
+            model_path: None,
+            backend: "media-companion".to_string(),
+            created_unix: 1,
+            files: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: ModelMetadata {
+                repository_layout: RepositoryLayout::Diffusers,
+                tasks: vec![task],
+                ..ModelMetadata::default()
+            },
+        }
+    }
+
+    fn effective_audio_request(
+        manifest: &ModelManifest,
+        duration_seconds: i64,
+        prompt: &str,
+    ) -> EffectiveInferenceRequest {
+        EffectiveInferenceRequest {
+            model: manifest.id.clone(),
+            task: InferenceTask::AudioGeneration,
+            prompt: Some(prompt.to_string()),
+            negative_prompt: None,
+            inputs: Vec::new(),
+            output_modality: InferenceTask::AudioGeneration.output_modality(),
+            parameters: BTreeMap::from([
+                (
+                    "audio.duration".to_string(),
+                    ResolvedParameter {
+                        value: ParameterValue::Integer(duration_seconds),
+                        source: ParameterSource::RequestOverride,
+                    },
+                ),
+                (
+                    "audio.variations".to_string(),
+                    ResolvedParameter {
+                        value: ParameterValue::Integer(1),
+                        source: ParameterSource::ModelDefault,
+                    },
+                ),
+            ]),
+            explicit_parameters: ["audio.duration".to_string()].into_iter().collect(),
+            parameter_policy: ParameterPolicy::Strict,
+            warnings: Vec::new(),
+        }
+    }
+
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -1119,15 +1439,113 @@ mod tests {
         let health = serde_json::to_string(&health).expect("serialize health response");
         let probe = serde_json::to_string(probe).expect("serialize probe response");
         let quote = |value: &str| value.replace('\'', "'\"'\"'");
+        // Keep the fixture independent of inherited PATH. `read` consumes the
+        // compact JSON payload through EOF without spawning `cat`.
         write_executable(
             &path,
             &format!(
-                "#!/bin/sh\ncat >/dev/null\ncase \"$1\" in\n  health) printf '%s\\n' '{}' ;;\n  probe-model) printf '%s\\n' '{}' ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\nIFS= read -r _payload || :\ncase \"$1\" in\n  health) printf '%s\\n' '{}' ;;\n  probe-model) printf '%s\\n' '{}' ;;\n  *) exit 64 ;;\nesac\n",
                 quote(&health),
                 quote(&probe),
             ),
         );
-        CompanionClient::from_command(path, Vec::<std::ffi::OsString>::new())
+        CompanionClient::from_command("/bin/sh", [path.into_os_string()])
+    }
+
+    #[cfg(unix)]
+    fn counting_preflight_client(
+        directory: &Path,
+        name: &str,
+        supported: bool,
+        estimate_succeeds: bool,
+    ) -> (CompanionClient, PathBuf) {
+        let path = directory.join(name);
+        let counter = directory.join(format!("{name}.calls"));
+        let health = json!({
+            "ok": true,
+            "status": "ok",
+            "protocol_version": 1,
+            "companion_version": "cache-test",
+            "python_version": "test",
+            "dependencies": {},
+            "accelerators": {
+                "cpu": {
+                    "available": true,
+                    "version": null,
+                    "detail": "test CPU"
+                }
+            }
+        });
+        let probe = json!({
+            "ok": true,
+            "supported": supported,
+            "detail": if supported { "test model ready" } else { "test backend unavailable" },
+        });
+        let estimate = if estimate_succeeds {
+            json!({
+                "ok": true,
+                "task": "audio_generation",
+                "download_size_bytes": 1,
+                "weight_payload_bytes": 1,
+                "accelerator_peak_bytes": 2,
+                "host_peak_bytes": 2,
+                "output_size_bytes": 3,
+                "fit_assessment": "unknown",
+                "confidence": "heuristic",
+                "assumptions": [],
+                "warnings": [],
+                "recommendations": []
+            })
+        } else {
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "backend_unavailable",
+                    "message": "test backend unavailable"
+                }
+            })
+        };
+        let health = serde_json::to_string(&health).expect("serialize health response");
+        let probe = serde_json::to_string(&probe).expect("serialize probe response");
+        let estimate = serde_json::to_string(&estimate).expect("serialize estimate response");
+        let quote = |value: &str| value.replace('\'', "'\"'\"'");
+        // See `static_probe_client`: use shell builtins only so PATH lookup
+        // cannot close stdin before the client finishes writing.
+        write_executable(
+            &path,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nIFS= read -r _payload || :\ncase \"$1\" in\n  health) printf '%s\\n' '{}' ;;\n  probe-model) printf '%s\\n' '{}' ;;\n  estimate) printf '%s\\n' '{}' ;;\n  *) exit 64 ;;\nesac\n",
+                quote(&counter.display().to_string()),
+                quote(&health),
+                quote(&probe),
+                quote(&estimate),
+            ),
+        );
+        (
+            CompanionClient::from_command("/bin/sh", [path.into_os_string()]),
+            counter,
+        )
+    }
+
+    #[cfg(unix)]
+    fn operation_count(counter: &Path, operation: &str) -> usize {
+        fs::read_to_string(counter)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == operation)
+            .count()
+    }
+
+    #[cfg(unix)]
+    fn install_fake_qwen_python(path: &Path) {
+        use std::os::unix::fs::symlink;
+
+        fs::create_dir_all(path.parent().expect("managed Python parent"))
+            .expect("create managed Python parent");
+        // Discovery only needs a successful `python -c ...` status here. A
+        // symlink to a stable executable avoids executing a just-written test
+        // script, which can intermittently return ETXTBSY on overlayfs.
+        symlink("/bin/echo", path).expect("create fake managed Python");
     }
 
     fn health_with_accelerators(
@@ -1154,6 +1572,289 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn bounded_positive_cache_is_lru_bounded_and_redacts_debug_values() {
+        let cache = BoundedPositiveCache::new(COMPANION_PREFLIGHT_CACHE_CAPACITY);
+        let key = |byte| CompanionPreflightCacheKey([byte; 32]);
+        cache.insert(key(1), "private/model/path".to_string());
+        for byte in 2..=64 {
+            cache.insert(key(byte), format!("value-{byte}"));
+        }
+        assert_eq!(cache.get(&key(1)).as_deref(), Some("private/model/path"));
+        cache.insert(key(65), "value-65".to_string());
+
+        assert_eq!(
+            cache.lock().entries.len(),
+            COMPANION_PREFLIGHT_CACHE_CAPACITY
+        );
+        assert!(cache.get(&key(2)).is_none());
+        assert_eq!(cache.get(&key(1)).as_deref(), Some("private/model/path"));
+        assert_eq!(cache.get(&key(65)).as_deref(), Some("value-65"));
+        let debug = format!("{cache:?}");
+        assert!(!debug.contains("private/model/path"));
+        assert!(!debug.contains("value-65"));
+        assert!(!debug.contains("010101"));
+    }
+
+    #[test]
+    fn bounded_positive_cache_is_safe_under_concurrent_cardinality() {
+        let cache = Arc::new(BoundedPositiveCache::new(8));
+        let threads = (0..4)
+            .map(|worker| {
+                let cache = Arc::clone(&cache);
+                std::thread::spawn(move || {
+                    for index in 0..64_u8 {
+                        let byte = index.wrapping_add(worker * 64);
+                        let key = CompanionPreflightCacheKey([byte; 32]);
+                        cache.insert(key, byte);
+                        let _ = cache.get(&key);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("cache worker");
+        }
+        assert!(cache.lock().entries.len() <= 8);
+        assert!(cache.lock().recency.len() <= 8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn positive_probe_cache_avoids_repeated_calls_and_keys_task_and_schema() {
+        let directory = CompanionTestDirectory::new("probe-cache");
+        let store = directory.store();
+        let manifest = media_manifest("probe-cache-model", InferenceTask::AudioGeneration);
+        let (client, counter) =
+            counting_preflight_client(&directory.0, "probe-cache-client", true, true);
+        let backend = CompanionMediaBackend::with_client(client);
+        let duration_schema = vec!["audio.duration".to_string()];
+
+        let first = backend.probe(
+            &store,
+            &manifest,
+            InferenceTask::AudioGeneration,
+            &duration_schema,
+        );
+        assert!(first.available, "first probe failed: {}", first.detail);
+        let cached = backend.clone().probe(
+            &store,
+            &manifest,
+            InferenceTask::AudioGeneration,
+            &duration_schema,
+        );
+        assert!(cached.available, "cached probe failed: {}", cached.detail);
+        assert_eq!(operation_count(&counter, "probe-model"), 1);
+
+        let other_task = backend.probe(
+            &store,
+            &manifest,
+            InferenceTask::MusicGeneration,
+            &duration_schema,
+        );
+        assert!(
+            other_task.available,
+            "other-task probe failed: {}",
+            other_task.detail
+        );
+        let other_schema = backend.probe(
+            &store,
+            &manifest,
+            InferenceTask::AudioGeneration,
+            &["audio.duration".to_string(), "audio.seed".to_string()],
+        );
+        assert!(
+            other_schema.available,
+            "other-schema probe failed: {}",
+            other_schema.detail
+        );
+        let other_manifest =
+            media_manifest("other-probe-cache-model", InferenceTask::AudioGeneration);
+        let other_model = backend.probe(
+            &store,
+            &other_manifest,
+            InferenceTask::AudioGeneration,
+            &duration_schema,
+        );
+        assert!(
+            other_model.available,
+            "other-model probe failed: {}",
+            other_model.detail
+        );
+        assert_eq!(operation_count(&counter, "probe-model"), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_probe_results_are_not_cached() {
+        let directory = CompanionTestDirectory::new("unavailable-probe-cache");
+        let store = directory.store();
+        let manifest = media_manifest(
+            "unavailable-probe-cache-model",
+            InferenceTask::AudioGeneration,
+        );
+        let (client, counter) =
+            counting_preflight_client(&directory.0, "unavailable-probe-cache-client", false, true);
+        let backend = CompanionMediaBackend::with_client(client);
+
+        let first = backend.probe(&store, &manifest, InferenceTask::AudioGeneration, &[]);
+        assert!(!first.available);
+        let second = backend.probe(&store, &manifest, InferenceTask::AudioGeneration, &[]);
+        assert!(!second.available);
+        assert_eq!(
+            operation_count(&counter, "probe-model"),
+            2,
+            "first probe detail: {}; second probe detail: {}",
+            first.detail,
+            second.detail
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn estimate_cache_ignores_prompts_but_keys_workload_configuration() {
+        let directory = CompanionTestDirectory::new("estimate-cache");
+        let store = directory.store();
+        let manifest = media_manifest("estimate-cache-model", InferenceTask::AudioGeneration);
+        let (client, counter) =
+            counting_preflight_client(&directory.0, "estimate-cache-client", true, true);
+        let backend = CompanionMediaBackend::with_client(client);
+
+        let probe = backend.probe(&store, &manifest, InferenceTask::AudioGeneration, &[]);
+        assert!(probe.available, "positive probe failed: {}", probe.detail);
+
+        let mut first = effective_audio_request(&manifest, 30, "private first prompt");
+        first.parameters.insert(
+            "audio.lyrics".to_string(),
+            ResolvedParameter {
+                value: ParameterValue::String("private first lyrics".to_string()),
+                source: ParameterSource::ModelDefault,
+            },
+        );
+        first.parameters.insert(
+            "audio.seed".to_string(),
+            ResolvedParameter {
+                value: ParameterValue::Integer(1),
+                source: ParameterSource::RequestOverride,
+            },
+        );
+        first.explicit_parameters.insert("audio.seed".to_string());
+        let mut different_prompt = effective_audio_request(&manifest, 30, "private second prompt");
+        different_prompt.parameters.insert(
+            "audio.lyrics".to_string(),
+            ResolvedParameter {
+                value: ParameterValue::String("private second lyrics".to_string()),
+                source: ParameterSource::ModelDefault,
+            },
+        );
+        different_prompt.parameters.insert(
+            "audio.seed".to_string(),
+            ResolvedParameter {
+                value: ParameterValue::Integer(2),
+                source: ParameterSource::RequestOverride,
+            },
+        );
+        different_prompt
+            .explicit_parameters
+            .insert("audio.seed".to_string());
+        let different_duration = effective_audio_request(&manifest, 45, "private first prompt");
+        let mut different_variations =
+            effective_audio_request(&manifest, 30, "private first prompt");
+        different_variations.parameters.insert(
+            "audio.variations".to_string(),
+            ResolvedParameter {
+                value: ParameterValue::Integer(2),
+                source: ParameterSource::ModelDefault,
+            },
+        );
+        assert!(
+            backend
+                .estimate(&store, &manifest, &first)
+                .expect("first estimate")
+                .is_some()
+        );
+        assert!(
+            backend
+                .clone()
+                .estimate(&store, &manifest, &different_prompt)
+                .expect("cached estimate")
+                .is_some()
+        );
+        assert_eq!(operation_count(&counter, "estimate"), 1);
+        let cache_debug = format!("{:?}", backend.estimate_cache);
+        assert!(!cache_debug.contains("private first prompt"));
+        assert!(!cache_debug.contains("private second prompt"));
+        assert!(!cache_debug.contains("private first lyrics"));
+        assert!(!cache_debug.contains("private second lyrics"));
+
+        assert!(
+            backend
+                .estimate(&store, &manifest, &different_duration)
+                .expect("distinct estimate")
+                .is_some()
+        );
+        assert_eq!(operation_count(&counter, "estimate"), 2);
+
+        assert!(
+            backend
+                .estimate(&store, &manifest, &different_variations)
+                .expect("distinct variation-count estimate")
+                .is_some()
+        );
+        assert_eq!(operation_count(&counter, "estimate"), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_estimate_is_not_cached_before_a_positive_probe() {
+        let directory = CompanionTestDirectory::new("estimate-without-probe-cache");
+        let store = directory.store();
+        let manifest = media_manifest(
+            "estimate-without-probe-cache-model",
+            InferenceTask::AudioGeneration,
+        );
+        let (client, counter) = counting_preflight_client(
+            &directory.0,
+            "estimate-without-probe-cache-client",
+            true,
+            true,
+        );
+        let backend = CompanionMediaBackend::with_client(client);
+        let request = effective_audio_request(&manifest, 30, "private prompt");
+
+        assert!(
+            backend
+                .estimate(&store, &manifest, &request)
+                .expect("first uncached estimate")
+                .is_some()
+        );
+        assert!(
+            backend
+                .estimate(&store, &manifest, &request)
+                .expect("second uncached estimate")
+                .is_some()
+        );
+        assert_eq!(operation_count(&counter, "estimate"), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn estimate_errors_are_not_cached_after_a_positive_probe() {
+        let directory = CompanionTestDirectory::new("estimate-error-cache");
+        let store = directory.store();
+        let manifest = media_manifest("estimate-error-cache-model", InferenceTask::AudioGeneration);
+        let (client, counter) =
+            counting_preflight_client(&directory.0, "estimate-error-cache-client", true, false);
+        let backend = CompanionMediaBackend::with_client(client);
+        let request = effective_audio_request(&manifest, 30, "private prompt");
+        let probe = backend.probe(&store, &manifest, InferenceTask::AudioGeneration, &[]);
+        assert!(probe.available, "positive probe failed: {}", probe.detail);
+
+        assert!(backend.estimate(&store, &manifest, &request).is_err());
+        assert!(backend.estimate(&store, &manifest, &request).is_err());
+        assert_eq!(operation_count(&counter, "estimate"), 2);
     }
 
     #[test]
@@ -1253,13 +1954,53 @@ mod tests {
         assert!(backend.qwen_client_cache.get().is_none());
 
         let managed_python = managed_qwen_tts_python(&store);
-        write_executable(&managed_python, "#!/bin/sh\nprintf '%s\\n' '0.1.1'\n");
+        install_fake_qwen_python(&managed_python);
 
         let (_client, isolated) = backend
             .client_for_manifest(&store, &manifest)
             .expect("newly installed Qwen backend must be discovered");
         assert!(isolated);
         assert!(backend.qwen_client_cache.get().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_qwen_client_is_resident_reused_and_isolated_from_preflight() {
+        let directory = CompanionTestDirectory::new("qwen-resident");
+        let store = directory.store();
+        let manifest = qwen_voice_design_manifest();
+        let general_client = static_probe_client(
+            &directory.0,
+            "general-companion",
+            &json!({"ok": true, "supported": false}),
+        )
+        .with_resident_worker();
+        let backend = CompanionMediaBackend::with_client(general_client.clone());
+        let managed_python = managed_qwen_tts_python(&store);
+        install_fake_qwen_python(&managed_python);
+
+        let (first, first_is_qwen) = backend
+            .client_for_manifest(&store, &manifest)
+            .expect("managed Qwen client");
+        let (second, second_is_qwen) = backend
+            .client_for_manifest(&store, &manifest)
+            .expect("cached managed Qwen client");
+
+        assert!(first_is_qwen);
+        assert!(second_is_qwen);
+        assert!(first.has_resident_worker());
+        assert!(first.shares_resident_worker_with(&second));
+        assert!(!first.shares_resident_worker_with(&general_client));
+        assert!(
+            first
+                .launcher_description()
+                .contains(&managed_python.display().to_string())
+        );
+
+        let preflight = first.clone().without_resident_worker();
+        assert!(!preflight.has_resident_worker());
+        assert!(first.has_resident_worker());
+        assert!(first.shares_resident_worker_with(&second));
     }
 
     #[cfg(unix)]

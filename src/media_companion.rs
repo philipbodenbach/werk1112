@@ -149,13 +149,22 @@ enum LauncherKind {
     Python,
 }
 
+#[derive(Clone, Copy)]
+struct EmbeddedScript(&'static str);
+
+impl fmt::Debug for EmbeddedScript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<embedded Python script: {} bytes>", self.0.len())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CompanionLauncher {
     program: PathBuf,
     args: Vec<OsString>,
     source: String,
     kind: LauncherKind,
-    embedded_script: bool,
+    embedded_script: Option<EmbeddedScript>,
 }
 
 impl CompanionLauncher {
@@ -167,7 +176,7 @@ impl CompanionLauncher {
 
     fn resident_command(&self) -> Command {
         let mut command = Command::new(&self.program);
-        if self.embedded_script {
+        if self.embedded_script.is_some() {
             command
                 .arg("-c")
                 .arg(EMBEDDED_RESIDENT_BOOTSTRAP)
@@ -284,7 +293,7 @@ enum ResidentSupportNegotiation {
 
 impl ResidentTransport {
     fn new(launcher: CompanionLauncher) -> Self {
-        let negotiation = if launcher.embedded_script {
+        let negotiation = if launcher.embedded_script.is_some() {
             ResidentNegotiation::Confirmed
         } else {
             ResidentNegotiation::Unknown
@@ -477,8 +486,8 @@ fn spawn_resident_process(launcher: &CompanionLauncher) -> Result<ResidentProces
         }
     });
 
-    if launcher.embedded_script {
-        let script = EMBEDDED_COMPANION.as_bytes();
+    if let Some(embedded_script) = launcher.embedded_script {
+        let script = embedded_script.0.as_bytes();
         if let Err(error) = (|| -> std::io::Result<()> {
             writeln!(stdin, "{}", script.len())?;
             stdin.write_all(script)?;
@@ -493,8 +502,7 @@ fn spawn_resident_process(launcher: &CompanionLauncher) -> Result<ResidentProces
                 stderr_tail,
             };
             let _ = process.terminate();
-            return Err(error)
-                .context("failed to send embedded media companion to resident worker");
+            return Err(error).context("failed to send embedded Python worker to resident process");
         }
     }
 
@@ -734,7 +742,7 @@ impl CompanionClient {
                 args: vec![script.into_os_string()],
                 source: format!("explicit Python; {source}"),
                 kind: LauncherKind::Python,
-                embedded_script: false,
+                embedded_script: None,
             }
         } else {
             CompanionLauncher {
@@ -742,7 +750,7 @@ impl CompanionClient {
                 args: vec![OsString::from("-c"), OsString::from(EMBEDDED_BOOTSTRAP)],
                 source: "explicit Python; embedded companion script".to_string(),
                 kind: LauncherKind::Python,
-                embedded_script: true,
+                embedded_script: Some(EmbeddedScript(EMBEDDED_COMPANION)),
             }
         };
         Ok(Self {
@@ -751,6 +759,28 @@ impl CompanionClient {
             execute_timeout: DEFAULT_EXECUTE_TIMEOUT,
             resident: None,
         })
+    }
+
+    /// Builds a client for a Werk-owned Python worker embedded in the binary.
+    /// The script is framed over stdin so it is never exposed in argv, and its
+    /// resident transport is shared by cloned clients when enabled.
+    pub(crate) fn from_embedded_python(
+        program: impl Into<PathBuf>,
+        script: &'static str,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            launcher: CompanionLauncher {
+                program: program.into(),
+                args: vec![OsString::from("-c"), OsString::from(EMBEDDED_BOOTSTRAP)],
+                source: source.into(),
+                kind: LauncherKind::Python,
+                embedded_script: Some(EmbeddedScript(script)),
+            },
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            execute_timeout: DEFAULT_EXECUTE_TIMEOUT,
+            resident: None,
+        }
     }
 
     /// Builds a client for an explicitly resolved process. `program` and
@@ -766,7 +796,7 @@ impl CompanionClient {
                 args: args.into_iter().collect(),
                 source: "explicit command".to_string(),
                 kind: LauncherKind::Executable,
-                embedded_script: false,
+                embedded_script: None,
             },
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             execute_timeout: DEFAULT_EXECUTE_TIMEOUT,
@@ -793,6 +823,19 @@ impl CompanionClient {
     pub fn without_resident_worker(mut self) -> Self {
         self.resident = None;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_resident_worker(&self) -> bool {
+        self.resident.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_resident_worker_with(&self, other: &Self) -> bool {
+        match (&self.resident, &other.resident) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -1003,8 +1046,8 @@ impl CompanionClient {
 
         let request_json = serde_json::to_vec(request)
             .with_context(|| format!("failed to serialize media companion {operation} request"))?;
-        let input = if self.launcher.embedded_script {
-            let script = EMBEDDED_COMPANION.as_bytes();
+        let input = if let Some(embedded_script) = self.launcher.embedded_script {
+            let script = embedded_script.0.as_bytes();
             let mut framed = format!("{}\n", script.len()).into_bytes();
             framed.extend_from_slice(script);
             framed.extend_from_slice(&request_json);
@@ -1221,7 +1264,7 @@ fn discover_launcher() -> Result<CompanionLauncher> {
             args: Vec::new(),
             source: "env WERK_MEDIA_COMPANION".to_string(),
             kind: LauncherKind::Executable,
-            embedded_script: false,
+            embedded_script: None,
         });
     }
 
@@ -1236,7 +1279,7 @@ fn discover_launcher() -> Result<CompanionLauncher> {
             args: vec![script.into_os_string()],
             source: format!("{python_source}; {source}"),
             kind: LauncherKind::Python,
-            embedded_script: false,
+            embedded_script: None,
         });
     }
 
@@ -1245,7 +1288,7 @@ fn discover_launcher() -> Result<CompanionLauncher> {
         args: vec![OsString::from("-c"), OsString::from(EMBEDDED_BOOTSTRAP)],
         source: format!("{python_source}; embedded companion script"),
         kind: LauncherKind::Python,
-        embedded_script: true,
+        embedded_script: Some(EmbeddedScript(EMBEDDED_COMPANION)),
     })
 }
 
@@ -1519,6 +1562,30 @@ for raw in sys.stdin:
         "response": response,
     }
     print(json.dumps(envelope, separators=(",", ":")), flush=True)
+"#;
+
+    const GENERIC_EMBEDDED_WORKER: &str = r#"
+import json
+import sys
+
+if len(sys.argv) != 2 or sys.argv[1] != "serve":
+    raise SystemExit(64)
+
+sequence = 0
+for raw in sys.stdin:
+    frame = json.loads(raw)
+    sequence += 1
+    response = {
+        "ok": True,
+        "operation": frame["operation"],
+        "sequence": sequence,
+        "echo": frame["payload"],
+    }
+    print(json.dumps({
+        "transport_version": 1,
+        "request_id": frame["request_id"],
+        "response": response,
+    }), flush=True)
 "#;
 
     const LEGACY_FALLBACK_COMPANION: &str = r#"
@@ -2096,7 +2163,7 @@ else:
                 args: vec![OsString::from("-c"), OsString::from(EMBEDDED_BOOTSTRAP)],
                 source: "embedded transport test".to_string(),
                 kind: LauncherKind::Python,
-                embedded_script: true,
+                embedded_script: Some(EmbeddedScript(EMBEDDED_COMPANION)),
             },
             request_timeout: Duration::from_secs(15),
             execute_timeout: Duration::from_secs(5),
@@ -2121,7 +2188,7 @@ else:
                 args: vec![OsString::from("-c"), OsString::from(EMBEDDED_BOOTSTRAP)],
                 source: "embedded resident transport test".to_string(),
                 kind: LauncherKind::Python,
-                embedded_script: true,
+                embedded_script: Some(EmbeddedScript(EMBEDDED_COMPANION)),
             },
             request_timeout: Duration::from_secs(15),
             execute_timeout: Duration::from_secs(5),
@@ -2136,6 +2203,32 @@ else:
         assert_eq!(first.protocol_version, PROTOCOL_VERSION);
         assert_eq!(second.status, "ok");
         assert_eq!(resident_process_id(&client), Some(first_process));
+    }
+
+    #[test]
+    fn generic_embedded_script_uses_the_shared_resident_transport() {
+        let Some(python) = python_program_names()
+            .iter()
+            .find_map(|name| find_in_path(name))
+        else {
+            return;
+        };
+        let client = CompanionClient::from_embedded_python(
+            python,
+            GENERIC_EMBEDDED_WORKER,
+            "generic embedded test worker",
+        )
+        .with_timeout(Duration::from_secs(3))
+        .with_resident_worker();
+
+        let first = client.request("alpha", &json!({"value": 1})).unwrap();
+        let second = client.request("beta", &json!({"value": 2})).unwrap();
+
+        assert_eq!(first["sequence"], 1);
+        assert_eq!(first["operation"], "alpha");
+        assert_eq!(second["sequence"], 2);
+        assert_eq!(second["echo"]["value"], 2);
+        assert!(!format!("{client:?}").contains(GENERIC_EMBEDDED_WORKER));
     }
 
     #[test]

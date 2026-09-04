@@ -76,14 +76,21 @@ use crate::{
         MessageContent, PromptSpec, image_urls_from_messages, messages_to_prompt_for_model,
         messages_to_prompt_for_model_with_template,
     },
+    runtime_control::ServerPersistenceConfig,
     runtime_planner::{
         RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
         plan_runtime, runtime_candidate_ids, select_runtime,
+    },
+    werk_protocol::{
+        PersistenceMode, PersistencePolicy, PruneStatesRequest, ReuseMode, StateAction,
+        StateActionRequest, StateListFilter, StateSelector, StateTier, WerkProtocolClient,
     },
 };
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
+const DEFAULT_RUNTIME_CONTROL_TIMEOUT_SECONDS: u64 = 30;
+const MAX_PERSISTENCE_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const CHAT_CONTEXT_SAFETY_TOKENS: usize = 64;
 const DEFAULT_MAX_VISION_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
@@ -421,6 +428,105 @@ impl From<DeviceArg> for CandleDeviceMode {
     }
 }
 
+#[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
+pub struct ServePersistenceArgs {
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Enable persistence defaults for /werk/v1/prefill and automatic prefix caching for local Werk-managed vLLM; remote vLLM remains externally managed"
+    )]
+    pub persistence: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Default prefill persistence mode when policy is omitted; implies --persistence"
+    )]
+    pub persistence_mode: Option<ServePersistenceModeArg>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Default prefill reuse policy when policy is omitted; disabled also disables the managed local-vLLM prefix-cache default; implies --persistence"
+    )]
+    pub persistence_reuse: Option<ServePersistenceReuseArg>,
+
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..=MAX_PERSISTENCE_TTL_SECONDS),
+        help = "Default prefill state TTL in seconds when policy is omitted; implies --persistence"
+    )]
+    pub persistence_ttl_seconds: Option<u64>,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Pin prefill state by default when policy is omitted; implies --persistence"
+    )]
+    pub persistence_pin: bool,
+}
+
+impl ServePersistenceArgs {
+    fn server_config(&self) -> ServerPersistenceConfig {
+        let enabled = self.persistence
+            || self.persistence_mode.is_some()
+            || self.persistence_reuse.is_some()
+            || self.persistence_ttl_seconds.is_some()
+            || self.persistence_pin;
+        if !enabled {
+            return ServerPersistenceConfig::default();
+        }
+        ServerPersistenceConfig::enabled(PersistencePolicy {
+            mode: self
+                .persistence_mode
+                .map(Into::into)
+                .unwrap_or(PersistenceMode::Auto),
+            reuse: self
+                .persistence_reuse
+                .map(Into::into)
+                .unwrap_or(ReuseMode::Prefer),
+            ttl_seconds: self.persistence_ttl_seconds,
+            pin: self.persistence_pin,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServePersistenceModeArg {
+    Ephemeral,
+    Memory,
+    Disk,
+    Auto,
+}
+
+impl From<ServePersistenceModeArg> for PersistenceMode {
+    fn from(value: ServePersistenceModeArg) -> Self {
+        match value {
+            ServePersistenceModeArg::Ephemeral => Self::Ephemeral,
+            ServePersistenceModeArg::Memory => Self::Memory,
+            ServePersistenceModeArg::Disk => Self::Disk,
+            ServePersistenceModeArg::Auto => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServePersistenceReuseArg {
+    Disabled,
+    Prefer,
+    Required,
+}
+
+impl From<ServePersistenceReuseArg> for ReuseMode {
+    fn from(value: ServePersistenceReuseArg) -> Self {
+        match value {
+            ServePersistenceReuseArg::Disabled => Self::Disabled,
+            ServePersistenceReuseArg::Prefer => Self::Prefer,
+            ServePersistenceReuseArg::Required => Self::Required,
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
@@ -476,6 +582,9 @@ pub enum Commands {
 
         #[arg(long, help = "Print HTTP request and generation logs")]
         verbose: bool,
+
+        #[command(flatten)]
+        persistence: ServePersistenceArgs,
     },
 
     #[command(
@@ -737,6 +846,35 @@ pub enum Commands {
         command: TempCommands,
     },
 
+    #[command(about = "Inspect and control a running Werk runtime")]
+    Runtime {
+        #[arg(
+            long,
+            default_value = "http://127.0.0.1:11434",
+            help = "Werk server base URL"
+        )]
+        url: String,
+
+        #[arg(
+            long,
+            env = "WERK_API_KEY",
+            hide_env_values = true,
+            help = "Bearer key for the Werk server"
+        )]
+        api_key: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_RUNTIME_CONTROL_TIMEOUT_SECONDS,
+            value_parser = clap::value_parser!(u64).range(1..=86_400),
+            help = "Timeout in seconds for one runtime-control request"
+        )]
+        timeout_seconds: u64,
+
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
+
     #[command(about = "Copy a local model file or directory into the managed model store")]
     Import {
         #[arg(help = "Model file or directory to copy")]
@@ -909,6 +1047,171 @@ pub enum TempCommands {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+pub enum RuntimeCommands {
+    #[command(about = "Show Werk Protocol and active-backend information")]
+    Info,
+
+    #[command(about = "Show truthful runtime capability statuses")]
+    Capabilities,
+
+    #[command(about = "Show live host and accelerator memory telemetry")]
+    Memory,
+
+    #[command(about = "List persistent and volatile inference states")]
+    States {
+        #[arg(long, help = "Filter by installed model ID")]
+        model: Option<String>,
+
+        #[arg(long, value_enum, help = "Filter by state tier")]
+        tier: Option<RuntimeStateTierArg>,
+
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=100), help = "Maximum entries")]
+        limit: Option<u16>,
+
+        #[arg(long, help = "Opaque pagination cursor from a previous response")]
+        cursor: Option<String>,
+    },
+
+    #[command(about = "Apply an explicit action to one inference state")]
+    State {
+        #[arg(help = "Opaque runtime-state ID")]
+        id: String,
+
+        #[command(subcommand)]
+        command: RuntimeStateCommands,
+    },
+
+    #[command(
+        about = "Prune explicitly selected inference states; dry-run by default",
+        visible_alias = "purge"
+    )]
+    Prune {
+        #[arg(long = "id", action = ArgAction::Append, help = "Exact state ID; repeat as needed")]
+        ids: Vec<String>,
+
+        #[arg(long, help = "Select states for one installed model")]
+        model: Option<String>,
+
+        #[arg(long, value_enum, help = "Select states in one tier")]
+        tier: Option<RuntimeStateTierArg>,
+
+        #[arg(
+            long,
+            help = "Select states last accessed before this Unix millisecond"
+        )]
+        older_than_unix_ms: Option<u64>,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Select every visible state")]
+        all: bool,
+
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
+            requires = "all",
+            help = "Required acknowledgement when --all is used"
+        )]
+        confirm_all: bool,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually delete; otherwise only preview")]
+        execute: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum RuntimeStateCommands {
+    #[command(about = "Pin a state against policy eviction")]
+    Pin {
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually apply the change")]
+        execute: bool,
+    },
+
+    #[command(about = "Remove a state's policy pin")]
+    Unpin {
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually apply the change")]
+        execute: bool,
+    },
+
+    #[command(about = "Promote a state to RAM or VRAM")]
+    Promote {
+        #[arg(value_enum, help = "Target memory tier")]
+        target: RuntimeMemoryTierArg,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually apply the change")]
+        execute: bool,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Allow an experimental backend adapter")]
+        allow_experimental: bool,
+    },
+
+    #[command(about = "Demote a state to RAM or disk")]
+    Demote {
+        #[arg(value_enum, help = "Target lower tier")]
+        target: RuntimeDemotionTierArg,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually apply the change")]
+        execute: bool,
+
+        #[arg(long, action = ArgAction::SetTrue, help = "Allow an experimental backend adapter")]
+        allow_experimental: bool,
+    },
+
+    #[command(about = "Evict one explicitly named state")]
+    Evict {
+        #[arg(long, action = ArgAction::SetTrue, help = "Actually delete the state")]
+        execute: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeStateTierArg {
+    Vram,
+    Ram,
+    Disk,
+    External,
+}
+
+impl From<RuntimeStateTierArg> for StateTier {
+    fn from(value: RuntimeStateTierArg) -> Self {
+        match value {
+            RuntimeStateTierArg::Vram => Self::Vram,
+            RuntimeStateTierArg::Ram => Self::Ram,
+            RuntimeStateTierArg::Disk => Self::Disk,
+            RuntimeStateTierArg::External => Self::External,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeMemoryTierArg {
+    Vram,
+    Ram,
+}
+
+impl From<RuntimeMemoryTierArg> for StateTier {
+    fn from(value: RuntimeMemoryTierArg) -> Self {
+        match value {
+            RuntimeMemoryTierArg::Vram => Self::Vram,
+            RuntimeMemoryTierArg::Ram => Self::Ram,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeDemotionTierArg {
+    Ram,
+    Disk,
+}
+
+impl From<RuntimeDemotionTierArg> for StateTier {
+    fn from(value: RuntimeDemotionTierArg) -> Self {
+        match value {
+            RuntimeDemotionTierArg::Ram => Self::Ram,
+            RuntimeDemotionTierArg::Disk => Self::Disk,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommands {
     #[command(
         name = "huggingface",
@@ -996,6 +1299,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         allow_unauthenticated: false,
         cors_origins: Vec::new(),
         verbose: false,
+        persistence: ServePersistenceArgs::default(),
     });
     let selection_options =
         selection_options.with_backend_install_output(command_backend_install_verbose(&command));
@@ -1015,6 +1319,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             allow_unauthenticated,
             cors_origins,
             verbose,
+            persistence,
         } => {
             let store = ModelStore::resolve(model_home)?;
             store.ensure()?;
@@ -1022,6 +1327,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let ip: IpAddr = host.parse()?;
             let addr = SocketAddr::new(ip, port);
+            let server_persistence = persistence.server_config();
+            let vllm_automatic_prefix_caching = server_persistence
+                .is_enabled()
+                .then(|| server_persistence.defaults().reuse != ReuseMode::Disabled);
+            let selection_options =
+                selection_options.with_vllm_automatic_prefix_caching(vllm_automatic_prefix_caching);
             let backend = build_generation_backend(
                 store.clone(),
                 backend_choice,
@@ -1072,6 +1383,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 println!("Default image model available: {image_model}");
             }
+            let server_persistence_summary = format_server_persistence_config(&server_persistence);
             let api_state = ApiState::new_with_default_model_prompt_options_and_verbose(
                 store,
                 backend,
@@ -1079,10 +1391,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(prompt_options_resolver),
                 verbose,
             )
+            .with_server_persistence(server_persistence)
             .with_default_image_model(image_model)
             .with_chat_context_size(llama_options.ctx_size)
             .with_api_keys(api_keys)
             .with_cors_origins(cors_origins);
+            if let Some(summary) = server_persistence_summary {
+                println!("{summary}");
+            }
             serve(addr, api_state).await
         }
         Commands::Run {
@@ -1155,6 +1471,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 stream_granularity: StreamGranularity::Chunk,
                 verbose,
                 debug,
+                tool_config: None,
             };
             let activity = ActivitySpec::chat();
             let response = with_activity(
@@ -1518,6 +1835,59 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Commands::Runtime {
+            url,
+            api_key,
+            timeout_seconds,
+            command,
+        } => tokio::task::spawn_blocking(move || -> Result<()> {
+            let client = WerkProtocolClient::new(&url, api_key)?
+                .with_timeout(Duration::from_secs(timeout_seconds));
+            match command {
+                RuntimeCommands::Info => print_runtime_json(&client.info()?),
+                RuntimeCommands::Capabilities => print_runtime_json(&client.capabilities()?),
+                RuntimeCommands::Memory => print_runtime_json(&client.memory_status()?),
+                RuntimeCommands::States {
+                    model,
+                    tier,
+                    limit,
+                    cursor,
+                } => print_runtime_json(&client.list_states(&StateListFilter {
+                    model_id: model,
+                    tier: tier.map(Into::into),
+                    limit,
+                    cursor,
+                })?),
+                RuntimeCommands::State { id, command } => {
+                    let request = runtime_state_action_request(command);
+                    print_runtime_json(&client.state_action(&id, &request)?)
+                }
+                RuntimeCommands::Prune {
+                    ids,
+                    model,
+                    tier,
+                    older_than_unix_ms,
+                    all,
+                    confirm_all,
+                    execute,
+                } => {
+                    let selector = runtime_prune_selector(
+                        ids,
+                        model,
+                        tier,
+                        older_than_unix_ms,
+                        all,
+                        confirm_all,
+                    )?;
+                    print_runtime_json(&client.prune_states(&PruneStatesRequest {
+                        selector,
+                        dry_run: !execute,
+                    })?)
+                }
+            }
+        })
+        .await
+        .context("runtime-control client task failed")?,
         Commands::Import { path, name } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.import_path(&path, &name)?;
@@ -2778,6 +3148,8 @@ fn vision_user_message(text: &str, image_urls: &[String]) -> ChatMessage {
         role: "user".to_string(),
         content: Some(content),
         name: None,
+        tool_calls: None,
+        tool_call_id: None,
     }
 }
 
@@ -3891,6 +4263,7 @@ fn should_print_startup_banner_for(
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
+        | Commands::Runtime { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
         | Commands::Inspect { .. }
@@ -3917,6 +4290,7 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
+        | Commands::Runtime { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
         | Commands::Inspect { .. }
@@ -6177,6 +6551,7 @@ async fn chat_loop(
             stream_granularity,
             verbose,
             debug,
+            tool_config: None,
         };
 
         print!("assistant> ");
@@ -6222,6 +6597,15 @@ async fn chat_loop(
                         last_flush = Instant::now();
                     }
                     assistant.push_str(&chunk);
+                }
+                Ok(GenerateStreamEvent::ToolCallDelta(tool_calls)) => {
+                    pending_spinner.clear()?;
+                    if debug {
+                        eprintln!(
+                            "\n[werk chat] received {} unexpected tool-call delta(s)",
+                            tool_calls.len()
+                        );
+                    }
                 }
                 Ok(GenerateStreamEvent::Done {
                     finish_reason: response_finish_reason,
@@ -6274,6 +6658,8 @@ async fn chat_loop(
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text(assistant)),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             });
         }
     }
@@ -6618,6 +7004,8 @@ fn bench_model(
             role: "user".to_string(),
             content: Some(MessageContent::Text(prompt.clone())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }],
     );
     let choices = benchmark_choices(backend_choice, &manifest, compare);
@@ -6719,6 +7107,8 @@ fn run_benchmark_choice(
                 role: "user".to_string(),
                 content: Some(MessageContent::Text(prompt.to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             }],
             image_urls: Vec::new(),
             max_tokens,
@@ -6729,6 +7119,7 @@ fn run_benchmark_choice(
             stream_granularity: StreamGranularity::Chunk,
             verbose: false,
             debug,
+            tool_config: None,
         };
         let response = if let Some(session) = session.as_ref() {
             session.generate(request)?
@@ -7393,6 +7784,7 @@ enum BackendChoice {
 struct SelectionOptions {
     provision_missing_backends: bool,
     verbose_backend_installs: bool,
+    vllm_automatic_prefix_caching: Option<bool>,
 }
 
 impl SelectionOptions {
@@ -7401,12 +7793,20 @@ impl SelectionOptions {
         Self {
             provision_missing_backends: !no_auto_install && (auto_install || default_provision),
             verbose_backend_installs: false,
+            vllm_automatic_prefix_caching: None,
         }
     }
 
     fn with_backend_install_output(self, verbose: bool) -> Self {
         Self {
             verbose_backend_installs: verbose,
+            ..self
+        }
+    }
+
+    fn with_vllm_automatic_prefix_caching(self, enabled: Option<bool>) -> Self {
+        Self {
+            vllm_automatic_prefix_caching: enabled,
             ..self
         }
     }
@@ -7464,11 +7864,21 @@ impl AutoBackend {
         manifest: &ModelManifest,
         has_images: bool,
     ) -> Result<Arc<dyn GenerationBackend>> {
-        let selected = selected_backend_for_request(
+        self.backend_for_capabilities(manifest, has_images, false)
+    }
+
+    fn backend_for_capabilities(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        tool_calling: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        let selected = selected_backend_for_request_with_tools(
             &self.store,
             BackendChoice::Auto,
             manifest,
             has_images,
+            tool_calling,
             self.selection_options,
         )?;
         self.cached_backend(selected)
@@ -7476,13 +7886,11 @@ impl AutoBackend {
 
     fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
         let key = backend_label(backend);
-        if let Some(backend) = self
+        let mut backends = self
             .backends
             .lock()
-            .map_err(|_| anyhow!("auto backend cache mutex poisoned"))?
-            .get(key)
-            .cloned()
-        {
+            .map_err(|_| anyhow!("auto backend cache mutex poisoned"))?;
+        if let Some(backend) = backends.get(key).cloned() {
             return Ok(backend);
         }
 
@@ -7492,15 +7900,33 @@ impl AutoBackend {
             self.runtime_options.clone(),
             self.selection_options,
         )?;
-        self.backends
-            .lock()
-            .map_err(|_| anyhow!("auto backend cache mutex poisoned"))?
-            .insert(key, backend.clone());
+        backends.insert(key, backend.clone());
         Ok(backend)
     }
 }
 
 impl GenerationBackend for AutoBackend {
+    fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
+        self.backend_for_capabilities(manifest, has_images, true)
+            .is_ok_and(|backend| backend.supports_tool_calling(manifest, has_images))
+    }
+
+    fn runtime_control_adapter_for(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for_request(manifest, false)
+    }
+
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.backend_for_request(manifest, has_images)?
+            .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for(manifest)?.prepare(manifest)
     }
@@ -7529,8 +7955,12 @@ impl GenerationBackend for AutoBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
-            .generate(manifest, request)
+        self.backend_for_capabilities(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .generate(manifest, request)
     }
 
     fn generate_stream(
@@ -7538,7 +7968,11 @@ impl GenerationBackend for AutoBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+        match self.backend_for_capabilities(
+            &manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        ) {
             Ok(backend) => backend.generate_stream(manifest, request),
             Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
         }
@@ -7572,17 +8006,27 @@ impl GgufPreferredBackend {
         manifest: &ModelManifest,
         has_images: bool,
     ) -> Result<Arc<dyn GenerationBackend>> {
+        self.backend_for_capabilities(manifest, has_images, false)
+    }
+
+    fn backend_for_capabilities(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        tool_calling: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
         let requested = match (self.gguf_backend, self.fallback_backend) {
             (BackendChoice::LlamaServer(llama), BackendChoice::Candle(candle)) => {
                 BackendChoice::GgufPreferred { llama, candle }
             }
             _ => self.gguf_backend,
         };
-        let selected = selected_backend_for_request(
+        let selected = selected_backend_for_request_with_tools(
             &self.store,
             requested,
             manifest,
             has_images,
+            tool_calling,
             self.selection_options,
         )?;
         self.cached_backend(selected)
@@ -7590,13 +8034,11 @@ impl GgufPreferredBackend {
 
     fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
         let key = backend_label(backend);
-        if let Some(backend) = self
+        let mut backends = self
             .backends
             .lock()
-            .map_err(|_| anyhow!("backend cache mutex poisoned"))?
-            .get(key)
-            .cloned()
-        {
+            .map_err(|_| anyhow!("backend cache mutex poisoned"))?;
+        if let Some(backend) = backends.get(key).cloned() {
             return Ok(backend);
         }
 
@@ -7606,15 +8048,33 @@ impl GgufPreferredBackend {
             self.runtime_options.clone(),
             self.selection_options,
         )?;
-        self.backends
-            .lock()
-            .map_err(|_| anyhow!("backend cache mutex poisoned"))?
-            .insert(key, backend.clone());
+        backends.insert(key, backend.clone());
         Ok(backend)
     }
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
+        self.backend_for_capabilities(manifest, has_images, true)
+            .is_ok_and(|backend| backend.supports_tool_calling(manifest, has_images))
+    }
+
+    fn runtime_control_adapter_for(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for_request(manifest, false)
+    }
+
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.backend_for_request(manifest, has_images)?
+            .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for(manifest)?.prepare(manifest)
     }
@@ -7655,8 +8115,12 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
-            .generate(manifest, request)
+        self.backend_for_capabilities(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .generate(manifest, request)
     }
 
     fn generate_stream(
@@ -7664,7 +8128,11 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+        match self.backend_for_capabilities(
+            &manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        ) {
             Ok(backend) => backend.generate_stream(manifest, request),
             Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
         }
@@ -7712,6 +8180,22 @@ fn manifest_requires_mlx_vlm(manifest: &ModelManifest) -> bool {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn runtime_control_adapter_for(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for_request(manifest, false)
+    }
+
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.backend_for_request(manifest, has_images)
+            .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for_request(manifest, false).prepare(manifest)
     }
@@ -7824,30 +8308,56 @@ impl VllmPreferredBackend {
             );
         }
         let key = backend_label(backend);
-        if let Some(backend) = self
+        let mut backends = self
             .backends
             .lock()
-            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?
-            .get(key)
-            .cloned()
-        {
+            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?;
+        if let Some(backend) = backends.get(key).cloned() {
             return Ok(backend);
         }
 
         let concrete: Arc<dyn GenerationBackend> = match backend {
-            BackendChoice::Vllm => Arc::new(VllmBackend::new(self.store.clone())),
-            BackendChoice::VllmRocm => Arc::new(VllmBackend::new_rocm(self.store.clone())),
+            BackendChoice::Vllm => Arc::new(
+                VllmBackend::new(self.store.clone()).with_automatic_prefix_caching(
+                    self.selection_options.vllm_automatic_prefix_caching,
+                ),
+            ),
+            BackendChoice::VllmRocm => Arc::new(
+                VllmBackend::new_rocm(self.store.clone()).with_automatic_prefix_caching(
+                    self.selection_options.vllm_automatic_prefix_caching,
+                ),
+            ),
             _ => unreachable!("validated above"),
         };
-        self.backends
-            .lock()
-            .map_err(|_| anyhow!("vLLM backend cache mutex poisoned"))?
-            .insert(key, concrete.clone());
+        backends.insert(key, concrete.clone());
         Ok(concrete)
     }
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        // This router contains only vLLM-family adapters. Report protocol
+        // capability independently of runtime readiness so malformed launch
+        // arguments and startup/request failures reach the caller verbatim.
+        true
+    }
+
+    fn runtime_control_adapter_for(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for_request(manifest, false)
+    }
+
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.backend_for_request(manifest, has_images)?
+            .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for_request(manifest, false)?.prepare(manifest)
     }
@@ -8036,8 +8546,14 @@ fn build_concrete_backend(
         BackendChoice::MlxVlm => Ok(Arc::new(MlxVlmBackend::new(store))),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
         BackendChoice::TransformersCompat => Ok(Arc::new(TransformersCompatBackend::new(store))),
-        BackendChoice::Vllm => Ok(Arc::new(VllmBackend::new(store))),
-        BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new_rocm(store))),
+        BackendChoice::Vllm => Ok(Arc::new(
+            VllmBackend::new(store)
+                .with_automatic_prefix_caching(selection_options.vllm_automatic_prefix_caching),
+        )),
+        BackendChoice::VllmRocm => Ok(Arc::new(
+            VllmBackend::new_rocm(store)
+                .with_automatic_prefix_caching(selection_options.vllm_automatic_prefix_caching),
+        )),
     }
 }
 
@@ -8488,13 +9004,31 @@ fn selected_backend_for_request(
     has_images: bool,
     selection_options: SelectionOptions,
 ) -> Result<BackendChoice> {
+    selected_backend_for_request_with_tools(
+        store,
+        backend,
+        manifest,
+        has_images,
+        false,
+        selection_options,
+    )
+}
+
+fn selected_backend_for_request_with_tools(
+    store: &ModelStore,
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    has_images: bool,
+    tool_calling: bool,
+    selection_options: SelectionOptions,
+) -> Result<BackendChoice> {
     if has_images && !manifest.supports_task(InferenceTask::ImageUnderstanding) {
         bail!(
             "model '{}' does not advertise image-understanding; select a vision-language model",
             manifest.id
         );
     }
-    let capabilities = request_capabilities(has_images);
+    let capabilities = request_capabilities(has_images).with_tool_calling(tool_calling);
     match backend {
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
@@ -8743,12 +9277,8 @@ fn runtime_unavailability_reason(
     selection_options: SelectionOptions,
 ) -> Option<String> {
     match runtime_id {
-        RuntimeId::VllmCuda => VllmBackend::probe(store)
-            .err()
-            .map(|_| VllmBackend::cuda_unavailable_reason(store)),
-        RuntimeId::VllmRocm => VllmBackend::probe_rocm(store)
-            .err()
-            .map(|_| VllmBackend::rocm_unavailable_reason(store)),
+        RuntimeId::VllmCuda => vllm_probe_unavailability_reason(VllmBackend::probe(store)),
+        RuntimeId::VllmRocm => vllm_probe_unavailability_reason(VllmBackend::probe_rocm(store)),
         _ => backend_unavailability_reason_for_request(
             store,
             backend,
@@ -8757,6 +9287,10 @@ fn runtime_unavailability_reason(
             selection_options,
         ),
     }
+}
+
+fn vllm_probe_unavailability_reason(probe: Result<String>) -> Option<String> {
+    probe.err().map(|error| error.to_string())
 }
 
 fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
@@ -9106,7 +9640,7 @@ fn candle_cuda_unavailable_message() -> String {
     if cfg!(feature = "candle-cuda") {
         "CUDA backend requested for safetensors model, but Candle CUDA is unavailable. Check the NVIDIA driver/CUDA runtime, or use: werk --backend auto / --backend cpu.".to_string()
     } else {
-        "CUDA backend requested for safetensors model. This Werk binary was built without Candle CUDA support. Rebuild with: cargo install --path . --locked --force --features cuda. Or use: werk --backend auto / --backend cpu.".to_string()
+        "CUDA backend requested for safetensors model. This Werk binary was built without Candle CUDA support. Rebuild with: cargo +stable install --path . --locked --force --features cuda. Or use: werk --backend auto / --backend cpu.".to_string()
     }
 }
 
@@ -9114,7 +9648,7 @@ fn candle_cuda_rejection_reason() -> String {
     if cfg!(feature = "candle-cuda") {
         "Candle CUDA is unavailable".to_string()
     } else {
-        "This Werk binary was built without Candle CUDA support. Rebuild with: cargo install --path . --locked --force --features cuda".to_string()
+        "This Werk binary was built without Candle CUDA support. Rebuild with: cargo +stable install --path . --locked --force --features cuda".to_string()
     }
 }
 
@@ -9554,6 +10088,128 @@ fn format_temp_list(entries: &[PathBuf]) -> String {
         .join("\n")
 }
 
+fn format_server_persistence_config(config: &ServerPersistenceConfig) -> Option<String> {
+    if !config.is_enabled() {
+        return None;
+    }
+
+    let defaults = config.defaults();
+    let mode = match defaults.mode {
+        PersistenceMode::Ephemeral => "ephemeral",
+        PersistenceMode::Memory => "memory",
+        PersistenceMode::Disk => "disk",
+        PersistenceMode::Auto => "auto",
+    };
+    let reuse = match defaults.reuse {
+        ReuseMode::Disabled => "disabled",
+        ReuseMode::Prefer => "prefer",
+        ReuseMode::Required => "required",
+    };
+    let vllm_prefix_cache = if defaults.reuse == ReuseMode::Disabled {
+        "disabled"
+    } else {
+        "enabled"
+    };
+    let ttl = defaults
+        .ttl_seconds
+        .map(|seconds| seconds.to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    Some(format!(
+        "Werk persistence enabled: prefill defaults mode={mode} reuse={reuse} \
+         ttl_seconds={ttl} pin={}; automatic model/pipeline residency remains active on \
+         supported Werk-managed runtimes; local vLLM automatic prefix caching defaults to \
+         {vllm_prefix_cache} unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM \
+         remains externally managed.",
+        defaults.pin
+    ))
+}
+
+fn print_runtime_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn runtime_state_action_request(command: RuntimeStateCommands) -> StateActionRequest {
+    match command {
+        RuntimeStateCommands::Pin { execute } => StateActionRequest {
+            action: StateAction::Pin,
+            target_tier: None,
+            dry_run: !execute,
+            allow_experimental: false,
+        },
+        RuntimeStateCommands::Unpin { execute } => StateActionRequest {
+            action: StateAction::Unpin,
+            target_tier: None,
+            dry_run: !execute,
+            allow_experimental: false,
+        },
+        RuntimeStateCommands::Promote {
+            target,
+            execute,
+            allow_experimental,
+        } => StateActionRequest {
+            action: StateAction::Promote,
+            target_tier: Some(target.into()),
+            dry_run: !execute,
+            allow_experimental,
+        },
+        RuntimeStateCommands::Demote {
+            target,
+            execute,
+            allow_experimental,
+        } => StateActionRequest {
+            action: StateAction::Demote,
+            target_tier: Some(target.into()),
+            dry_run: !execute,
+            allow_experimental,
+        },
+        RuntimeStateCommands::Evict { execute } => StateActionRequest {
+            action: StateAction::Evict,
+            target_tier: None,
+            dry_run: !execute,
+            allow_experimental: false,
+        },
+    }
+}
+
+fn runtime_prune_selector(
+    ids: Vec<String>,
+    model: Option<String>,
+    tier: Option<RuntimeStateTierArg>,
+    older_than_unix_ms: Option<u64>,
+    all: bool,
+    confirm_all: bool,
+) -> Result<StateSelector> {
+    let has_filter = model.is_some() || tier.is_some() || older_than_unix_ms.is_some();
+    let selector_count = usize::from(!ids.is_empty()) + usize::from(has_filter) + usize::from(all);
+    if selector_count != 1 {
+        bail!(
+            "runtime prune requires exactly one selector: --id, a model/tier/time filter, or --all --confirm-all"
+        );
+    }
+    if !ids.is_empty() {
+        if confirm_all {
+            bail!("--confirm-all is valid only with --all");
+        }
+        return Ok(StateSelector::Ids { ids });
+    }
+    if all {
+        if !confirm_all {
+            bail!("--all requires --confirm-all; no states were selected");
+        }
+        return Ok(StateSelector::All { confirm: true });
+    }
+    if confirm_all {
+        bail!("--confirm-all is valid only with --all");
+    }
+    Ok(StateSelector::Filter {
+        model_id: model,
+        tier: tier.map(Into::into),
+        older_than_unix_ms,
+    })
+}
+
 fn format_bytes_per_second(bytes_per_second: f64) -> String {
     format_bytes_f64(bytes_per_second.max(0.0))
 }
@@ -9585,6 +10241,7 @@ mod tests {
     };
     use crate::inference_service::OutputMetadata;
     use crate::model_store::{ModelFile, ModelSource};
+    use clap::CommandFactory;
     use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -9677,6 +10334,7 @@ mod tests {
                 allow_unauthenticated,
                 cors_origins,
                 verbose,
+                persistence,
             } => {
                 assert_eq!(host, "0.0.0.0");
                 assert_eq!(port, 8080);
@@ -9687,6 +10345,7 @@ mod tests {
                 assert!(!allow_unauthenticated);
                 assert!(cors_origins.is_empty());
                 assert!(!verbose);
+                assert_eq!(persistence, ServePersistenceArgs::default());
             }
             command => panic!("unexpected command: {command:?}"),
         }
@@ -10143,6 +10802,150 @@ mod tests {
         }
     }
 
+    fn parse_serve_persistence(args: &[&str]) -> ServePersistenceArgs {
+        let mut argv = vec!["werk", "serve"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)
+            .expect("serve persistence arguments")
+            .command
+        {
+            Some(Commands::Serve { persistence, .. }) => persistence,
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_server_persistence_options_and_granular_options_imply_enablement() {
+        let umbrella = parse_serve_persistence(&["--persistence"]);
+        let config = umbrella.server_config();
+        assert!(config.is_enabled());
+        assert_eq!(config.defaults(), &PersistencePolicy::default());
+
+        let granular = parse_serve_persistence(&[
+            "--persistence-mode",
+            "disk",
+            "--persistence-reuse",
+            "required",
+            "--persistence-ttl-seconds",
+            "900",
+            "--persistence-pin",
+        ]);
+        assert!(!granular.persistence);
+        let config = granular.server_config();
+        assert!(config.is_enabled());
+        assert_eq!(config.defaults().mode, PersistenceMode::Disk);
+        assert_eq!(config.defaults().reuse, ReuseMode::Required);
+        assert_eq!(config.defaults().ttl_seconds, Some(900));
+        assert!(config.defaults().pin);
+
+        for args in [
+            &["--persistence-mode", "memory"][..],
+            &["--persistence-reuse", "disabled"][..],
+            &["--persistence-ttl-seconds", "60"][..],
+            &["--persistence-pin"][..],
+        ] {
+            assert!(parse_serve_persistence(args).server_config().is_enabled());
+        }
+
+        assert!(Cli::try_parse_from(["werk", "serve", "--persistence-ttl-seconds", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["werk", "serve", "--persistence-ttl-seconds", "2592001"]).is_err()
+        );
+    }
+
+    #[test]
+    fn serve_help_and_startup_summary_state_persistence_scope() {
+        let mut command = Cli::command();
+        let serve = command
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand");
+        let help = serve.render_long_help().to_string();
+        assert!(help.contains("persistence defaults for /werk/v1/prefill"));
+        assert!(help.contains("automatic prefix caching for local Werk-managed vLLM"));
+        assert!(help.contains("remote vLLM remains externally managed"));
+        assert!(help.contains("policy is omitted; implies --persistence"));
+        assert!(help.contains("disabled also disables the managed local-vLLM prefix-cache"));
+
+        assert_eq!(
+            format_server_persistence_config(&ServerPersistenceConfig::default()),
+            None
+        );
+        let config = parse_serve_persistence(&[
+            "--persistence-mode",
+            "disk",
+            "--persistence-reuse",
+            "required",
+            "--persistence-ttl-seconds",
+            "900",
+            "--persistence-pin",
+        ])
+        .server_config();
+        assert_eq!(
+            format_server_persistence_config(&config).as_deref(),
+            Some(
+                "Werk persistence enabled: prefill defaults mode=disk reuse=required \
+                 ttl_seconds=900 pin=true; automatic model/pipeline residency remains active on \
+                 supported Werk-managed runtimes; local vLLM automatic prefix caching defaults to \
+                 enabled unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM \
+                 remains externally managed."
+            )
+        );
+
+        let disabled =
+            parse_serve_persistence(&["--persistence-reuse", "disabled"]).server_config();
+        assert!(
+            format_server_persistence_config(&disabled)
+                .unwrap()
+                .contains("local vLLM automatic prefix caching defaults to disabled")
+        );
+    }
+
+    #[test]
+    fn only_enabled_serve_persistence_requests_vllm_automatic_prefix_caching() {
+        let base = SelectionOptions::from_cli(BackendArg::Vllm, false, false);
+        assert_eq!(base.vllm_automatic_prefix_caching, None);
+
+        let disabled = parse_serve_persistence(&[]).server_config();
+        let disabled_default = disabled
+            .is_enabled()
+            .then(|| disabled.defaults().reuse != ReuseMode::Disabled);
+        assert_eq!(
+            base.with_vllm_automatic_prefix_caching(disabled_default)
+                .vllm_automatic_prefix_caching,
+            None
+        );
+
+        let enabled = parse_serve_persistence(&["--persistence"]).server_config();
+        let enabled_default = enabled
+            .is_enabled()
+            .then(|| enabled.defaults().reuse != ReuseMode::Disabled);
+        assert_eq!(
+            base.with_vllm_automatic_prefix_caching(enabled_default)
+                .vllm_automatic_prefix_caching,
+            Some(true)
+        );
+
+        let no_reuse =
+            parse_serve_persistence(&["--persistence-reuse", "disabled"]).server_config();
+        assert_eq!(
+            base.with_vllm_automatic_prefix_caching(Some(
+                no_reuse.defaults().reuse != ReuseMode::Disabled
+            ))
+            .vllm_automatic_prefix_caching,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn vllm_args_are_not_a_backend_selection_input() {
+        let cli = Cli::try_parse_from(["werk", "serve"]).unwrap();
+        assert_eq!(cli.backend, BackendArg::Auto);
+        assert!(matches!(
+            backend_arg_to_choice(cli.backend),
+            BackendChoice::Auto
+        ));
+    }
+
     #[test]
     fn parses_temp_commands_and_global_model_home() {
         let cli = Cli::try_parse_from([
@@ -10253,6 +11056,135 @@ mod tests {
             ),
             "Purged 2 temporary entries."
         );
+    }
+
+    #[test]
+    fn parses_runtime_status_and_persistence_controls() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "runtime",
+            "--url",
+            "http://127.0.0.1:12000",
+            "states",
+            "--model",
+            "org/model",
+            "--tier",
+            "disk",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Runtime {
+                url,
+                api_key,
+                timeout_seconds,
+                command:
+                    RuntimeCommands::States {
+                        model,
+                        tier,
+                        limit,
+                        cursor,
+                    },
+            } => {
+                assert_eq!(url, "http://127.0.0.1:12000");
+                assert!(api_key.is_none());
+                assert_eq!(timeout_seconds, DEFAULT_RUNTIME_CONTROL_TIMEOUT_SECONDS);
+                assert_eq!(model.as_deref(), Some("org/model"));
+                assert_eq!(tier, Some(RuntimeStateTierArg::Disk));
+                assert_eq!(limit, Some(25));
+                assert!(cursor.is_none());
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "runtime",
+            "state",
+            "st_example",
+            "promote",
+            "vram",
+            "--execute",
+            "--allow-experimental",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime {
+                command: RuntimeCommands::State {
+                    command: RuntimeStateCommands::Promote {
+                        target: RuntimeMemoryTierArg::Vram,
+                        execute: true,
+                        allow_experimental: true,
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["werk", "runtime", "--timeout-seconds", "75", "info"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime {
+                timeout_seconds: 75,
+                command: RuntimeCommands::Info,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["werk", "runtime", "--timeout-seconds", "0", "info",]).is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_prune_requires_one_explicit_selector_and_defaults_to_preview() {
+        assert!(runtime_prune_selector(Vec::new(), None, None, None, false, false).is_err());
+        assert!(
+            runtime_prune_selector(
+                vec!["st_one".to_string()],
+                Some("model".to_string()),
+                None,
+                None,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert!(runtime_prune_selector(Vec::new(), None, None, None, true, false).is_err());
+        assert_eq!(
+            runtime_prune_selector(Vec::new(), None, None, None, true, true).unwrap(),
+            StateSelector::All { confirm: true }
+        );
+
+        let cli = Cli::try_parse_from(["werk", "runtime", "prune", "--id", "st_one"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Runtime {
+                command: RuntimeCommands::Prune { ids, execute, .. },
+                ..
+            } => {
+                assert_eq!(ids, vec!["st_one"]);
+                assert!(!execute);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let alias =
+            Cli::try_parse_from(["werk", "runtime", "purge", "--all", "--confirm-all"]).unwrap();
+        assert!(matches!(
+            alias.command,
+            Some(Commands::Runtime {
+                command: RuntimeCommands::Prune {
+                    all: true,
+                    confirm_all: true,
+                    execute: false,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -11506,6 +12438,80 @@ mod tests {
     }
 
     #[test]
+    fn explicit_vllm_planner_preserves_probe_configuration_errors() {
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let probe_error =
+            "invalid WERK_VLLM_ARGS POSIX-style shell-word list: missing closing quote";
+        let captured = vllm_probe_unavailability_reason(Err(anyhow!(probe_error))).unwrap();
+        assert_eq!(captured, probe_error);
+
+        let availability = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: false,
+                reason: Some(captured),
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::CandleCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+        let plan = plan_runtime(
+            &manifest,
+            RequestedBackend::Vllm,
+            RequestCapabilities::text(false),
+            &availability,
+        );
+
+        assert!(plan.selected.is_none());
+        assert!(plan.candidates.iter().any(|candidate| {
+            candidate.runtime_id == RuntimeId::VllmCuda && candidate.reason.contains(probe_error)
+        }));
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| candidate.runtime_id != RuntimeId::CandleCuda)
+        );
+    }
+
+    #[test]
+    fn explicit_vllm_reports_tool_capability_even_when_runtime_is_unavailable() {
+        let store = test_store("explicit-vllm-tool-capability");
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let backend = VllmPreferredBackend::new(store.clone(), SelectionOptions::default());
+
+        assert!(backend.supports_tool_calling(&manifest, false));
+        let error = backend
+            .generate(
+                &manifest,
+                GenerateRequest {
+                    prompt: "use the tool".to_string(),
+                    messages: Vec::new(),
+                    image_urls: Vec::new(),
+                    max_tokens: 8,
+                    temperature: None,
+                    top_p: None,
+                    stop: Vec::new(),
+                    seed: None,
+                    stream_granularity: StreamGranularity::Chunk,
+                    verbose: false,
+                    debug: false,
+                    tool_config: Some(crate::backend::ToolCallingConfig {
+                        tools: Some(Vec::new()),
+                        tool_choice: None,
+                        parallel_tool_calls: None,
+                    }),
+                },
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("vLLM CUDA"), "{message}");
+        assert!(!message.contains("Candle CUDA:"), "{message}");
+        assert!(!message.contains("unsupported_tool_calling"), "{message}");
+    }
+
+    #[test]
     fn explicit_onnx_selection_never_falls_back_to_candle() {
         let store = test_store("explicit-onnx-missing");
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
@@ -11789,6 +12795,14 @@ mod tests {
         }
 
         impl GenerationBackend for RecordingMlxBackend {
+            fn runtime_control_adapter(
+                &self,
+            ) -> Arc<dyn crate::runtime_control::BackendRuntimeAdapter> {
+                Arc::new(crate::runtime_control::UnsupportedRuntimeAdapter::new(
+                    self.label,
+                ))
+            }
+
             fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
                 self.calls.lock().unwrap().push("prepare");
                 Ok(())
@@ -11829,6 +12843,7 @@ mod tests {
                 self.calls.lock().unwrap().push("generate");
                 Ok(crate::backend::GenerateResponse {
                     text: self.label.to_string(),
+                    assistant_message: None,
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     finish_reason: "stop".to_string(),
@@ -11867,6 +12882,22 @@ mod tests {
             .metadata
             .tasks
             .push(InferenceTask::ImageUnderstanding);
+        assert_eq!(
+            backend
+                .runtime_control_adapter_for(&text_manifest)
+                .unwrap()
+                .descriptor()
+                .backend,
+            "mlx-lm"
+        );
+        assert_eq!(
+            backend
+                .runtime_control_adapter_for(&vision_manifest)
+                .unwrap()
+                .descriptor()
+                .backend,
+            "mlx-vlm"
+        );
         let text_request = GenerateRequest {
             prompt: "hello".to_string(),
             messages: Vec::new(),
@@ -11879,6 +12910,7 @@ mod tests {
             stream_granularity: StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
         let mut vision_request = text_request.clone();
         vision_request.image_urls = vec!["data:image/png;base64,AAAA".to_string()];
@@ -12003,6 +13035,7 @@ mod tests {
                 self.calls.lock().unwrap().push("generate");
                 Ok(crate::backend::GenerateResponse {
                     text: self.label.to_string(),
+                    assistant_message: None,
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     finish_reason: "stop".to_string(),
@@ -12059,6 +13092,7 @@ mod tests {
             stream_granularity: StreamGranularity::Chunk,
             verbose: false,
             debug: false,
+            tool_config: None,
         };
         let mut image_request = text_request.clone();
         image_request.image_urls = vec!["data:image/png;base64,AAAA".to_string()];
@@ -12099,6 +13133,7 @@ mod tests {
             allow_unauthenticated: false,
             cors_origins: Vec::new(),
             verbose: false,
+            persistence: ServePersistenceArgs::default(),
         };
         assert!(should_print_startup_banner_for(&serve, true, true));
         assert!(!should_print_startup_banner_for(&serve, false, true));
@@ -12447,6 +13482,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -12473,6 +13510,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -12500,6 +13539,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -12526,6 +13567,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -12546,6 +13589,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -12568,6 +13613,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -12590,6 +13637,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let prompt = prompt_for_backend(
             &manifest,
@@ -12612,6 +13661,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Text("first".to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let request_messages = request_messages_for_turn(
             &mut history,
@@ -12619,6 +13670,8 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("second".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             true,
         );
@@ -12641,11 +13694,15 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("first".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text("answer".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
         let request_messages = request_messages_for_turn(
@@ -12654,6 +13711,8 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("second".to_string())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             false,
         );

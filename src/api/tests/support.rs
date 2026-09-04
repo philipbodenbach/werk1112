@@ -49,6 +49,7 @@ impl GenerationBackend for MockBackend {
     ) -> anyhow::Result<GenerateResponse> {
         Ok(GenerateResponse {
             text: "hello".to_string(),
+            assistant_message: None,
             prompt_tokens: 2,
             completion_tokens: 1,
             finish_reason: "stop".to_string(),
@@ -101,6 +102,7 @@ impl GenerationBackend for PromptEchoBackend {
     ) -> anyhow::Result<GenerateResponse> {
         Ok(GenerateResponse {
             text: request.prompt,
+            assistant_message: None,
             prompt_tokens: 1,
             completion_tokens: 1,
             finish_reason: "stop".to_string(),

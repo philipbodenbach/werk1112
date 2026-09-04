@@ -10,6 +10,7 @@ mod media;
 mod response;
 mod router;
 mod state;
+mod werk;
 
 #[cfg(test)]
 mod tests;

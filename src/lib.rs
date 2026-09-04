@@ -46,4 +46,6 @@ pub mod media_cli;
 pub mod media_companion;
 pub mod model_store;
 pub mod openai;
+pub mod runtime_control;
 pub mod runtime_planner;
+pub mod werk_protocol;

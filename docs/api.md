@@ -15,11 +15,12 @@ of truth.
 
 Current surface:
 
-- 21 unique paths
-- 23 method/path operations
+- 31 unique paths
+- 33 method/path operations
 - JSON requests except raw output downloads
 - server-sent events only for chat streaming
 - persisted asynchronous jobs for video, generated audio and the native job API
+- a separate, versioned Werk Protocol 1.0 runtime-control surface
 
 ## Base URL
 
@@ -53,6 +54,7 @@ with <code>--allow-unauthenticated</code>.
 | OpenAI-compatible subset | Common OpenAI request and response shapes are implemented, but only documented fields are supported. |
 | OpenAI-inspired | The path or general purpose resembles OpenAI, but Werk adds or changes request/response behavior. |
 | Werk-native | The route exposes Werk tasks, routing, estimates, plans, jobs or outputs directly. |
+| Werk Protocol 1.0 | Versioned runtime-control envelope with typed capability, state, memory and prefill/decode semantics. |
 | Comfy alias | A compatibility path used by ComfyUI hosted nodes. |
 | A1111 subset | A deliberately small AUTOMATIC1111-compatible surface. |
 
@@ -85,6 +87,26 @@ Do not infer compatibility with an entire upstream API from the path prefix.
 | A1111 subset | GET | <code>/sdapi/v1/options</code> | Current compatibility model selection |
 | A1111 subset | POST | <code>/sdapi/v1/options</code> | Update compatibility model selection |
 | A1111 subset | GET | <code>/sdapi/v1/progress</code> | Coarse idle/active state |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/info</code> | Version, active backend and protocol limits |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/capabilities</code> | Truthful runtime capability statuses |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/memory</code> | Live host/accelerator telemetry and managed accounting |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/states</code> | Principal-scoped runtime-state page |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/states/{id}/actions</code> | Dry-run or explicit state action |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/states/prune</code> | Explicitly selected state-prune summary |
+| Werk Protocol 1.0 | GET | <code>/werk/v1/experts</code> | Capability-gated expert metadata page |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/experts/actions</code> | Capability-gated explicit expert action |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/prefill</code> | Capability-gated prefill and opaque handoff |
+| Werk Protocol 1.0 | POST | <code>/werk/v1/decode</code> | Single-use handoff decode |
+
+The `/werk/v1` routes are additive and do not replace or reinterpret any
+existing `/v1`, `/proxy/openai` or `/sdapi/v1` route. Their complete envelopes,
+DTOs, limits, errors and examples are in the
+[Werk Protocol 1.0 reference](reference/werk-protocol-v1.md). Architecture and
+the exact production-backend capability matrix are in
+[Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md).
+Protocol clients should send `Accept: application/json` and
+`X-Werk-Protocol-Version: 1.0`. Responses declare the same protocol version,
+disable caching and MIME sniffing, and vary on `Accept`.
 
 ## Authentication
 
@@ -107,7 +129,11 @@ A1111 routes additionally accept HTTP Basic authentication with username
 
 Authentication properties:
 
-- keys currently have equal permissions; there are no scopes or tenants;
+- keys currently have equal inference permissions; there are no configurable
+  authorization scopes;
+- Werk Protocol runtime state is nevertheless partitioned by a keyed opaque
+  principal derived from the accepted API key, so different keys cannot list
+  or reuse each other's state;
 - no built-in rate limiting is implemented;
 - the server does not terminate TLS;
 - remote deployments should use a TLS reverse proxy;
@@ -133,6 +159,10 @@ The following JSON routes default to 128 MiB and can be configured up to
 Other JSON routes retain Axum's smaller default, approximately 2 MiB. The
 larger chat limit permits inline vision data URLs but remains a bound on the
 complete JSON body, not just the decoded image.
+
+Werk Protocol mutation, expert, prefill and decode routes have their own fixed
+1 MiB body limit. They additionally enforce the smaller typed limits returned
+by <code>GET /werk/v1/info</code>.
 
 Base64 expands binary data by roughly one third. Prefer server-local paths when
 the client and server intentionally share a trusted filesystem.
@@ -359,6 +389,9 @@ Accepted top-level fields:
 | <code>max_completion_tokens</code> | No | integer | Wins over max_tokens |
 | <code>stop</code> | No | string or string array | Added to model/template stops |
 | <code>seed</code> | No | integer | Backend dependent |
+| <code>tools</code> | No | array | OpenAI function-tool definitions; supported by the vLLM adapter |
+| <code>tool_choice</code> | No | string or object | <code>none</code>, <code>auto</code>, <code>required</code>, or a named function selection |
+| <code>parallel_tool_calls</code> | No | boolean | Forwarded unchanged to vLLM |
 
 The response-token default is 256 when neither field is present. Werk does not
 silently clamp an explicit response budget; the selected model context and
@@ -380,6 +413,31 @@ and vLLM forward that multipart structure to their chat endpoints; the current
 MLX-VLM subprocess accepts the image list but does not preserve arbitrary
 interleaving or `detail`. A hint such as `detail: "high"` does not guarantee an
 identical resolution policy across model processors.
+
+Tool-capable messages use the standard OpenAI chat shapes. An assistant
+message can have `content: null` and a `tool_calls` array. Each call contains
+an ID, `type: "function"`, a function name and `arguments` encoded as a JSON
+string. A following message uses `role: "tool"`, the matching `tool_call_id`
+and its result in `content`. Text, ordered multimodal content arrays and null
+content retain their existing representations.
+
+Each `tools` item contains `type: "function"` and a `function` object with a
+name, optional description, arbitrary JSON Schema in `parameters` and optional
+`strict`. A named tool choice has this form:
+
+~~~json
+{"type":"function","function":{"name":"get_weather"}}
+~~~
+
+Werk forwards these request fields and tool-message fields unchanged through
+the local and remote vLLM chat transports. It does not execute tools, hardcode
+a parser or automatically enable vLLM's automatic tool choice. vLLM generally
+requires `--enable-auto-tool-choice` for `tool_choice: "auto"`. Parser names and
+required server flags vary by model and vLLM version; Werk does not validate,
+replace or rewrite an arbitrary parser name. Configure these values where vLLM
+is launched. Other chat adapters return HTTP 400 with error code
+`unsupported_tool_calling`, rather than ignoring the fields. With
+`--backend auto`, tool support is a required routing capability.
 
 Image input additionally requires a model manifest that advertises
 <code>image-understanding</code> and an eligible vision runtime. Current routes
@@ -424,6 +482,60 @@ curl -fsS http://127.0.0.1:11434/v1/chat/completions \
   }'
 ~~~
 
+Tool-call example for a vLLM-backed Werk server:
+
+~~~bash
+curl -fsS http://127.0.0.1:11434/v1/chat/completions \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-coder",
+    "messages": [{"role": "user", "content": "What is the weather in Berlin?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+~~~
+
+A compatible model/runtime can return a choice like this. The value of
+`function.arguments` is intentionally a string containing JSON:
+
+~~~json
+{
+  "index": 0,
+  "message": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [{
+      "id": "call_weather_1",
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "arguments": "{\"location\":\"Berlin\"}"
+      }
+    }]
+  },
+  "finish_reason": "tool_calls"
+}
+~~~
+
+After executing the function, send the prior assistant message back unchanged
+and append its result:
+
+~~~json
+{"role":"tool","tool_call_id":"call_weather_1","content":"{\"temperature_c\":18}"}
+~~~
+
 With <code>--backend auto</code>, image input participates in server-side
 runtime selection. <code>backend</code>, <code>accelerator</code> and Werk media
 <code>routing</code> are not chat request fields; constrain the backend when
@@ -431,7 +543,6 @@ starting Werk when an exact route is required.
 
 Not implemented:
 
-- tools and tool calls
 - structured <code>response_format</code>
 - audio or video content
 - choice count <code>n</code>
@@ -448,11 +559,17 @@ With <code>stream: true</code>, the response content type is
 <code>text/event-stream</code>. The event sequence is:
 
 1. assistant-role chunk;
-2. one or more content chunks;
+2. zero or more content and/or tool-call delta chunks;
 3. finish chunk;
 4. literal <code>data: [DONE]</code>.
 
 Output chunks are buffered text pieces rather than necessarily one token each.
+Tool-call deltas preserve each call's `index`, optional ID and type, partial
+function name and partial argument string. Multiple calls and the upstream
+finish reason remain distinct; tool arguments are not concatenated into
+assistant content. Clients must assemble partial fields by call index as they
+would for an OpenAI chat stream.
+
 If generation fails after the HTTP stream starts, the failure is emitted as an
 error event inside the already successful HTTP response.
 
@@ -843,7 +960,7 @@ There is no output deletion endpoint today.
 
 ## Error response
 
-Most Werk routes use:
+Most established `/v1`, proxy and compatibility routes use:
 
 ~~~json
 {
@@ -879,6 +996,16 @@ Current caveats:
 - model-load/backend errors are often reported as 400;
 - A1111 compatibility routes use their own error shape.
 
+Werk Protocol routes do not use this legacy error object. Every `/werk/v1`
+failure retains the protocol version and opaque request ID and returns a typed
+code, public message and retryability flag. HTTP status mapping includes 409
+for incompatible state, 406 with `incompatible_protocol` for an incompatible
+version or JSON representation, 410 for an expired/consumed handoff, 428 when
+an experimental operation lacks opt-in, 429 for bounded resource exhaustion,
+501 for an unsupported adapter operation and 503 for a temporarily unavailable
+prerequisite. See [Werk Protocol errors](reference/werk-protocol-v1.md#errors)
+for the complete mapping.
+
 ## AUTOMATIC1111 subset
 
 The supported compatibility routes are:
@@ -911,8 +1038,8 @@ preview image when the backend has no progress callback.
 
 ## Security and privacy considerations
 
-The current diagnostic contracts are intentionally transparent but can contain
-sensitive information:
+The established inference diagnostic contracts are intentionally transparent
+but can contain sensitive information:
 
 - direct responses include the effective request and absolute server output
   paths inside <code>werk</code>;
@@ -920,7 +1047,16 @@ sensitive information:
 - inline Base64 input is therefore persisted in job JSON;
 - prompts, negative prompts and server-local input paths can be persisted;
 - job records have no independent retention or deletion API;
-- all API keys currently have equal access.
+- all API keys currently have equal access to those legacy inference and
+  diagnostic routes.
+
+Werk Protocol runtime state has a narrower public summary. It does not expose
+raw credentials, prompts, backend handles, external cache keys or snapshot
+paths. Each accepted API key maps through HMAC-SHA-256 to a separate opaque
+state namespace and prompt-fingerprint scope. Handoffs are random,
+principal-bound, single-use secrets and responses carry `Cache-Control:
+no-store`. These protections do not turn plain HTTP into a secure remote
+transport.
 
 Do not expose Werk directly to an untrusted network. Use TLS termination,
 access controls and a trusted reverse proxy. Prefer dedicated store roots for

@@ -1272,6 +1272,40 @@ class AudioRuntimeTests(unittest.TestCase):
             parameters,
         )
 
+    def test_estimate_uses_canonical_audio_variations_and_legacy_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text(
+                json.dumps({"model_type": "fixture"}),
+                encoding="utf-8",
+            )
+            base = {
+                "model_path": str(model),
+                "task": "audio_generation",
+                "effective_parameters": {
+                    "audio.duration": 2,
+                    "audio.sample_rate": 8_000,
+                    "audio.channels": 1,
+                    "audio.bit_depth": 16,
+                },
+            }
+            canonical = dict(base)
+            canonical["effective_parameters"] = {
+                **base["effective_parameters"],
+                "audio.variations": 3,
+            }
+            legacy = dict(base)
+            legacy["effective_parameters"] = {
+                **base["effective_parameters"],
+                "num_variations": 2,
+            }
+
+            canonical_estimate = COMPANION.command_estimate(canonical)
+            legacy_estimate = COMPANION.command_estimate(legacy)
+
+        self.assertEqual(canonical_estimate["output_size_bytes"], 96_000)
+        self.assertEqual(legacy_estimate["output_size_bytes"], 64_000)
+
     def test_pipeline_sample_rate_finds_nested_audio_processor_feature_extractor(self):
         feature_extractor = types.SimpleNamespace(sampling_rate=24_000)
         audio_processor = types.SimpleNamespace(
@@ -2187,35 +2221,60 @@ class AudioRuntimeTests(unittest.TestCase):
         self.assertEqual(result["adapter"], "transformers_audio_text")
         self.assertIn("audio_understanding", result["probe"]["tasks"])
 
-    def test_command_execute_dispatches_each_new_transformers_adapter(self):
+    def test_command_execute_forwards_resident_runtime_to_every_adapter(self):
         cases = (
-            ("audio_classification", "execute_audio_classification"),
-            ("audio_captioning", "execute_audio_text"),
-            ("audio_embedding", "execute_audio_embedding"),
+            ("image_generation", "diffusers", "execute_diffusers"),
+            ("audio_generation", "diffusers_audio", "execute_diffusers_audio"),
+            ("audio_generation", "transformers_audio", "execute_audio_generation"),
+            ("text_to_speech", "transformers_tts", "execute_tts"),
+            (
+                "text_to_speech",
+                COMPANION.QWEN3_TTS_ADAPTER,
+                "execute_qwen3_tts_voice_design",
+            ),
+            ("audio_transcription", "transformers_asr", "execute_asr"),
+            (
+                "audio_classification",
+                "transformers_audio_classification",
+                "execute_audio_classification",
+            ),
+            ("audio_captioning", "transformers_audio_text", "execute_audio_text"),
+            (
+                "audio_embedding",
+                "transformers_audio_embedding",
+                "execute_audio_embedding",
+            ),
         )
+        runtime = object()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = root / "model"
             model.mkdir()
-            (model / "config.json").write_text(
-                json.dumps({"model_type": "fixture"}),
-                encoding="utf-8",
-            )
-            for task, executor_name in cases:
-                with self.subTest(task=task), mock.patch.object(
-                    COMPANION,
-                    executor_name,
-                    return_value=([], [], {"runtime": "transformers"}),
-                ) as executor:
+            for task, adapter, executor_name in cases:
+                with (
+                    self.subTest(task=task, adapter=adapter),
+                    mock.patch.object(
+                        COMPANION,
+                        "execution_adapter",
+                        return_value=adapter,
+                    ),
+                    mock.patch.object(
+                        COMPANION,
+                        executor_name,
+                        return_value=([], [], {"runtime": adapter}),
+                    ) as executor,
+                ):
                     result = COMPANION.command_execute(
                         {
                             "model_path": str(model),
                             "task": task,
                             "output_dir": str(root / "outputs"),
-                        }
+                        },
+                        runtime=runtime,
                     )
 
                 executor.assert_called_once()
+                self.assertIs(executor.call_args.kwargs["runtime"], runtime)
                 self.assertEqual(result["task"], task)
 
 
@@ -2995,6 +3054,51 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
         self.assertEqual(device, "cuda")
         self.assertEqual(dtype, "bfloat16")
         self.assertEqual(calls, [(str(model), {"device_map": "cuda:0", "dtype": "bfloat16"})])
+
+    def test_resident_runtime_reuses_qwen_model_and_reports_cache_hit(self):
+        model = object()
+        torch = self.RuntimeTorch()
+        runtime = COMPANION.CompanionRuntime(1)
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory)
+            self.write_model(model_path)
+            with (
+                mock.patch.object(
+                    COMPANION,
+                    "torch_runtime",
+                    return_value=(torch, "cpu", "bfloat16"),
+                ),
+                mock.patch.object(
+                    COMPANION,
+                    "load_qwen3_tts_voice_design",
+                    return_value=(model, torch, "cpu", "bfloat16"),
+                ) as loader,
+            ):
+                first, first_key, first_hit, first_resident = (
+                    COMPANION.prepare_qwen3_tts_voice_design(
+                        runtime,
+                        model_path,
+                        {},
+                    )
+                )
+                second, second_key, second_hit, second_resident = (
+                    COMPANION.prepare_qwen3_tts_voice_design(
+                        runtime,
+                        model_path,
+                        {},
+                    )
+                )
+
+        loader.assert_called_once()
+        self.assertIs(first, second)
+        self.assertEqual(first_key, second_key)
+        self.assertFalse(first_hit)
+        self.assertTrue(second_hit)
+        self.assertTrue(first_resident)
+        self.assertTrue(second_resident)
+        self.assertIs(second.model, model)
+        runtime.close()
+        self.assertIsNone(second.model)
 
     @unittest.skipUnless(
         importlib.util.find_spec("numpy"),

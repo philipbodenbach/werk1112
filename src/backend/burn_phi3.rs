@@ -68,7 +68,7 @@ fn load_cuda(
     _tokenizer: Tokenizer,
 ) -> Result<BurnPhi3Runtime> {
     bail!(
-        "This Werk binary was built without Burn CUDA support. Rebuild with: cargo install --path . --locked --force --features burn-cuda. Burn CUDA requires native CUDA and NCCL system libraries."
+        "This Werk binary was built without Burn CUDA support. Rebuild with: cargo +stable install --path . --locked --force --features burn-cuda. Burn CUDA requires native CUDA and NCCL system libraries."
     )
 }
 
@@ -90,7 +90,7 @@ fn load_cpu(
     _tokenizer: Tokenizer,
 ) -> Result<BurnPhi3Runtime> {
     bail!(
-        "This Werk binary was built without Burn CPU support. Rebuild with: cargo install --path . --locked --force --features burn-cpu"
+        "This Werk binary was built without Burn CPU support. Rebuild with: cargo +stable install --path . --locked --force --features burn-cpu"
     )
 }
 
@@ -262,6 +262,7 @@ impl<B: Backend> Phi3Generator<B> {
 
         Ok(GenerateResponse {
             text: generated_text,
+            assistant_message: None,
             prompt_tokens,
             completion_tokens: generated.len(),
             finish_reason,

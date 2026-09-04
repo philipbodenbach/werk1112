@@ -75,7 +75,10 @@ use crate::{
     capabilities::{InferenceTask, RepositoryLayout},
     inference::{ParameterSupportStatus, TaskReadiness},
     model_store::{ModelFormat, ModelManifest},
-    openai::ChatMessage,
+    openai::{
+        ChatCompletionTool, ChatCompletionToolCall, ChatCompletionToolCallDelta, ChatMessage,
+        ToolChoice,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +290,7 @@ const MLX_FORMATS: &[ModelFormat] = &[ModelFormat::Mlx, ModelFormat::SafeTensors
 const MEDIA_FORMATS: &[ModelFormat] = &[ModelFormat::SafeTensors, ModelFormat::PyTorch];
 
 const ANY_ARCH: &[&str] = &[];
+const BURN_ARCHES: &[&str] = &["phi3"];
 const VLLM_ARCHES: &[&str] = &[
     "llama",
     "qwen2",
@@ -453,7 +457,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Burn,
         display_name: "Burn CUDA",
         supported_formats: SAFETENSORS_FORMATS,
-        supported_architectures: ANY_ARCH,
+        supported_architectures: BURN_ARCHES,
         supported_tasks: TEXT_GENERATION_TASKS,
         supported_layouts: TRANSFORMERS_LAYOUTS,
         accelerators: &[BackendAccelerator::Cuda],
@@ -472,7 +476,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Burn,
         display_name: "Burn CPU",
         supported_formats: SAFETENSORS_FORMATS,
-        supported_architectures: ANY_ARCH,
+        supported_architectures: BURN_ARCHES,
         supported_tasks: TEXT_GENERATION_TASKS,
         supported_layouts: TRANSFORMERS_LAYOUTS,
         accelerators: &[BackendAccelerator::Cpu],
@@ -1057,6 +1061,23 @@ pub struct GenerateRequest {
     pub stream_granularity: StreamGranularity,
     pub verbose: bool,
     pub debug: bool,
+    pub tool_config: Option<ToolCallingConfig>,
+}
+
+impl GenerateRequest {
+    pub fn requires_tool_calling(&self) -> bool {
+        self.tool_config.is_some() || self.messages.iter().any(ChatMessage::uses_tool_calling)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolCallingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ChatCompletionTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1068,11 +1089,22 @@ pub enum StreamGranularity {
 #[derive(Debug, Clone)]
 pub struct GenerateResponse {
     pub text: String,
+    /// Exact assistant payload returned by an OpenAI-compatible backend.
+    ///
+    /// Legacy text backends leave this unset and the API returns `text` as a
+    /// non-null assistant content string.
+    pub assistant_message: Option<GeneratedAssistantMessage>,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub finish_reason: String,
     pub timings: GenerationTimings,
     pub backend_diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedAssistantMessage {
+    pub content: Option<String>,
+    pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1120,6 +1152,7 @@ pub struct LlamaRuntimeOptions {
 #[derive(Debug, Clone)]
 pub enum GenerateStreamEvent {
     TextChunk(String),
+    ToolCallDelta(Vec<ChatCompletionToolCallDelta>),
     Done {
         finish_reason: String,
         prompt_tokens: usize,
@@ -1138,6 +1171,53 @@ pub trait ChatGenerationSession: Send + Sync {
 }
 
 pub trait GenerationBackend: Send + Sync {
+    /// Returns the runtime-control adapter owned by this generation backend.
+    ///
+    /// Backends that do not expose operational persistence, memory, expert,
+    /// or prefill/decode controls get an explicit unsupported adapter. This
+    /// keeps capability reporting truthful while allowing concrete backends
+    /// to share their existing process and model state with the control plane.
+    fn runtime_control_adapter(
+        &self,
+    ) -> std::sync::Arc<dyn crate::runtime_control::BackendRuntimeAdapter> {
+        std::sync::Arc::new(crate::runtime_control::UnsupportedRuntimeAdapter::new(
+            "generation-backend",
+        ))
+    }
+
+    /// Resolves the concrete runtime-control adapter for a model.
+    ///
+    /// Routing backends override this hook and delegate to the concrete
+    /// backend selected for `manifest`. The default preserves direct backend
+    /// implementations and their existing adapter API.
+    fn runtime_control_adapter_for(
+        &self,
+        _manifest: &ModelManifest,
+    ) -> Result<std::sync::Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        Ok(self.runtime_control_adapter())
+    }
+
+    /// Resolves the concrete runtime-control adapter for the same modality
+    /// choice as a generation request. Model routers whose selection changes
+    /// for image-bearing requests override this; direct backends inherit the
+    /// manifest-only implementation.
+    fn runtime_control_adapter_for_request(
+        &self,
+        manifest: &ModelManifest,
+        _has_images: bool,
+    ) -> Result<std::sync::Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
+        self.runtime_control_adapter_for(manifest)
+    }
+
+    /// Reports whether this configured backend can preserve OpenAI tool-call
+    /// requests and responses for the selected model and modality.
+    ///
+    /// The default is deliberately false so adapters never silently discard
+    /// tool definitions, choices, calls, or continuation messages.
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        false
+    }
+
     fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
         Ok(())
     }

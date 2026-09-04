@@ -18,12 +18,16 @@ and describe the current repository state.
 | Install Werk1112 and run a first request | [Getting started](getting-started.md) |
 | Look up a command or global option | [CLI reference](reference/cli.md) |
 | Understand every HTTP route | [HTTP API](api.md) |
+| Integrate runtime state, memory or prefill/decode | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |
+| Understand persistence safety and backend support | [Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md) |
 | Install or select an inference runtime | [Backends](backends.md) |
+| Configure vLLM arguments or OpenAI tool calling | [vLLM launch and tools](backends.md#vllm-launch-arguments-and-tool-calling) |
 | Run image, video or audio inference | [Media inference](media-inference.md) |
 
 ## Models and configuration
 
 - [Models, manifests and managed storage](concepts/models-manifests-and-store.md)
+- [Runtime persistence, memory and capability boundaries](concepts/runtime-persistence-and-memory.md)
 - [Tasks, modalities, repository layouts and formats](reference/tasks-and-formats.md)
 - [Environment variables](reference/environment-variables.md)
 

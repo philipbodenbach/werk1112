@@ -162,14 +162,24 @@ http://127.0.0.1:11434/v1
 
 Werk exposes an OpenAI-compatible chat subset, OpenAI-inspired media routes,
 Werk-native discovery/jobs/outputs and a small AUTOMATIC1111 compatibility
-surface. These classes are intentionally documented separately.
+surface. A separate `/werk/v1` protocol provides versioned runtime capability,
+state and memory control without changing those existing routes. These classes
+are intentionally documented separately.
 
 ~~~bash
 curl -fsS http://127.0.0.1:11434/v1/models \
   -H "Authorization: Bearer $WERK_API_KEY"
 ~~~
 
-See the [HTTP API reference and coverage matrix](docs/api.md) for all 23
+OpenAI function tools are supported through compatible local or remote vLLM
+servers. Werk preserves normal and streaming tool-call structures, while the
+operator remains responsible for selecting the model-specific vLLM tool parser
+and enabling any required vLLM flags. Other chat adapters reject tool requests
+explicitly instead of ignoring them. See the
+[chat API contract](docs/api.md#post-v1chatcompletions) and
+[vLLM launch configuration](docs/backends.md#vllm-launch-arguments-and-tool-calling).
+
+See the [HTTP API reference and coverage matrix](docs/api.md) for all 33
 method/path operations, exact request fields, task coverage, responses,
 authentication, limits, persistence and known gaps.
 
@@ -183,6 +193,8 @@ authentication, limits, persistence and known gaps.
 | Installation and first run | [docs/getting-started.md](docs/getting-started.md) |
 | CLI command groups and semantics | [docs/reference/cli.md](docs/reference/cli.md) |
 | HTTP API contract and coverage | [docs/api.md](docs/api.md) |
+| Werk Protocol 1.0 HTTP contract | [docs/reference/werk-protocol-v1.md](docs/reference/werk-protocol-v1.md) |
+| Runtime persistence, memory and capability boundaries | [docs/concepts/runtime-persistence-and-memory.md](docs/concepts/runtime-persistence-and-memory.md) |
 | Backends, routing, installation and OS support | [docs/backends.md](docs/backends.md) |
 | Tasks, modalities, repository layouts and formats | [docs/reference/tasks-and-formats.md](docs/reference/tasks-and-formats.md) |
 | Models, manifests and managed storage | [docs/concepts/models-manifests-and-store.md](docs/concepts/models-manifests-and-store.md) |

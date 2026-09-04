@@ -3,19 +3,19 @@ import importlib
 import json
 from io import BytesIO
 from pathlib import Path
+from typing import ClassVar
 
-from PIL import Image
 import pytest
 import torch
+from PIL import Image
 
-from .. import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, WEB_DIRECTORY
+from .. import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, WEB_DIRECTORY, nodes
 from ..config import (
     WerkConnection,
     WerkImageConfig,
     WerkRoutingConfig,
     WerkVideoConfig,
 )
-from .. import nodes
 from ..nodes import (
     WerkConnectionNode,
     WerkImageConfigNode,
@@ -43,6 +43,7 @@ from ..nodes import (
     normalize_routing_config_parameters,
     normalize_video_config_parameters,
     routing_config_payload,
+    safe_media_job_metadata,
     video_config_payload,
     wait_for_video_job,
 )
@@ -70,11 +71,11 @@ def capabilities_payload():
 
 
 class FakeClient:
-    responses = {}
+    responses: ClassVar[dict] = {}
     posted = None
-    downloads = {}
-    deleted = []
-    download_limits = []
+    downloads: ClassVar[dict] = {}
+    deleted: ClassVar[list] = []
+    download_limits: ClassVar[list] = []
 
     def __init__(self, _connection):
         pass
@@ -1024,7 +1025,14 @@ def completed_video_job():
             },
             "estimate": {},
             "plan": {},
-            "backend_metadata": {"path": "/private/model"},
+            "backend_metadata": {
+                "path": "/private/model",
+                "backend": {
+                    "path": "/private/pipeline",
+                    "model_cache_hit": True,
+                    "model_load_seconds": 7.5,
+                },
+            },
             "timings": {"total_seconds": 1.2},
             "warnings": [],
             "created_unix": 2,
@@ -1088,6 +1096,17 @@ def test_video_generate_posts_polls_downloads_and_returns_native_video_list(
     assert json.loads(metadata)["result"]["effective_request"]["inputs"][0][
         "source"
     ] == {"kind": "base64", "embedded": True}
+
+
+def test_safe_media_job_metadata_preserves_model_cache_diagnostics():
+    metadata = safe_media_job_metadata(completed_video_job())
+
+    backend_metadata = metadata["result"]["backend_metadata"]
+    backend = backend_metadata["backend"]
+    assert backend["model_cache_hit"] is True
+    assert backend["model_load_seconds"] == 7.5
+    assert "path" not in backend_metadata
+    assert "path" not in backend
 
 
 def test_video_job_timeout_cancels_best_effort(fake_client):
@@ -1176,6 +1195,16 @@ def test_node_exports_and_display_names_are_complete():
         "WerkAudioProcess",
         "WerkAudioAnalyze",
         "WerkVisionAnalyze",
+        "WerkRuntimeInfo",
+        "WerkPersistencePolicy",
+        "WerkRuntimeStates",
+        "WerkStateControl",
+        "WerkStatePrune",
+        "WerkMemoryStatus",
+        "WerkRuntimeExperts",
+        "WerkExpertControl",
+        "WerkPrefill",
+        "WerkDecode",
     }
     assert set(NODE_CLASS_MAPPINGS) == expected
     assert set(NODE_DISPLAY_NAME_MAPPINGS) == expected

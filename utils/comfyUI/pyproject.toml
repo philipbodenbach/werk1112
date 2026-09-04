@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "werk1112"
-version = "0.1.0"
-description = "Beta Werk1112 inference nodes for ComfyUI"
+version = "0.2.0"
+description = "Beta Werk1112 inference and runtime-control nodes for ComfyUI"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Elastic-2.0"
@@ -20,7 +20,7 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/philipbodenbach/werk1112"
-Documentation = "https://github.com/philipbodenbach/werk1112/tree/main/utils/comfyUI"
+Documentation = "https://philipbodenbach.github.io/werk1112/integrations/comfyui.html"
 "Issue Tracker" = "https://github.com/philipbodenbach/werk1112/issues"
 
 [tool.comfy]

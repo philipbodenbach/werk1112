@@ -1976,15 +1976,24 @@ def command_estimate(payload):
         weight_payload = download_size
 
     batch = positive_int(parameters, "batch_size", 1)
-    count = positive_int(
-        parameters,
-        "num_images"
-        if task in IMAGE_TASKS
-        else "num_videos"
-        if task in VIDEO_TASKS
-        else "num_variations",
-        1,
-    )
+    if task in IMAGE_TASKS:
+        count = positive_int(parameters, "num_images", 1)
+    elif task in VIDEO_TASKS:
+        count = positive_int(parameters, "num_videos", 1)
+    else:
+        # ``audio.variations`` is the canonical Werk schema path and is
+        # normalized to the ``variations`` leaf. Keep ``num_variations`` only
+        # as a compatibility alias for older direct companion callers.
+        count = positive_int(
+            {
+                "variations": parameters.get(
+                    "variations",
+                    parameters.get("num_variations", 1),
+                )
+            },
+            "variations",
+            1,
+        )
     assumptions = [
         "weights are loaded from the local repository without conversion",
         "activation memory is a conservative architecture-independent heuristic",
@@ -2127,7 +2136,9 @@ def command_estimate(payload):
             + component_overhead
         )
         bit_depth = positive_int(parameters, "bit_depth", 16)
-        output_size = int(duration * sample_rate * channels * bit_depth / 8 * stems)
+        output_size = int(
+            duration * sample_rate * channels * bit_depth / 8 * stems * count
+        )
         assumptions.append(
             f"{duration:g}s, {sample_rate} Hz, {channels} channel(s), {stems} output stem(s)"
         )

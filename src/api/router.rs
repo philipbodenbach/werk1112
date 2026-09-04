@@ -22,7 +22,9 @@ use super::{
         video_generations_handler,
     },
     state::ApiState,
+    werk,
 };
+use crate::werk_protocol::PROTOCOL_VERSION_HEADER;
 
 const DEFAULT_API_BODY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_API_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
@@ -83,6 +85,7 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
             get(get_options_handler).post(set_options_handler),
         )
         .route("/sdapi/v1/progress", get(progress_handler))
+        .merge(werk::routes())
         .with_state(state);
 
     if cors_origins.is_empty() {
@@ -108,6 +111,7 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::ACCEPT,
+            HeaderName::from_static(PROTOCOL_VERSION_HEADER),
             HeaderName::from_static("x-api-key"),
             HeaderName::from_static("openai-organization"),
             HeaderName::from_static("openai-project"),
@@ -123,7 +127,11 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
             HeaderName::from_static("x-stainless-helper-method"),
             HeaderName::from_static("x-stainless-async"),
         ])
-        .expose_headers([HeaderName::from_static("x-werk-output-id")])
+        .expose_headers([
+            HeaderName::from_static("x-werk-output-id"),
+            HeaderName::from_static("x-werk-request-id"),
+            HeaderName::from_static(PROTOCOL_VERSION_HEADER),
+        ])
 }
 
 pub async fn serve(addr: SocketAddr, state: ApiState) -> anyhow::Result<()> {
