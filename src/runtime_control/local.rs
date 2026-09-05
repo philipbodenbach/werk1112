@@ -3188,7 +3188,7 @@ fn max_pressure(left: PressureLevel, right: PressureLevel) -> PressureLevel {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn host_memory_observation() -> Option<(u64, Option<u64>)> {
     // SAFETY: sysconf has no pointer arguments and is safe to query. Negative
     // values are treated as unavailable rather than cast.
@@ -3206,7 +3206,50 @@ fn host_memory_observation() -> Option<(u64, Option<u64>)> {
     Some((total, available))
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "macos")]
+fn host_memory_observation() -> Option<(u64, Option<u64>)> {
+    // Darwin does not expose the Linux-specific _SC_AVPHYS_PAGES query. Use
+    // Mach host statistics for reclaimable pages while retaining sysconf for
+    // the physical page count and page size.
+    // SAFETY: sysconf has no pointer arguments and negative results are
+    // rejected below.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // SAFETY: same as above.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    if page_size <= 0 || pages <= 0 {
+        return None;
+    }
+    let page_size = page_size as u64;
+    let total = page_size.saturating_mul(pages as u64);
+
+    let mut statistics = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // mach_host_self returns a send right. Cache it so repeated telemetry
+    // samples do not acquire additional rights for the lifetime of the process.
+    static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    #[allow(deprecated)] // mach2 would add a macOS-only dependency for this single stable API.
+    let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
+    // SAFETY: statistics points to enough writable storage for the requested
+    // HOST_VM_INFO64 payload and count describes that exact storage size.
+    let status = unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            statistics.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    let available = (status == libc::KERN_SUCCESS).then(|| {
+        // SAFETY: a successful host_statistics64 call initialized the payload.
+        let statistics = unsafe { statistics.assume_init() };
+        let available_pages =
+            u64::from(statistics.free_count).saturating_add(u64::from(statistics.inactive_count));
+        page_size.saturating_mul(available_pages).min(total)
+    });
+    Some((total, available))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 fn host_memory_observation() -> Option<(u64, Option<u64>)> {
     None
 }
@@ -3312,6 +3355,15 @@ mod tests {
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_memory_observation_reports_bounded_available_memory() {
+        let (total, available) = host_memory_observation().expect("physical memory is available");
+        let available = available.expect("Mach VM statistics are available");
+        assert!(total > 0);
+        assert!(available <= total);
+    }
 
     #[derive(Clone)]
     struct FakeAdapter {

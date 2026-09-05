@@ -4,12 +4,13 @@ use std::{env, fs};
 #[cfg(not(target_os = "macos"))]
 use std::{path::Path, process::Command, sync::OnceLock};
 
-use crate::{
-    backend::{current_host_is_strix_halo, current_selected_rocm_device_is_strix_halo},
-    inference::{HostResources, MemoryTopology, RuntimeAccelerator},
-};
+#[cfg(not(target_os = "macos"))]
+use crate::backend::current_host_is_strix_halo;
+#[cfg(target_os = "linux")]
+use crate::backend::current_selected_rocm_device_is_strix_halo;
+use crate::inference::{HostResources, MemoryTopology, RuntimeAccelerator};
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(not(target_os = "macos"))]
 const NVIDIA_DEVICE_PATHS: [&str; 2] = ["/dev/nvidiactl", "/dev/nvidia0"];
 
 #[cfg(any(not(target_os = "macos"), test))]
@@ -84,6 +85,7 @@ pub(super) fn detected_memory_topology(_accelerator: RuntimeAccelerator) -> Opti
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn memory_topology_for_platform(
     accelerator: RuntimeAccelerator,
     dgx_spark: bool,
