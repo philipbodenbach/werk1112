@@ -1,0 +1,64 @@
+{
+  "name": "02-image - WERK Beta",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "generate-image",
+      "name": "Generate Image",
+      "type": "CUSTOM.werkImage",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "operation": "generate",
+        "model": {
+          "__rl": true,
+          "value": "REPLACE_IMAGE_MODEL_ID",
+          "mode": "id"
+        },
+        "prompt": "A quiet orbital greenhouse, botanical illustration",
+        "negativePrompt": "",
+        "configuration": {
+          "count": 1,
+          "outputFormat": "png",
+          "responseFormat": "b64_json"
+        },
+        "additionalParameters": "{}",
+        "routing": {}
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Generate Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}

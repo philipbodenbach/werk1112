@@ -37,6 +37,7 @@ and describe the current repository state.
 - [Open WebUI](integrations/open-webui.md)
 - [AUTOMATIC1111-compatible clients](integrations/automatic1111.md)
 - [ComfyUI integration choices](integrations/comfyui.md)
+- [Native n8n custom nodes (Beta)][n8n-source]
 - [Vision and visual quality assurance](integrations/vision.md)
 - [NVIDIA DGX Spark and Nemotron](integrations/dgx-spark.md)
 - [AMD Strix Halo, ROCm and Vulkan](integrations/strix-halo.md)
@@ -57,4 +58,5 @@ OpenAPI description becomes a tested source of truth.
 
 [changelog]: https://github.com/philipbodenbach/werk1112/blob/main/CHANGELOG.md
 [comfyui-source]: https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/README.md
+[n8n-source]: https://github.com/philipbodenbach/werk1112/blob/main/utils/n8n/README.md
 [docs-source]: https://github.com/philipbodenbach/werk1112/tree/main/docs

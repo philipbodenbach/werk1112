@@ -1,0 +1,62 @@
+{
+  "name": "08-prefill-decode - WERK Beta",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "prefill-and-decode",
+      "name": "Prefill And Decode",
+      "type": "CUSTOM.werkRuntime",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "operation": "prefillDecode",
+        "modelId": "REPLACE_GGUF_MODEL_ID",
+        "inputType": "text",
+        "text": "Write a short greeting.",
+        "allowExperimental": true,
+        "maxTokens": 128,
+        "persistencePolicy": {
+          "enabled": true,
+          "mode": "memory",
+          "reuse": "prefer",
+          "ttlSeconds": 0,
+          "pin": false
+        }
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prefill And Decode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}

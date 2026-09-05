@@ -1,0 +1,67 @@
+name: n8n Custom Nodes (Beta)
+
+on:
+  push:
+    paths:
+      - "utils/n8n/**"
+      - "utils/comfyUI/nodes.py"
+      - "utils/comfyUI/runtime_nodes.py"
+      - ".github/workflows/n8n.yml"
+  pull_request:
+    paths:
+      - "utils/n8n/**"
+      - "utils/comfyUI/nodes.py"
+      - "utils/comfyUI/runtime_nodes.py"
+      - ".github/workflows/n8n.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Build, contracts and real n8n loader
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: utils/n8n
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.12.0"
+          cache: npm
+          cache-dependency-path: utils/n8n/package-lock.json
+
+      - name: Install separate pinned n8n host with bundled npm 11.6.2
+        run: npm install --prefix "${RUNNER_TEMP}/werk-n8n-host" --save-exact n8n@2.37.10
+
+      - name: Set up pinned package-build npm
+        run: npm install --global npm@11.19.1
+
+      - name: Install package from lockfile
+        run: npm ci
+
+      - name: Build complete custom-directory artifact
+        run: npm run build
+
+      - name: Lint and strict type check
+        run: npm run lint
+
+      - name: Run contracts, binary-helper and example tests
+        run: npm test
+
+      - name: Start real loader and execute imported mock workflow
+        run: N8N_BIN="${RUNNER_TEMP}/werk-n8n-host/node_modules/n8n/bin/n8n" npm run test:loader
+
+      - name: Upload complete validated custom directory
+        uses: actions/upload-artifact@v7
+        with:
+          name: werk1112-n8n-beta-dist
+          path: utils/n8n/dist
+          if-no-files-found: error
+          retention-days: 7

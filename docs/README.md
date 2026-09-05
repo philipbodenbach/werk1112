@@ -31,6 +31,7 @@ The browser-friendly index is published as the
 | Build Werk from source | [Build guide](development/build.md) |
 | Package release artifacts | [Packaging and releases](development/packaging-releases.md) |
 | Install and use ComfyUI nodes | [ComfyUI integration](../utils/comfyUI/README.md) |
+| Manually install native n8n nodes (Beta) | [n8n integration](../utils/n8n/README.md) |
 
 ## Documentation vocabulary
 
@@ -139,6 +140,7 @@ Client-specific setup and compatibility boundaries are documented separately:
 - [Open WebUI](integrations/open-webui.md)
 - [AUTOMATIC1111-compatible clients](integrations/automatic1111.md)
 - [ComfyUI integration choices](integrations/comfyui.md)
+- [Native n8n custom nodes (Beta)](../utils/n8n/README.md)
 - [NVIDIA DGX Spark and Nemotron](integrations/dgx-spark.md)
 - [AMD Strix Halo, ROCm and Vulkan](integrations/strix-halo.md)
 

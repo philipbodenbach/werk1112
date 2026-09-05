@@ -1,0 +1,285 @@
+{
+  "name": "04-image-to-video-jobs - WERK Beta",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "read-initial-image",
+      "name": "Read Initial Image",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "/data/werk-examples/input.png",
+        "options": {}
+      }
+    },
+    {
+      "id": "submit-video",
+      "name": "Submit Video",
+      "type": "CUSTOM.werkVideo",
+      "typeVersion": 1,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "operation": "imageToVideo",
+        "model": {
+          "__rl": true,
+          "value": "REPLACE_VIDEO_MODEL_ID",
+          "mode": "id"
+        },
+        "prompt": "A gentle camera movement through the scene",
+        "negativePrompt": "",
+        "binaryProperty": "data",
+        "configuration": {
+          "count": 1,
+          "outputFormat": "mp4"
+        },
+        "routing": {},
+        "additionalParameters": "{}",
+        "waitMode": "submitOnly"
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    },
+    {
+      "id": "wait-before-status",
+      "name": "Wait Before Status",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 10,
+        "unit": "seconds"
+      },
+      "webhookId": "werk-beta-video-status-wait"
+    },
+    {
+      "id": "get-video-job",
+      "name": "Get Video Job",
+      "type": "CUSTOM.werkJobs",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        0
+      ],
+      "parameters": {
+        "operation": "get",
+        "jobId": "={{ $('Submit Video').item.json.jobId }}"
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    },
+    {
+      "id": "completed",
+      "name": "Completed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "status-check",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "completed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "download-video",
+      "name": "Download Video",
+      "type": "CUSTOM.werkJobs",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        -160
+      ],
+      "parameters": {
+        "operation": "download",
+        "outputId": "={{ $json.outputIds[0] }}"
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    },
+    {
+      "id": "terminal-failure",
+      "name": "Terminal Failure",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1560,
+        160
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "status-check",
+              "leftValue": "={{ ['failed', 'cancelled'].includes($json.status) ? 'terminal' : 'pending' }}",
+              "rightValue": "terminal",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "inspect-failed-or-cancelled",
+      "name": "Inspect Failed Or Cancelled",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1820,
+        160
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Initial Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Initial Image": {
+      "main": [
+        [
+          {
+            "node": "Submit Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit Video": {
+      "main": [
+        [
+          {
+            "node": "Wait Before Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Before Status": {
+      "main": [
+        [
+          {
+            "node": "Get Video Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Video Job": {
+      "main": [
+        [
+          {
+            "node": "Completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Completed": {
+      "main": [
+        [
+          {
+            "node": "Download Video",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Terminal Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Terminal Failure": {
+      "main": [
+        [
+          {
+            "node": "Inspect Failed Or Cancelled",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait Before Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}

@@ -21,6 +21,8 @@ architecture-specific companion runtimes.
 - workload estimation, parameter validation and provenance
 - an OpenAI-compatible subset plus Werk-native media and job APIs
 - optional ComfyUI nodes with native IMAGE, VIDEO and AUDIO values
+- unpublished [native n8n nodes (Beta)](utils/n8n/README.md), planned for 1.6.0,
+  with manual installation, binary media and runtime operations
 
 Werk is an inference runtime and router, not an agent framework, workflow
 engine or GUI.

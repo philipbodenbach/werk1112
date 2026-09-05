@@ -1,0 +1,65 @@
+{
+  "name": "05-tts - WERK Beta",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "generate-speech",
+      "name": "Generate Speech",
+      "type": "CUSTOM.werkAudio",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "operation": "generate",
+        "task": "text-to-speech",
+        "model": {
+          "__rl": true,
+          "value": "REPLACE_TTS_MODEL_ID",
+          "mode": "id"
+        },
+        "prompt": "Werk is ready to run your workflow.",
+        "configuration": {
+          "outputFormat": "wav"
+        },
+        "routing": {},
+        "additionalParameters": "{}",
+        "waitMode": "wait",
+        "waitSeconds": 900,
+        "pollSeconds": 1
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Generate Speech",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}
