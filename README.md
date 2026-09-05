@@ -4,7 +4,8 @@
   <img src="docs/assets/banner_werk.png" alt="Werk1112 startup banner: WERK1112 - Inference Router." />
 </p>
 
-Werk1112 is a local-first, multimodal inference router written in Rust.
+Werk1112 is a local-first, multimodal inference runtime and router written in
+Rust.
 Applications use one CLI and HTTP service; Werk resolves models, parameters,
 hardware and installed runtimes, then selects an executable backend.
 
@@ -21,7 +22,8 @@ architecture-specific companion runtimes.
 - an OpenAI-compatible subset plus Werk-native media and job APIs
 - optional ComfyUI nodes with native IMAGE, VIDEO and AUDIO values
 
-Werk is an inference router, not an agent framework, workflow engine or GUI.
+Werk is an inference runtime and router, not an agent framework, workflow
+engine or GUI.
 
 ## Status
 
@@ -36,6 +38,29 @@ werk doctor --model MODEL --task TASK --debug
 
 The detailed support levels and known gaps are documented rather than hidden
 behind an “all models supported” claim.
+
+## What’s new in v1.5.0
+
+v1.5.0 extends Werk's routing architecture with a backend-aware runtime/control
+layer:
+
+- runtime-state lifecycle and persistence infrastructure, memory telemetry and
+  pressure-aware runtime management, plus capability-gated state and expert
+  controls that preserve `unsupported` as a valid backend result
+- experimental split prefill/decode primitives for supported runtimes; state
+  restore remains capability-gated and cross-restart restore remains
+  unavailable
+- vLLM tool-call passthrough, hardened `WERK_VLLM_ARGS` handling and delegated
+  native functionality; vLLM continues to own Automatic Prefix Caching and its
+  internal KV cache
+- ten new ComfyUI runtime-control nodes and `werk temp` inspection and cleanup
+  commands
+
+See the [v1.5.0 changelog](CHANGELOG.md),
+[runtime persistence and memory architecture](docs/concepts/runtime-persistence-and-memory.md),
+[vLLM launch and tool-calling guide](docs/backends.md#vllm-launch-arguments-and-tool-calling),
+and [ComfyUI integration](docs/integrations/comfyui.md) for details and backend
+support boundaries.
 
 ## Install
 
