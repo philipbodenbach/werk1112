@@ -5,7 +5,19 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
-## [1.5.0] - 2026-09-04
+## [1.5.1] - 2026-09-05
+
+### Changed
+
+- Advanced the synchronized Werk Core, Werk ComfyUI package and Werk Media
+  Companion release version to `1.5.1`.
+
+### Fixed
+
+- Fixed macOS builds by isolating Linux-specific resource detection and using
+  Darwin Mach VM statistics for bounded available-memory telemetry.
+
+## [1.5.0] - 2026-09-05
 
 ### Added
 
@@ -144,6 +156,7 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/philipbodenbach/werk1112/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/philipbodenbach/werk1112/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/philipbodenbach/werk1112/compare/v1.3.3...v1.4.0

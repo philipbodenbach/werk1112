@@ -87,7 +87,7 @@ def test_info_and_all_six_capability_statuses_are_validated(servers):
                 payload=envelope(
                     {
                         "service": "werk1112",
-                        "service_version": "1.5.0",
+                        "service_version": "1.5.1",
                         "protocol": {"major": 1, "minor": 0},
                         "active_backend": "llama.cpp",
                         "limits": {

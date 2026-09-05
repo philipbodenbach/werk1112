@@ -39,10 +39,14 @@ werk doctor --model MODEL --task TASK --debug
 The detailed support levels and known gaps are documented rather than hidden
 behind an “all models supported” claim.
 
-## What’s new in v1.5.0
+## What’s new in v1.5.1
 
-v1.5.0 extends Werk's routing architecture with a backend-aware runtime/control
-layer:
+v1.5.1 is a maintenance release that restores macOS builds and uses Darwin
+Mach VM statistics for bounded available-memory telemetry. Werk Core, the
+ComfyUI package and Media Companion remain version-synchronized.
+
+The v1.5 feature set introduced in v1.5.0 extends Werk's routing architecture
+with a backend-aware runtime/control layer:
 
 - runtime-state lifecycle and persistence infrastructure, memory telemetry and
   pressure-aware runtime management, plus capability-gated state and expert
@@ -56,7 +60,7 @@ layer:
 - ten new ComfyUI runtime-control nodes and `werk temp` inspection and cleanup
   commands
 
-See the [v1.5.0 changelog](CHANGELOG.md),
+See the [v1.5.1 changelog](CHANGELOG.md#151---2026-09-05),
 [runtime persistence and memory architecture](docs/concepts/runtime-persistence-and-memory.md),
 [vLLM launch and tool-calling guide](docs/backends.md#vllm-launch-arguments-and-tool-calling),
 and [ComfyUI integration](docs/integrations/comfyui.md) for details and backend

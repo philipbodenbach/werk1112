@@ -910,7 +910,7 @@ mod tests {
                 "request_id": "req_test",
                 "data": {
                     "service": "werk1112",
-                    "service_version": "1.5.0",
+                    "service_version": "1.5.1",
                     "protocol": {"major": 1, "minor": 0},
                     "active_backend": "test",
                     "limits": {
