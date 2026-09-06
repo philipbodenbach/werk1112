@@ -1,0 +1,81 @@
+{
+  "name": "07-runtime-dry-run - WERK Beta",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "runtime-info",
+      "name": "Runtime Info",
+      "type": "CUSTOM.werkRuntime",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "operation": "info"
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    },
+    {
+      "id": "pin-state-dry-run",
+      "name": "Pin State Dry Run",
+      "type": "CUSTOM.werkRuntime",
+      "typeVersion": 1,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "operation": "stateAction",
+        "stateId": "REPLACE_STATE_ID",
+        "stateAction": "pin",
+        "targetTier": "unchanged",
+        "dryRun": true,
+        "allowExperimental": false
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Runtime Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runtime Info": {
+      "main": [
+        [
+          {
+            "node": "Pin State Dry Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}

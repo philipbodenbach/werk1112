@@ -1,0 +1,89 @@
+{
+  "name": "06-audio-analysis - WERK Beta",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "read-audio",
+      "name": "Read Audio",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "/data/werk-examples/input.wav",
+        "options": {}
+      }
+    },
+    {
+      "id": "transcribe-audio",
+      "name": "Transcribe Audio",
+      "type": "CUSTOM.werkAudio",
+      "typeVersion": 1,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "operation": "analyze",
+        "task": "speech-to-text",
+        "model": {
+          "__rl": true,
+          "value": "REPLACE_TRANSCRIPTION_MODEL_ID",
+          "mode": "id"
+        },
+        "binaryProperty": "data",
+        "prompt": "",
+        "routing": {},
+        "additionalParameters": "{}",
+        "waitMode": "wait",
+        "waitSeconds": 900,
+        "pollSeconds": 1
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Audio": {
+      "main": [
+        [
+          {
+            "node": "Transcribe Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}

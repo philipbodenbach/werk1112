@@ -1,0 +1,94 @@
+{
+  "name": "03-vision - WERK Beta",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "read-image",
+      "name": "Read Image",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "/data/werk-examples/input.png",
+        "options": {}
+      }
+    },
+    {
+      "id": "analyze-image",
+      "name": "Analyze Image",
+      "type": "CUSTOM.werkVision",
+      "typeVersion": 1,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "operation": "analyze",
+        "model": {
+          "__rl": true,
+          "value": "REPLACE_VISION_MODEL_ID",
+          "mode": "id"
+        },
+        "prompt": "Describe the image.",
+        "systemPrompt": "",
+        "images": {
+          "image": [
+            {
+              "binaryProperty": "data"
+            }
+          ]
+        },
+        "options": {
+          "imageDetail": "auto",
+          "maxCompletionTokens": 256
+        }
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Image": {
+      "main": [
+        [
+          {
+            "node": "Analyze Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}

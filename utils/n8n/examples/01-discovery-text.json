@@ -1,0 +1,92 @@
+{
+  "name": "01-discovery-text - WERK Beta",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "discovery",
+      "name": "Discovery",
+      "type": "CUSTOM.werkDiscovery",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "operation": "serverInfo"
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    },
+    {
+      "id": "text",
+      "name": "Text",
+      "type": "CUSTOM.werkText",
+      "typeVersion": 1,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "operation": "complete",
+        "model": {
+          "__rl": true,
+          "value": "REPLACE_TEXT_MODEL_ID",
+          "mode": "id"
+        },
+        "messages": {
+          "message": [
+            {
+              "role": "user",
+              "content": "Explain what an inference server does in one sentence."
+            }
+          ]
+        },
+        "options": {
+          "maxCompletionTokens": 128
+        }
+      },
+      "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Discovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discovery": {
+      "main": [
+        [
+          {
+            "node": "Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}

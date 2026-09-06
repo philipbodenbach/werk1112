@@ -1,0 +1,43 @@
+{
+  "name": "n8n-nodes-werk1112",
+  "version": "1.6.0",
+  "private": true,
+  "description": "Beta native Werk1112 inference and runtime nodes for n8n; unpublished feature for Werk 1.6.0",
+  "license": "Elastic-2.0",
+  "author": "Philip Bodenbach",
+  "homepage": "https://github.com/philipbodenbach/werk1112/tree/main/utils/n8n",
+  "repository": { "type": "git", "url": "https://github.com/philipbodenbach/werk1112.git", "directory": "utils/n8n" },
+  "keywords": ["n8n-community-node-package"],
+  "engines": { "node": ">=24.0.0 <25", "npm": ">=11.19.1 <12" },
+  "packageManager": "npm@11.19.1",
+  "files": ["dist", "README.md", "LICENSE", "docs", "examples"],
+  "scripts": {
+    "build": "n8n-node build && node scripts/build-assets.cjs",
+    "lint": "eslint . && tsc --noEmit",
+    "test": "node --test --test-isolation=none tests/*.test.cjs",
+    "test:loader": "node tests/loader-smoke.cjs"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": ["dist/credentials/WerkApi.credentials.js"],
+    "nodes": [
+      "dist/nodes/WerkDiscovery/WerkDiscovery.node.js",
+      "dist/nodes/WerkText/WerkText.node.js",
+      "dist/nodes/WerkImage/WerkImage.node.js",
+      "dist/nodes/WerkVision/WerkVision.node.js",
+      "dist/nodes/WerkVideo/WerkVideo.node.js",
+      "dist/nodes/WerkAudio/WerkAudio.node.js",
+      "dist/nodes/WerkJobs/WerkJobs.node.js",
+      "dist/nodes/WerkRuntime/WerkRuntime.node.js"
+    ]
+  },
+  "peerDependencies": { "n8n-workflow": "2.37.4" },
+  "devDependencies": {
+    "@n8n/node-cli": "0.46.4",
+    "@types/node": "24.10.1",
+    "eslint": "9.39.4",
+    "n8n-workflow": "2.37.4",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.69.0"
+  }
+}

@@ -5,6 +5,15 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+### Added
+
+- Added the unpublished `n8n-nodes-werk1112` 1.6.0 Beta under `utils/n8n`:
+  eight native discovery, text, image, vision, video, audio, jobs and runtime
+  nodes; shared credentials, native binary data, combined in-memory
+  prefill/decode, manual custom-directory installation and example workflows.
+  Existing Core, Companion and ComfyUI version files remain at 1.5.1 pending
+  the later 1.6.0 release preparation. See the [n8n guide](utils/n8n/README.md).
+
 ## [1.5.1] - 2026-09-05
 
 ### Changed
