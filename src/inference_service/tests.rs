@@ -20,7 +20,7 @@ use super::{
     jobs::{JobStatus, JobStore},
     output::OutputStore,
     service::{
-        InferenceService, complete_backend_fit, resources_for_request,
+        InferenceService, RoutingDiagnostics, complete_backend_fit, resources_for_request,
         resources_for_request_with_topology_detector,
     },
     types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome},
@@ -655,6 +655,11 @@ fn execution_retries_accepted_runtime_and_records_backend_adjustment() {
     assert_eq!(result.runtime, "mock-cpu");
     assert_eq!(result.plan.selected_runtime.as_deref(), Some("mock-cpu"));
     assert!(result.plan.backend_fallback);
+    let note = result.plan.fallback_note("flux").unwrap();
+    assert!(note.contains("preferred runtime 'mock-cuda'"));
+    assert!(note.contains("simulated accelerator load failure"));
+    assert!(note.contains("compatible fallback 'mock-cpu'"));
+    assert_eq!(result.plan.fallback_chain.len(), 1);
     assert_eq!(result.timings.runtime_attempts.len(), 2);
     assert_eq!(
         result.timings.runtime_attempts[0].outcome,
@@ -733,6 +738,88 @@ fn plan_and_attempt_observers_report_a_later_backend_failure() {
 }
 
 #[test]
+fn media_runtime_diagnostics_deduplicate_routes_and_report_changes() {
+    let mut diagnostics = RoutingDiagnostics::default();
+    let task = InferenceTask::ImageGeneration;
+    let fallback = Some("CUDA unavailable; using CPU".to_string());
+    assert_eq!(
+        diagnostics.observe("flux", task, "cpu", fallback.clone()),
+        fallback
+    );
+    assert!(
+        diagnostics
+            .observe("flux", task, "cpu", fallback.clone())
+            .is_none()
+    );
+    // Another model/task must not suppress an otherwise identical route note.
+    assert_eq!(
+        diagnostics.observe("other", task, "cpu", fallback.clone()),
+        fallback
+    );
+    assert_eq!(
+        diagnostics.observe("flux", InferenceTask::ImageEditing, "cpu", fallback.clone()),
+        fallback
+    );
+    let changed_reason = Some("CUDA backend failed to load; using CPU".to_string());
+    assert_eq!(
+        diagnostics.observe("flux", task, "cpu", changed_reason.clone()),
+        changed_reason
+    );
+    // Recovery to the preferred route clears the old fallback diagnostic.
+    assert!(diagnostics.observe("flux", task, "cuda", None).is_none());
+    assert_eq!(
+        diagnostics.observe("flux", task, "cpu", fallback.clone()),
+        fallback
+    );
+}
+
+#[test]
+fn media_runtime_diagnostics_bound_retained_models() {
+    let mut diagnostics = RoutingDiagnostics::default();
+    let task = InferenceTask::ImageGeneration;
+    let note = Some("using CPU fallback".to_string());
+    for index in 0..256 {
+        diagnostics.observe(&format!("model-{index:03}"), task, "cpu", note.clone());
+    }
+    diagnostics.observe("new-model", task, "cpu", note.clone());
+    assert!(
+        diagnostics
+            .observe("model-100", task, "cpu", note.clone())
+            .is_none()
+    );
+    // The first sorted model key was evicted instead of retaining an
+    // unbounded history of models removed from a long-running server.
+    assert_eq!(
+        diagnostics.observe("model-000", task, "cpu", note.clone()),
+        note
+    );
+}
+
+#[test]
+fn execution_failure_does_not_relax_an_explicit_device() {
+    let (root, store) = image_store("fallback-hard-device");
+    let service = InferenceService::with_backend(store, Arc::new(FallbackMediaBackend));
+    let mut request = InferenceRequest::new("flux", InferenceTask::ImageGeneration);
+    request.prompt = Some("preserve requested device".to_string());
+    request.routing.device = Some("cuda".to_string());
+    let attempts = RefCell::new(Vec::new());
+    let error = service
+        .execute_with_observers(
+            request,
+            |_, _, plan| assert_eq!(plan.selected_runtime.as_deref(), Some("mock-cuda")),
+            |attempt| attempts.borrow_mut().push(attempt.runtime.clone()),
+        )
+        .unwrap_err();
+    assert_eq!(*attempts.borrow(), vec!["mock-cuda"]);
+    assert!(
+        error
+            .to_string()
+            .contains("simulated accelerator load failure")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn inference_result_diagnostics_are_backward_compatible_with_legacy_metadata() {
     let (root, store) = image_store("legacy-result");
     let service = InferenceService::with_backend(store, Arc::new(MockMediaBackend));
@@ -743,10 +830,17 @@ fn inference_result_diagnostics_are_backward_compatible_with_legacy_metadata() {
     let fields = value.as_object_mut().unwrap();
     fields.remove("backend_metadata");
     fields.remove("timings");
+    fields
+        .get_mut("plan")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("fallback_chain");
 
     let legacy: InferenceResult = serde_json::from_value(value).unwrap();
     assert_eq!(legacy.backend_metadata, Value::Null);
     assert_eq!(legacy.timings, Default::default());
+    assert!(legacy.plan.fallback_chain.is_empty());
     let _ = fs::remove_dir_all(root);
 }
 

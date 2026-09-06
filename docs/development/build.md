@@ -66,7 +66,12 @@ Python companion and ComfyUI tests are independent of the Rust build:
 ~~~bash
 python -m unittest runtime.test_werk_media_companion
 python -m pytest utils/comfyUI/tests
+python -B -m unittest src/backend/test_mlx_probe.py
 ~~~
+
+The MLX probe tests use small simulated installed runtimes and metadata,
+including mixed MXFP4/MXFP8 DeepSeek fixtures. They require no MLX installation,
+model weights or GPU and do not establish real model inference support.
 
 ## Backend-neutral development build
 

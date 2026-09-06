@@ -1509,7 +1509,7 @@ fn planner_scores_fallbacks_and_never_applies_quality_downgrade() {
             memory_topology: None,
         },
     );
-    let candidates = vec![
+    let mut candidates = vec![
         InferenceRuntimeCandidate {
             id: "unavailable".to_string(),
             backend: "diffusers".to_string(),
@@ -1554,6 +1554,43 @@ fn planner_scores_fallbacks_and_never_applies_quality_downgrade() {
                 && candidate.status == PlanCandidateStatus::Rejected)
     );
     assert!(plan.model_or_quality_downgrades.is_empty());
+    assert!(plan.backend_fallback);
+    let note = plan.fallback_note(&manifest.id).unwrap();
+    assert!(note.contains(&manifest.id));
+    assert!(note.contains("preferred runtime 'unavailable'"));
+    assert!(note.contains("missing"));
+    assert!(note.contains("compatible fallback 'working'"));
+
+    candidates[0].available = true;
+    let preferred = plan_execution(&manifest, &effective, &estimate, &candidates);
+    assert_eq!(preferred.selected_runtime.as_deref(), Some("unavailable"));
+    assert!(preferred.fallback_chain.is_empty());
+    assert!(preferred.fallback_note(&manifest.id).is_none());
+
+    candidates[0].supported_tasks = vec![InferenceTask::TextGeneration];
+    let irrelevant = plan_execution(&manifest, &effective, &estimate, &candidates);
+    assert_eq!(irrelevant.selected_runtime.as_deref(), Some("working"));
+    assert!(!irrelevant.backend_fallback);
+    assert!(irrelevant.fallback_note(&manifest.id).is_none());
+
+    candidates[0].supported_tasks = vec![InferenceTask::ImageGeneration];
+    candidates[0].supported_architectures = vec!["incompatible_architecture".to_string()];
+    let mut architecture_manifest = manifest.clone();
+    architecture_manifest.architecture = Some("flux".to_string());
+    let incompatible = plan_execution(&architecture_manifest, &effective, &estimate, &candidates);
+    assert_eq!(incompatible.selected_runtime.as_deref(), Some("working"));
+    assert!(
+        incompatible
+            .fallback_note(&manifest.id)
+            .unwrap()
+            .contains("architecture 'flux'")
+    );
+
+    candidates[1].available = false;
+    candidates[1].availability_reason = Some("not installed".to_string());
+    let unavailable = plan_execution(&architecture_manifest, &effective, &estimate, &candidates);
+    assert!(unavailable.selected_runtime.is_none());
+    assert!(unavailable.fallback_note(&manifest.id).is_none());
 }
 
 #[test]

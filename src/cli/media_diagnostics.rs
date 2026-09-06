@@ -1570,6 +1570,7 @@ mod tests {
                 selected_backend: Some("test-backend".to_string()),
                 score: Some(1),
                 candidates: Vec::new(),
+                fallback_chain: Vec::new(),
                 backend_fallback: false,
                 degradations: Vec::new(),
                 model_or_quality_downgrades: Vec::new(),

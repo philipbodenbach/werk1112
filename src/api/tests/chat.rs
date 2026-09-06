@@ -127,6 +127,51 @@ struct UnsupportedToolBackend {
     calls: Arc<AtomicUsize>,
 }
 
+struct FailingAfterFragmentBackend {
+    calls: Arc<AtomicUsize>,
+    tool_fragment: bool,
+}
+
+impl GenerationBackend for FailingAfterFragmentBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
+    fn generate(
+        &self,
+        _manifest: &ModelManifest,
+        _request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("streaming generation must never restart as nonstreaming generation")
+    }
+
+    fn generate_stream(
+        &self,
+        _manifest: ModelManifest,
+        _request: GenerateRequest,
+    ) -> GenerateStream {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let fragment = if self.tool_fragment {
+            GenerateStreamEvent::ToolCallDelta(vec![ChatCompletionToolCallDelta {
+                index: 0,
+                id: Some("call_partial".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(ChatCompletionFunctionCallDelta {
+                    name: Some("get_weather".to_string()),
+                    arguments: Some(r#"{"city":"#.to_string()),
+                }),
+            }])
+        } else {
+            GenerateStreamEvent::TextChunk("partial answer".to_string())
+        };
+        Box::pin(tokio_stream::iter(vec![
+            Ok(fragment),
+            Err("simulated backend failure after fragment".to_string()),
+        ]))
+    }
+}
+
 impl GenerationBackend for UnsupportedToolBackend {
     fn generate(
         &self,
@@ -438,6 +483,65 @@ async fn tool_calling_stream_preserves_indexes_fragments_finish_and_done() {
     assert_eq!(chunks[3]["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn streaming_backend_failure_never_restarts_after_text_or_tool_fragments() {
+    for tool_fragment in [false, true] {
+        let store = test_store();
+        install_tool_chat_model(&store);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = router(ApiState::new(
+            store,
+            Arc::new(FailingAfterFragmentBackend {
+                calls: calls.clone(),
+                tool_fragment,
+            }),
+        ));
+        let mut request = json!({
+            "model": "tool-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Weather?"}]
+        });
+        if tool_fragment {
+            request["tools"] = json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}}
+            }]);
+        }
+        let response = post_json(&app, "/v1/chat/completions", request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stream = String::from_utf8(bytes.to_vec()).unwrap();
+        let data = stream
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect::<Vec<_>>();
+        assert_eq!(data.last().copied(), Some("[DONE]"));
+        let chunks = data[..data.len() - 1]
+            .iter()
+            .map(|value| serde_json::from_str::<Value>(value).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 3, "role, one fragment, one error");
+        if tool_fragment {
+            assert_eq!(
+                chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+                r#"{"city":"#
+            );
+        } else {
+            assert_eq!(
+                chunks[1]["choices"][0]["delta"]["content"],
+                "partial answer"
+            );
+        }
+        assert_eq!(
+            chunks[2]["error"]["message"],
+            "simulated backend failure after fragment"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]

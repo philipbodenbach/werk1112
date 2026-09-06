@@ -14,6 +14,22 @@ All notable changes to Werk1112 are documented in this file. The project uses
   Existing Core, Companion and ComfyUI version files remain at 1.5.1 pending
   the later 1.6.0 release preparation. See the [n8n guide](utils/n8n/README.md).
 
+### Fixed
+
+- Applied runtime priorities to actual selection while retaining model, task,
+  platform and explicit device/backend constraints. Excluded unsupported Candle
+  architectures and known incompatible packed safetensors quantization.
+- Added bounded MLX model preflight in the configured execution environment:
+  architecture resolution, model metadata and installed quantization support
+  are checked before weight loading, including the existing Gemma4 compatibility
+  path. Importing `mlx-lm` alone no longer establishes model compatibility.
+- Preserved structured routing reasons through CLI and service execution and
+  report compatible fallbacks on stderr without verbose/debug flags, with
+  repeated server diagnostics deduplicated. Media runtime retries preserve the
+  actual route and failure reasons; streaming text/tool errors do not restart
+  generation. Added simulated DeepSeek metadata and routing regressions without
+  introducing new architecture support or inference engines.
+
 ## [1.5.1] - 2026-09-05
 
 ### Changed

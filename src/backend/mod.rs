@@ -187,6 +187,8 @@ pub struct RuntimeDescriptor {
     pub runtime: BackendRuntime,
     pub display_name: &'static str,
     pub supported_formats: &'static [ModelFormat],
+    /// Static architecture eligibility. An empty list imposes no static filter;
+    /// it does not replace a concrete runtime's model compatibility probe.
     pub supported_architectures: &'static [&'static str],
     pub supported_tasks: &'static [InferenceTask],
     pub supported_layouts: &'static [RepositoryLayout],
@@ -290,6 +292,14 @@ const MLX_FORMATS: &[ModelFormat] = &[ModelFormat::Mlx, ModelFormat::SafeTensors
 const MEDIA_FORMATS: &[ModelFormat] = &[ModelFormat::SafeTensors, ModelFormat::PyTorch];
 
 const ANY_ARCH: &[&str] = &[];
+// Keep these aligned with Candle's concrete loaders in backend/candle.rs.
+const CANDLE_ARCHES: &[&str] = &[
+    "llama", "qwen2", "qwen3", "phi", "phi2", "phi3", "gemma", "gemma2", "gemma3", "mistral",
+];
+const CANDLE_GGUF_ARCHES: &[&str] = &["llama", "qwen2", "qwen3", "phi", "phi2", "phi3", "gemma3"];
+const CANDLE_SAFETENSORS_ARCHES: &[&str] = &[
+    "llama", "gemma", "gemma2", "qwen2", "qwen3", "mistral", "phi3",
+];
 const BURN_ARCHES: &[&str] = &["phi3"];
 const VLLM_ARCHES: &[&str] = &[
     "llama",
@@ -590,7 +600,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Candle,
         display_name: "Candle CUDA",
         supported_formats: CANDLE_FORMATS,
-        supported_architectures: ANY_ARCH,
+        supported_architectures: CANDLE_ARCHES,
         supported_tasks: TEXT_GENERATION_TASKS,
         supported_layouts: CANDLE_LAYOUTS,
         accelerators: &[BackendAccelerator::Cuda],
@@ -647,7 +657,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Candle,
         display_name: "Candle Metal",
         supported_formats: CANDLE_FORMATS,
-        supported_architectures: ANY_ARCH,
+        supported_architectures: CANDLE_ARCHES,
         supported_tasks: TEXT_GENERATION_TASKS,
         supported_layouts: CANDLE_LAYOUTS,
         accelerators: &[BackendAccelerator::Metal],
@@ -666,7 +676,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Candle,
         display_name: "Candle CPU",
         supported_formats: CANDLE_FORMATS,
-        supported_architectures: ANY_ARCH,
+        supported_architectures: CANDLE_ARCHES,
         supported_tasks: TEXT_GENERATION_TASKS,
         supported_layouts: CANDLE_LAYOUTS,
         accelerators: &[BackendAccelerator::Cpu],
@@ -883,29 +893,60 @@ pub fn runtime_descriptor(id: RuntimeId) -> &'static RuntimeDescriptor {
         .expect("runtime descriptor exists")
 }
 
-pub fn runtime_supports_model(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticModelSupport {
+    Unsupported,
+    Supported,
+    /// Architecture and configuration must be resolved in the execution
+    /// environment before the candidate can be reported as available.
+    RequiresProbe,
+}
+
+pub fn runtime_static_model_support(
     descriptor: &RuntimeDescriptor,
     format: &ModelFormat,
     architecture: Option<&str>,
-) -> bool {
+) -> StaticModelSupport {
     if !descriptor
         .supported_formats
         .iter()
         .any(|item| item == format)
     {
-        return false;
+        return StaticModelSupport::Unsupported;
     }
-    if descriptor.supported_architectures.is_empty() {
-        return true;
+    if descriptor.runtime == BackendRuntime::Mlx {
+        // mlx-lm architecture support depends on the installed implementation,
+        // including Werk's explicit Python/module/generator configuration.
+        return StaticModelSupport::RequiresProbe;
     }
-    architecture
-        .map(|architecture| {
-            descriptor
-                .supported_architectures
-                .iter()
-                .any(|supported| supported.eq_ignore_ascii_case(architecture))
-        })
-        .unwrap_or(false)
+    let architectures = match (descriptor.runtime, format) {
+        (BackendRuntime::Candle, ModelFormat::Gguf) => CANDLE_GGUF_ARCHES,
+        (BackendRuntime::Candle, ModelFormat::SafeTensors) => CANDLE_SAFETENSORS_ARCHES,
+        _ => descriptor.supported_architectures,
+    };
+    if architectures.is_empty() {
+        return StaticModelSupport::Supported;
+    }
+    if architecture.is_some_and(|architecture| {
+        architectures
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(architecture))
+    }) {
+        StaticModelSupport::Supported
+    } else {
+        StaticModelSupport::Unsupported
+    }
+}
+
+/// Returns whether the registry has static support for this model. MLX support
+/// cannot be confirmed here; candidate discovery must consider RequiresProbe
+/// from runtime_static_model_support and then probe the concrete environment.
+pub fn runtime_supports_model(
+    descriptor: &RuntimeDescriptor,
+    format: &ModelFormat,
+    architecture: Option<&str>,
+) -> bool {
+    runtime_static_model_support(descriptor, format, architecture) == StaticModelSupport::Supported
 }
 
 pub fn runtime_supports_task(descriptor: &RuntimeDescriptor, task: InferenceTask) -> bool {
@@ -1256,6 +1297,59 @@ pub trait GenerationBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mlx_architecture_support_requires_the_concrete_environment_probe() {
+        let descriptor = runtime_descriptor(RuntimeId::Mlx);
+        for architecture in [
+            Some("llama"),
+            Some("deepseek_v4"),
+            Some("future_model"),
+            None,
+        ] {
+            assert_eq!(
+                runtime_static_model_support(descriptor, &ModelFormat::Mlx, architecture),
+                StaticModelSupport::RequiresProbe,
+            );
+            assert!(!runtime_supports_model(
+                descriptor,
+                &ModelFormat::Mlx,
+                architecture
+            ));
+        }
+        assert_eq!(
+            runtime_static_model_support(descriptor, &ModelFormat::Gguf, Some("llama")),
+            StaticModelSupport::Unsupported,
+        );
+    }
+
+    #[test]
+    fn candle_architecture_support_matches_the_format_specific_loaders() {
+        let descriptor = runtime_descriptor(RuntimeId::CandleCpu);
+        for architecture in CANDLE_GGUF_ARCHES {
+            assert!(runtime_supports_model(
+                descriptor,
+                &ModelFormat::Gguf,
+                Some(architecture)
+            ));
+        }
+        for architecture in CANDLE_SAFETENSORS_ARCHES {
+            assert!(runtime_supports_model(
+                descriptor,
+                &ModelFormat::SafeTensors,
+                Some(architecture)
+            ));
+        }
+        for (format, architecture) in [
+            (ModelFormat::SafeTensors, Some("deepseek_v4")),
+            (ModelFormat::SafeTensors, Some("phi2")),
+            (ModelFormat::SafeTensors, Some("gemma3")),
+            (ModelFormat::Gguf, Some("mistral")),
+            (ModelFormat::SafeTensors, None),
+        ] {
+            assert!(!runtime_supports_model(descriptor, &format, architecture));
+        }
+    }
 
     #[test]
     fn backend_install_recommendations_accept_only_exact_known_targets() {

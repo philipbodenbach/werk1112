@@ -11,11 +11,11 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -53,6 +53,7 @@ const GEMMA4_UNIFIED_MODEL_TYPE: &str = "gemma4_unified";
 const GEMMA4_UNIFIED_MLX_COMPAT_DIR: &str = "mlx-gemma4-unified-text";
 const GEMMA4_UNIFIED_MLX_COMPAT_MODEL_FILE: &str = "werk_gemma4_unified_compat.py";
 const DEFAULT_MAX_MLX_VLM_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MLX_MODEL_PROBE_PY: &str = include_str!("mlx_probe.py");
 const TRANSFORMERS_COMPAT_PY: &str = r#"
 import argparse
 import contextlib
@@ -582,8 +583,185 @@ pub struct LlamaCppBackend {
 #[derive(Debug, Clone)]
 pub struct MlxBackend {
     store: ModelStore,
-    python: PathBuf,
-    module: String,
+    invocation: MlxInvocation,
+}
+
+#[derive(Debug, Clone)]
+enum MlxInvocation {
+    Module { python: PathBuf, module: String },
+    Generator(PathBuf),
+}
+
+impl MlxInvocation {
+    fn configured() -> Self {
+        let python = Self::pin_program(backend_program("WERK_MLX_PYTHON", default_python()));
+        let configured = |name| env::var(name).ok().filter(|value| !value.trim().is_empty());
+        if let Some(module) = configured("WERK_MLX_MODULE") {
+            return Self::Module { python, module };
+        }
+        if let Some(generator) = configured("WERK_MLX_GENERATE") {
+            return Self::Generator(Self::pin_program(PathBuf::from(generator)));
+        }
+        // An explicit Python must not silently execute a PATH entry point from
+        // another virtual environment. Otherwise retain console-entry discovery.
+        if configured("WERK_MLX_PYTHON").is_none()
+            && let Some(generator) = sibling_program(&python, mlx_generate_program())
+                .or_else(|| find_program_in_path(mlx_generate_program()))
+        {
+            return Self::Generator(Self::pin_program(generator));
+        }
+        Self::Module {
+            python,
+            module: "mlx_lm.generate".to_string(),
+        }
+    }
+
+    fn pin_program(program: PathBuf) -> PathBuf {
+        let path = find_program_in_path(&program.to_string_lossy()).unwrap_or(program);
+        if path.is_relative() && path.components().count() > 1 {
+            return env::current_dir()
+                .map(|directory| directory.join(&path))
+                .unwrap_or(path);
+        }
+        // Do not canonicalize Python symlinks: that would discard virtualenv
+        // identity by replacing venv/bin/python with the system interpreter.
+        path
+    }
+
+    fn command(&self) -> Command {
+        match self {
+            Self::Module { python, module } => python_module_command(python, module),
+            Self::Generator(path) => Command::new(path),
+        }
+    }
+
+    fn probe_command(&self) -> Result<Command> {
+        let (mut command, mode, target) = match self {
+            Self::Module { python, module } => {
+                (Command::new(python), "module", OsString::from(module))
+            }
+            Self::Generator(path) => {
+                let path = if path.is_file() {
+                    path.clone()
+                } else {
+                    find_program_in_path(&path.to_string_lossy()).with_context(|| {
+                        format!("MLX generator does not exist: {}", path.display())
+                    })?
+                };
+                let mut header = String::new();
+                fs::File::open(&path)?.take(4096).read_to_string(&mut header)
+                    .context("cannot verify non-Python MLX generator; select WERK_MLX_PYTHON and WERK_MLX_MODULE")?;
+                let shebang = header.lines().next().and_then(|line| line.strip_prefix("#!"))
+                    .context("cannot verify MLX generator interpreter: missing Python shebang; select WERK_MLX_PYTHON and WERK_MLX_MODULE")?;
+                let mut words = shebang.split_whitespace();
+                let mut python = words.next().context("empty MLX generator shebang")?;
+                if Path::new(python)
+                    .file_name()
+                    .is_some_and(|name| name == "env")
+                {
+                    python = words
+                        .next()
+                        .context("missing Python in MLX generator shebang")?;
+                    if python == "-S" {
+                        python = words.next().context("missing Python after env -S")?;
+                    }
+                }
+                if !Path::new(python)
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("python"))
+                {
+                    bail!(
+                        "cannot verify MLX generator interpreter '{}'; select WERK_MLX_PYTHON and WERK_MLX_MODULE",
+                        python
+                    );
+                }
+                let mut command = Command::new(python);
+                for flag in words {
+                    if !matches!(flag, "-s" | "-S" | "-E" | "-I" | "-B" | "-u") {
+                        bail!("cannot verify MLX generator Python flag '{flag}'");
+                    }
+                    command.arg(flag);
+                }
+                (command, "launcher", path.into_os_string())
+            }
+        };
+        command.args(["-c", MLX_MODEL_PROBE_PY, mode]).arg(target);
+        Ok(command)
+    }
+
+    fn probe(&self, payload: Value) -> Result<String> {
+        let mut command = self.probe_command()?;
+        command
+            .env("HF_HUB_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .context("failed to start the selected MLX runtime probe")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open MLX probe stdin")?;
+        let payload = serde_json::to_vec(&payload)?;
+        let writer = thread::spawn(move || stdin.write_all(&payload));
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("failed to open MLX probe stdout")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("failed to open MLX probe stderr")?;
+        let read_bounded = |reader: &mut dyn Read| {
+            let mut captured = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while let Ok(count) = reader.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                let keep = count.min(65536_usize.saturating_sub(captured.len()));
+                captured.extend_from_slice(&buffer[..keep]);
+            }
+            captured
+        };
+        let out_reader = thread::spawn(move || read_bounded(&mut stdout));
+        let err_reader = thread::spawn(move || read_bounded(&mut stderr));
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if started.elapsed() >= Duration::from_secs(20) {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("MLX metadata compatibility probe timed out after 20 seconds");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let _ = writer.join();
+        let stdout = out_reader.join().unwrap_or_default();
+        let stderr = err_reader.join().unwrap_or_default();
+        let result = String::from_utf8_lossy(&stdout)
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
+        if let Some(result) = result {
+            let detail = result["detail"]
+                .as_str()
+                .unwrap_or("MLX probe returned no detail");
+            if status.success() && result["ok"] == true {
+                return Ok(detail.to_string());
+            }
+            bail!("{detail}");
+        }
+        bail!(
+            "selected MLX runtime probe failed ({status}): {}",
+            trim_output_tail(&String::from_utf8_lossy(&stderr))
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1312,30 +1490,58 @@ impl MlxBackend {
     pub fn new(store: ModelStore) -> Self {
         Self {
             store,
-            python: backend_program("WERK_MLX_PYTHON", default_python()),
-            module: env::var("WERK_MLX_MODULE").unwrap_or_else(|_| "mlx_lm.generate".to_string()),
+            invocation: MlxInvocation::configured(),
         }
     }
 
+    /// Checks installation only. Model routing must use `probe_model`.
     pub fn probe() -> Result<String> {
-        let python = backend_program("WERK_MLX_PYTHON", default_python());
-        let output = Command::new(&python)
-            .args(["-c", "import mlx_lm"])
-            .output()
+        MlxInvocation::configured().probe(json!({}))
+    }
+
+    /// Resolves architecture and quantization in the actual selected runtime,
+    /// without reading weights or executing Python from a model repository.
+    /// Deliberately uncached: model metadata and runtime environments can change.
+    pub fn probe_model(&self, manifest: &ModelManifest) -> Result<()> {
+        if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
+            bail!("mlx backend supports MLX or Hugging Face-style safetensors model directories");
+        }
+        let model_dir = original_mlx_model_dir(&self.store, manifest)?;
+        let config_path = model_dir.join("config.json");
+        const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        fs::File::open(&config_path)
             .with_context(|| {
                 format!(
-                    "failed to execute {}; set WERK_MLX_PYTHON to a Python with mlx-lm installed",
-                    python.display()
+                    "missing or unreadable model metadata: {}",
+                    config_path.display()
                 )
-            })?;
-        if !output.status.success() {
-            bail!(
-                "mlx-lm is not importable with {}: {}",
-                python.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            })?
+            .take(MAX_CONFIG_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            bail!("cannot verify model metadata: config.json exceeds the 4 MiB probe limit");
         }
-        Ok(format!("mlx-lm via {}", python.display()))
+        let config: Value = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "damaged model metadata: invalid JSON in {}",
+                config_path.display()
+            )
+        })?;
+        let compat =
+            config.get("model_type").and_then(Value::as_str) == Some(GEMMA4_UNIFIED_MODEL_TYPE);
+        let config = if compat {
+            patch_gemma4_unified_config(config)
+        } else {
+            config
+        };
+        self.invocation
+            .probe(json!({
+                "config": config,
+                "werk_gemma4_compat": compat,
+            }))
+            .with_context(|| format!("MLX model '{}' is not verified compatible", manifest.id))?;
+        Ok(())
     }
 
     fn command_for(&self, manifest: &ModelManifest, request: &GenerateRequest) -> Result<Command> {
@@ -1366,28 +1572,7 @@ impl MlxBackend {
     }
 
     fn mlx_generate_command(&self) -> Command {
-        if env::var("WERK_MLX_MODULE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .is_some()
-        {
-            return python_module_command(&self.python, &self.module);
-        }
-
-        if let Ok(path) = env::var("WERK_MLX_GENERATE")
-            && !path.trim().is_empty()
-        {
-            return Command::new(PathBuf::from(path));
-        }
-
-        if let Some(generator) = sibling_program(&self.python, mlx_generate_program()) {
-            return Command::new(generator);
-        }
-        if let Some(generator) = find_program_in_path(mlx_generate_program()) {
-            return Command::new(generator);
-        }
-
-        python_module_command(&self.python, &self.module)
+        self.invocation.command()
     }
 }
 
@@ -1749,7 +1934,7 @@ fn gemma4_unified_compat_config(model_dir: &Path) -> Result<Option<Value>> {
         return Ok(None);
     }
 
-    let mut config: Value =
+    let config: Value =
         serde_json::from_slice(&fs::read(&config_path).with_context(|| {
             format!("failed to read MLX model config {}", config_path.display())
         })?)?;
@@ -1757,6 +1942,10 @@ fn gemma4_unified_compat_config(model_dir: &Path) -> Result<Option<Value>> {
         return Ok(None);
     }
 
+    Ok(Some(patch_gemma4_unified_config(config)))
+}
+
+fn patch_gemma4_unified_config(mut config: Value) -> Value {
     config["model_type"] = json!("gemma4");
     config["architectures"] = json!(["Gemma4ForCausalLM"]);
     config["model_file"] = json!(GEMMA4_UNIFIED_MLX_COMPAT_MODEL_FILE);
@@ -1765,7 +1954,7 @@ fn gemma4_unified_compat_config(model_dir: &Path) -> Result<Option<Value>> {
     {
         text_config["model_type"] = json!("gemma4_text");
     }
-    Ok(Some(config))
+    config
 }
 
 fn mirror_mlx_compat_files(
@@ -1924,7 +2113,7 @@ impl GenerationBackend for MlxBackend {
         if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
             bail!("mlx backend supports MLX or Hugging Face-style safetensors model directories");
         }
-        Self::probe()?;
+        self.probe_model(manifest)?;
         resolve_mlx_model_dir(&self.store, manifest)?;
         Ok(())
     }
@@ -1934,11 +2123,13 @@ impl GenerationBackend for MlxBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
+        self.probe_model(manifest)?;
         let mut command = self.command_for(manifest, &request)?;
+        let program = command.get_program().to_string_lossy().to_string();
         let started = Instant::now();
         let output = command
             .output()
-            .with_context(|| format!("failed to execute {}", self.python.display()))?;
+            .with_context(|| format!("failed to execute {program}"))?;
         if !output.status.success() {
             bail!(
                 "mlx generation failed: {}",
@@ -2112,6 +2303,7 @@ impl MlxBackend {
         request: GenerateRequest,
         tx: mpsc::Sender<Result<GenerateStreamEvent, String>>,
     ) -> Result<()> {
+        self.probe_model(manifest)?;
         let mut command = self.command_for(manifest, &request)?;
         command
             .arg("--verbose")
@@ -3185,6 +3377,98 @@ mod tests {
     }
 
     #[test]
+    fn mlx_module_probe_uses_the_same_interpreter_and_configured_module() {
+        let invocation = MlxInvocation::Module {
+            python: PathBuf::from("/selected/venv/bin/python3"),
+            module: "configured_generator".to_string(),
+        };
+        let generation = invocation.command();
+        let probe = invocation.probe_command().unwrap();
+        assert_eq!(generation.get_program(), probe.get_program());
+        assert_eq!(
+            generation.get_args().collect::<Vec<_>>(),
+            ["-m", "configured_generator"]
+        );
+        assert_eq!(probe.get_args().last().unwrap(), "configured_generator");
+    }
+
+    #[test]
+    fn mlx_generator_probe_uses_launcher_shebang_instead_of_unrelated_python() {
+        let root = test_root("mlx-generator-interpreter");
+        fs::create_dir_all(&root).unwrap();
+        let generator = root.join("mlx_lm.generate");
+        fs::write(
+            &generator,
+            "#!/selected/venv/bin/python3\nfrom mlx_lm.generate import main\n",
+        )
+        .unwrap();
+        let invocation = MlxInvocation::Generator(generator.clone());
+        let generation = invocation.command();
+        let probe = invocation.probe_command().unwrap();
+        assert_eq!(generation.get_program(), generator.as_os_str());
+        assert_eq!(probe.get_program(), "/selected/venv/bin/python3");
+        assert_eq!(probe.get_args().last().unwrap(), generator.as_os_str());
+        fs::write(
+            &generator,
+            "#!/usr/bin/env -S python3 -s\nfrom mlx_lm.generate import main\n",
+        )
+        .unwrap();
+        let probe = invocation.probe_command().unwrap();
+        assert_eq!(probe.get_program(), "python3");
+        assert_eq!(probe.get_args().next().unwrap(), "-s");
+    }
+
+    #[test]
+    fn mlx_probe_does_not_certify_opaque_generator_environment() {
+        let root = test_root("mlx-opaque-generator");
+        fs::create_dir_all(&root).unwrap();
+        let generator = root.join("generate");
+        fs::write(
+            &generator,
+            "#!/bin/sh\nexec /other/env/python3 -m mlx_lm.generate\n",
+        )
+        .unwrap();
+        let error = MlxInvocation::Generator(generator)
+            .probe_command()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot verify MLX generator interpreter")
+        );
+    }
+
+    #[test]
+    fn mlx_model_probe_rejects_missing_and_damaged_metadata_before_python() {
+        let store = test_store("mlx-damaged-config");
+        let manifest = test_manifest("Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX", "deepseek_v4");
+        let model_dir = store.model_dir(&manifest.id).join("files");
+        fs::create_dir_all(&model_dir).unwrap();
+        let backend = MlxBackend {
+            store,
+            invocation: MlxInvocation::Module {
+                python: PathBuf::from("must-not-be-executed"),
+                module: "mlx_lm.generate".to_string(),
+            },
+        };
+        assert!(
+            backend
+                .probe_model(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("missing or unreadable model metadata")
+        );
+        fs::write(model_dir.join("config.json"), "{broken").unwrap();
+        assert!(
+            backend
+                .probe_model(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("damaged model metadata")
+        );
+    }
+
+    #[test]
     fn gemma4_unified_config_is_detected_and_patched_for_mlx() {
         let root = test_root("gemma4-unified-detect");
         let model_dir = root.join("files");
@@ -3310,8 +3594,10 @@ mod tests {
 
         let backend = MlxBackend {
             store,
-            python: PathBuf::from("python3"),
-            module: "mlx_lm.generate".to_string(),
+            invocation: MlxInvocation::Module {
+                python: PathBuf::from("python3"),
+                module: "mlx_lm.generate".to_string(),
+            },
         };
         let command = backend
             .command_for(&manifest, &test_request("Hello"))
@@ -3341,8 +3627,10 @@ mod tests {
 
         let backend = MlxBackend {
             store,
-            python: PathBuf::from("python3"),
-            module: "mlx_lm.generate".to_string(),
+            invocation: MlxInvocation::Module {
+                python: PathBuf::from("python3"),
+                module: "mlx_lm.generate".to_string(),
+            },
         };
         let command = backend
             .command_for(&manifest, &test_request("write a story"))

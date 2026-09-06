@@ -17,7 +17,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio_stream::StreamExt;
@@ -79,13 +79,17 @@ use crate::{
     runtime_control::ServerPersistenceConfig,
     runtime_planner::{
         RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
-        plan_runtime, runtime_candidate_ids, select_runtime,
+        SelectedRuntime, runtime_candidate_ids, runtime_static_rejection, select_runtime,
+        select_runtime_from_candidates,
     },
     werk_protocol::{
         PersistenceMode, PersistencePolicy, PruneStatesRequest, ReuseMode, StateAction,
         StateActionRequest, StateListFilter, StateSelector, StateTier, WerkProtocolClient,
     },
 };
+
+#[cfg(test)]
+use crate::runtime_planner::plan_runtime;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
@@ -1349,13 +1353,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                             has_images,
                             selection_options,
                         )?;
-                        if verbose {
-                            eprintln!(
-                                "[werk serve] route model={} backend={}",
-                                manifest.id,
-                                verbose_backend_label(selected_backend)
-                            );
-                        }
                         Ok(chat_template_options_for_backend(
                             manifest,
                             selected_backend,
@@ -1418,35 +1415,27 @@ pub async fn run(cli: Cli) -> Result<()> {
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
-            let selected_backend = selected_backend_for_request(
+            let selected_route = routed_backend_for_request_with_tools(
                 &store,
                 backend_choice,
                 &manifest,
                 !images.is_empty(),
+                false,
                 selection_options,
             )?;
+            let selected_backend = selected_route.choice;
+            selected_route.report();
             print_routing_debug(
                 &store,
                 backend_override,
-                backend_choice,
                 &manifest,
                 !images.is_empty(),
-                selected_backend,
+                &selected_route,
                 debug,
             );
-            print_verbose_fallback_note(
-                &store,
-                backend_choice,
-                &manifest,
-                !images.is_empty(),
-                selected_backend,
-                verbose,
-            );
-            let backend_to_build =
-                backend_to_build_for_request(backend_choice, selected_backend, &manifest);
-            let backend = build_generation_backend(
+            let backend = build_concrete_backend(
                 store,
-                backend_to_build,
+                selected_backend,
                 llama_options.clone(),
                 selection_options,
             )?;
@@ -1514,35 +1503,27 @@ pub async fn run(cli: Cli) -> Result<()> {
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
-            let selected_backend = selected_backend_for_request(
+            let selected_route = routed_backend_for_request_with_tools(
                 &store,
                 backend_choice,
                 &manifest,
                 !images.is_empty(),
+                false,
                 selection_options,
             )?;
+            let selected_backend = selected_route.choice;
+            selected_route.report();
             print_routing_debug(
                 &store,
                 backend_override,
-                backend_choice,
                 &manifest,
                 !images.is_empty(),
-                selected_backend,
+                &selected_route,
                 debug,
             );
-            print_verbose_fallback_note(
-                &store,
-                backend_choice,
-                &manifest,
-                !images.is_empty(),
-                selected_backend,
-                verbose,
-            );
-            let backend_to_build =
-                backend_to_build_for_request(backend_choice, selected_backend, &manifest);
-            let backend = build_generation_backend(
+            let backend = build_concrete_backend(
                 store,
-                backend_to_build,
+                selected_backend,
                 llama_options.clone(),
                 selection_options,
             )?;
@@ -7780,6 +7761,69 @@ enum BackendChoice {
     VllmRocm,
 }
 
+#[derive(Debug, Clone)]
+struct RoutedBackend {
+    choice: BackendChoice,
+    selection: Option<SelectedRuntime>,
+}
+
+impl RoutedBackend {
+    fn from_selection(selection: SelectedRuntime, requested: RequestedBackend) -> Result<Self> {
+        let choice = runtime_id_to_backend_for_request(selection.runtime_id, requested)
+            .ok_or_else(|| {
+                anyhow!(
+                    "selected runtime {} has no executable backend yet",
+                    selection.display_name
+                )
+            })?;
+        Ok(Self {
+            choice,
+            selection: Some(selection),
+        })
+    }
+
+    fn fallback_note(&self) -> Option<String> {
+        self.selection
+            .as_ref()
+            .and_then(SelectedRuntime::fallback_note)
+    }
+
+    fn report(&self) {
+        let Some(selection) = &self.selection else {
+            return;
+        };
+        // Only diagnostics are retained here, never availability or compatibility.
+        static ROUTES: OnceLock<Mutex<RouteDiagnostics>> = OnceLock::new();
+        if let Ok(mut routes) = ROUTES.get_or_init(Mutex::default).lock()
+            && !routes.changed(selection)
+        {
+            return;
+        }
+        if let Some(note) = self.fallback_note() {
+            eprintln!("{note}");
+        }
+    }
+}
+
+#[derive(Default)]
+struct RouteDiagnostics {
+    routes: HashMap<String, (RuntimeId, Option<String>)>,
+}
+
+impl RouteDiagnostics {
+    fn changed(&mut self, selection: &SelectedRuntime) -> bool {
+        let signature = (selection.runtime_id, selection.fallback_note());
+        if self.routes.get(&selection.model_id) == Some(&signature) {
+            return false;
+        }
+        if self.routes.len() >= 256 {
+            self.routes.clear();
+        }
+        self.routes.insert(selection.model_id.clone(), signature);
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct SelectionOptions {
     provision_missing_backends: bool,
@@ -7829,6 +7873,7 @@ struct GgufPreferredBackend {
 }
 
 struct MlxPreferredBackend {
+    selection_store: Option<ModelStore>,
     text_backend: Arc<dyn GenerationBackend>,
     vision_backend: Arc<dyn GenerationBackend>,
 }
@@ -7855,10 +7900,6 @@ impl AutoBackend {
         }
     }
 
-    fn backend_for(&self, manifest: &ModelManifest) -> Result<Arc<dyn GenerationBackend>> {
-        self.backend_for_request(manifest, false)
-    }
-
     fn backend_for_request(
         &self,
         manifest: &ModelManifest,
@@ -7873,7 +7914,26 @@ impl AutoBackend {
         has_images: bool,
         tool_calling: bool,
     ) -> Result<Arc<dyn GenerationBackend>> {
-        let selected = selected_backend_for_request_with_tools(
+        self.backend_for_route(manifest, has_images, tool_calling, false)
+    }
+
+    fn backend_for_execution(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        tool_calling: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        self.backend_for_route(manifest, has_images, tool_calling, true)
+    }
+
+    fn backend_for_route(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        tool_calling: bool,
+        report: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        let selected = routed_backend_for_request_with_tools(
             &self.store,
             BackendChoice::Auto,
             manifest,
@@ -7881,10 +7941,24 @@ impl AutoBackend {
             tool_calling,
             self.selection_options,
         )?;
-        self.cached_backend(selected)
+        if report {
+            selected.report();
+        }
+        self.cached_backend(selected.choice)
     }
 
     fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
+        // These subprocess adapters capture Python/module/generator selection.
+        // Rebuild them for each route so an environment change cannot execute
+        // an older invocation after probing the newly configured environment.
+        if matches!(backend, BackendChoice::Mlx | BackendChoice::MlxVlm) {
+            return build_concrete_backend(
+                self.store.clone(),
+                backend,
+                self.runtime_options.clone(),
+                self.selection_options,
+            );
+        }
         let key = backend_label(backend);
         let mut backends = self
             .backends
@@ -7928,7 +8002,8 @@ impl GenerationBackend for AutoBackend {
     }
 
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
-        self.backend_for(manifest)?.prepare(manifest)
+        self.backend_for_execution(manifest, false, false)?
+            .prepare(manifest)
     }
 
     fn start_chat_session(
@@ -7936,7 +8011,7 @@ impl GenerationBackend for AutoBackend {
         manifest: &ModelManifest,
         seed: Option<u64>,
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
-        self.backend_for(manifest)?
+        self.backend_for_execution(manifest, false, false)?
             .start_chat_session(manifest, seed)
     }
 
@@ -7955,7 +8030,7 @@ impl GenerationBackend for AutoBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_capabilities(
+        self.backend_for_execution(
             manifest,
             !request.image_urls.is_empty(),
             request.requires_tool_calling(),
@@ -7968,7 +8043,7 @@ impl GenerationBackend for AutoBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for_capabilities(
+        match self.backend_for_execution(
             &manifest,
             !request.image_urls.is_empty(),
             request.requires_tool_calling(),
@@ -7997,10 +8072,6 @@ impl GgufPreferredBackend {
         }
     }
 
-    fn backend_for(&self, manifest: &ModelManifest) -> Result<Arc<dyn GenerationBackend>> {
-        self.backend_for_request(manifest, false)
-    }
-
     fn backend_for_request(
         &self,
         manifest: &ModelManifest,
@@ -8015,13 +8086,32 @@ impl GgufPreferredBackend {
         has_images: bool,
         tool_calling: bool,
     ) -> Result<Arc<dyn GenerationBackend>> {
+        self.backend_for_route(manifest, has_images, tool_calling, false)
+    }
+
+    fn backend_for_execution(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        tool_calling: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        self.backend_for_route(manifest, has_images, tool_calling, true)
+    }
+
+    fn backend_for_route(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        tool_calling: bool,
+        report: bool,
+    ) -> Result<Arc<dyn GenerationBackend>> {
         let requested = match (self.gguf_backend, self.fallback_backend) {
             (BackendChoice::LlamaServer(llama), BackendChoice::Candle(candle)) => {
                 BackendChoice::GgufPreferred { llama, candle }
             }
             _ => self.gguf_backend,
         };
-        let selected = selected_backend_for_request_with_tools(
+        let selected = routed_backend_for_request_with_tools(
             &self.store,
             requested,
             manifest,
@@ -8029,10 +8119,24 @@ impl GgufPreferredBackend {
             tool_calling,
             self.selection_options,
         )?;
-        self.cached_backend(selected)
+        if report {
+            selected.report();
+        }
+        self.cached_backend(selected.choice)
     }
 
     fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
+        // These subprocess adapters capture Python/module/generator selection.
+        // Rebuild them for each route so an environment change cannot execute
+        // an older invocation after probing the newly configured environment.
+        if matches!(backend, BackendChoice::Mlx | BackendChoice::MlxVlm) {
+            return build_concrete_backend(
+                self.store.clone(),
+                backend,
+                self.runtime_options.clone(),
+                self.selection_options,
+            );
+        }
         let key = backend_label(backend);
         let mut backends = self
             .backends
@@ -8076,7 +8180,8 @@ impl GenerationBackend for GgufPreferredBackend {
     }
 
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
-        self.backend_for(manifest)?.prepare(manifest)
+        self.backend_for_execution(manifest, false, false)?
+            .prepare(manifest)
     }
 
     fn start_chat_session(
@@ -8084,7 +8189,7 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: &ModelManifest,
         seed: Option<u64>,
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
-        self.backend_for(manifest)?
+        self.backend_for_execution(manifest, false, false)?
             .start_chat_session(manifest, seed)
     }
 
@@ -8115,7 +8220,7 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_capabilities(
+        self.backend_for_execution(
             manifest,
             !request.image_urls.is_empty(),
             request.requires_tool_calling(),
@@ -8128,7 +8233,7 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for_capabilities(
+        match self.backend_for_execution(
             &manifest,
             !request.image_urls.is_empty(),
             request.requires_tool_calling(),
@@ -8142,6 +8247,7 @@ impl GenerationBackend for GgufPreferredBackend {
 impl MlxPreferredBackend {
     fn new(store: ModelStore) -> Self {
         Self {
+            selection_store: Some(store.clone()),
             text_backend: Arc::new(MlxBackend::new(store.clone())),
             vision_backend: Arc::new(MlxVlmBackend::new(store)),
         }
@@ -8153,6 +8259,7 @@ impl MlxPreferredBackend {
         vision_backend: Arc<dyn GenerationBackend>,
     ) -> Self {
         Self {
+            selection_store: None,
             text_backend,
             vision_backend,
         }
@@ -8162,21 +8269,31 @@ impl MlxPreferredBackend {
         &self,
         manifest: &ModelManifest,
         has_images: bool,
-    ) -> Arc<dyn GenerationBackend> {
-        if has_images || manifest_requires_mlx_vlm(manifest) {
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        if let Some(store) = &self.selection_store {
+            let route = routed_backend_for_request_with_tools(
+                store,
+                BackendChoice::Mlx,
+                manifest,
+                has_images,
+                false,
+                SelectionOptions::default(),
+            )?;
+            // Execute this exact selection; a text-only Gemma request must
+            // not be rerouted to MLX-VLM here.
+            return build_concrete_backend(
+                store.clone(),
+                route.choice,
+                LlamaRuntimeOptions::default(),
+                SelectionOptions::default(),
+            );
+        }
+        Ok(if has_images {
             self.vision_backend.clone()
         } else {
             self.text_backend.clone()
-        }
+        })
     }
-}
-
-fn manifest_requires_mlx_vlm(manifest: &ModelManifest) -> bool {
-    manifest.supports_task(InferenceTask::ImageUnderstanding)
-        && manifest
-            .architecture
-            .as_deref()
-            .is_some_and(|architecture| architecture.eq_ignore_ascii_case("gemma4_unified"))
 }
 
 impl GenerationBackend for MlxPreferredBackend {
@@ -8192,12 +8309,12 @@ impl GenerationBackend for MlxPreferredBackend {
         manifest: &ModelManifest,
         has_images: bool,
     ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
-        self.backend_for_request(manifest, has_images)
+        self.backend_for_request(manifest, has_images)?
             .runtime_control_adapter_for_request(manifest, has_images)
     }
 
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
-        self.backend_for_request(manifest, false).prepare(manifest)
+        self.backend_for_request(manifest, false)?.prepare(manifest)
     }
 
     fn start_chat_session(
@@ -8205,7 +8322,7 @@ impl GenerationBackend for MlxPreferredBackend {
         manifest: &ModelManifest,
         seed: Option<u64>,
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
-        self.backend_for_request(manifest, false)
+        self.backend_for_request(manifest, false)?
             .start_chat_session(manifest, seed)
     }
 
@@ -8226,7 +8343,7 @@ impl GenerationBackend for MlxPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
             .generate(manifest, request)
     }
 
@@ -8235,8 +8352,10 @@ impl GenerationBackend for MlxPreferredBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        self.backend_for_request(&manifest, !request.image_urls.is_empty())
-            .generate_stream(manifest, request)
+        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+            Ok(backend) => backend.generate_stream(manifest, request),
+            Err(error) => Box::pin(tokio_stream::iter(vec![Err(format!("{error:#}"))])),
+        }
     }
 }
 
@@ -8277,7 +8396,8 @@ impl VllmPreferredBackend {
     ) -> Result<Arc<dyn GenerationBackend>> {
         let selected =
             self.select_backend_for_request(manifest, has_images, self.selection_options)?;
-        self.cached_backend(selected)
+        selected.report();
+        self.cached_backend(selected.choice)
     }
 
     fn select_backend_for_request(
@@ -8285,17 +8405,21 @@ impl VllmPreferredBackend {
         manifest: &ModelManifest,
         has_images: bool,
         selection_options: SelectionOptions,
-    ) -> Result<BackendChoice> {
+    ) -> Result<RoutedBackend> {
         #[cfg(test)]
         if let Some(select) = &self.selection_override {
-            return Ok(select(has_images));
+            return Ok(RoutedBackend {
+                choice: select(has_images),
+                selection: None,
+            });
         }
 
-        selected_backend_for_request(
+        routed_backend_for_request_with_tools(
             &self.store,
             BackendChoice::Vllm,
             manifest,
             has_images,
+            false,
             selection_options,
         )
     }
@@ -8381,7 +8505,7 @@ impl GenerationBackend for VllmPreferredBackend {
         }
         let readiness = self
             .select_backend_for_request(manifest, true, SelectionOptions::default())
-            .and_then(|selected| self.cached_backend(selected));
+            .and_then(|selected| self.cached_backend(selected.choice));
         match readiness {
             Ok(backend) => backend.task_readiness(manifest, task),
             Err(error) => Some(TaskReadiness {
@@ -8653,80 +8777,44 @@ fn select_backend_from_runtime_candidates(
     requested: RequestedBackend,
     capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
-) -> Result<BackendChoice> {
-    let mut rejected = Vec::new();
-    for candidate in candidates {
-        let descriptor = runtime_descriptor(*candidate);
-        if !runtime_supports_model(
-            descriptor,
-            &manifest.format,
-            manifest.architecture.as_deref(),
-        ) {
-            rejected.push(format!(
-                "{}: model format or architecture is not supported",
-                descriptor.display_name
-            ));
-            continue;
-        }
-        if !descriptor.implemented {
-            rejected.push(format!(
-                "{}: runtime integration is not implemented yet",
-                descriptor.display_name
-            ));
-            continue;
-        }
-        if *candidate == RuntimeId::MlxVlm && !capabilities.image_input {
-            rejected.push(format!(
-                "{}: MLX-VLM is reserved for image requests; text-only MLX uses mlx-lm",
-                descriptor.display_name
-            ));
-            continue;
-        }
-        if capabilities.image_input
-            && descriptor.runtime == BackendRuntime::Vllm
-            && !vllm_architecture_supports_images(manifest.architecture.as_deref())
-        {
-            rejected.push(format!(
-                "{}: vLLM does not support image input for this architecture",
-                descriptor.display_name
-            ));
-            continue;
-        }
-        if capabilities.image_input && !descriptor.capabilities.vision_language {
-            rejected.push(format!(
-                "{}: runtime is not VLM-capable",
-                descriptor.display_name
-            ));
-            continue;
-        }
-        let Some(backend) = runtime_id_to_backend_for_request(*candidate, requested) else {
-            rejected.push(format!(
-                "{}: runtime has no executable backend yet",
-                descriptor.display_name
-            ));
-            continue;
-        };
-        if let Some(reason) = backend_unavailability_reason_for_request(
-            store,
-            backend,
-            manifest,
-            capabilities.image_input,
-            selection_options,
-        ) {
-            let reason = if candidates.len() == 1 && !capabilities.image_input {
-                unavailable_backend_message(store, backend, manifest)
-            } else {
-                reason
-            };
-            rejected.push(format!("{}: {}", descriptor.display_name, reason));
-            continue;
-        }
-        return Ok(backend);
-    }
-    bail!(
-        "no compatible runtime available; tried: {}",
-        rejected.join("; ")
+) -> Result<RoutedBackend> {
+    let availability = candidates
+        .iter()
+        .copied()
+        .map(|runtime_id| {
+            let reason = runtime_static_rejection(manifest, requested, capabilities, runtime_id)
+                .or_else(|| {
+                    runtime_id_to_backend_for_request(runtime_id, requested)
+                        .map(|backend| {
+                            runtime_unavailability_reason(
+                                store,
+                                runtime_id,
+                                backend,
+                                manifest,
+                                capabilities,
+                                selection_options,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            Some("runtime has no executable backend yet".to_string())
+                        })
+                });
+            RuntimeAvailability {
+                runtime_id,
+                available: reason.is_none(),
+                reason,
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = select_runtime_from_candidates(
+        manifest,
+        requested,
+        capabilities,
+        &availability,
+        candidates,
     )
+    .map_err(|err| anyhow!("{}", format_runtime_plan_error(manifest, &err)))?;
+    RoutedBackend::from_selection(selected, requested)
 }
 
 fn backend_supports_manifest(backend: BackendChoice, manifest: &ModelManifest) -> bool {
@@ -8833,9 +8921,10 @@ fn backend_unavailability_reason(
                 })
             })
         }
-        BackendChoice::Mlx => MlxBackend::probe()
+        BackendChoice::Mlx => MlxBackend::new(store.clone())
+            .probe_model(manifest)
             .err()
-            .map(|_| "mlx-lm is unavailable".to_string()),
+            .map(|error| compact_reason(&format!("{error:#}"))),
         BackendChoice::MlxVlm => MlxVlmBackend::probe().err().map(|_| {
             "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
         }),
@@ -9022,6 +9111,25 @@ fn selected_backend_for_request_with_tools(
     tool_calling: bool,
     selection_options: SelectionOptions,
 ) -> Result<BackendChoice> {
+    routed_backend_for_request_with_tools(
+        store,
+        backend,
+        manifest,
+        has_images,
+        tool_calling,
+        selection_options,
+    )
+    .map(|route| route.choice)
+}
+
+fn routed_backend_for_request_with_tools(
+    store: &ModelStore,
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    has_images: bool,
+    tool_calling: bool,
+    selection_options: SelectionOptions,
+) -> Result<RoutedBackend> {
     if has_images && !manifest.supports_task(InferenceTask::ImageUnderstanding) {
         bail!(
             "model '{}' does not advertise image-understanding; select a vision-language model",
@@ -9046,7 +9154,7 @@ fn selected_backend_for_request_with_tools(
                 capabilities,
                 selection_options,
             )?;
-            ensure_backend_supports_images(selected, has_images)?;
+            ensure_backend_supports_images(selected.choice, has_images)?;
             Ok(selected)
         }
         BackendChoice::LlamaServer(_)
@@ -9075,7 +9183,7 @@ fn selected_backend_for_request_with_tools(
                 capabilities,
                 selection_options,
             )?;
-            ensure_backend_supports_images(selected, has_images)?;
+            ensure_backend_supports_images(selected.choice, has_images)?;
             Ok(selected)
         }
         BackendChoice::LlamaFast(_) | BackendChoice::LlamaHighlevel(_) => {
@@ -9086,7 +9194,13 @@ fn selected_backend_for_request_with_tools(
             if !backend_available_for_store(store, backend, manifest, selection_options) {
                 bail!("{}", unavailable_backend_message(store, backend, manifest));
             }
-            Ok(backend)
+            if tool_calling {
+                bail!("runtime does not support OpenAI tool calling");
+            }
+            Ok(RoutedBackend {
+                choice: backend,
+                selection: None,
+            })
         }
     }
 }
@@ -9097,7 +9211,7 @@ fn select_backend_with_planner(
     manifest: &ModelManifest,
     capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
-) -> Result<BackendChoice> {
+) -> Result<RoutedBackend> {
     let requested = requested_backend_for_choice(backend);
     let availability = runtime_availabilities_for_request(
         store,
@@ -9108,41 +9222,7 @@ fn select_backend_with_planner(
     );
     let selected = select_runtime(manifest, requested, capabilities, &availability)
         .map_err(|err| anyhow!("{}", format_runtime_plan_error(manifest, &err)))?;
-    runtime_id_to_backend_for_request(selected.runtime_id, requested).ok_or_else(|| {
-        anyhow!(
-            "selected runtime {} has no executable backend yet",
-            selected.display_name
-        )
-    })
-}
-
-fn verbose_fallback_note(
-    store: &ModelStore,
-    requested_choice: BackendChoice,
-    manifest: &ModelManifest,
-    has_images: bool,
-    selected: BackendChoice,
-) -> Option<String> {
-    let _ = (store, requested_choice, manifest, has_images, selected);
-    None
-}
-
-fn print_verbose_fallback_note(
-    store: &ModelStore,
-    requested_choice: BackendChoice,
-    manifest: &ModelManifest,
-    has_images: bool,
-    selected: BackendChoice,
-    verbose: bool,
-) {
-    if !verbose {
-        return;
-    }
-    if let Some(note) =
-        verbose_fallback_note(store, requested_choice, manifest, has_images, selected)
-    {
-        eprintln!("{note}");
-    }
+    RoutedBackend::from_selection(selected, requested)
 }
 
 fn compact_reason(reason: &str) -> String {
@@ -9159,6 +9239,15 @@ fn runtime_availabilities_for_request(
     runtime_candidate_ids_for_selection(store, manifest, requested)
         .into_iter()
         .map(|runtime_id| {
+            if let Some(reason) =
+                runtime_static_rejection(manifest, requested, capabilities, runtime_id)
+            {
+                return RuntimeAvailability {
+                    runtime_id,
+                    available: false,
+                    reason: Some(reason),
+                };
+            }
             if let Some(backend) = runtime_id_to_backend_for_request(runtime_id, requested) {
                 let reason = runtime_unavailability_reason(
                     store,
@@ -9413,49 +9502,19 @@ fn unavailable_backend_message(
     }
 }
 
-fn backend_to_build_for_request(
-    requested: BackendChoice,
-    selected: BackendChoice,
-    manifest: &ModelManifest,
-) -> BackendChoice {
-    if matches!(
-        (requested, manifest.format.clone()),
-        (
-            BackendChoice::GgufPreferred {
-                llama: LlamaCppMode::Cpu,
-                ..
-            },
-            ModelFormat::Gguf
-        )
-    ) {
-        requested
-    } else {
-        selected
-    }
-}
-
 fn print_routing_debug(
     store: &ModelStore,
     requested: BackendArg,
-    requested_choice: BackendChoice,
     manifest: &ModelManifest,
     has_images: bool,
-    selected: BackendChoice,
+    selected: &RoutedBackend,
     debug: bool,
 ) {
     if !debug {
         return;
     }
     let capabilities = request_capabilities(has_images);
-    let requested_backend = requested_backend_for_choice(requested_choice);
-    let availability = runtime_availabilities_for_request(
-        store,
-        manifest,
-        requested_backend,
-        capabilities,
-        SelectionOptions::default(),
-    );
-    let plan = plan_runtime(manifest, requested_backend, capabilities, &availability);
+    let requested_backend = requested_backend_for_choice(backend_arg_to_choice(requested));
 
     eprintln!("requested backend: {}", requested_backend_label(requested));
     eprintln!("model format: {:?}", manifest.format);
@@ -9466,20 +9525,15 @@ fn print_routing_debug(
     eprintln!("artifact: {}", artifact_debug_label(store, manifest));
     eprintln!("request capabilities:");
     eprintln!("  text_generation: yes");
-    eprintln!(
-        "  image_input: {}",
-        yes_no(plan.request_capabilities.image_input)
-    );
-    eprintln!(
-        "  embeddings: {}",
-        yes_no(plan.request_capabilities.embeddings)
-    );
-    eprintln!(
-        "  streaming: {}",
-        yes_no(plan.request_capabilities.streaming)
-    );
+    eprintln!("  image_input: {}", yes_no(capabilities.image_input));
+    eprintln!("  embeddings: {}", yes_no(capabilities.embeddings));
+    eprintln!("  streaming: {}", yes_no(capabilities.streaming));
     eprintln!("candidate runtimes:");
-    for decision in &plan.candidates {
+    for decision in selected
+        .selection
+        .iter()
+        .flat_map(|selection| &selection.rejection_reasons)
+    {
         let descriptor = runtime_descriptor(decision.runtime_id);
         let status = match decision.status {
             RuntimeDecisionStatus::Accepted => "accepted",
@@ -9522,21 +9576,18 @@ fn print_routing_debug(
             print_onnxruntime_debug_details(store, mode);
         }
     }
-    if let Some(planned) = plan.selected {
+    if let Some(planned) = &selected.selection {
         eprintln!("selected runtime: {}", planned.display_name);
         eprintln!(
             "selected role: {}",
             runtime_role(manifest, requested_backend, planned.runtime_id)
         );
         eprintln!("reason: {}", planned.reason);
-        if candle_safetensors_cuda_fallback_warning(manifest, requested_backend, planned.runtime_id)
-        {
-            eprintln!(
-                "warning: Candle is a compatibility fallback for safetensors CUDA. Install vLLM for better serving performance."
-            );
-        }
     } else {
-        eprintln!("selected runtime: {}", verbose_backend_label(selected));
+        eprintln!(
+            "selected runtime: {}",
+            verbose_backend_label(selected.choice)
+        );
     }
 }
 
@@ -9554,19 +9605,6 @@ fn runtime_role(
     } else {
         "primary runtime"
     }
-}
-
-fn candle_safetensors_cuda_fallback_warning(
-    manifest: &ModelManifest,
-    requested_backend: RequestedBackend,
-    runtime_id: RuntimeId,
-) -> bool {
-    manifest.format == ModelFormat::SafeTensors
-        && matches!(
-            requested_backend,
-            RequestedBackend::Auto | RequestedBackend::Cuda
-        )
-        && runtime_id == RuntimeId::CandleCuda
 }
 
 #[cfg(feature = "burn-experimental")]
@@ -12390,7 +12428,7 @@ mod tests {
     #[test]
     fn backend_selection_routes_safetensors_cuda_without_burn_or_cpu_fallback() {
         let store = test_store("safetensors-cuda");
-        let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
         let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {
@@ -12528,35 +12566,103 @@ mod tests {
         assert!(!message.contains("Candle CUDA"));
     }
 
-    #[test]
-    fn auto_safetensors_fallback_note_is_suppressed_outside_debug() {
-        let store = test_store("auto-burn-fallback-note");
+    fn simulated_text_route(preferred_available: bool) -> RoutedBackend {
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
-        let note = verbose_fallback_note(
-            &store,
-            BackendChoice::Auto,
+        let availability = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::VllmCuda,
+                available: preferred_available,
+                reason: (!preferred_available).then(|| {
+                    "installed vLLM version lacks required model implementation".to_string()
+                }),
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::CandleCuda,
+                available: true,
+                reason: None,
+            },
+        ];
+        let selected = select_runtime_from_candidates(
             &manifest,
-            false,
-            BackendChoice::Candle(CandleDeviceMode::Cuda),
-        );
-        assert!(note.is_none());
+            RequestedBackend::Cuda,
+            RequestCapabilities::text(true),
+            &availability,
+            &[RuntimeId::VllmCuda, RuntimeId::CandleCuda],
+        )
+        .unwrap();
+        RoutedBackend::from_selection(selected, RequestedBackend::Cuda).unwrap()
     }
 
     #[test]
-    fn auto_safetensors_can_fallback_to_candle_without_verbose_burn_note() {
-        let store = test_store("auto-burn-fallback");
-        let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
-        let selected =
-            selected_backend_for_manifest(&store, BackendChoice::Auto, &manifest).unwrap();
-        assert!(matches!(selected, BackendChoice::Candle(_)));
-        let note = verbose_fallback_note(&store, BackendChoice::Auto, &manifest, false, selected);
-        assert!(note.is_none());
+    fn fallback_diagnostic_retains_the_executed_route_without_verbose_or_reprobe() {
+        let route = simulated_text_route(false);
+        assert!(matches!(
+            route.choice,
+            BackendChoice::Candle(CandleDeviceMode::Cuda)
+        ));
+        let note = route.fallback_note().unwrap();
+        assert!(
+            note.contains(&route.selection.as_ref().unwrap().model_id),
+            "{note}"
+        );
+        assert!(note.contains("vLLM CUDA"), "{note}");
+        assert!(note.contains("installed vLLM version"), "{note}");
+        assert!(note.contains("Candle CUDA"), "{note}");
+        // A later independently observed route cannot rewrite this decision.
+        let preferred = simulated_text_route(true);
+        assert!(preferred.fallback_note().is_none());
+        assert_eq!(route.fallback_note().as_deref(), Some(note.as_str()));
+    }
+
+    #[test]
+    fn repeated_route_notes_are_deduplicated_and_recovery_resets_them() {
+        let fallback = simulated_text_route(false).selection.unwrap();
+        let preferred = simulated_text_route(true).selection.unwrap();
+        let mut reports = RouteDiagnostics::default();
+        assert!(reports.changed(&fallback));
+        assert!(!reports.changed(&fallback));
+        assert!(reports.changed(&preferred));
+        assert!(reports.changed(&fallback));
+        let mut another_model = fallback.clone();
+        another_model.model_id = "another/model".to_string();
+        assert!(reports.changed(&another_model));
+        let mut another_reason = fallback;
+        another_reason.fallback_chain[0].reason = "runtime process failed".to_string();
+        assert!(reports.changed(&another_reason));
+    }
+
+    #[test]
+    fn explicit_candle_binding_rejects_required_tool_calling() {
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let error = selected_backend_for_request_with_tools(
+            &test_store("candle-required-tools"),
+            BackendChoice::Candle(CandleDeviceMode::Cpu),
+            &manifest,
+            false,
+            true,
+            SelectionOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tool calling"), "{error}");
+    }
+
+    #[test]
+    fn installed_cpu_backend_rejects_an_unimplemented_architecture() {
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("deepseek_v4"));
+        let error = selected_backend_for_manifest(
+            &test_store("cpu-unknown-arch"),
+            BackendChoice::Candle(CandleDeviceMode::Cpu),
+            &manifest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("architecture"), "{error}");
+        assert!(error.to_string().contains("Candle CPU"), "{error}");
     }
 
     #[test]
     fn backend_selection_falls_back_to_candle_cuda_when_vllm_missing() {
         let store = test_store("safetensors-cuda-fallback");
-        let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
         let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {
@@ -12598,7 +12704,7 @@ mod tests {
             BackendChoice::LlamaServer(LlamaCppMode::Cuda)
         ));
 
-        let safetensors = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
+        let safetensors = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
         let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {
@@ -12661,14 +12767,18 @@ mod tests {
         let result = selected_backend_for_manifest(&store, BackendChoice::Mlx, &manifest);
         match result {
             Ok(selected) => assert!(matches!(selected, BackendChoice::Mlx)),
-            Err(err) => assert!(err.to_string().contains("mlx-lm is unavailable")),
+            Err(err) => assert!(err.to_string().contains("MLX"), "{err}"),
         }
     }
 
     #[test]
     fn image_request_does_not_select_plain_mlx_fallback() {
         let store = test_store("mlx-image-fallback");
-        let manifest = test_manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        let mut manifest = test_manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        manifest.metadata.tasks = vec![
+            InferenceTask::TextGeneration,
+            InferenceTask::ImageUnderstanding,
+        ];
         let err = select_backend_from_runtime_candidates(
             &store,
             &[RuntimeId::Mlx],
@@ -12680,7 +12790,7 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("MLX"));
-        assert!(err.to_string().contains("VLM"));
+        assert!(err.to_string().contains("VLM"), "{err}");
     }
 
     #[test]
@@ -12892,7 +13002,7 @@ mod tests {
         );
         assert_eq!(
             backend
-                .runtime_control_adapter_for(&vision_manifest)
+                .runtime_control_adapter_for_request(&vision_manifest, true)
                 .unwrap()
                 .descriptor()
                 .backend,
@@ -12942,7 +13052,7 @@ mod tests {
                 .generate(&vision_manifest, text_request)
                 .unwrap()
                 .text,
-            "mlx-vlm"
+            "mlx-lm"
         );
         let readiness = backend
             .task_readiness(&vision_manifest, InferenceTask::ImageUnderstanding)
@@ -12957,17 +13067,18 @@ mod tests {
         );
         assert_eq!(
             text_calls.lock().unwrap().as_slice(),
-            &["prepare", "start_chat_session", "generate"]
-        );
-        assert_eq!(
-            vision_calls.lock().unwrap().as_slice(),
             &[
                 "prepare",
                 "start_chat_session",
                 "generate",
-                "task_readiness",
+                "prepare",
+                "start_chat_session",
                 "generate"
             ]
+        );
+        assert_eq!(
+            vision_calls.lock().unwrap().as_slice(),
+            &["task_readiness", "generate"]
         );
     }
 
@@ -14310,6 +14421,7 @@ mod tests {
                 selected_backend: Some("test-backend".to_string()),
                 score: Some(1),
                 candidates: Vec::new(),
+                fallback_chain: Vec::new(),
                 backend_fallback: false,
                 degradations: Vec::new(),
                 model_or_quality_downgrades: Vec::new(),
