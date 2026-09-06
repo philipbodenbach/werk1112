@@ -2,10 +2,10 @@ use std::{collections::HashMap, fmt};
 
 use crate::{
     backend::{
-        BackendAccelerator, BackendRuntime, RuntimeId, backend_supports_images,
+        BackendAccelerator, BackendRuntime, RuntimeId, StaticModelSupport, backend_supports_images,
         explain_backend_rejection, is_transformers_compat_model, runtime_descriptor,
-        runtime_registry, runtime_supports_layout, runtime_supports_model, runtime_supports_task,
-        vllm_architecture_supports_images,
+        runtime_registry, runtime_static_model_support, runtime_supports_layout,
+        runtime_supports_model, runtime_supports_task, vllm_architecture_supports_images,
     },
     capabilities::{InferenceTask, InputModality, OutputModality},
     model_store::{ModelFormat, ModelManifest},
@@ -92,6 +92,8 @@ impl RequestCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeAvailability {
     pub runtime_id: RuntimeId,
+    /// Availability for this model and request, after the concrete runtime's
+    /// compatibility probe. A successful package import alone is insufficient.
     pub available: bool,
     pub reason: Option<String>,
 }
@@ -118,12 +120,38 @@ pub struct RuntimeDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedRuntime {
+    pub model_id: String,
     pub runtime_id: RuntimeId,
     pub display_name: &'static str,
     pub accelerator: BackendAccelerator,
     pub reason: String,
     pub fallback_chain: Vec<RuntimeDecision>,
     pub rejection_reasons: Vec<RuntimeDecision>,
+}
+
+impl SelectedRuntime {
+    /// Render the routing decision itself; callers must not run selection again
+    /// to reconstruct a fallback warning.
+    pub fn fallback_note(&self) -> Option<String> {
+        let preferred = self.fallback_chain.first()?;
+        let reason = preferred
+            .reason
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut note = format!(
+            "Model {}: preferred runtime {} cannot be used ({}). Using compatible fallback {}.",
+            self.model_id, preferred.display_name, reason, self.display_name,
+        );
+        if self.accelerator == BackendAccelerator::Cpu
+            && !runtime_descriptor(preferred.runtime_id)
+                .accelerators
+                .contains(&BackendAccelerator::Cpu)
+        {
+            note.push_str(" The selected route uses CPU execution.");
+        }
+        Some(note)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +164,7 @@ pub struct RuntimePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePlanError {
+    pub model_id: String,
     pub requested_backend: RequestedBackend,
     pub decisions: Vec<RuntimeDecision>,
 }
@@ -144,8 +173,8 @@ impl fmt::Display for RuntimePlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "no available runtime for requested backend {:?}",
-            self.requested_backend
+            "no available compatible runtime for model '{}' and requested backend {:?}",
+            self.model_id, self.requested_backend
         )?;
         if self.decisions.is_empty() {
             return write!(f, "no runtime candidates matched this request");
@@ -173,6 +202,30 @@ pub fn select_runtime(
         available_runtimes,
     );
     plan.selected.clone().ok_or(RuntimePlanError {
+        model_id: manifest.id.clone(),
+        requested_backend,
+        decisions: plan.candidates,
+    })
+}
+
+/// Select from an already constrained and ordered set, preserving explicit
+/// backend/device bindings while applying the same compatibility rules as auto.
+pub fn select_runtime_from_candidates(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    request_capabilities: RequestCapabilities,
+    available_runtimes: &[RuntimeAvailability],
+    candidates: &[RuntimeId],
+) -> Result<SelectedRuntime, RuntimePlanError> {
+    let plan = plan_runtime_from_candidates(
+        manifest,
+        requested_backend,
+        request_capabilities,
+        available_runtimes,
+        candidates,
+    );
+    plan.selected.ok_or(RuntimePlanError {
+        model_id: manifest.id.clone(),
         requested_backend,
         decisions: plan.candidates,
     })
@@ -198,40 +251,82 @@ pub fn plan_runtime(
     request_capabilities: RequestCapabilities,
     available_runtimes: &[RuntimeAvailability],
 ) -> RuntimePlan {
-    let availability = availability_map(available_runtimes);
-    let mut candidates = Vec::new();
-    let mut selected = None;
-    let mut rejections = Vec::new();
-
-    for runtime_id in runtime_candidate_ids_for_plan(
+    let candidate_ids = runtime_candidate_ids_for_plan(
         manifest,
         requested_backend,
         request_capabilities,
         available_runtimes,
-    ) {
+    );
+    plan_runtime_from_candidates(
+        manifest,
+        requested_backend,
+        request_capabilities,
+        available_runtimes,
+        &candidate_ids,
+    )
+}
+
+fn plan_runtime_from_candidates(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    request_capabilities: RequestCapabilities,
+    available_runtimes: &[RuntimeAvailability],
+    candidate_ids: &[RuntimeId],
+) -> RuntimePlan {
+    let availability = availability_map(available_runtimes);
+    let decisions = candidate_ids.iter().copied().map(|runtime_id| {
+        (
+            candidate_decision(
+                manifest,
+                requested_backend,
+                request_capabilities,
+                runtime_id,
+                availability.get(&runtime_id),
+            ),
+            is_preferred_route(
+                manifest,
+                requested_backend,
+                request_capabilities,
+                runtime_id,
+            ),
+        )
+    });
+    plan_from_decisions(manifest, requested_backend, request_capabilities, decisions)
+}
+
+fn plan_from_decisions(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    request_capabilities: RequestCapabilities,
+    decisions: impl IntoIterator<Item = (RuntimeDecision, bool)>,
+) -> RuntimePlan {
+    let mut candidates = Vec::new();
+    let mut selected = None;
+    let mut rejections = Vec::new();
+    let mut fallback_chain = Vec::new();
+
+    for (decision, preferred_route) in decisions {
+        let runtime_id = decision.runtime_id;
         let descriptor = runtime_descriptor(runtime_id);
-        let decision = candidate_decision(
-            manifest,
-            requested_backend,
-            request_capabilities,
-            runtime_id,
-            availability.get(&runtime_id),
-        );
         if decision.status == RuntimeDecisionStatus::Accepted {
             selected = Some(SelectedRuntime {
+                model_id: manifest.id.clone(),
                 runtime_id,
-                display_name: descriptor.display_name,
+                display_name: decision.display_name,
                 accelerator: descriptor
                     .accelerators
                     .first()
                     .copied()
                     .unwrap_or(BackendAccelerator::Auto),
-                reason: selection_reason(manifest, requested_backend, descriptor.runtime),
-                fallback_chain: rejections.clone(),
+                reason: decision.reason.clone(),
+                fallback_chain,
                 rejection_reasons: rejections.clone(),
             });
             candidates.push(decision);
             break;
+        }
+        if preferred_route {
+            fallback_chain.push(decision.clone());
         }
         rejections.push(decision.clone());
         candidates.push(decision);
@@ -298,7 +393,7 @@ pub fn runtime_candidate_ids(
     manifest: &ModelManifest,
     requested_backend: RequestedBackend,
 ) -> Vec<RuntimeId> {
-    match requested_backend {
+    let mut candidates = match requested_backend {
         RequestedBackend::Auto => auto_candidates(manifest),
         RequestedBackend::Cpu => cpu_candidates(manifest),
         RequestedBackend::Cuda => cuda_candidates(manifest),
@@ -311,7 +406,15 @@ pub fn runtime_candidate_ids(
         RequestedBackend::Transformers => vec![RuntimeId::TransformersCompat],
         RequestedBackend::Vllm => vec![RuntimeId::VllmCuda],
         RequestedBackend::LlamaLegacy | RequestedBackend::LlamaHighlevel => Vec::new(),
-    }
+    };
+    // The format/architecture rules determine membership; registry priorities
+    // determine the actual order. Hardware profile overrides are applied later.
+    candidates.sort_by(|left, right| {
+        runtime_descriptor(*right)
+            .priority
+            .cmp(&runtime_descriptor(*left).priority)
+    });
+    candidates
 }
 
 fn runtime_candidate_ids_for_plan(
@@ -320,7 +423,10 @@ fn runtime_candidate_ids_for_plan(
     request_capabilities: RequestCapabilities,
     available_runtimes: &[RuntimeAvailability],
 ) -> Vec<RuntimeId> {
-    if let Some(task) = request_capabilities.task {
+    if let Some(task) = request_capabilities
+        .task
+        .filter(|task| is_media_task(*task))
+    {
         return typed_runtime_candidate_ids(manifest, requested_backend, task);
     }
     let mut candidates = runtime_candidate_ids(manifest, requested_backend);
@@ -365,6 +471,10 @@ fn runtime_candidate_ids_for_plan(
         // generic CUDA vLLM candidate. This keeps both auto and the
         // accelerator-neutral explicit `vllm` route correctly labelled.
         candidates.insert(0, RuntimeId::VllmRocm);
+    }
+    if let Some(task) = request_capabilities.task {
+        candidates
+            .retain(|runtime_id| runtime_supports_task(runtime_descriptor(*runtime_id), task));
     }
     candidates
 }
@@ -417,16 +527,22 @@ fn requested_backend_matches_descriptor(
         RequestedBackend::Cpu => descriptor.accelerators.contains(&BackendAccelerator::Cpu),
         RequestedBackend::Cuda => descriptor.accelerators.contains(&BackendAccelerator::Cuda),
         RequestedBackend::Rocm => descriptor.accelerators.contains(&BackendAccelerator::Rocm),
-        RequestedBackend::Metal | RequestedBackend::Mlx => {
-            descriptor.accelerators.contains(&BackendAccelerator::Metal)
+        RequestedBackend::Metal => descriptor.accelerators.contains(&BackendAccelerator::Metal),
+        RequestedBackend::Mlx => {
+            matches!(
+                descriptor.runtime,
+                BackendRuntime::Mlx | BackendRuntime::MlxVlm
+            ) || (descriptor.runtime == BackendRuntime::MediaCompanion
+                && descriptor.accelerators.contains(&BackendAccelerator::Metal))
         }
-        RequestedBackend::Vulkan
-        | RequestedBackend::Burn
-        | RequestedBackend::Candle
-        | RequestedBackend::Transformers
-        | RequestedBackend::Vllm
-        | RequestedBackend::LlamaLegacy
-        | RequestedBackend::LlamaHighlevel => false,
+        RequestedBackend::Vulkan => descriptor
+            .accelerators
+            .contains(&BackendAccelerator::Vulkan),
+        RequestedBackend::Burn => descriptor.runtime == BackendRuntime::Burn,
+        RequestedBackend::Candle => descriptor.runtime == BackendRuntime::Candle,
+        RequestedBackend::Transformers => descriptor.runtime == BackendRuntime::TransformersCompat,
+        RequestedBackend::Vllm => descriptor.runtime == BackendRuntime::Vllm,
+        RequestedBackend::LlamaLegacy | RequestedBackend::LlamaHighlevel => false,
     }
 }
 
@@ -643,14 +759,76 @@ fn candidate_decision(
     }
 }
 
+/// Static checks shared by execution callers before running any external probe.
+pub fn runtime_static_rejection(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    request_capabilities: RequestCapabilities,
+    runtime_id: RuntimeId,
+) -> Option<String> {
+    rejection_reason(
+        manifest,
+        requested_backend,
+        request_capabilities,
+        runtime_id,
+        Some(&RuntimeAvailability {
+            runtime_id,
+            available: true,
+            reason: None,
+        }),
+    )
+}
+
+fn is_preferred_route(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    request_capabilities: RequestCapabilities,
+    runtime_id: RuntimeId,
+) -> bool {
+    // A backend for a different task, architecture, modality, or host platform
+    // was never a preferred route. Keep its rejection in the full diagnostics.
+    let host_eligible = match runtime_id {
+        RuntimeId::LlamaServerMetal | RuntimeId::CandleMetal | RuntimeId::MediaCompanionMetal => {
+            cfg!(target_os = "macos")
+        }
+        RuntimeId::Mlx | RuntimeId::MlxVlm => {
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        }
+        RuntimeId::LlamaServerCuda
+        | RuntimeId::LlamaServerRocm
+        | RuntimeId::LlamaServerVulkan
+        | RuntimeId::CandleCuda
+        | RuntimeId::VllmCuda
+        | RuntimeId::VllmRocm
+        | RuntimeId::OnnxRuntimeCuda
+        | RuntimeId::OnnxRuntimeRocm
+        | RuntimeId::MediaCompanionCuda
+        | RuntimeId::MediaCompanionRocm => cfg!(any(windows, target_os = "linux")),
+        _ => true,
+    };
+    host_eligible
+        && runtime_static_rejection(
+            manifest,
+            requested_backend,
+            request_capabilities,
+            runtime_id,
+        )
+        .is_none()
+}
+
 fn rejection_reason(
     manifest: &ModelManifest,
-    _requested_backend: RequestedBackend,
+    requested_backend: RequestedBackend,
     request_capabilities: RequestCapabilities,
     runtime_id: RuntimeId,
     availability: Option<&RuntimeAvailability>,
 ) -> Option<String> {
     let descriptor = runtime_descriptor(runtime_id);
+    if !requested_backend_matches_descriptor(requested_backend, descriptor) {
+        return Some(format!(
+            "runtime does not match the explicit {requested_backend:?} backend/device binding"
+        ));
+    }
     if request_capabilities.tool_calling && descriptor.runtime != BackendRuntime::Vllm {
         return Some("runtime does not support OpenAI tool calling".to_string());
     }
@@ -699,12 +877,34 @@ fn rejection_reason(
             }
         }
     }
-    if !runtime_supports_model(
+    if runtime_static_model_support(
         descriptor,
         &manifest.format,
         manifest.architecture.as_deref(),
-    ) {
+    ) == StaticModelSupport::Unsupported
+    {
         return Some(model_support_rejection(manifest, descriptor.runtime));
+    }
+    if descriptor.runtime == BackendRuntime::Candle
+        && manifest.format == ModelFormat::SafeTensors
+        && let Some(quantization) = manifest.metadata.quantization.as_deref()
+        && [
+            "awq", "gptq", "nf4", "int4", "int8", "fp8", "mxfp4", "affine",
+        ]
+        .iter()
+        .any(|layout| quantization.to_ascii_lowercase().contains(layout))
+    {
+        return Some(format!(
+            "Candle does not support the quantized safetensors layout '{quantization}'"
+        ));
+    }
+    if runtime_id == RuntimeId::MlxVlm
+        && !request_capabilities.image_input
+        && request_capabilities.task != Some(InferenceTask::ImageUnderstanding)
+    {
+        return Some(
+            "MLX-VLM is reserved for image requests; text-only MLX uses mlx-lm".to_string(),
+        );
     }
     if request_capabilities.task.is_none() {
         if request_capabilities.image_input
@@ -714,11 +914,6 @@ fn rejection_reason(
         }
         if request_capabilities.text_generation && !descriptor.capabilities.text_generation {
             return Some("runtime does not support text generation".to_string());
-        }
-        if runtime_id == RuntimeId::MlxVlm && !request_capabilities.image_input {
-            return Some(
-                "MLX-VLM is reserved for image requests; text-only MLX uses mlx-lm".to_string(),
-            );
         }
         if request_capabilities.image_input && !descriptor.capabilities.vision_language {
             return Some("runtime is not VLM-capable".to_string());
@@ -770,6 +965,15 @@ fn rejection_reason(
 }
 
 fn model_support_rejection(manifest: &ModelManifest, runtime: BackendRuntime) -> String {
+    if runtime == BackendRuntime::Candle {
+        return match manifest.architecture.as_deref() {
+            Some(architecture) => format!(
+                "Candle does not support architecture '{architecture}' in {:?} format",
+                manifest.format
+            ),
+            None => "model metadata is missing the architecture required by Candle".to_string(),
+        };
+    }
     match (runtime, &manifest.format) {
         (BackendRuntime::Vllm, ModelFormat::SafeTensors) => {
             "vLLM is not selected for this architecture".to_string()
@@ -857,6 +1061,235 @@ mod tests {
     use super::*;
     use crate::capabilities::{InferenceTask, RepositoryLayout};
     use crate::model_store::{ModelManifest, ModelSource};
+
+    #[test]
+    fn preferred_available_route_has_no_fallback_diagnostic() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let selected = select_runtime(
+            &manifest,
+            RequestedBackend::Cuda,
+            RequestCapabilities::text(true),
+            &[
+                available(RuntimeId::VllmCuda),
+                available(RuntimeId::CandleCuda),
+            ],
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::VllmCuda);
+        assert!(selected.fallback_chain.is_empty());
+        assert_eq!(selected.fallback_note(), None);
+    }
+
+    #[test]
+    fn missing_or_incompatible_preferred_runtime_reports_the_actual_fallback() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
+        for reason in [
+            "vLLM is not installed",
+            "installed vLLM fixture version cannot resolve phi3",
+        ] {
+            let selected = select_runtime(
+                &manifest,
+                RequestedBackend::Cuda,
+                RequestCapabilities::text(true),
+                &[
+                    RuntimeAvailability {
+                        runtime_id: RuntimeId::VllmCuda,
+                        available: false,
+                        reason: Some(reason.into()),
+                    },
+                    available(RuntimeId::CandleCuda),
+                ],
+            )
+            .unwrap();
+            assert_eq!(selected.runtime_id, RuntimeId::CandleCuda);
+            let note = selected.fallback_note().unwrap();
+            assert!(note.contains(&manifest.id));
+            assert!(note.contains("preferred runtime vLLM CUDA"));
+            assert!(note.contains(reason));
+            assert!(note.contains("compatible fallback Candle CUDA"));
+            assert_eq!(selected.fallback_chain, selected.rejection_reasons);
+        }
+    }
+
+    #[test]
+    fn typed_text_request_preserves_detected_rocm_hardware_preference() {
+        let mut manifest = manifest(ModelFormat::SafeTensors, Some("qwen3"));
+        manifest.metadata.tasks = vec![InferenceTask::TextGeneration];
+        let selected = select_runtime_for_task(
+            &manifest,
+            RequestedBackend::Auto,
+            InferenceTask::TextGeneration,
+            &[
+                available(RuntimeId::VllmRocm),
+                available(RuntimeId::VllmCuda),
+            ],
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::VllmRocm);
+        assert!(selected.fallback_note().is_none());
+    }
+
+    #[test]
+    fn candidate_order_applies_registry_priorities_before_hardware_overrides() {
+        for format in [
+            ModelFormat::Gguf,
+            ModelFormat::SafeTensors,
+            ModelFormat::Mlx,
+            ModelFormat::Onnx,
+        ] {
+            let manifest = manifest(format, Some("qwen3"));
+            let candidates = runtime_candidates(&manifest, RequestedBackend::Auto);
+            assert!(
+                candidates
+                    .windows(2)
+                    .all(|pair| pair[0].priority >= pair[1].priority)
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_candidates_do_not_escape_device_or_tool_calling_requirements() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let available = [
+            available(RuntimeId::CandleCpu),
+            available(RuntimeId::CandleCuda),
+        ];
+        let error = select_runtime_from_candidates(
+            &manifest,
+            RequestedBackend::Cuda,
+            RequestCapabilities::text(true).with_tool_calling(true),
+            &available,
+            &[RuntimeId::CandleCuda],
+        )
+        .unwrap_err();
+        assert_eq!(error.decisions.len(), 1);
+        assert_eq!(error.decisions[0].runtime_id, RuntimeId::CandleCuda);
+        assert!(error.to_string().contains("tool calling"));
+        assert!(!error.to_string().contains("Candle CPU"));
+        let error = select_runtime_from_candidates(
+            &manifest,
+            RequestedBackend::Cuda,
+            RequestCapabilities::text(true),
+            &available,
+            &[RuntimeId::CandleCpu],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("explicit Cuda backend/device binding")
+        );
+    }
+
+    #[test]
+    fn installed_candle_rejects_unsupported_architecture_and_quantization_before_generation() {
+        for (architecture, quantization, expected) in [
+            ("deepseek_v4", None, "architecture 'deepseek_v4'"),
+            ("llama", Some("MXFP4/MXFP8"), "quantized safetensors layout"),
+            ("qwen3", Some("gptq-4bit"), "quantized safetensors layout"),
+        ] {
+            let mut manifest = manifest(ModelFormat::SafeTensors, Some(architecture));
+            manifest.metadata.quantization = quantization.map(str::to_owned);
+            let error = select_runtime(
+                &manifest,
+                RequestedBackend::Cpu,
+                RequestCapabilities::text(true),
+                &[available(RuntimeId::CandleCpu)],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    fn deepseek_fixture() -> ModelManifest {
+        // Metadata only: no weights and no claim of a real supporting backend.
+        let mut manifest = manifest(ModelFormat::Mlx, Some("deepseek_v4"));
+        manifest.id = "Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX".into();
+        manifest.metadata.repository_layout = RepositoryLayout::Mlx;
+        manifest.metadata.quantization = Some("MXFP4/MXFP8".into());
+        manifest
+    }
+
+    fn unsupported_deepseek_mlx() -> RuntimeAvailability {
+        RuntimeAvailability {
+            runtime_id: RuntimeId::Mlx,
+            available: false,
+            reason: Some("installed mlx-lm fixture version does not support architecture deepseek_v4 (mixed MXFP4/MXFP8)".into()),
+        }
+    }
+
+    #[test]
+    fn deepseek_without_a_compatible_runtime_fails_with_architecture_probe_reason() {
+        let manifest = deepseek_fixture();
+        let error = select_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &[unsupported_deepseek_mlx(), available(RuntimeId::CandleCpu)],
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&manifest.id));
+        assert!(message.contains(
+            "installed mlx-lm fixture version does not support architecture deepseek_v4"
+        ));
+        assert!(message.contains("MXFP4/MXFP8"));
+        assert!(
+            error
+                .decisions
+                .iter()
+                .all(|decision| decision.status == RuntimeDecisionStatus::Rejected)
+        );
+    }
+
+    #[test]
+    fn deepseek_simulated_compatible_candidate_is_selected_and_reported() {
+        let manifest = deepseek_fixture();
+        let capabilities = RequestCapabilities::text(true);
+        let mlx_rejection = candidate_decision(
+            &manifest,
+            RequestedBackend::Auto,
+            capabilities,
+            RuntimeId::Mlx,
+            Some(&unsupported_deepseek_mlx()),
+        );
+        assert_eq!(mlx_rejection.status, RuntimeDecisionStatus::Rejected);
+        // Inject a synthetic accepted decision only at the common decision
+        // reducer. The production registry still rejects this model for Candle;
+        // no real DeepSeek, Candle, MLX-VLM, or oMLX support is invented here.
+        let simulated = RuntimeDecision {
+            runtime_id: RuntimeId::CandleCpu,
+            display_name: "simulated compatible runtime",
+            status: RuntimeDecisionStatus::Accepted,
+            reason: "test fixture reports model-specific compatibility".into(),
+        };
+        let selected = plan_from_decisions(
+            &manifest,
+            RequestedBackend::Auto,
+            capabilities,
+            [(mlx_rejection, true), (simulated, true)],
+        )
+        .selected
+        .unwrap();
+        assert_eq!(selected.display_name, "simulated compatible runtime");
+        let note = selected.fallback_note().unwrap();
+        assert!(note.contains(&manifest.id));
+        assert!(note.contains("deepseek_v4"));
+        assert!(note.contains("compatible fallback simulated compatible runtime"));
+        assert!(!runtime_supports_model(
+            runtime_descriptor(RuntimeId::CandleCpu),
+            &manifest.format,
+            manifest.architecture.as_deref()
+        ));
+    }
+
+    fn available(runtime_id: RuntimeId) -> RuntimeAvailability {
+        RuntimeAvailability {
+            runtime_id,
+            available: true,
+            reason: None,
+        }
+    }
 
     #[test]
     fn tool_calling_capability_never_falls_back_from_vllm() {
@@ -1402,13 +1835,38 @@ mod tests {
             &available,
         );
 
-        assert_eq!(plan.selected.unwrap().runtime_id, RuntimeId::Mlx);
+        let selected = plan.selected.unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::Mlx);
+        assert!(selected.fallback_chain.is_empty());
+        assert!(selected.fallback_note().is_none());
+        assert!(
+            selected
+                .rejection_reasons
+                .iter()
+                .any(|decision| decision.runtime_id == RuntimeId::MlxVlm)
+        );
         assert!(
             plan.candidates
                 .iter()
                 .any(|decision| decision.runtime_id == RuntimeId::MlxVlm
                     && decision.reason.contains("text-only MLX uses mlx-lm"))
         );
+    }
+
+    #[test]
+    fn typed_text_request_does_not_treat_mlx_vlm_as_a_preferred_route() {
+        let mut manifest = manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        manifest.metadata.repository_layout = RepositoryLayout::Mlx;
+        manifest.metadata.tasks = vec![InferenceTask::TextGeneration];
+        let selected = select_runtime_for_task(
+            &manifest,
+            RequestedBackend::Mlx,
+            InferenceTask::TextGeneration,
+            &[available(RuntimeId::MlxVlm), available(RuntimeId::Mlx)],
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::Mlx);
+        assert!(selected.fallback_note().is_none());
     }
 
     #[test]

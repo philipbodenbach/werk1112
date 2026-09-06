@@ -135,7 +135,7 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_ONNX_GENAI_PYTHON`, `WERK_ONNX_RUNTIME_PYTHON` | Python interpreter fallbacks for the CPU `onnxruntime_genai` path, checked in that order. |
 | `WERK_ONNX_GENAI_MODEL_CACHE_SIZE` | Exact ONNX GenAI model/tokenizer entries retained by the Werk-owned resident CPU-fallback worker. Default: `1`; values are clamped to `0..8`; `0` disables this model cache. It does not affect an opaque external ONNX runner. |
 | `WERK_ONNX_EXPORTER` | Executable used by `werk artifacts build` before `optimum-cli` or Python module discovery. |
-| `WERK_MLX_PYTHON`, `WERK_MLX_MODULE`, `WERK_MLX_GENERATE` | MLX-LM interpreter, module (default `mlx_lm.generate`), and executable fallback. |
+| `WERK_MLX_PYTHON`, `WERK_MLX_MODULE`, `WERK_MLX_GENERATE` | MLX-LM interpreter, module (default `mlx_lm.generate`), and executable override. An explicit module takes precedence over the executable; an explicit Python alone uses its own default module. Model preflight and generation use the same resolved environment. |
 | `WERK_MLX_VLM_PYTHON`, `WERK_MLX_VLM_MODULE`, `WERK_MLX_VLM_GENERATE` | MLX-VLM equivalents; the default module is `mlx_vlm`. |
 | `WERK_TRANSFORMERS_PYTHON` | Python interpreter containing PyTorch and Transformers for the compatibility backend. |
 | `WERK_TRANSFORMERS_DEVICE` | Device override; `auto` chooses CUDA, then MPS, then CPU. |

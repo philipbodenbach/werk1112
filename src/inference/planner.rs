@@ -132,11 +132,47 @@ pub struct ExecutionPlan {
     pub selected_backend: Option<String>,
     pub score: Option<i32>,
     pub candidates: Vec<PlanCandidateDecision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_chain: Vec<PlanCandidateDecision>,
     pub backend_fallback: bool,
     pub degradations: Vec<ExecutionDegradation>,
     pub model_or_quality_downgrades: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_readiness: Option<TaskReadiness>,
+}
+
+impl ExecutionPlan {
+    /// Describe the route recorded in this plan without probing or selecting again.
+    pub fn fallback_note(&self, model_id: &str) -> Option<String> {
+        let selected = self.selected_runtime.as_deref()?;
+        let preferred = self.fallback_chain.first()?;
+        let mut note = format!(
+            "Model {model_id}: preferred runtime '{}' is unavailable ({}). Using compatible fallback '{selected}'.",
+            preferred.runtime_id,
+            preferred.reasons.join("; "),
+        );
+        if !self.degradations.is_empty() {
+            let limitations = self
+                .degradations
+                .iter()
+                .map(|degradation| match degradation {
+                    ExecutionDegradation::CpuOffload => "CPU offload".to_string(),
+                    ExecutionDegradation::SequentialOffload => "sequential offload".to_string(),
+                    ExecutionDegradation::ComponentOffload => "component offload".to_string(),
+                    ExecutionDegradation::VaeTiling => "VAE tiling".to_string(),
+                    ExecutionDegradation::TemporalWindowing => "temporal windowing".to_string(),
+                    ExecutionDegradation::SlowerAttention { backend } => {
+                        format!("slower attention backend '{backend}'")
+                    }
+                })
+                .collect::<Vec<_>>();
+            note.push_str(&format!(
+                " Execution adjustments: {}.",
+                limitations.join(", ")
+            ));
+        }
+        Some(note)
+    }
 }
 
 pub fn plan_execution(
@@ -175,6 +211,7 @@ pub fn plan_execution(
         || accelerator_memory_exceeded
         || host_memory_exceeded;
     let mut decisions = Vec::new();
+    let mut preference_order = Vec::new();
 
     for candidate in candidates {
         let mut reasons = Vec::new();
@@ -301,7 +338,7 @@ pub fn plan_execution(
         if candidate.accelerator == RuntimeAccelerator::Cpu {
             score -= 120;
         }
-        decisions.push(PlanCandidateDecision {
+        let decision = PlanCandidateDecision {
             runtime_id: candidate.id.clone(),
             backend: candidate.backend.clone(),
             status: if accepted {
@@ -312,7 +349,26 @@ pub fn plan_execution(
             score: accepted.then_some(score),
             reasons,
             degradations,
-        });
+        };
+        // Preserve the same score used for selection for failed candidates too.
+        // Other tasks, formats and explicit devices are not preferred routes.
+        if candidate.supported_tasks.contains(&request.task)
+            && (candidate.supported_layouts.is_empty()
+                || candidate
+                    .supported_layouts
+                    .contains(&manifest.metadata.repository_layout))
+            && (candidate.supported_formats.is_empty()
+                || candidate.supported_formats.contains(&manifest.format))
+            && requested_accelerator.is_none_or(|accelerator| {
+                runtime_accelerator_matches(candidate.accelerator, accelerator)
+            })
+            && (fallback_policy != "none"
+                || requested_backend
+                    .is_none_or(|backend| candidate.backend.eq_ignore_ascii_case(backend)))
+        {
+            preference_order.push((score, decision.clone()));
+        }
+        decisions.push(decision);
     }
 
     decisions.sort_by(|left, right| {
@@ -326,10 +382,27 @@ pub fn plan_execution(
         .find(|decision| decision.status == PlanCandidateStatus::Accepted)
         .cloned();
     let selected_backend = selected.as_ref().map(|decision| decision.backend.clone());
-    let backend_fallback = match (requested_backend, selected_backend.as_deref()) {
-        (Some(requested), Some(selected)) => !requested.eq_ignore_ascii_case(selected),
-        _ => false,
-    };
+    preference_order.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.runtime_id.cmp(&right.runtime_id))
+    });
+    let fallback_chain = selected
+        .as_ref()
+        .map(|selected| {
+            preference_order
+                .into_iter()
+                .take_while(|(_, decision)| decision.runtime_id != selected.runtime_id)
+                .filter(|(_, decision)| decision.status == PlanCandidateStatus::Rejected)
+                .map(|(_, decision)| decision)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let backend_fallback = !fallback_chain.is_empty()
+        || match (requested_backend, selected_backend.as_deref()) {
+            (Some(requested), Some(selected)) => !requested.eq_ignore_ascii_case(selected),
+            _ => false,
+        };
     let model_or_quality_downgrades = if memory_pressure {
         vec![
             "consider a smaller model or stronger quantization".to_string(),
@@ -356,6 +429,7 @@ pub fn plan_execution(
         selected_backend,
         score: selected.as_ref().and_then(|decision| decision.score),
         candidates: decisions,
+        fallback_chain,
         backend_fallback,
         degradations: selected
             .map(|decision| decision.degradations)

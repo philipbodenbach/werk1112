@@ -1,6 +1,11 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fs,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use super::{
     backend::{BackendExecution, BackendProbe, MediaInferenceBackend},
@@ -30,6 +35,35 @@ pub struct InferenceService {
     backend: Arc<dyn MediaInferenceBackend>,
     outputs: OutputStore,
     resource_detector: Arc<dyn Fn() -> HostResources + Send + Sync>,
+    routing_diagnostics: Arc<Mutex<RoutingDiagnostics>>,
+}
+
+#[derive(Default)]
+pub(super) struct RoutingDiagnostics {
+    routes: BTreeMap<(String, String), (String, Option<String>)>,
+}
+
+impl RoutingDiagnostics {
+    /// Keep the latest route for each model/task so identical server requests
+    /// are quiet, while route changes and changed rejection reasons are visible.
+    pub(super) fn observe(
+        &mut self,
+        model: &str,
+        task: InferenceTask,
+        runtime: &str,
+        note: Option<String>,
+    ) -> Option<String> {
+        let key = (model.to_string(), task.to_string());
+        let route = (runtime.to_string(), note.clone());
+        if self.routes.get(&key) == Some(&route) {
+            return None;
+        }
+        if self.routes.len() >= 256 && !self.routes.contains_key(&key) {
+            self.routes.pop_first();
+        }
+        self.routes.insert(key, route);
+        note
+    }
 }
 
 impl InferenceService {
@@ -40,6 +74,7 @@ impl InferenceService {
             backend: Arc::new(CompanionMediaBackend::discover()),
             outputs,
             resource_detector: Arc::new(detect_host_resources),
+            routing_diagnostics: Arc::default(),
         }
     }
 
@@ -50,6 +85,7 @@ impl InferenceService {
             backend,
             outputs,
             resource_detector: Arc::new(detect_host_resources),
+            routing_diagnostics: Arc::default(),
         }
     }
 
@@ -65,6 +101,7 @@ impl InferenceService {
             backend,
             outputs,
             resource_detector: Arc::new(move || resources.clone()),
+            routing_diagnostics: Arc::default(),
         }
     }
 
@@ -264,6 +301,14 @@ impl InferenceService {
             if index > 0 {
                 remove_output_dir(&self.outputs.root, &output_dir)?;
                 fs::create_dir_all(&output_dir)?;
+                plan.selected_runtime = Some(candidate.runtime_id.clone());
+                plan.selected_backend = Some(candidate.backend.clone());
+                plan.score = candidate.score;
+                plan.degradations = candidate.degradations.clone();
+                plan.backend_fallback = true;
+            }
+            if let Some(note) = plan.fallback_note(&manifest.id) {
+                self.report_route(&manifest.id, &plan, Some(note));
             }
             let mut attempt_effective = effective.clone();
             apply_candidate_adjustments(
@@ -291,12 +336,10 @@ impl InferenceService {
                     };
                     attempt_observer(&attempt_timing);
                     timings.runtime_attempts.push(attempt_timing);
-                    if candidate.runtime_id != selected_runtime {
-                        plan.selected_runtime = Some(candidate.runtime_id.clone());
-                        plan.selected_backend = Some(candidate.backend.clone());
-                        plan.score = candidate.score;
-                        plan.degradations = candidate.degradations.clone();
-                        plan.backend_fallback = true;
+                    if plan.fallback_chain.is_empty() {
+                        // A healthy preferred route clears an older fallback.
+                        // Failed first attempts must not defeat deduplication.
+                        self.report_route(&manifest.id, &plan, None);
                     }
                     effective = attempt_effective;
                     execution = Some(value);
@@ -313,6 +356,20 @@ impl InferenceService {
                     attempt_observer(&attempt_timing);
                     timings.runtime_attempts.push(attempt_timing);
                     execution_errors.push(format!("{}: {error}", candidate.runtime_id));
+                    let mut failed = candidate.clone();
+                    failed.status = PlanCandidateStatus::Rejected;
+                    failed.score = None;
+                    failed
+                        .reasons
+                        .push(format!("backend execution failed: {error}"));
+                    if let Some(decision) = plan
+                        .candidates
+                        .iter_mut()
+                        .find(|decision| decision.runtime_id == candidate.runtime_id)
+                    {
+                        *decision = failed.clone();
+                    }
+                    plan.fallback_chain.push(failed);
                 }
             }
         }
@@ -399,6 +456,21 @@ impl InferenceService {
             write_json_atomic(&output_dir.join("metadata.json"), &result)?;
         }
         Ok(result)
+    }
+
+    fn report_route(&self, model: &str, plan: &ExecutionPlan, note: Option<String>) {
+        let Some(runtime) = plan.selected_runtime.as_deref() else {
+            return;
+        };
+        // A poisoned diagnostics lock must not prevent execution or suppress
+        // the warning: logging is independent of the backend cache.
+        let note = match self.routing_diagnostics.lock() {
+            Ok(mut diagnostics) => diagnostics.observe(model, plan.task, runtime, note),
+            Err(_) => note,
+        };
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
     }
 
     pub fn capabilities(&self) -> Result<Value> {

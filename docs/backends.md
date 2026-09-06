@@ -64,6 +64,64 @@ For a typed request Werk:
 8. optionally retries another already accepted candidate according to the
    fallback policy.
 
+Automatic text selection also executes the existing model/platform preference
+order, with the registered priorities applied before the existing hardware
+profile overrides. Availability is evaluated for the requested model and
+capabilities: an importable runtime alone is not proof of compatibility.
+Candle eligibility follows its implemented architecture loaders, including
+format and known packed-quantization restrictions.
+
+If a preferred eligible runtime is missing or its installed implementation
+cannot accept the model, Werk selects the next compatible available runtime
+and reports, for example:
+
+~~~text
+Model example/phi3: preferred runtime vLLM CUDA cannot be used (runtime unavailable). Using compatible fallback Candle CUDA.
+~~~
+
+The message contains the actual routing decision and rejection reason. It is
+written to stderr without `--verbose` or `--debug`; `werk serve` logs it when
+selecting a fallback or changing routes and suppresses identical repeats.
+Diagnostics never become generated text, OpenAI response fields or SSE token
+content. Candidates for another task or modality, such as MLX-VLM for a text
+request, do not create a fallback warning. If no compatible runtime exists,
+the request fails before generation with the relevant candidates and causes.
+Known managed installation hints remain available in the error diagnostics.
+
+Media retries retain the same accepted candidates and explicit constraints,
+record failed attempts, and log the actual replacement route. Text generation
+errors propagate without restarting a stream after text or tool-call fragments
+have been emitted. `fallback_policy=none` continues to disable media execution
+retries.
+
+### MLX compatibility before loading
+
+MLX text preflight reads local `config.json` and uses the installed loader's
+architecture resolver and model argument validation in the Python environment
+that will execute generation. It checks quantization support in that loader
+and installed MLX core using only bounded synthetic inputs, without loading
+model weights or running repository-provided model code. Missing architectures,
+incompatible runtime implementations, damaged metadata and properties that
+cannot be verified produce distinct actionable diagnostics. A successful
+preflight does not prove that model weights fit in memory or guarantee inference
+success.
+
+`WERK_MLX_MODULE` selects a module in `WERK_MLX_PYTHON`; an explicit
+`WERK_MLX_GENERATE` selects its executable when no module override is supplied.
+With only `WERK_MLX_PYTHON`, Werk uses that interpreter's default generation
+module, so a PATH launcher cannot silently switch environments. Recognized
+Python console launchers are probed through their own interpreter. For opaque
+custom launchers whose model resolver cannot be verified, diagnostics explain
+the limitation. Existing Werk Gemma4 compatibility metadata is checked against
+the installed loader as well. Model probe results are not globally cached.
+
+A model such as `Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX` with
+`model_type=deepseek_v4` and mixed MXFP4/MXFP8 quantization is rejected when the
+selected installed `mlx-lm` cannot resolve that architecture or support that
+layout. This routing fix adds no DeepSeek adapter, inference engine or automatic
+backend download. Regression fixtures simulate compatibility outcomes; they do
+not establish real DeepSeek or oMLX inference support.
+
 Use diagnostics before a large request:
 
 ~~~bash
