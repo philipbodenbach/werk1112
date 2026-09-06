@@ -1,6 +1,7 @@
 """Small installed-runtime simulations; no MLX installation or model weights."""
 
 import contextlib
+import copy
 import importlib.util
 import io
 import inspect
@@ -17,15 +18,167 @@ probe_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe_module)
 
 
-def fixture_load(path):
-    return load_model(path)
-
-
 def fixture_overridden_load(path):
     return load_model(path, get_model_classes=custom_resolver)
 
 
-def fake_runtime(architectures=("llama",), modes=("affine",)):
+# Parameter order and relevant call/normalization structure from MLX-LM
+# revision 6d21ce4b065a2e163fa6de76a9936c61aeb5784a, utils.py lines 309-435,
+# 498-545:
+# https://github.com/ml-explore/mlx-lm/blob/6d21ce4b065a2e163fa6de76a9936c61aeb5784a/mlx_lm/utils.py
+# These source-inspection fixtures deliberately fail if the probe calls them;
+# download, weight loading, model construction and tokenizer code are omitted.
+def fixture_upstream_load(
+    path_or_hf_repo, tokenizer_config=None, model_config=None, adapter_path=None,
+    lazy=False, return_config=False, revision=None, trust_remote_code=False,
+):
+    raise AssertionError("probe must never call load")
+    model_path = Path(path_or_hf_repo)
+    model, config = load_model(
+        model_path, lazy, model_config=model_config, trust_remote_code=trust_remote_code,
+    )
+    return model, config
+
+
+def fixture_upstream_load_model(
+    model_path, lazy=False, strict=True, model_config=None,
+    get_model_classes=None, trust_remote_code=False,
+):
+    raise AssertionError("probe must never call load_model")
+    config = load_config(model_path)
+    if model_config is not None:
+        config.update(model_config)
+    model_class, model_args_class = get_model_classes(config=config)
+    if "quantization_config" not in config:
+        text_config = config.get("text_config", {})
+        if "quantization_config" in text_config:
+            config["quantization_config"] = text_config["quantization_config"]
+    model = model_class(model_args_class.from_dict(config))
+
+    def _quantize(quantization):
+        def class_predicate(p, m):
+            if p in config["quantization"]:
+                return config["quantization"][p]
+            if not hasattr(m, "to_quantized"):
+                return False
+            return f"{p}.scales" in weights
+
+        nn.quantize(
+            model, group_size=quantization["group_size"], bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"), class_predicate=class_predicate,
+        )
+
+    if (quantization := config.get("quantization", None)) is not None:
+        _quantize(quantization)
+    elif quantization_config := config.get("quantization_config", False):
+        quant_method = quantization_config["quant_method"]
+        if quant_method == "bitnet":
+            raise AssertionError("unused fixture bitnet path")
+        elif quant_method == "mxfp4":
+            quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+    return model, config
+
+
+def fixture_positional_resolver_load(path):
+    return load_model(path, False, True, None, custom_resolver)
+
+
+def fixture_star_args_load(path, *args):
+    return load_model(path, *args)
+
+
+def fixture_star_kwargs_load(path, **kwargs):
+    return load_model(path, **kwargs)
+
+
+def fixture_duplicate_lazy_load(path):
+    return load_model(path, False, lazy=True)
+
+
+def fixture_regular_keywords_load(path):
+    return load_model(model_path=path, lazy=False, strict=True, model_config=None, trust_remote_code=False)
+
+
+def fixture_regular_positional_load(path):
+    return load_model(path, False, True, None, trust_remote_code=False)
+
+
+def fixture_inert_expression_load(path):
+    return load_model(path, lazy=must_not_run())
+
+
+def fixture_root_only_load_model(
+    model_path, lazy=False, strict=True, model_config=None,
+    get_model_classes=None, trust_remote_code=False,
+):
+    raise AssertionError("probe must never call load_model")
+    config = load_config(model_path)
+
+    def _quantize(quantization):
+        nn.quantize(model, group_size=quantization["group_size"], bits=quantization["bits"],
+                    mode=quantization.get("mode", "affine"))
+
+    if (quantization := config.get("quantization", None)) is not None:
+        _quantize(quantization)
+    elif quantization_config := config.get("quantization_config", False):
+        quant_method = quantization_config["quant_method"]
+        if quant_method == "mxfp4":
+            quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+
+
+def fixture_wrong_normalization_load_model(
+    model_path, lazy=False, strict=True, model_config=None,
+    get_model_classes=None, trust_remote_code=False,
+):
+    raise AssertionError("probe must never call load_model")
+    config = load_config(model_path)
+
+    def _quantize(quantization):
+        nn.quantize(model, group_size=quantization["group_size"], bits=quantization["bits"],
+                    mode=quantization.get("mode", "affine"))
+
+    if (quantization := config.get("quantization", None)) is not None:
+        _quantize(quantization)
+    elif quantization_config := config.get("quantization_config", False):
+        quant_method = quantization_config["quant_method"]
+        if quant_method == "mxfp4":
+            quantization = {"group_size": 64, "bits": 4, "mode": "mxfp4"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+
+
+def install_load_fixture(runtime, fixture):
+    def custom_resolver(config=None):
+        raise AssertionError("loader argument expressions must not be executed")
+
+    load = types.FunctionType(fixture.__code__, {
+        "load_model": runtime["mlx_lm.utils"].load_model,
+        "custom_resolver": custom_resolver,
+        "must_not_run": custom_resolver,
+    }, argdefs=fixture.__defaults__)
+    runtime["mlx_lm.generate"].load = load
+    runtime["mlx_lm.utils"].load = load
+
+
+def fake_upstream_runtime(architectures=("llama",), modes=("affine",)):
+    runtime = fake_runtime(architectures, modes)
+    resolver = inspect.signature(runtime["mlx_lm.utils"].load_model).parameters["get_model_classes"].default
+    runtime["mlx_lm.utils"].load_model = types.FunctionType(
+        fixture_upstream_load_model.__code__, {"nn": runtime["mlx.nn"]},
+        argdefs=(False, True, None, resolver, False),
+    )
+    install_load_fixture(runtime, fixture_upstream_load)
+    return runtime
+
+
+def fake_runtime(architectures=("llama",), modes=("affine",), allow_model_file=False):
     class Model:
         def __init__(self, *args):
             raise AssertionError("probe must never construct a model")
@@ -43,12 +196,15 @@ def fake_runtime(architectures=("llama",), modes=("affine",)):
             raise ValueError(f"Model type {architecture} not supported.")
         return Model, ModelArgs
 
-    def load_model(path, get_model_classes=resolve):
+    def load_model(
+        model_path, lazy=False, strict=True, model_config=None,
+        get_model_classes=resolve, trust_remote_code=allow_model_file,
+    ):
         # An executable miniature of the installed loader dispatch, deliberately
         # using a path whose read fails if preflight ever calls this function.
-        config = json.loads(path.read_text())
+        config = json.loads(model_path.read_text())
         if model_file := config.get("model_file"):
-            spec = importlib.util.spec_from_file_location("custom_model", path / model_file)
+            spec = importlib.util.spec_from_file_location("custom_model", model_path / model_file)
             arch = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(arch)
 
@@ -65,7 +221,8 @@ def fake_runtime(architectures=("llama",), modes=("affine",)):
         if quantization := config.get("quantization"):
             _quantize(quantization)
 
-    load = types.FunctionType(fixture_load.__code__, {"load_model": load_model})
+    load = types.FunctionType(fixture_upstream_load.__code__, {"load_model": load_model},
+                              argdefs=(*fixture_upstream_load.__defaults__[:-1], allow_model_file))
 
     def quantize(array, group_size, bits, mode="affine"):
         if mode not in modes:
@@ -109,6 +266,96 @@ class MlxMetadataProbeTests(unittest.TestCase):
     def test_installed_runtime_resolves_architecture_alias_without_name_allowlist(self):
         self.assertIn("mlx-lm", self.run_probe({"model_type": "mistral"}))
         self.assertIn("mlx-lm", self.run_probe({"model_type": "new_arch"}, fake_runtime(("new_arch",))))
+
+    def test_upstream_load_accepts_positional_lazy(self):
+        self.assertIn("mlx-lm", self.run_probe({"model_type": "llama"}, fake_upstream_runtime()))
+
+    def test_standard_loader_binds_other_regular_arguments_without_executing_them(self):
+        for fixture in (
+            fixture_regular_keywords_load, fixture_regular_positional_load, fixture_inert_expression_load,
+        ):
+            with self.subTest(fixture=fixture.__name__):
+                runtime = fake_upstream_runtime()
+                install_load_fixture(runtime, fixture)
+                self.assertIn("mlx-lm", self.run_probe({"model_type": "llama"}, runtime))
+
+    def test_upstream_signature_rejects_resolver_overrides_and_opaque_arguments(self):
+        for fixture in (
+            fixture_overridden_load, fixture_positional_resolver_load,
+            fixture_star_args_load, fixture_star_kwargs_load, fixture_duplicate_lazy_load,
+        ):
+            with self.subTest(fixture=fixture.__name__):
+                runtime = fake_upstream_runtime()
+                install_load_fixture(runtime, fixture)
+                with self.assertRaisesRegex(ValueError, "overrides or hides its model-class resolver"):
+                    self.run_probe({"model_type": "llama"}, runtime)
+
+    def test_upstream_gpt_oss_quantization_config_mxfp4_is_supported_without_mutation(self):
+        # Metadata shape from https://huggingface.co/openai/gpt-oss-20b/blob/main/config.json.
+        config = {
+            "model_type": "gpt_oss",
+            "quantization_config": {"quant_method": "mxfp4", "modules_to_not_convert": ["lm_head"]},
+        }
+        original = copy.deepcopy(config)
+        runtime = fake_upstream_runtime(("gpt_oss",), ("mxfp4",))
+        self.assertIn("mlx-lm", self.run_probe(config, runtime))
+        self.assertEqual(config, original)
+
+    def test_upstream_mxfp4_metadata_still_checks_installed_core_support(self):
+        runtime = fake_upstream_runtime(("gpt_oss",), ("affine",))
+        config = {"model_type": "gpt_oss", "quantization_config": {"quant_method": "mxfp4"}}
+        with self.assertRaisesRegex(ValueError, "incompatible runtime quantization mxfp4/4-bit/group-32"):
+            self.run_probe(config, runtime)
+
+    def test_mxfp4_core_support_does_not_certify_missing_loader_normalization(self):
+        runtime = fake_runtime(("gpt_oss",), ("mxfp4",))
+        config = {"model_type": "gpt_oss", "quantization_config": {"quant_method": "mxfp4"}}
+        with self.assertRaisesRegex(ValueError, "cannot verify.*quantization_config"):
+            self.run_probe(config, runtime)
+
+    def test_nested_mxfp4_metadata_uses_installed_loader_promotion(self):
+        config = {
+            "model_type": "gpt_oss",
+            "text_config": {"quantization_config": {"quant_method": "mxfp4"}},
+        }
+        self.assertIn("mlx-lm", self.run_probe(config, fake_upstream_runtime(("gpt_oss",), ("mxfp4",))))
+
+    def test_nested_metadata_requires_loader_promotion_even_when_root_mxfp4_works(self):
+        runtime = fake_upstream_runtime(("gpt_oss",), ("mxfp4",))
+        resolver = inspect.signature(runtime["mlx_lm.utils"].load_model).parameters["get_model_classes"].default
+        runtime["mlx_lm.utils"].load_model = types.FunctionType(
+            fixture_root_only_load_model.__code__, {"nn": runtime["mlx.nn"]},
+            argdefs=(False, True, None, resolver, False),
+        )
+        install_load_fixture(runtime, fixture_upstream_load)
+        quantization = {"quant_method": "mxfp4"}
+        self.assertIn("mlx-lm", self.run_probe({
+            "model_type": "gpt_oss", "quantization_config": quantization,
+        }, runtime))
+        with self.assertRaisesRegex(ValueError, "cannot verify.*quantization_config"):
+            self.run_probe({
+                "model_type": "gpt_oss", "text_config": {"quantization_config": quantization},
+            }, runtime)
+
+    def test_installed_normalization_must_match_supported_mxfp4_layout(self):
+        runtime = fake_upstream_runtime(("gpt_oss",), ("mxfp4",))
+        resolver = inspect.signature(runtime["mlx_lm.utils"].load_model).parameters["get_model_classes"].default
+        runtime["mlx_lm.utils"].load_model = types.FunctionType(
+            fixture_wrong_normalization_load_model.__code__, {"nn": runtime["mlx.nn"]},
+            argdefs=(False, True, None, resolver, False),
+        )
+        install_load_fixture(runtime, fixture_upstream_load)
+        config = {"model_type": "gpt_oss", "quantization_config": {"quant_method": "mxfp4"}}
+        with self.assertRaisesRegex(ValueError, "cannot verify.*quantization_config"):
+            self.run_probe(config, runtime)
+
+    def test_unknown_legacy_quantization_method_remains_unverified(self):
+        runtime = fake_upstream_runtime(("gpt_oss",), ("mxfp4",))
+        for method in ("gptq", "unknown-mxfp4"):
+            with self.subTest(method=method):
+                config = {"model_type": "gpt_oss", "quantization_config": {"quant_method": method}}
+                with self.assertRaisesRegex(ValueError, "cannot verify.*quantization_config"):
+                    self.run_probe(config, runtime)
 
     def test_deepseek_mixed_mxfp_fixture_rejects_importable_unsupported_architecture(self):
         config = {
@@ -186,7 +433,10 @@ class MlxMetadataProbeTests(unittest.TestCase):
         runtime = fake_runtime(("gemma4",))
         resolver = inspect.signature(runtime["mlx_lm.utils"].load_model).parameters["get_model_classes"].default
 
-        def comments_only_model_file(path, get_model_classes=resolver):
+        def comments_only_model_file(
+            model_path, lazy=False, strict=True, model_config=None,
+            get_model_classes=resolver, trust_remote_code=False,
+        ):
             # model_file spec_from_file_location exec_module
             return None
 
@@ -219,7 +469,9 @@ class MlxMetadataProbeTests(unittest.TestCase):
 
     def test_gemma4_werk_config_checks_installed_gemma_class(self):
         config = {"model_type": "gemma4", "model_file": "werk_gemma4_unified_compat.py"}
-        self.run_probe(config, fake_runtime(("gemma4",)), werk_gemma4_compat=True)
+        # Simulate an explicitly trusted installed loader, as required by the
+        # pre-existing Werk compatibility-file contract.
+        self.run_probe(config, fake_runtime(("gemma4",), allow_model_file=True), werk_gemma4_compat=True)
         with self.assertRaisesRegex(ValueError, "architecture 'gemma4'.*unsupported"):
             self.run_probe(config, werk_gemma4_compat=True)
 

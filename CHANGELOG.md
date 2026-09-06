@@ -16,6 +16,12 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Fixed
 
+- Fixed MLX preflight rejecting the regular MLX-LM loader's positional `lazy`
+  argument by binding calls to the installed `load_model` signature while
+  retaining resolver-override checks.
+- Restored supported MXFP4 `quantization_config` metadata (including GPT-OSS)
+  when the installed loader provides the matching normalization path, while
+  retaining architecture and runtime quantization checks.
 - Applied runtime priorities to actual selection while retaining model, task,
   platform and explicit device/backend constraints. Excluded unsupported Candle
   architectures and known incompatible packed safetensors quantization.

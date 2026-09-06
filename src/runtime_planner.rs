@@ -1081,6 +1081,42 @@ mod tests {
     }
 
     #[test]
+    fn supported_standard_and_gpt_oss_models_keep_the_mlx_lm_route() {
+        for (format, architecture, quantization) in [
+            (ModelFormat::Mlx, "llama", None),
+            (ModelFormat::Mlx, "gpt_oss", Some("MXFP4")),
+            (ModelFormat::SafeTensors, "gpt_oss", Some("MXFP4")),
+        ] {
+            let mut manifest = manifest(format, Some(architecture));
+            let backends: &[RequestedBackend] = if manifest.format == ModelFormat::SafeTensors {
+                manifest.metadata.repository_layout = RepositoryLayout::Transformers;
+                &[RequestedBackend::Mlx]
+            } else {
+                manifest.metadata.repository_layout = RepositoryLayout::Mlx;
+                &[RequestedBackend::Auto, RequestedBackend::Mlx]
+            };
+            manifest.metadata.quantization = quantization.map(str::to_owned);
+            // Simulate a successful model-specific probe. The Python tests
+            // verify the installed loader and GPT-OSS quantization_config path.
+            for &requested_backend in backends {
+                let selected = select_runtime(
+                    &manifest,
+                    requested_backend,
+                    RequestCapabilities::text(true),
+                    &[available(RuntimeId::Mlx), available(RuntimeId::CandleCpu)],
+                )
+                .unwrap();
+                assert_eq!(selected.runtime_id, RuntimeId::Mlx);
+                if manifest.format == ModelFormat::Mlx {
+                    assert_eq!(selected.reason, "MLX model uses mlx-lm");
+                }
+                assert!(selected.fallback_chain.is_empty());
+                assert!(selected.fallback_note().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn missing_or_incompatible_preferred_runtime_reports_the_actual_fallback() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
         for reason in [
@@ -1216,6 +1252,24 @@ mod tests {
             available: false,
             reason: Some("installed mlx-lm fixture version does not support architecture deepseek_v4 (mixed MXFP4/MXFP8)".into()),
         }
+    }
+
+    #[test]
+    fn deepseek_simulated_supported_mlx_is_selected_without_fallback() {
+        let manifest = deepseek_fixture();
+        // Availability represents a probe confirming both deepseek_v4 and
+        // mixed MXFP4/MXFP8 support, not evidence of real runtime support.
+        let selected = select_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &[available(RuntimeId::Mlx)],
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::Mlx);
+        assert_eq!(selected.reason, "MLX model uses mlx-lm");
+        assert!(selected.fallback_chain.is_empty());
+        assert!(selected.fallback_note().is_none());
     }
 
     #[test]
