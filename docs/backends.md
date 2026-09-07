@@ -173,8 +173,9 @@ werk video generate VIDEO_MODEL \
 ## Optional local oMLX backend
 
 On Apple Silicon, `auto` considers an installed oMLX after MLX-LM for compatible
-MLX and Hugging Face safetensors text models. A supported MLX-LM model stays on
-MLX-LM. If its actual loader cannot accept a model but oMLX's loader can, Werk
+MLX and Hugging Face safetensors text models. Requests without tool requirements
+stay on MLX-LM when its loader supports the model. If its actual loader cannot
+accept a model but oMLX's loader can, Werk
 selects oMLX and reports the MLX-LM rejection and compatible fallback on stderr.
 `--backend omlx` binds execution to oMLX; `--backend mlx` retains its existing
 MLX-LM/MLX-VLM meaning.
@@ -189,9 +190,10 @@ werk --backend omlx doctor --model MODEL --task text-generation --debug
 ~~~
 
 Install the [upstream oMLX CLI](https://github.com/jundot/omlx#install) separately.
-Werk discovers `omlx` on `PATH`, or the exact executable specified by
-`WERK_OMLX_BIN`. The macOS application alone does not install that CLI. Werk
-does not install or upgrade oMLX, change the normal MLX-LM environment, manage a
+Werk checks `WERK_OMLX_BIN` first, then `omlx` on `PATH` when that override is
+unset. An empty or invalid override fails discovery. The macOS application
+alone does not install that CLI. Werk does not install or upgrade oMLX,
+change the normal MLX-LM environment, manage a
 system service, or connect to an external oMLX server. `omlx` is not a
 `werk backend install` target, including when automatic provisioning is enabled.
 
@@ -200,6 +202,9 @@ Python console entry points can be verified; opaque custom wrappers fail with
 an explanation. The same captured installation is used for model preflight and
 execution. The integration is based on upstream v0.6.4 loader and API behavior;
 a package version string alone is not proof of model compatibility.
+Inherited upstream `OMLX_*` settings are excluded from the private worker;
+see the [environment-variable reference](reference/environment-variables.md)
+for the supported overrides.
 
 An independent bounded probe activates installed oMLX pre-load patches, resolves
 the model architecture and validates metadata and quantization support without
@@ -216,18 +221,22 @@ the actual local model directory and an isolated `--base-path`. It verifies the
 physical model path advertised by `/v1/models/status`, then loads that exact
 model before generation. Startup and loading share a 900-second default
 deadline; `WERK_OMLX_HEALTH_TIMEOUT_SECONDS` accepts a positive integer override.
+Invalid values fail discovery. The metadata probe has a separate fixed
+20-second limit, and this setting does not change generation timeouts.
 No duplicate weight download or model-directory copy is required. Exact model
 and runtime processes are reused while their backend lives and stopped when
-Werk releases them. Failed startup and load attempts retain their diagnostics.
+Werk releases them. A parent-lifetime pipe also stops the worker if Werk exits
+without normal cleanup. Failed startup and load attempts retain their diagnostics.
 
 Text, chat, streaming and native tool calls use `/v1/chat/completions`. Tool
 requests require a verified model parser; the initial verified tool path is
 DeepSeek V4's native DSML parser and template. Other models remain text-only
 until their native tool wiring is verified. The verified oMLX API supports
 omitted, `auto` and `none` tool choice; required/named choices, explicit
-`parallel_tool_calls` and strict function schemas are rejected because their
-constraints are not enforced by that upstream API. Image, embedding and media requests
-are outside this adapter's scope. Separate upstream reasoning fields are not
+`parallel_tool_calls` (either value) and function definitions with `strict: true`
+are rejected because their constraints are not enforced by that upstream API.
+Omit `strict` or set it to `false`. Image, embedding and media requests are
+outside this adapter's scope. Separate upstream reasoning fields are not
 rendered as answer text; empty reasoning-only results are errors. Errors after
 text or tool-call fragments have been emitted never trigger another generation.
 oMLX's internal caches do not imply Werk named Prefill, KV snapshot or restore
@@ -624,6 +633,7 @@ Managed backend children are:
 | llama targets | <code>backends/llama-cuda</code>, <code>llama-rocm</code>, <code>llama-vulkan</code>, <code>llama-metal</code> or <code>llama-cpu</code> |
 | ONNX targets | <code>backends/onnxruntime-cuda</code>, <code>onnxruntime-rocm</code> or <code>onnxruntime-cpu</code> |
 | vLLM | <code>backends/vllm</code> |
+| oMLX worker data | <code>backends/omlx/workers/PROCESS_ID</code>; isolated data for a Werk-owned child, removed during normal worker cleanup. The installed oMLX CLI remains external. |
 | Qwen-TTS | <code>backends/qwen-tts</code> |
 
 Models, optimized model artifacts, outputs and jobs are separate siblings.

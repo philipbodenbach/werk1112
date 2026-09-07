@@ -2,7 +2,7 @@
   "name": "n8n-nodes-werk1112",
   "version": "1.6.0",
   "private": true,
-  "description": "Beta native Werk1112 inference and runtime nodes for n8n; unpublished feature for Werk 1.6.0",
+  "description": "Beta native Werk1112 inference and runtime nodes for n8n; manual installation for Werk 1.6.0",
   "license": "Elastic-2.0",
   "author": "Philip Bodenbach",
   "homepage": "https://github.com/philipbodenbach/werk1112/tree/main/utils/n8n",

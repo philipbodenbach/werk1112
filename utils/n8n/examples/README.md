@@ -3,7 +3,9 @@
 Import a JSON file in n8n, select your **WERK API** credential on every WERK
 node, and replace each `REPLACE_*` model/state ID with one from your server's
 Discovery/Runtime results. No credentials, private paths or model downloads are
-embedded. Examples are inactive and use node version 1.
+embedded. These examples accompany package **1.6.0** and Werk **1.6.0**.
+Examples are inactive and use node version **1**; their workflow schema and
+node IDs remain unchanged for this release.
 
 The primary **complete-dist custom-directory** installation loads these IDs
 in n8n **2.37.10**:

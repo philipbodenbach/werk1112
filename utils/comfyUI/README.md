@@ -4,9 +4,9 @@
 > This integration is currently in beta. Node inputs, outputs, and discovery
 > behavior may still change before the first stable release.
 
-Starting with v1.5.0, the Werk ComfyUI package uses the same release version as
-Werk Core and Werk Media Companion. This synchronized versioning does not
-change the integration's beta status.
+The Werk ComfyUI package is version **1.6.0**, synchronized with Werk Core,
+Werk Media Companion and the n8n package. This synchronized versioning does
+not change the integration's beta status.
 
 This package connects native ComfyUI nodes to `werk serve` over HTTP. ComfyUI
 still owns its workflow graph, queue, history, previews, and saved media; Werk

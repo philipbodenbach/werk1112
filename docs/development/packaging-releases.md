@@ -51,7 +51,7 @@ time. The archive does **not** contain:
 
 - model weights or optimized model artifacts;
 - CUDA, ROCm, Metal, Vulkan or accelerator drivers/toolkits;
-- llama.cpp, vLLM, ONNX Runtime, MLX or managed Python environments;
+- llama.cpp, vLLM, ONNX Runtime, MLX, oMLX or managed Python environments;
 - Diffusers, Transformers, audio/video codecs or other optional Python
   packages;
 - Rust, Cargo, Visual Studio, CMake, Git, libclang or `nvcc`;
@@ -196,20 +196,20 @@ release workflow.
 
 ## Local output layout
 
-For package version `1.5.1`, the generated tree is:
+For package version `1.6.0`, the generated tree is:
 
 ~~~text
 releases/
-├── werk1112-v1.5.1-linux-x86_64.tar.gz
-├── werk1112-v1.5.1-linux-x86_64.tar.gz.sha256
-├── werk1112-v1.5.1-linux-x86_64-amd-strix-halo.tar.gz
-├── werk1112-v1.5.1-linux-x86_64-amd-strix-halo.tar.gz.sha256
-├── werk1112-v1.5.1-linux-aarch64-dgx-spark.tar.gz
-├── werk1112-v1.5.1-linux-aarch64-dgx-spark.tar.gz.sha256
-├── werk1112-v1.5.1-windows-x86_64.zip
-├── werk1112-v1.5.1-windows-x86_64.zip.sha256
-├── werk1112-v1.5.1-macos-aarch64.tar.gz
-└── werk1112-v1.5.1-macos-aarch64.tar.gz.sha256
+├── werk1112-v1.6.0-linux-x86_64.tar.gz
+├── werk1112-v1.6.0-linux-x86_64.tar.gz.sha256
+├── werk1112-v1.6.0-linux-x86_64-amd-strix-halo.tar.gz
+├── werk1112-v1.6.0-linux-x86_64-amd-strix-halo.tar.gz.sha256
+├── werk1112-v1.6.0-linux-aarch64-dgx-spark.tar.gz
+├── werk1112-v1.6.0-linux-aarch64-dgx-spark.tar.gz.sha256
+├── werk1112-v1.6.0-windows-x86_64.zip
+├── werk1112-v1.6.0-windows-x86_64.zip.sha256
+├── werk1112-v1.6.0-macos-aarch64.tar.gz
+└── werk1112-v1.6.0-macos-aarch64.tar.gz.sha256
 ~~~
 
 Staging directories are recreated below `target/package/<platform>`. Existing
@@ -283,9 +283,17 @@ create a GitHub release or upload artifacts.
 
 ## Maintainer release checklist
 
-1. Set the intended package version in `Cargo.toml` and ensure the root package
-   entry in `Cargo.lock` agrees.
-2. Run the Rust, companion and relevant integration tests.
+1. Synchronize the intended product version in `Cargo.toml`, the root package
+   entry in `Cargo.lock`, `COMPANION_VERSION` in
+   `runtime/werk_media_companion.py`, `utils/comfyUI/pyproject.toml`, and the
+   root package entries in `utils/n8n/package.json` and its lockfile. Dependency,
+   protocol and schema versions follow their own compatibility rules.
+2. Move the completed changes from `Unreleased` into the dated release section
+   in `CHANGELOG.md`, update its comparison links, the README release highlights
+   and versioned installation examples. Run the Rust, Python probe, companion,
+   ComfyUI and n8n checks described in [Building from source](build.md) and the
+   [n8n validation guide](https://github.com/philipbodenbach/werk1112/blob/main/utils/n8n/docs/validation.md). Validate and pack
+   the ComfyUI Registry archive; keep the integrations' Beta status explicit.
 3. Build/package every target on its matching host.
 4. Inspect archive contents and verify every checksum.
 5. Smoke-test the extracted binary on the target operating system.
@@ -293,6 +301,14 @@ create a GitHub release or upload artifacts.
 7. Upload all five archives and their five checksum files to the GitHub
    release.
 8. Test each public installer against that release.
+
+ComfyUI Registry publication is a separate manual workflow dispatch on the
+default branch, after its validation and archive checks pass. The n8n package
+remains private and is distributed through the documented manual
+custom-directory installation; preparing the product release does not publish
+it to npm. Optional oMLX requires a separate installed runtime, and its native
+Apple Silicon smoke tests must be distinguished from simulated preflight and
+HTTP tests.
 
 The repository currently has no checked-in GitHub Actions workflow that builds
 or publishes the Werk release archives. The steps above remain a manual or
