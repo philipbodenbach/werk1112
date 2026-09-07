@@ -164,7 +164,7 @@ pub(super) async fn chat_completions_handler(
     {
         return api_error_with_code(
             StatusCode::BAD_REQUEST,
-            "the configured backend does not support OpenAI tool calling; use --backend vllm"
+            "the configured backend does not support OpenAI tool calling; use --backend vllm or --backend omlx with a compatible model and native tool parser"
                 .to_string(),
             Some(tool_calling_parameter(&request).to_string()),
             Some("unsupported_tool_calling".to_string()),

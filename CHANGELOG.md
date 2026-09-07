@@ -7,6 +7,11 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Added
 
+- Added optional local oMLX text, chat, streaming and native tool-call support
+  through an already installed CLI on Apple Silicon. Compatible MLX-LM keeps
+  priority; model-specific oMLX preflight enables compatible fallbacks and
+  explicit `--backend omlx` selection. Werk reuses owned oMLX processes without
+  installing the runtime, copying weights or exposing named KV-state support.
 - Added the unpublished `n8n-nodes-werk1112` 1.6.0 Beta under `utils/n8n`:
   eight native discovery, text, image, vision, video, audio, jobs and runtime
   nodes; shared credentials, native binary data, combined in-memory
@@ -16,6 +21,12 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Fixed
 
+- Fixed MLX preflight rejecting the regular MLX-LM loader's positional `lazy`
+  argument by binding calls to the installed `load_model` signature while
+  retaining resolver-override checks.
+- Restored supported MXFP4 `quantization_config` metadata (including GPT-OSS)
+  when the installed loader provides the matching normalization path, while
+  retaining architecture and runtime quantization checks.
 - Applied runtime priorities to actual selection while retaining model, task,
   platform and explicit device/backend constraints. Excluded unsupported Candle
   architectures and known incompatible packed safetensors quantization.

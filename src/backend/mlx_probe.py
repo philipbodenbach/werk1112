@@ -87,9 +87,28 @@ def standard_loader(module):
         raise ValueError("cannot verify architecture resolution: configured module must re-export the installed mlx_lm.utils.load; custom load wrappers are unverified")
     calls = [node for node in ast.walk(function_tree(load)) if isinstance(node, ast.Call)
              and isinstance(node.func, ast.Name) and node.func.id == "load_model"]
-    if not calls or any(len(call.args) != 1 or any(
-            keyword.arg in (None, "get_model_classes") for keyword in call.keywords) for call in calls):
-        raise ValueError("cannot verify architecture resolution: installed load overrides or hides its model-class resolver")
+    message = "cannot verify architecture resolution: installed load overrides or hides its model-class resolver"
+    if not calls:
+        raise ValueError(message)
+    signature = inspect.signature(loader)
+    for call in calls:
+        if any(isinstance(arg, ast.Starred) for arg in call.args) or any(
+                keyword.arg is None for keyword in call.keywords):
+            raise ValueError(message)
+        try:
+            # AST nodes are inert argument values: binding neither evaluates
+            # their expressions nor calls the loader. Positional lazy/strict
+            # bind normally; a positional or keyword resolver is still explicit.
+            bound = signature.bind(*call.args, **{
+                keyword.arg: keyword.value for keyword in call.keywords
+            })
+        except TypeError as error:
+            raise ValueError(message) from error
+        if "get_model_classes" in bound.arguments or any(
+                signature.parameters[name].kind in (
+                    inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD,
+                ) for name in bound.arguments):
+            raise ValueError(message)
     return loader
 
 
@@ -154,16 +173,65 @@ def verify_nn_dictionary_dispatch(quantize):
     raise ValueError("incompatible runtime version: mlx.nn.quantize cannot verify per-layer parameter dictionaries")
 
 
-def quantization_layouts(config):
+def legacy_mxfp4_quantization(loader, nested):
+    # The pinned loader has no separate metadata-only normalizer: this branch
+    # runs after weight loading and model construction. Recognize its installed
+    # AST, then copy only the fixed metadata locally; never execute that branch.
+    # Source: mlx-lm/utils.py, 6d21ce4b065a2e163fa6de76a9936c61aeb5784a,
+    # lines 376-379 (nested metadata) and 408-419 (MXFP4 dispatch).
+    message = "cannot verify legacy quantization_config layout 'mxfp4': installed loader normalization is unsupported or unverified"
+    if loader is None:
+        raise ValueError(message)
+    body = function_tree(loader).body[0].body
+    if nested:
+        promotion = ast.parse('''
+if "quantization_config" not in config:
+    text_config = config.get("text_config", {})
+    if "quantization_config" in text_config:
+        config["quantization_config"] = text_config["quantization_config"]
+''').body[0]
+        if not any(ast.dump(node) == ast.dump(promotion) for node in body):
+            raise ValueError(message)
+    normalization = ast.parse('''
+quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+config["quantization"] = quantization
+config["quantization_config"] = quantization
+_quantize(quantization)
+''').body
+    method_assignment = ast.parse('quant_method = quantization_config["quant_method"]').body[0]
+    method_test = ast.parse('quant_method == "mxfp4"', mode="eval").body
+    # Walk only executable top-level if/elif chains, not unrelated nested
+    # helpers that happen to contain similar metadata or normalization code.
+    for statement in body:
+        node = statement
+        while isinstance(node, ast.If):
+            if (isinstance(node.test, ast.NamedExpr)
+                    and isinstance(node.test.target, ast.Name)
+                    and node.test.target.id == "quantization_config"
+                    and is_get(node.test.value, "config", "quantization_config")
+                    and node.body and ast.dump(node.body[0]) == ast.dump(method_assignment)):
+                for branch in node.body[1:]:
+                    while isinstance(branch, ast.If):
+                        if (ast.dump(branch.test) == ast.dump(method_test)
+                                and [ast.dump(item) for item in branch.body]
+                                == [ast.dump(item) for item in normalization]):
+                            return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+                        branch = branch.orelse[0] if len(branch.orelse) == 1 else None
+            node = node.orelse[0] if len(node.orelse) == 1 else None
+    raise ValueError(message)
+
+
+def quantization_layouts(config, loader=None):
     quant = config.get("quantization")
     legacy = config.get("quantization_config", config.get("text_config", {}).get("quantization_config"))
     if quant is None:
         if legacy:
-            # Legacy loaders transform packed weights in version-specific ways.
-            # Importability or a mode name alone cannot validate that layout.
             method = legacy.get("quant_method", "unknown") if isinstance(legacy, dict) else "invalid"
-            raise ValueError(f"cannot verify legacy quantization_config layout '{method}' without a supported metadata contract")
-        return []
+            if method != "mxfp4":
+                raise ValueError(f"cannot verify legacy quantization_config layout '{method}' without a supported metadata contract")
+            quant = legacy_mxfp4_quantization(loader, nested="quantization_config" not in config)
+        else:
+            return []
     if not isinstance(quant, dict):
         raise ValueError("damaged model metadata: quantization must be an object")
     if not all(key in quant for key in ("group_size", "bits")):
@@ -235,9 +303,9 @@ def probe(payload, target, launcher=False):
             trust = inspect.signature(loader).parameters.get("trust_remote_code")
             if trust is not None and trust.default is False:
                 raise ValueError("incompatible runtime version: the configured loader disables Werk's Gemma4 compatibility model_file")
-        layouts = quantization_layouts(config)
+        layouts = quantization_layouts(config, loader)
         if layouts:
-            mixed = any(key not in ("group_size", "bits", "mode") for key in config["quantization"])
+            mixed = any(key not in ("group_size", "bits", "mode") for key in (config.get("quantization") or {}))
             verify_quantization_loader(loader, mixed, [mode for _, _, mode in layouts])
             nn = importlib.import_module("mlx.nn")
             if mixed:

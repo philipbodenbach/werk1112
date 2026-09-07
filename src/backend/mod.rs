@@ -3,7 +3,9 @@ mod candle;
 mod external;
 mod llama_fast;
 mod llama_server;
+mod omlx;
 mod onnxruntime;
+mod openai_transport;
 mod qwen_tts;
 mod vllm;
 
@@ -27,6 +29,7 @@ pub(crate) use llama_server::{
     SelectedRocmDeviceStatus, current_host_is_strix_halo,
     current_selected_rocm_device_is_strix_halo, current_selected_rocm_device_status,
 };
+pub use omlx::OmlxBackend;
 pub use onnxruntime::{
     OnnxProvisionOptions, OnnxRuntimeAvailability, OnnxRuntimeBackend, OnnxRuntimeMode,
     install_managed_onnx_runtime, managed_runner_path,
@@ -93,6 +96,7 @@ pub enum BackendRuntime {
     OnnxRuntime,
     Mlx,
     MlxVlm,
+    Omlx,
     MediaCompanion,
 }
 
@@ -127,6 +131,7 @@ pub enum RuntimeId {
     TransformersCompat,
     Mlx,
     MlxVlm,
+    Omlx,
     VllmCuda,
     VllmRocm,
     OnnxRuntimeCuda,
@@ -205,6 +210,12 @@ pub struct RuntimeDescriptor {
 }
 
 impl RuntimeDescriptor {
+    /// Native OpenAI tool transport; each backend still validates the concrete
+    /// model and configured parser before a tool request is executable.
+    pub fn supports_native_tool_calling(&self) -> bool {
+        matches!(self.runtime, BackendRuntime::Vllm | BackendRuntime::Omlx)
+    }
+
     pub fn supports_task(&self, task: InferenceTask) -> bool {
         self.supported_tasks.contains(&task)
     }
@@ -805,6 +816,25 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         install_target: None,
     },
     RuntimeDescriptor {
+        id: RuntimeId::Omlx,
+        runtime: BackendRuntime::Omlx,
+        display_name: "oMLX",
+        supported_formats: MLX_FORMATS,
+        supported_architectures: ANY_ARCH,
+        supported_tasks: TEXT_GENERATION_TASKS,
+        supported_layouts: MLX_LAYOUTS,
+        accelerators: &[BackendAccelerator::Mlx],
+        parameter_support: TEXT_PARAMETER_SUPPORT,
+        capabilities: MLX_TEXT_CAPABILITIES,
+        supports_offloading: false,
+        supports_quantization: true,
+        supports_compile: false,
+        supports_batching: true,
+        priority: 845,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
         id: RuntimeId::MediaCompanionCuda,
         runtime: BackendRuntime::MediaCompanion,
         display_name: "Media companion CUDA",
@@ -914,9 +944,12 @@ pub fn runtime_static_model_support(
     {
         return StaticModelSupport::Unsupported;
     }
-    if descriptor.runtime == BackendRuntime::Mlx {
-        // mlx-lm architecture support depends on the installed implementation,
-        // including Werk's explicit Python/module/generator configuration.
+    if matches!(
+        descriptor.runtime,
+        BackendRuntime::Mlx | BackendRuntime::Omlx
+    ) {
+        // mlx-lm and oMLX support depend on their installed implementations.
+        // Each backend probes its captured Python/module/launcher environment.
         return StaticModelSupport::RequiresProbe;
     }
     let architectures = match (descriptor.runtime, format) {
@@ -938,7 +971,7 @@ pub fn runtime_static_model_support(
     }
 }
 
-/// Returns whether the registry has static support for this model. MLX support
+/// Returns whether the registry has static support for this model. MLX/oMLX support
 /// cannot be confirmed here; candidate discovery must consider RequiresProbe
 /// from runtime_static_model_support and then probe the concrete environment.
 pub fn runtime_supports_model(
@@ -969,7 +1002,7 @@ pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) ->
             matches!(format, ModelFormat::SafeTensors | ModelFormat::Onnx)
         }
         BackendRuntime::TransformersCompat => matches!(format, ModelFormat::SafeTensors),
-        BackendRuntime::Mlx | BackendRuntime::MlxVlm => {
+        BackendRuntime::Mlx | BackendRuntime::MlxVlm | BackendRuntime::Omlx => {
             matches!(format, ModelFormat::Mlx | ModelFormat::SafeTensors)
         }
         BackendRuntime::MediaCompanion => MEDIA_FORMATS.contains(format),
@@ -1025,7 +1058,7 @@ pub fn backend_supports_accelerator(
                 | BackendAccelerator::Cuda
                 | BackendAccelerator::Metal
         ),
-        BackendRuntime::Mlx | BackendRuntime::MlxVlm => {
+        BackendRuntime::Mlx | BackendRuntime::MlxVlm | BackendRuntime::Omlx => {
             matches!(accelerator, BackendAccelerator::Mlx)
         }
         BackendRuntime::MediaCompanion => matches!(
@@ -1059,6 +1092,7 @@ pub fn explain_backend_rejection(
                 "Transformers compatibility supports selected raw HF safetensors models"
             }
             BackendRuntime::Mlx => "MLX supports MLX and HF-style safetensors only",
+            BackendRuntime::Omlx => "oMLX supports MLX and HF-style safetensors text models only",
             BackendRuntime::MlxVlm => "MLX-VLM supports MLX and HF-style safetensors VLMs only",
             BackendRuntime::MediaCompanion => {
                 "media companion supports safetensors, PyTorch, ONNX, MLX, TensorFlow, and custom media repositories"
@@ -1297,6 +1331,33 @@ pub trait GenerationBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omlx_requires_model_probe_and_has_no_install_target_or_vision_claim() {
+        let descriptor = runtime_descriptor(RuntimeId::Omlx);
+        assert!(descriptor.supports_native_tool_calling());
+        assert!(runtime_descriptor(RuntimeId::VllmCuda).supports_native_tool_calling());
+        assert!(!runtime_descriptor(RuntimeId::Mlx).supports_native_tool_calling());
+        assert!(!descriptor.capabilities.vision_language);
+        assert!(descriptor.install_target.is_none());
+        assert_eq!(descriptor.priority, 845);
+        assert!(descriptor.priority < runtime_descriptor(RuntimeId::Mlx).priority);
+        for format in [ModelFormat::Mlx, ModelFormat::SafeTensors] {
+            assert_eq!(
+                runtime_static_model_support(descriptor, &format, Some("deepseek_v4")),
+                StaticModelSupport::RequiresProbe
+            );
+            assert!(!runtime_supports_model(
+                descriptor,
+                &format,
+                Some("deepseek_v4")
+            ));
+        }
+        assert_eq!(
+            runtime_static_model_support(descriptor, &ModelFormat::Gguf, Some("llama")),
+            StaticModelSupport::Unsupported
+        );
+    }
 
     #[test]
     fn mlx_architecture_support_requires_the_concrete_environment_probe() {
