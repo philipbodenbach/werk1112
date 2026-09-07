@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::{
     collections::{HashMap, VecDeque},
     env,
     ffi::OsStr,
     fs,
-    io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
+    io::{BufRead, BufReader, Read},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -18,26 +20,31 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     BackendDoctorCheck, ChatGenerationSession, GenerateRequest, GenerateResponse, GenerateStream,
-    GenerateStreamEvent, GeneratedAssistantMessage, GenerationBackend, GenerationTimings,
-    SelectedRocmDeviceStatus, current_host_is_strix_halo,
-    current_selected_rocm_device_is_strix_halo, current_selected_rocm_device_status,
+    GenerateStreamEvent, GenerationBackend, GenerationTimings, SelectedRocmDeviceStatus,
+    current_host_is_strix_halo, current_selected_rocm_device_is_strix_halo,
+    current_selected_rocm_device_status,
 };
 use crate::{
     capabilities::InferenceTask,
     inference::{TaskReadiness, TaskReadinessStatus},
     model_store::{ModelFormat, ModelManifest, ModelRuntimeIdentity, ModelStore},
-    openai::{ChatCompletionToolCall, ChatCompletionToolCallDelta},
     runtime_control::BackendRuntimeAdapter,
 };
 
 mod runtime_control;
 use self::runtime_control::VllmRuntimeControlAdapter;
+use super::openai_transport::{
+    HttpDeadline, OpenAiCompletion as VllmCompletion, SseAccumulator, append_assistant_content,
+    chat_completion_body, delta_content, delta_tool_calls,
+    ensure_visible_completion as ensure_vllm_visible_completion, finalize_completion_stats,
+    get_with_timeout, post_json, send_stream_result, send_text_chunk, send_tool_call_delta,
+    stream_body, update_completion_from_event, update_completion_from_message,
+};
 
 const DEFAULT_HEALTH_TIMEOUT_SECONDS: u64 = 300;
 const DGX_SPARK_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 const STRIX_HALO_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HEALTH_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Exact Hugging Face `config.json.model_type` values for vLLM-backed VLMs.
@@ -197,33 +204,6 @@ pub enum VllmCommand {
     Python(PathBuf),
     Executable(PathBuf),
     Remote { host: String, port: u16 },
-}
-
-#[derive(Default)]
-struct VllmCompletion {
-    text: String,
-    assistant_content: Option<Option<String>>,
-    tool_calls: Option<Vec<ChatCompletionToolCall>>,
-    saw_tool_call_delta: bool,
-    saw_reasoning_content: bool,
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    prompt_seconds: f64,
-    decode_seconds: f64,
-    first_token_seconds: f64,
-    finish_reason: String,
-}
-
-impl VllmCompletion {
-    fn assistant_message(&self) -> GeneratedAssistantMessage {
-        GeneratedAssistantMessage {
-            content: self
-                .assistant_content
-                .clone()
-                .unwrap_or_else(|| Some(self.text.clone())),
-            tool_calls: self.tool_calls.clone(),
-        }
-    }
 }
 
 impl VllmBackend {
@@ -970,39 +950,6 @@ impl VllmCommand {
     }
 }
 
-struct HttpResponse {
-    status: u16,
-    headers: Vec<(String, String)>,
-    reader: BufReader<TcpStream>,
-    deadline: Option<HttpDeadline>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct HttpDeadline {
-    started: Instant,
-    timeout: Duration,
-}
-
-impl HttpDeadline {
-    fn new(timeout: Duration) -> Self {
-        Self {
-            started: Instant::now(),
-            timeout,
-        }
-    }
-
-    fn remaining(self) -> Result<Duration> {
-        self.timeout
-            .checked_sub(self.started.elapsed())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| anyhow!("vLLM HTTP probe timed out"))
-    }
-
-    fn remaining_capped(self, cap: Duration) -> Result<Duration> {
-        Ok(self.remaining()?.min(cap))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VllmRemoteConfig {
     host: String,
@@ -1057,33 +1004,6 @@ impl VllmCacheEnvironment {
             port: env::var("WERK_VLLM_PORT").unwrap_or_default(),
             python: env::var("WERK_VLLM_PYTHON").unwrap_or_default(),
         }
-    }
-}
-
-#[derive(Default)]
-struct SseAccumulator {
-    pending: Vec<u8>,
-}
-
-impl SseAccumulator {
-    fn push<F>(&mut self, bytes: &[u8], mut on_event: F) -> Result<()>
-    where
-        F: FnMut(&str) -> Result<()>,
-    {
-        self.pending.extend_from_slice(bytes);
-        while let Some(index) = find_sse_boundary(&self.pending) {
-            let event = self.pending.drain(..index).collect::<Vec<_>>();
-            while matches!(self.pending.first(), Some(b'\r' | b'\n')) {
-                self.pending.remove(0);
-            }
-            let event = String::from_utf8_lossy(&event);
-            for line in event.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    on_event(data.trim())?;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1423,227 +1343,6 @@ fn vllm_server_cache_key(
         environment.python,
         vllm_discovery_cache_identity(discovery),
     )
-}
-
-fn chat_completion_body(model_name: &str, request: &GenerateRequest, stream: bool) -> Value {
-    let messages = if request.messages.is_empty() {
-        json!([{
-            "role": "user",
-            "content": request.prompt,
-        }])
-    } else {
-        vllm_chat_messages(&request.messages)
-    };
-    let mut body = json!({
-        "model": model_name,
-        "messages": messages,
-        "max_tokens": request.max_tokens,
-        "stream": stream,
-    });
-    if stream {
-        body["stream_options"] = json!({"include_usage": true});
-    }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = request.top_p {
-        body["top_p"] = json!(top_p);
-    }
-    if !request.stop.is_empty() {
-        body["stop"] = json!(request.stop);
-    }
-    if let Some(seed) = request.seed {
-        body["seed"] = json!(seed);
-    }
-    if let Some(tool_config) = &request.tool_config {
-        if let Some(tools) = &tool_config.tools {
-            body["tools"] = json!(tools);
-        }
-        if let Some(tool_choice) = &tool_config.tool_choice {
-            body["tool_choice"] = json!(tool_choice);
-        }
-        if let Some(parallel_tool_calls) = tool_config.parallel_tool_calls {
-            body["parallel_tool_calls"] = json!(parallel_tool_calls);
-        }
-    }
-    body
-}
-
-fn vllm_chat_messages(messages: &[crate::openai::ChatMessage]) -> Value {
-    let mut messages =
-        serde_json::to_value(messages).expect("ChatMessage serialization cannot fail");
-    if let Some(messages) = messages.as_array_mut() {
-        for message in messages {
-            let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
-                continue;
-            };
-            for part in parts {
-                if part.get("type").and_then(Value::as_str) == Some("input_image") {
-                    part["type"] = json!("image_url");
-                }
-                if matches!(part.get("type").and_then(Value::as_str), Some("image_url"))
-                    && let Some(url) = part.get("image_url").and_then(Value::as_str)
-                {
-                    part["image_url"] = json!({"url": url});
-                }
-            }
-        }
-    }
-    messages
-}
-
-fn update_completion_from_event(completion: &mut VllmCompletion, value: &Value) {
-    if delta_has_reasoning_content(value) {
-        completion.saw_reasoning_content = true;
-    }
-    if let Some(choice) = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        && let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
-        && !reason.is_empty()
-    {
-        completion.finish_reason = reason.to_string();
-    }
-    if let Some(usage) = value.get("usage") {
-        if let Some(tokens) = usage.get("prompt_tokens").and_then(Value::as_u64) {
-            completion.prompt_tokens = tokens as usize;
-        }
-        if let Some(tokens) = usage.get("completion_tokens").and_then(Value::as_u64) {
-            completion.completion_tokens = tokens as usize;
-        }
-    }
-}
-
-fn update_completion_from_message(completion: &mut VllmCompletion, value: &Value) -> Result<()> {
-    let choice = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .context("vLLM non-streaming response has no completion choice")?;
-    let message = choice
-        .get("message")
-        .and_then(Value::as_object)
-        .context("vLLM non-streaming response has no assistant message")?;
-
-    completion.assistant_content = match message.get("content") {
-        Some(Value::Null) => Some(None),
-        Some(Value::String(content)) => {
-            completion.text.clone_from(content);
-            Some(Some(content.clone()))
-        }
-        Some(_) => bail!("vLLM assistant message content must be a string or null"),
-        None => None,
-    };
-    completion.tool_calls = match message.get("tool_calls") {
-        Some(Value::Null) | None => None,
-        Some(tool_calls) => Some(
-            serde_json::from_value(tool_calls.clone())
-                .context("vLLM returned invalid assistant message.tool_calls")?,
-        ),
-    };
-    if completion.assistant_content.is_none()
-        && completion
-            .tool_calls
-            .as_ref()
-            .is_some_and(|tool_calls| !tool_calls.is_empty())
-    {
-        completion.assistant_content = Some(None);
-    }
-    Ok(())
-}
-
-fn append_assistant_content(content: &mut Option<Option<String>>, chunk: &str) {
-    match content {
-        Some(Some(current)) => current.push_str(chunk),
-        _ => *content = Some(Some(chunk.to_string())),
-    }
-}
-
-fn delta_tool_calls(value: &Value) -> Result<Option<Vec<ChatCompletionToolCallDelta>>> {
-    let Some(tool_calls) = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("delta"))
-        .and_then(|delta| delta.get("tool_calls"))
-    else {
-        return Ok(None);
-    };
-    if tool_calls.is_null() {
-        return Ok(None);
-    }
-    serde_json::from_value(tool_calls.clone())
-        .map(Some)
-        .context("vLLM returned invalid delta.tool_calls")
-}
-
-fn delta_has_reasoning_content(value: &Value) -> bool {
-    let Some(delta) = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("delta"))
-    else {
-        return false;
-    };
-    ["reasoning", "reasoning_content"].into_iter().any(|key| {
-        delta.get(key).is_some_and(|value| match value {
-            Value::String(text) => !text.is_empty(),
-            Value::Null => false,
-            _ => true,
-        })
-    })
-}
-
-fn ensure_vllm_visible_completion(completion: &VllmCompletion) -> Result<()> {
-    let has_tool_calls = completion.saw_tool_call_delta
-        || completion
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty());
-    if completion.text.trim().is_empty() && completion.saw_reasoning_content && !has_tool_calls {
-        bail!(
-            "vLLM generated hidden reasoning but no visible answer content; increase max tokens so the model can finish its answer, or disable the configured reasoning parser/mode when hidden reasoning is not wanted"
-        );
-    }
-    Ok(())
-}
-
-fn delta_content(value: &Value) -> Option<String> {
-    value
-        .get("choices")?
-        .as_array()?
-        .first()?
-        .get("delta")?
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn finalize_completion_stats(
-    completion: &mut VllmCompletion,
-    request: &GenerateRequest,
-    elapsed_seconds: f64,
-) {
-    if completion.prompt_tokens == 0 && !request.prompt.trim().is_empty() {
-        completion.prompt_tokens = estimate_tokens(&request.prompt);
-    }
-    if completion.prompt_seconds <= 0.0 && completion.first_token_seconds > 0.0 {
-        completion.prompt_seconds = completion.first_token_seconds;
-    }
-    if completion.decode_seconds <= 0.0 {
-        completion.decode_seconds = if completion.first_token_seconds > 0.0
-            && elapsed_seconds > completion.first_token_seconds
-        {
-            elapsed_seconds - completion.first_token_seconds
-        } else {
-            elapsed_seconds
-        };
-    }
-    if completion.completion_tokens == 0 {
-        completion.completion_tokens = estimate_tokens(&completion.text);
-    }
 }
 
 pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
@@ -2805,364 +2504,6 @@ fn vllm_version(command: &VllmCommand) -> Option<String> {
     }
 }
 
-fn get_with_timeout(base_url: &str, path: &str, timeout: Duration) -> Result<HttpResponse> {
-    request(base_url, path, "GET", None, Some(timeout))
-}
-
-fn post_json(base_url: &str, path: &str, body: &Value) -> Result<HttpResponse> {
-    request(base_url, path, "POST", Some(body), None)
-}
-
-fn request(
-    base_url: &str,
-    path: &str,
-    method: &str,
-    body: Option<&Value>,
-    timeout: Option<Duration>,
-) -> Result<HttpResponse> {
-    let (_, host, port) = parse_http_url(base_url)?;
-    let deadline = timeout.map(HttpDeadline::new);
-    let mut stream = match deadline {
-        Some(deadline) => connect_http_with_deadline(&host, port, deadline),
-        None => connect_http(&host, port),
-    }
-    .with_context(|| format!("failed to connect to vLLM server at {base_url}"))?;
-    stream.set_nodelay(true).ok();
-    let body_text = body.map(serde_json::to_string).transpose()?;
-    let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: text/event-stream\r\n"
-    );
-    if let Some(body_text) = &body_text {
-        request.push_str("Content-Type: application/json\r\n");
-        request.push_str(&format!("Content-Length: {}\r\n", body_text.len()));
-    }
-    request.push_str("\r\n");
-    write_http_bytes(&mut stream, request.as_bytes(), deadline)?;
-    if let Some(body_text) = body_text {
-        write_http_bytes(&mut stream, body_text.as_bytes(), deadline)?;
-    }
-    if let Some(deadline) = deadline {
-        stream.set_write_timeout(Some(deadline.remaining()?))?;
-    }
-    stream.flush()?;
-
-    let mut reader = BufReader::new(stream);
-    let status_line = read_http_line(&mut reader, deadline)?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("invalid HTTP response from vLLM server: {status_line:?}"))?;
-    let mut headers = Vec::new();
-    loop {
-        let line = read_http_line(&mut reader, deadline)?;
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-        }
-    }
-    if status >= 400 {
-        if deadline.is_some() {
-            bail!("vLLM HTTP {status}");
-        } else {
-            let mut text = String::new();
-            let _ = reader.read_to_string(&mut text);
-            bail!("vLLM HTTP {status}: {}", text.trim());
-        }
-    }
-    Ok(HttpResponse {
-        status,
-        headers,
-        reader,
-        deadline,
-    })
-}
-
-fn write_http_bytes(
-    stream: &mut TcpStream,
-    mut bytes: &[u8],
-    deadline: Option<HttpDeadline>,
-) -> Result<()> {
-    if deadline.is_none() {
-        stream.write_all(bytes)?;
-        return Ok(());
-    }
-    while !bytes.is_empty() {
-        let remaining = deadline
-            .context("missing vLLM HTTP deadline")?
-            .remaining()?;
-        stream.set_write_timeout(Some(remaining))?;
-        let written = stream.write(bytes)?;
-        if written == 0 {
-            bail!("vLLM HTTP connection closed while writing request");
-        }
-        bytes = &bytes[written..];
-    }
-    Ok(())
-}
-
-fn read_http_line(
-    reader: &mut BufReader<TcpStream>,
-    deadline: Option<HttpDeadline>,
-) -> Result<String> {
-    let Some(deadline) = deadline else {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        return Ok(line);
-    };
-
-    let mut bytes = Vec::new();
-    loop {
-        reader
-            .get_mut()
-            .set_read_timeout(Some(deadline.remaining()?))?;
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            break;
-        }
-        let count = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-            .unwrap_or(available.len());
-        let found_newline = available[..count].ends_with(b"\n");
-        bytes.extend_from_slice(&available[..count]);
-        reader.consume(count);
-        if found_newline {
-            break;
-        }
-    }
-    String::from_utf8(bytes).context("vLLM returned a non-UTF-8 HTTP header")
-}
-
-fn connect_http(host: &str, port: u16) -> Result<TcpStream> {
-    let addresses = resolve_http_addresses(host, port)?;
-    connect_http_addresses(host, port, &addresses, |_| Ok(HTTP_CONNECT_TIMEOUT))
-}
-
-fn connect_http_with_deadline(host: &str, port: u16, deadline: HttpDeadline) -> Result<TcpStream> {
-    let addresses = resolve_http_addresses_with_deadline(host, port, deadline)?;
-    connect_http_addresses(host, port, &addresses, |_| {
-        deadline.remaining_capped(HTTP_CONNECT_TIMEOUT)
-    })
-}
-
-fn resolve_http_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("could not resolve vLLM host {host}"))?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        bail!("vLLM host {host} resolved to no socket addresses");
-    }
-    Ok(addresses)
-}
-
-fn resolve_http_addresses_with_deadline(
-    host: &str,
-    port: u16,
-    deadline: HttpDeadline,
-) -> Result<Vec<SocketAddr>> {
-    let host_owned = host.to_string();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let result = (host_owned.as_str(), port)
-            .to_socket_addrs()
-            .map(|addresses| addresses.collect::<Vec<_>>())
-            .map_err(|error| error.to_string());
-        let _ = sender.send(result);
-    });
-    let addresses = receiver
-        .recv_timeout(deadline.remaining()?)
-        .map_err(|error| anyhow!("timed out resolving vLLM host {host}: {error}"))?
-        .map_err(|error| anyhow!("could not resolve vLLM host {host}: {error}"))?;
-    if addresses.is_empty() {
-        bail!("vLLM host {host} resolved to no socket addresses");
-    }
-    Ok(addresses)
-}
-
-fn connect_http_addresses<F>(
-    host: &str,
-    port: u16,
-    addresses: &[SocketAddr],
-    mut timeout_for: F,
-) -> Result<TcpStream>
-where
-    F: FnMut(&SocketAddr) -> Result<Duration>,
-{
-    let mut errors = Vec::new();
-    for address in addresses {
-        let timeout = timeout_for(address)?;
-        match TcpStream::connect_timeout(address, timeout) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => errors.push(format!("{address}: {error}")),
-        }
-    }
-    Err(anyhow!(
-        "could not connect to {host}:{port}: {}",
-        errors.join("; ")
-    ))
-}
-
-fn stream_body<F>(response: &mut HttpResponse, mut on_bytes: F) -> Result<()>
-where
-    F: FnMut(&[u8]) -> Result<()>,
-{
-    if header_contains(&response.headers, "transfer-encoding", "chunked") {
-        loop {
-            let size_line = read_http_line(&mut response.reader, response.deadline)?;
-            let size_text = size_line
-                .trim()
-                .split_once(';')
-                .map(|(size, _)| size)
-                .unwrap_or_else(|| size_line.trim());
-            let size = usize::from_str_radix(size_text, 16)
-                .with_context(|| format!("invalid chunk size from vLLM: {size_text}"))?;
-            if size == 0 {
-                break;
-            }
-            let mut chunk = vec![0u8; size];
-            read_http_exact(&mut response.reader, &mut chunk, response.deadline)?;
-            on_bytes(&chunk)?;
-            let mut crlf = [0u8; 2];
-            read_http_exact(&mut response.reader, &mut crlf, response.deadline)?;
-        }
-    } else if let Some(length) = response
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.parse::<usize>().ok())
-    {
-        let mut remaining = length;
-        let mut buffer = [0u8; 8192];
-        while remaining > 0 {
-            let requested = remaining.min(buffer.len());
-            let count = read_http_bytes(
-                &mut response.reader,
-                &mut buffer[..requested],
-                response.deadline,
-            )?;
-            if count == 0 {
-                bail!("vLLM HTTP response ended before Content-Length bytes were received");
-            }
-            on_bytes(&buffer[..count])?;
-            remaining -= count;
-        }
-    } else {
-        let mut buffer = [0u8; 8192];
-        loop {
-            let n = read_http_bytes(&mut response.reader, &mut buffer, response.deadline)?;
-            if n == 0 {
-                break;
-            }
-            on_bytes(&buffer[..n])?;
-        }
-    }
-    Ok(())
-}
-
-fn read_http_bytes(
-    reader: &mut BufReader<TcpStream>,
-    bytes: &mut [u8],
-    deadline: Option<HttpDeadline>,
-) -> Result<usize> {
-    if let Some(deadline) = deadline {
-        reader
-            .get_mut()
-            .set_read_timeout(Some(deadline.remaining()?))?;
-    }
-    Ok(reader.read(bytes)?)
-}
-
-fn read_http_exact(
-    reader: &mut BufReader<TcpStream>,
-    mut bytes: &mut [u8],
-    deadline: Option<HttpDeadline>,
-) -> Result<()> {
-    while !bytes.is_empty() {
-        let count = read_http_bytes(reader, bytes, deadline)?;
-        if count == 0 {
-            bail!("vLLM HTTP response ended unexpectedly");
-        }
-        bytes = &mut bytes[count..];
-    }
-    Ok(())
-}
-
-fn parse_http_url(url: &str) -> Result<(String, String, u16)> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| anyhow!("only http vLLM URLs are supported: {url}"))?;
-    let (host_port, _) = rest.split_once('/').unwrap_or((rest, ""));
-    let (host, port) = host_port
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("vLLM URL has no port: {url}"))?;
-    Ok(("http".to_string(), host.to_string(), port.parse()?))
-}
-
-fn header_contains(headers: &[(String, String)], name: &str, needle: &str) -> bool {
-    headers.iter().any(|(header, value)| {
-        header.eq_ignore_ascii_case(name) && value.to_ascii_lowercase().contains(needle)
-    })
-}
-
-fn find_sse_boundary(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .or_else(|| bytes.windows(4).position(|window| window == b"\r\n\r\n"))
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    text.split_whitespace().count().max(1)
-}
-
-fn send_stream_result(
-    tx: mpsc::Sender<Result<GenerateStreamEvent, String>>,
-    result: Result<GenerateResponse>,
-) {
-    match result {
-        Ok(response) => {
-            let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
-                finish_reason: response.finish_reason,
-                prompt_tokens: response.prompt_tokens,
-                completion_tokens: response.completion_tokens,
-                timings: response.timings,
-                backend_diagnostics: response.backend_diagnostics,
-            }));
-        }
-        Err(err) => {
-            let _ = tx.blocking_send(Err(format_error_chain(&err)));
-        }
-    }
-}
-
-fn send_text_chunk(
-    tx: &Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
-    chunk: String,
-) -> Result<()> {
-    if let Some(tx) = tx {
-        tx.blocking_send(Ok(GenerateStreamEvent::TextChunk(chunk)))
-            .map_err(|err| anyhow!("stream receiver closed: {err}"))?;
-    }
-    Ok(())
-}
-
-fn send_tool_call_delta(
-    tx: &Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
-    tool_calls: Vec<ChatCompletionToolCallDelta>,
-) -> Result<()> {
-    if let Some(tx) = tx {
-        tx.blocking_send(Ok(GenerateStreamEvent::ToolCallDelta(tool_calls)))
-            .map_err(|err| anyhow!("stream receiver closed: {err}"))?;
-    }
-    Ok(())
-}
-
 const WERK_OWNED_VLLM_ARGS: &[&str] = &["--model", "--host", "--port", "--served-model-name"];
 const VLLM_ENABLE_PREFIX_CACHING_ARG: &str = "--enable-prefix-caching";
 const VLLM_DISABLE_PREFIX_CACHING_ARG: &str = "--no-enable-prefix-caching";
@@ -3429,12 +2770,6 @@ fn shell_join(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn format_error_chain(err: &anyhow::Error) -> String {
-    let mut parts = err.chain().map(ToString::to_string).collect::<Vec<_>>();
-    parts.dedup();
-    parts.join(": ")
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ pub enum RequestedBackend {
     Vulkan,
     Metal,
     Mlx,
+    Omlx,
     Burn,
     Candle,
     Transformers,
@@ -401,6 +402,7 @@ pub fn runtime_candidate_ids(
         RequestedBackend::Vulkan => vulkan_candidates(manifest),
         RequestedBackend::Metal => metal_candidates(manifest),
         RequestedBackend::Mlx => vec![RuntimeId::MlxVlm, RuntimeId::Mlx],
+        RequestedBackend::Omlx => vec![RuntimeId::Omlx],
         RequestedBackend::Burn => burn_candidates(),
         RequestedBackend::Candle => candle_candidates(manifest),
         RequestedBackend::Transformers => vec![RuntimeId::TransformersCompat],
@@ -542,6 +544,7 @@ fn requested_backend_matches_descriptor(
         RequestedBackend::Candle => descriptor.runtime == BackendRuntime::Candle,
         RequestedBackend::Transformers => descriptor.runtime == BackendRuntime::TransformersCompat,
         RequestedBackend::Vllm => descriptor.runtime == BackendRuntime::Vllm,
+        RequestedBackend::Omlx => descriptor.runtime == BackendRuntime::Omlx,
         RequestedBackend::LlamaLegacy | RequestedBackend::LlamaHighlevel => false,
     }
 }
@@ -570,6 +573,7 @@ fn auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
                 vec![
                     RuntimeId::MlxVlm,
                     RuntimeId::Mlx,
+                    RuntimeId::Omlx,
                     RuntimeId::CandleMetal,
                     RuntimeId::CandleCpu,
                 ]
@@ -626,6 +630,7 @@ fn safetensors_auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
         vec![
             RuntimeId::MlxVlm,
             RuntimeId::Mlx,
+            RuntimeId::Omlx,
             RuntimeId::CandleMetal,
             RuntimeId::CandleCpu,
         ]
@@ -791,7 +796,7 @@ fn is_preferred_route(
         RuntimeId::LlamaServerMetal | RuntimeId::CandleMetal | RuntimeId::MediaCompanionMetal => {
             cfg!(target_os = "macos")
         }
-        RuntimeId::Mlx | RuntimeId::MlxVlm => {
+        RuntimeId::Mlx | RuntimeId::MlxVlm | RuntimeId::Omlx => {
             cfg!(all(target_os = "macos", target_arch = "aarch64"))
         }
         RuntimeId::LlamaServerCuda
@@ -829,7 +834,7 @@ fn rejection_reason(
             "runtime does not match the explicit {requested_backend:?} backend/device binding"
         ));
     }
-    if request_capabilities.tool_calling && descriptor.runtime != BackendRuntime::Vllm {
+    if request_capabilities.tool_calling && !descriptor.supports_native_tool_calling() {
         return Some("runtime does not support OpenAI tool calling".to_string());
     }
     if let Some(task) = request_capabilities.task {
@@ -1034,6 +1039,10 @@ fn selection_reason(
             "MLX VLM runtime selected for compatible model".to_string()
         }
         (_, BackendRuntime::Mlx, _) => "MLX runtime selected for compatible model".to_string(),
+        (_, BackendRuntime::Omlx, RequestedBackend::Omlx) => {
+            "explicit oMLX runtime selected for compatible model".to_string()
+        }
+        (_, BackendRuntime::Omlx, _) => "oMLX runtime selected for compatible model".to_string(),
         (_, _, RequestedBackend::Cpu) => "best CPU runtime for this model".to_string(),
         (_, _, RequestedBackend::Cuda) => "best CUDA runtime for this model".to_string(),
         (_, _, RequestedBackend::Rocm) => "best ROCm runtime for this model".to_string(),
@@ -1270,6 +1279,208 @@ mod tests {
         assert_eq!(selected.reason, "MLX model uses mlx-lm");
         assert!(selected.fallback_chain.is_empty());
         assert!(selected.fallback_note().is_none());
+    }
+
+    #[test]
+    fn installed_omlx_does_not_displace_compatible_mlx() {
+        // Explicit candidate injection exercises Apple routing on Linux CI too.
+        // Availability fixtures represent model-specific probes, not inference.
+        for manifest in [
+            manifest(ModelFormat::Mlx, Some("llama")),
+            manifest(ModelFormat::SafeTensors, Some("gpt_oss")),
+            deepseek_fixture(),
+        ] {
+            let mut candidates = [RuntimeId::Omlx, RuntimeId::Mlx];
+            candidates.sort_by_key(|id| std::cmp::Reverse(runtime_descriptor(*id).priority));
+            let selected = select_runtime_from_candidates(
+                &manifest,
+                RequestedBackend::Auto,
+                RequestCapabilities::text(true),
+                &[available(RuntimeId::Omlx), available(RuntimeId::Mlx)],
+                &candidates,
+            )
+            .unwrap();
+            assert_eq!(selected.runtime_id, RuntimeId::Mlx);
+            assert!(selected.rejection_reasons.is_empty());
+            assert!(selected.fallback_note().is_none());
+        }
+    }
+
+    #[test]
+    fn compatible_omlx_handles_deepseek_after_mlx_probe_rejection() {
+        let manifest = deepseek_fixture();
+        let selected = select_runtime_from_candidates(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &[unsupported_deepseek_mlx(), available(RuntimeId::Omlx)],
+            &[RuntimeId::Mlx, RuntimeId::Omlx, RuntimeId::CandleCpu],
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::Omlx);
+        assert_eq!(selected.rejection_reasons.len(), 1);
+        assert!(selected.rejection_reasons[0].reason.contains("deepseek_v4"));
+        // The real logger suppresses Apple-only preferred routes on other hosts.
+        // Exercise its same decision reducer with the Apple host eligibility.
+        let selected = plan_from_decisions(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            [
+                (selected.rejection_reasons[0].clone(), true),
+                (
+                    candidate_decision(
+                        &manifest,
+                        RequestedBackend::Auto,
+                        RequestCapabilities::text(true),
+                        RuntimeId::Omlx,
+                        Some(&available(RuntimeId::Omlx)),
+                    ),
+                    true,
+                ),
+            ],
+        )
+        .selected
+        .unwrap();
+        let note = selected.fallback_note().unwrap();
+        assert!(note.contains("deepseek_v4"));
+        assert!(note.contains("compatible fallback oMLX"));
+    }
+
+    #[test]
+    fn missing_or_incompatible_omlx_preserves_each_probe_failure() {
+        let manifest = deepseek_fixture();
+        for reason in [
+            "oMLX executable is missing",
+            "oMLX MXFP8 support is unverified",
+        ] {
+            let error = select_runtime_from_candidates(
+                &manifest,
+                RequestedBackend::Auto,
+                RequestCapabilities::text(true),
+                &[
+                    unsupported_deepseek_mlx(),
+                    RuntimeAvailability {
+                        runtime_id: RuntimeId::Omlx,
+                        available: false,
+                        reason: Some(reason.into()),
+                    },
+                    available(RuntimeId::CandleCpu),
+                ],
+                &[RuntimeId::Mlx, RuntimeId::Omlx, RuntimeId::CandleCpu],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(reason));
+            assert!(error.to_string().contains("deepseek_v4"));
+            assert_eq!(error.decisions.len(), 3);
+        }
+    }
+
+    #[test]
+    fn explicit_omlx_is_bound_and_does_not_change_explicit_mlx() {
+        let manifest = deepseek_fixture();
+        let both = [available(RuntimeId::Mlx), available(RuntimeId::Omlx)];
+        for (requested, expected) in [
+            (RequestedBackend::Mlx, RuntimeId::Mlx),
+            (RequestedBackend::Omlx, RuntimeId::Omlx),
+        ] {
+            let selected =
+                select_runtime(&manifest, requested, RequestCapabilities::text(true), &both)
+                    .unwrap();
+            assert_eq!(selected.runtime_id, expected);
+            assert!(selected.fallback_note().is_none());
+        }
+        let error = select_runtime(
+            &manifest,
+            RequestedBackend::Omlx,
+            RequestCapabilities::text(true),
+            &[available(RuntimeId::Mlx)],
+        )
+        .unwrap_err();
+        assert_eq!(error.decisions.len(), 1);
+        assert_eq!(error.decisions[0].runtime_id, RuntimeId::Omlx);
+    }
+
+    #[test]
+    fn omlx_respects_devices_formats_modalities_and_model_tool_probe() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("llama"));
+        for requested in [
+            RequestedBackend::Cpu,
+            RequestedBackend::Cuda,
+            RequestedBackend::Rocm,
+            RequestedBackend::Metal,
+        ] {
+            let error = select_runtime_from_candidates(
+                &manifest,
+                requested,
+                RequestCapabilities::text(true),
+                &[available(RuntimeId::Omlx)],
+                &[RuntimeId::Omlx],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("backend/device binding"));
+        }
+        let tool_request = RequestCapabilities::text(true).with_tool_calling(true);
+        let selected = select_runtime(
+            &manifest,
+            RequestedBackend::Omlx,
+            tool_request,
+            &[available(RuntimeId::Omlx)],
+        )
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::Omlx);
+        let error = select_runtime(
+            &manifest,
+            RequestedBackend::Omlx,
+            tool_request,
+            &[RuntimeAvailability {
+                runtime_id: RuntimeId::Omlx,
+                available: false,
+                reason: Some("installed oMLX has no verified tool parser for this model".into()),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("verified tool parser"));
+        for request in [
+            RequestCapabilities::text_with_images(true, true),
+            RequestCapabilities::for_task(InferenceTask::TextEmbedding),
+        ] {
+            assert!(
+                select_runtime(
+                    &manifest,
+                    RequestedBackend::Omlx,
+                    request,
+                    &[available(RuntimeId::Omlx)]
+                )
+                .is_err()
+            );
+        }
+        let mut gguf = manifest.clone();
+        gguf.format = ModelFormat::Gguf;
+        assert!(
+            select_runtime(
+                &gguf,
+                RequestedBackend::Omlx,
+                RequestCapabilities::text(true),
+                &[available(RuntimeId::Omlx)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn auto_omlx_membership_is_limited_to_apple_text_routes() {
+        for format in [ModelFormat::Mlx, ModelFormat::SafeTensors] {
+            let manifest = manifest(format, Some("llama"));
+            let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Auto);
+            assert_eq!(
+                candidates.contains(&RuntimeId::Omlx),
+                cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            );
+            if let Some(omlx) = candidates.iter().position(|id| *id == RuntimeId::Omlx) {
+                assert_eq!(candidates[omlx - 1], RuntimeId::Mlx);
+            }
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
 };
 use tokio_stream::StreamExt;
@@ -39,7 +39,7 @@ use crate::{
         ChatGenerationSession, GenerateRequest, GenerateStreamEvent, GenerationBackend,
         GenerationTimings, LlamaCppBackend, LlamaCppMode, LlamaFastBackend, LlamaFastRuntimeReport,
         LlamaKvCacheType, LlamaRuntimeOptions, LlamaServerBackend, LlamaServerDiscovery,
-        LlamaServerInstallOptions, MlxBackend, MlxVlmBackend, OnnxProvisionOptions,
+        LlamaServerInstallOptions, MlxBackend, MlxVlmBackend, OmlxBackend, OnnxProvisionOptions,
         OnnxRuntimeAvailability, OnnxRuntimeBackend, OnnxRuntimeMode, RuntimeId, StreamGranularity,
         TransformersCompatBackend, VllmBackend, backend_doctor_checks,
         backend_supports_accelerator, backend_supports_format,
@@ -130,7 +130,7 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value_t = BackendArg::Auto,
-        help = "Backend for this process: auto, cpu, cuda, rocm, vulkan, metal, mlx, onnx, transformers, vllm, candle, llama-highlevel, or llama-legacy"
+        help = "Backend for this process: auto, cpu, cuda, rocm, vulkan, metal, mlx, omlx, onnx, transformers, vllm, candle, llama-highlevel, or llama-legacy"
     )]
     pub backend: BackendArg,
 
@@ -228,6 +228,7 @@ pub enum BackendArg {
     LlamaLegacy,
     Metal,
     Mlx,
+    Omlx,
     Onnx,
     Rocm,
     Transformers,
@@ -1433,12 +1434,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &selected_route,
                 debug,
             );
-            let backend = build_concrete_backend(
-                store,
-                selected_backend,
-                llama_options.clone(),
-                selection_options,
-            )?;
+            let backend = selected_route.build(store, llama_options.clone(), selection_options)?;
             let messages = vec![vision_user_message(&prompt, &images)];
             let prompt = prompt_for_backend(&manifest, &messages, selected_backend, chat_template);
             let prompt_diagnostics = prompt_diagnostics(&prompt, messages.len(), None);
@@ -1521,12 +1517,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &selected_route,
                 debug,
             );
-            let backend = build_concrete_backend(
-                store,
-                selected_backend,
-                llama_options.clone(),
-                selection_options,
-            )?;
+            let backend = selected_route.build(store, llama_options.clone(), selection_options)?;
             let chat_context_size =
                 chat_context_size(selected_backend, &manifest, llama_options.ctx_size);
             chat_loop(
@@ -3258,6 +3249,9 @@ fn media_routing(
     backend: BackendArg,
     device: Option<DeviceArg>,
 ) -> Result<RoutingOverrides> {
+    if backend == BackendArg::Omlx {
+        bail!("oMLX supports text generation only; --backend omlx cannot execute media tasks");
+    }
     let backend_accelerator = match backend {
         BackendArg::Cpu => Some("cpu"),
         BackendArg::Cuda => Some("cuda"),
@@ -4124,6 +4118,58 @@ fn print_inference_doctor(
         let selected_task = task
             .or_else(|| manifest.metadata.tasks.first().copied())
             .ok_or_else(|| anyhow!("model '{model}' does not declare an inference task"))?;
+        if selected_task == InferenceTask::TextGeneration {
+            let requested = match runtime {
+                Some(runtime) => runtime_registry()
+                    .iter()
+                    .filter_map(|descriptor| runtime_id_to_backend(descriptor.id))
+                    .find(|choice| {
+                        backend_label(*choice).eq_ignore_ascii_case(runtime)
+                            || verbose_backend_label(*choice).eq_ignore_ascii_case(runtime)
+                    })
+                    .or_else(|| {
+                        BackendArg::from_str(runtime, true)
+                            .ok()
+                            .map(backend_arg_to_choice)
+                    })
+                    .ok_or_else(|| anyhow!("unknown text runtime '{runtime}'"))?,
+                None => resolve_backend(backend, device)?,
+            };
+            match routed_backend_for_request_with_tools(
+                store,
+                requested,
+                &manifest,
+                false,
+                false,
+                SelectionOptions::default(),
+            ) {
+                Ok(route) => {
+                    println!(
+                        "Model {}: task={}, runtime={}",
+                        manifest.id,
+                        selected_task,
+                        verbose_backend_label(route.choice)
+                    );
+                    if let Some(selection) = &route.selection {
+                        for rejection in &selection.rejection_reasons {
+                            println!(
+                                "  {:<24} rejected: {}",
+                                rejection.display_name, rejection.reason
+                            );
+                        }
+                        println!(
+                            "  {:<24} selected: {}",
+                            selection.display_name, selection.reason
+                        );
+                    }
+                    if let Some(note) = route.fallback_note() {
+                        eprintln!("{note}");
+                    }
+                }
+                Err(error) => println!("Model {}: diagnostic warning: {error:#}", manifest.id),
+            }
+            return Ok(());
+        }
         let mut request = workload_estimate_request(
             manifest.id.clone(),
             selected_task,
@@ -6832,6 +6878,7 @@ fn chat_template_default_source(
         }
         BackendChoice::Mlx
         | BackendChoice::MlxVlm
+        | BackendChoice::Omlx
         | BackendChoice::TransformersCompat
         | BackendChoice::Vllm
         | BackendChoice::VllmRocm => ChatTemplateSource::Model,
@@ -6847,7 +6894,10 @@ fn chat_template_model_preferred(manifest: &ModelManifest, backend: BackendChoic
                 | BackendChoice::LlamaFast(_)
                 | BackendChoice::LlamaHighlevel(_)
         ) && manifest.format == ModelFormat::Gguf
-        || matches!(backend, BackendChoice::Vllm | BackendChoice::VllmRocm)
+        || matches!(
+            backend,
+            BackendChoice::Vllm | BackendChoice::VllmRocm | BackendChoice::Omlx
+        )
 }
 
 fn prompt_diagnostics(
@@ -7307,6 +7357,10 @@ fn print_backend_list(store: &ModelStore) {
     );
 
     println!();
+    println!("oMLX discovery (model compatibility is checked per request)");
+    print_omlx_discovery();
+
+    println!();
     println!(
         "{:<24} {:<12} {:<12} {:<8} INSTALL",
         "RUNTIME", "STATE", "ACCEL", "VLM"
@@ -7490,6 +7544,7 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
     }
     println!();
     println!("{:<24} {:<12} DETAIL", "RUNTIME", "STATUS");
+    print_omlx_discovery();
     #[cfg(feature = "burn-experimental")]
     for mode in [BurnMode::Cuda, BurnMode::Cpu] {
         let status = BurnBackend::runtime_status(mode);
@@ -7538,6 +7593,14 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
             print_onnxruntime_debug_details(store, mode);
         }
     }
+}
+
+fn print_omlx_discovery() {
+    let (status, detail) = match OmlxBackend::probe() {
+        Ok(detail) => ("installed", detail),
+        Err(error) => ("unavailable", compact_reason(&format!("{error:#}"))),
+    };
+    println!("{:<24} {:<12} {}", "oMLX", status, detail);
 }
 
 fn compiled_runtime_summary() -> String {
@@ -7755,16 +7818,70 @@ enum BackendChoice {
     Burn(BurnMode),
     Mlx,
     MlxVlm,
+    Omlx,
     OnnxRuntime(OnnxRuntimeMode),
     TransformersCompat,
     Vllm,
     VllmRocm,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RoutedBackend {
     choice: BackendChoice,
     selection: Option<SelectedRuntime>,
+    omlx: Option<Arc<OmlxBackend>>,
+}
+
+impl std::fmt::Debug for RoutedBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RoutedBackend")
+            .field("choice", &self.choice)
+            .field("selection", &self.selection)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Share configuration-identical instances while their CLI/server owner lives.
+/// Weak entries cannot keep child processes alive after that owner shuts down.
+fn configured_omlx_backend(store: &ModelStore) -> Result<Arc<OmlxBackend>> {
+    type Cache = HashMap<(PathBuf, String), Weak<OmlxBackend>>;
+    static BACKENDS: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let discovered = OmlxBackend::new(store.clone());
+    let key = (store.home().to_path_buf(), discovered.cache_identity());
+    let mut backends = BACKENDS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| anyhow!("oMLX backend cache mutex poisoned"))?;
+    if let Some(backend) = backends.get(&key).and_then(Weak::upgrade) {
+        return Ok(backend);
+    }
+    backends.retain(|_, backend| backend.strong_count() > 0);
+    if backends.len() >= 256 {
+        backends.clear();
+    }
+    let backend = Arc::new(discovered);
+    backends.insert(key, Arc::downgrade(&backend));
+    Ok(backend)
+}
+
+fn retain_omlx_backend(
+    backends: &Mutex<Vec<Arc<OmlxBackend>>>,
+    selected: Arc<OmlxBackend>,
+) -> Result<Arc<dyn GenerationBackend>> {
+    let mut backends = backends
+        .lock()
+        .map_err(|_| anyhow!("oMLX route cache mutex poisoned"))?;
+    if !backends
+        .iter()
+        .any(|backend| Arc::ptr_eq(backend, &selected))
+    {
+        if backends.len() >= 16 {
+            backends.remove(0);
+        }
+        backends.push(selected.clone());
+    }
+    Ok(selected)
 }
 
 impl RoutedBackend {
@@ -7779,7 +7896,27 @@ impl RoutedBackend {
         Ok(Self {
             choice,
             selection: Some(selection),
+            omlx: None,
         })
+    }
+
+    fn with_omlx(mut self, backend: Option<Arc<OmlxBackend>>) -> Self {
+        if matches!(self.choice, BackendChoice::Omlx) {
+            self.omlx = backend;
+        }
+        self
+    }
+
+    fn build(
+        &self,
+        store: ModelStore,
+        runtime_options: LlamaRuntimeOptions,
+        selection_options: SelectionOptions,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        if let Some(backend) = &self.omlx {
+            return Ok(backend.clone());
+        }
+        build_concrete_backend(store, self.choice, runtime_options, selection_options)
     }
 
     fn fallback_note(&self) -> Option<String> {
@@ -7861,6 +7998,7 @@ struct AutoBackend {
     runtime_options: LlamaRuntimeOptions,
     selection_options: SelectionOptions,
     backends: Mutex<HashMap<&'static str, Arc<dyn GenerationBackend>>>,
+    omlx_backends: Mutex<Vec<Arc<OmlxBackend>>>,
 }
 
 struct GgufPreferredBackend {
@@ -7870,6 +8008,7 @@ struct GgufPreferredBackend {
     runtime_options: LlamaRuntimeOptions,
     selection_options: SelectionOptions,
     backends: Mutex<HashMap<&'static str, Arc<dyn GenerationBackend>>>,
+    omlx_backends: Mutex<Vec<Arc<OmlxBackend>>>,
 }
 
 struct MlxPreferredBackend {
@@ -7897,6 +8036,7 @@ impl AutoBackend {
             runtime_options,
             selection_options,
             backends: Mutex::new(HashMap::new()),
+            omlx_backends: Mutex::new(Vec::new()),
         }
     }
 
@@ -7943,6 +8083,9 @@ impl AutoBackend {
         )?;
         if report {
             selected.report();
+        }
+        if let Some(backend) = selected.omlx {
+            return retain_omlx_backend(&self.omlx_backends, backend);
         }
         self.cached_backend(selected.choice)
     }
@@ -8069,6 +8212,7 @@ impl GgufPreferredBackend {
             runtime_options,
             selection_options,
             backends: Mutex::new(HashMap::new()),
+            omlx_backends: Mutex::new(Vec::new()),
         }
     }
 
@@ -8121,6 +8265,9 @@ impl GgufPreferredBackend {
         )?;
         if report {
             selected.report();
+        }
+        if let Some(backend) = selected.omlx {
+            return retain_omlx_backend(&self.omlx_backends, backend);
         }
         self.cached_backend(selected.choice)
     }
@@ -8411,6 +8558,7 @@ impl VllmPreferredBackend {
             return Ok(RoutedBackend {
                 choice: select(has_images),
                 selection: None,
+                omlx: None,
             });
         }
 
@@ -8560,6 +8708,7 @@ fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
             candle: CandleDeviceMode::Metal,
         },
         BackendArg::Mlx => BackendChoice::Mlx,
+        BackendArg::Omlx => BackendChoice::Omlx,
         BackendArg::Onnx => BackendChoice::OnnxRuntime(preferred_onnx_mode()),
         BackendArg::Rocm => BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Rocm,
@@ -8668,6 +8817,7 @@ fn build_concrete_backend(
         BackendChoice::Burn(mode) => Ok(Arc::new(BurnBackend::new(store, mode))),
         BackendChoice::Mlx => Ok(Arc::new(MlxBackend::new(store))),
         BackendChoice::MlxVlm => Ok(Arc::new(MlxVlmBackend::new(store))),
+        BackendChoice::Omlx => Ok(configured_omlx_backend(&store)?),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
         BackendChoice::TransformersCompat => Ok(Arc::new(TransformersCompatBackend::new(store))),
         BackendChoice::Vllm => Ok(Arc::new(
@@ -8709,6 +8859,7 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::CandleCpu => Some(BackendChoice::Candle(CandleDeviceMode::Cpu)),
         RuntimeId::Mlx => Some(BackendChoice::Mlx),
         RuntimeId::MlxVlm => Some(BackendChoice::MlxVlm),
+        RuntimeId::Omlx => Some(BackendChoice::Omlx),
         RuntimeId::OnnxRuntimeCuda => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda)),
         RuntimeId::OnnxRuntimeRocm => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm)),
         RuntimeId::OnnxRuntimeCpu => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu)),
@@ -8748,6 +8899,7 @@ fn backend_to_runtime_id(backend: BackendChoice) -> Option<RuntimeId> {
         | BackendChoice::Candle(CandleDeviceMode::Auto) => Some(RuntimeId::CandleCpu),
         BackendChoice::Mlx => Some(RuntimeId::Mlx),
         BackendChoice::MlxVlm => Some(RuntimeId::MlxVlm),
+        BackendChoice::Omlx => Some(RuntimeId::Omlx),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => Some(RuntimeId::OnnxRuntimeCuda),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => Some(RuntimeId::OnnxRuntimeRocm),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => Some(RuntimeId::OnnxRuntimeCpu),
@@ -8778,6 +8930,10 @@ fn select_backend_from_runtime_candidates(
     capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
 ) -> Result<RoutedBackend> {
+    let omlx = candidates
+        .contains(&RuntimeId::Omlx)
+        .then(|| configured_omlx_backend(store))
+        .transpose()?;
     let availability = candidates
         .iter()
         .copied()
@@ -8793,6 +8949,7 @@ fn select_backend_from_runtime_candidates(
                                 manifest,
                                 capabilities,
                                 selection_options,
+                                omlx.as_deref(),
                             )
                         })
                         .unwrap_or_else(|| {
@@ -8814,7 +8971,7 @@ fn select_backend_from_runtime_candidates(
         candidates,
     )
     .map_err(|err| anyhow!("{}", format_runtime_plan_error(manifest, &err)))?;
-    RoutedBackend::from_selection(selected, requested)
+    RoutedBackend::from_selection(selected, requested).map(|route| route.with_omlx(omlx))
 }
 
 fn backend_supports_manifest(backend: BackendChoice, manifest: &ModelManifest) -> bool {
@@ -8848,6 +9005,7 @@ fn backend_runtime(backend: BackendChoice) -> BackendRuntime {
         BackendChoice::LlamaHighlevel(_) => BackendRuntime::LlamaHighlevel,
         BackendChoice::Mlx => BackendRuntime::Mlx,
         BackendChoice::MlxVlm => BackendRuntime::MlxVlm,
+        BackendChoice::Omlx => BackendRuntime::Omlx,
         BackendChoice::OnnxRuntime(_) => BackendRuntime::OnnxRuntime,
         BackendChoice::TransformersCompat => BackendRuntime::TransformersCompat,
         BackendChoice::Vllm | BackendChoice::VllmRocm => BackendRuntime::Vllm,
@@ -8880,7 +9038,7 @@ fn backend_accelerator(backend: BackendChoice) -> BackendAccelerator {
         | BackendChoice::LlamaServer(LlamaCppMode::Metal)
         | BackendChoice::LlamaFast(LlamaCppMode::Metal)
         | BackendChoice::LlamaHighlevel(LlamaCppMode::Metal) => BackendAccelerator::Metal,
-        BackendChoice::Mlx | BackendChoice::MlxVlm => BackendAccelerator::Mlx,
+        BackendChoice::Mlx | BackendChoice::MlxVlm | BackendChoice::Omlx => BackendAccelerator::Mlx,
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => BackendAccelerator::Cuda,
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => BackendAccelerator::Cpu,
         BackendChoice::TransformersCompat => BackendAccelerator::Auto,
@@ -8923,6 +9081,10 @@ fn backend_unavailability_reason(
         }
         BackendChoice::Mlx => MlxBackend::new(store.clone())
             .probe_model(manifest)
+            .err()
+            .map(|error| compact_reason(&format!("{error:#}"))),
+        BackendChoice::Omlx => configured_omlx_backend(store)
+            .and_then(|backend| backend.probe_model(manifest))
             .err()
             .map(|error| compact_reason(&format!("{error:#}"))),
         BackendChoice::MlxVlm => MlxVlmBackend::probe().err().map(|_| {
@@ -9161,6 +9323,7 @@ fn routed_backend_for_request_with_tools(
         | BackendChoice::Burn(_)
         | BackendChoice::Mlx
         | BackendChoice::MlxVlm
+        | BackendChoice::Omlx
         | BackendChoice::OnnxRuntime(_)
         | BackendChoice::TransformersCompat
         | BackendChoice::VllmRocm => {
@@ -9200,6 +9363,7 @@ fn routed_backend_for_request_with_tools(
             Ok(RoutedBackend {
                 choice: backend,
                 selection: None,
+                omlx: None,
             })
         }
     }
@@ -9213,28 +9377,34 @@ fn select_backend_with_planner(
     selection_options: SelectionOptions,
 ) -> Result<RoutedBackend> {
     let requested = requested_backend_for_choice(backend);
-    let availability = runtime_availabilities_for_request(
+    let omlx = runtime_candidate_ids_for_selection(store, manifest, requested)
+        .contains(&RuntimeId::Omlx)
+        .then(|| configured_omlx_backend(store))
+        .transpose()?;
+    let availability = runtime_availabilities_for_request_with_omlx(
         store,
         manifest,
         requested,
         capabilities,
         selection_options,
+        omlx.as_deref(),
     );
     let selected = select_runtime(manifest, requested, capabilities, &availability)
         .map_err(|err| anyhow!("{}", format_runtime_plan_error(manifest, &err)))?;
-    RoutedBackend::from_selection(selected, requested)
+    RoutedBackend::from_selection(selected, requested).map(|route| route.with_omlx(omlx))
 }
 
 fn compact_reason(reason: &str) -> String {
     reason.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn runtime_availabilities_for_request(
+fn runtime_availabilities_for_request_with_omlx(
     store: &ModelStore,
     manifest: &ModelManifest,
     requested: RequestedBackend,
     capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
+    omlx: Option<&OmlxBackend>,
 ) -> Vec<RuntimeAvailability> {
     runtime_candidate_ids_for_selection(store, manifest, requested)
         .into_iter()
@@ -9256,6 +9426,7 @@ fn runtime_availabilities_for_request(
                     manifest,
                     capabilities,
                     selection_options,
+                    omlx,
                 );
                 RuntimeAvailability {
                     runtime_id,
@@ -9364,8 +9535,16 @@ fn runtime_unavailability_reason(
     manifest: &ModelManifest,
     capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
+    omlx: Option<&OmlxBackend>,
 ) -> Option<String> {
     match runtime_id {
+        RuntimeId::Omlx => match omlx {
+            Some(backend) => omlx_unavailability_reason(backend, manifest, capabilities),
+            None => match configured_omlx_backend(store) {
+                Ok(backend) => omlx_unavailability_reason(&backend, manifest, capabilities),
+                Err(error) => Some(compact_reason(&format!("{error:#}"))),
+            },
+        },
         RuntimeId::VllmCuda => vllm_probe_unavailability_reason(VllmBackend::probe(store)),
         RuntimeId::VllmRocm => vllm_probe_unavailability_reason(VllmBackend::probe_rocm(store)),
         _ => backend_unavailability_reason_for_request(
@@ -9376,6 +9555,27 @@ fn runtime_unavailability_reason(
             selection_options,
         ),
     }
+}
+
+fn omlx_unavailability_reason(
+    backend: &OmlxBackend,
+    manifest: &ModelManifest,
+    capabilities: RequestCapabilities,
+) -> Option<String> {
+    let probe = if capabilities.tool_calling {
+        backend.probe_tool_calling(manifest).and_then(|supported| {
+            if supported {
+                Ok(())
+            } else {
+                bail!("oMLX has no verified native tool parser for this model")
+            }
+        })
+    } else {
+        backend.probe_model(manifest)
+    };
+    probe
+        .err()
+        .map(|error| compact_reason(&format!("{error:#}")))
 }
 
 fn vllm_probe_unavailability_reason(probe: Result<String>) -> Option<String> {
@@ -9416,6 +9616,7 @@ fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
         BackendChoice::Burn(_) => RequestedBackend::Burn,
         BackendChoice::Candle(_) => RequestedBackend::Candle,
         BackendChoice::Mlx | BackendChoice::MlxVlm => RequestedBackend::Mlx,
+        BackendChoice::Omlx => RequestedBackend::Omlx,
         BackendChoice::TransformersCompat => RequestedBackend::Transformers,
         BackendChoice::Vllm => RequestedBackend::Vllm,
         BackendChoice::VllmRocm => RequestedBackend::Rocm,
@@ -9487,6 +9688,7 @@ fn unavailable_backend_message(
             VllmBackend::rocm_unavailable_reason(store)
         }
         (BackendChoice::Mlx, _) => "mlx-lm is unavailable".to_string(),
+        (BackendChoice::Omlx, _) => "oMLX is unavailable; inspect the configured oMLX runtime with werk doctor".to_string(),
         (BackendChoice::MlxVlm, _) => {
             "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
         }
@@ -9701,6 +9903,7 @@ fn requested_backend_label(backend: BackendArg) -> &'static str {
         BackendArg::LlamaLegacy => "llama-legacy",
         BackendArg::Metal => "metal",
         BackendArg::Mlx => "mlx",
+        BackendArg::Omlx => "omlx",
         BackendArg::Onnx => "onnx",
         BackendArg::Rocm => "rocm",
         BackendArg::Transformers => "transformers",
@@ -9795,6 +9998,7 @@ fn backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Metal) => "metal",
         BackendChoice::Mlx => "mlx",
         BackendChoice::MlxVlm => "mlx-vlm",
+        BackendChoice::Omlx => "omlx",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => "onnxruntime-cuda",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => "onnxruntime-rocm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => "onnxruntime-cpu",
@@ -9846,6 +10050,7 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Metal) => "Candle Metal",
         BackendChoice::Mlx => "MLX",
         BackendChoice::MlxVlm => "MLX-VLM",
+        BackendChoice::Omlx => "oMLX",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => "ONNX Runtime CUDA",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => "ONNX Runtime ROCm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => "ONNX Runtime CPU",
@@ -12591,6 +12796,95 @@ mod tests {
         )
         .unwrap();
         RoutedBackend::from_selection(selected, RequestedBackend::Cuda).unwrap()
+    }
+
+    #[test]
+    fn explicit_omlx_backend_parses_as_a_hard_binding() {
+        let cli = Cli::try_parse_from(["werk", "--backend", "omlx", "chat", "tiny"]).unwrap();
+        assert_eq!(cli.backend, BackendArg::Omlx);
+        let choice = resolve_backend(cli.backend, None).unwrap();
+        assert!(matches!(choice, BackendChoice::Omlx));
+        assert_eq!(requested_backend_for_choice(choice), RequestedBackend::Omlx);
+        assert!(resolve_backend(cli.backend, Some(DeviceArg::Cpu)).is_err());
+        assert!(!SelectionOptions::from_cli(cli.backend, false, false).provision_missing_backends);
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let error =
+            selected_backend_for_manifest(&test_store("omlx-hard-binding"), choice, &manifest)
+                .unwrap_err();
+        assert!(error.to_string().contains("oMLX"), "{error}");
+        assert!(!error.to_string().contains("llama.cpp"), "{error}");
+    }
+
+    #[test]
+    fn explicit_omlx_backend_rejects_media_instead_of_selecting_a_companion() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "--backend",
+            "omlx",
+            "image",
+            "generate",
+            "flux",
+            "--prompt",
+            "test",
+        ])
+        .unwrap();
+        let Some(Commands::Image {
+            command: ImageCommands::Generate(args),
+        }) = cli.command
+        else {
+            panic!("image generation command expected");
+        };
+        let error = media_routing(&args.routing, cli.backend, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("oMLX supports text generation only")
+        );
+    }
+
+    #[test]
+    fn omlx_route_retains_probed_instance_and_weak_cache_does_not_own_workers() {
+        let store = test_store("omlx-selected-instance");
+        let backend = configured_omlx_backend(&store).unwrap();
+        let repeated = configured_omlx_backend(&store).unwrap();
+        assert!(Arc::ptr_eq(&backend, &repeated));
+        let other_store = test_store("omlx-other-store");
+        let other = configured_omlx_backend(&other_store).unwrap();
+        assert!(!Arc::ptr_eq(&backend, &other));
+        let weak = Arc::downgrade(&backend);
+        let route = RoutedBackend {
+            choice: BackendChoice::Omlx,
+            selection: None,
+            omlx: Some(backend.clone()),
+        };
+        let expected: Arc<dyn GenerationBackend> = backend.clone();
+        // Even passing another store here cannot replace the already-probed route.
+        let executed = route
+            .build(
+                other_store,
+                LlamaRuntimeOptions::default(),
+                SelectionOptions::default(),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&expected, &executed));
+        drop((backend, repeated, route, expected, executed));
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn omlx_server_route_owner_reuses_and_releases_its_configured_backend() {
+        let store = test_store("omlx-server-route-owner");
+        let backend = configured_omlx_backend(&store).unwrap();
+        let weak = Arc::downgrade(&backend);
+        let owner = Mutex::new(Vec::new());
+        let executed = retain_omlx_backend(&owner, backend.clone()).unwrap();
+        drop((backend, executed));
+        let repeated = configured_omlx_backend(&store).unwrap();
+        assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &repeated));
+        let executed = retain_omlx_backend(&owner, repeated.clone()).unwrap();
+        assert_eq!(owner.lock().unwrap().len(), 1);
+        drop((repeated, executed, owner));
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

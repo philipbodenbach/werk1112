@@ -7,6 +7,11 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Added
 
+- Added optional local oMLX text, chat, streaming and native tool-call support
+  through an already installed CLI on Apple Silicon. Compatible MLX-LM keeps
+  priority; model-specific oMLX preflight enables compatible fallbacks and
+  explicit `--backend omlx` selection. Werk reuses owned oMLX processes without
+  installing the runtime, copying weights or exposing named KV-state support.
 - Added the unpublished `n8n-nodes-werk1112` 1.6.0 Beta under `utils/n8n`:
   eight native discovery, text, image, vision, video, audio, jobs and runtime
   nodes; shared credentials, native binary data, combined in-memory

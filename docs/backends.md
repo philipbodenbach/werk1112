@@ -38,6 +38,7 @@ cross-restart restore.
 | In-process Candle, Burn and compiled llama.cpp adapters | Exact model entries remain in Werk-owned process caches where the concrete runtime is available. | Backend-specific; no generic cross-backend KV contract. | No. |
 | Local Werk-started vLLM | The exact vLLM model process is reused. | vLLM-owned APC. `werk serve --persistence` supplies `--enable-prefix-caching` unless explicit `WERK_VLLM_ARGS` wins. | No; Werk cannot name, snapshot, restore, move or prune APC entries. |
 | Remote vLLM | The remote operator owns process and model lifetime. | Opaque to Werk; the OpenAI endpoint does not prove its cache configuration. | No. |
+| Local oMLX | Werk starts an installed oMLX CLI on demand and reuses its exact model/runtime process. | oMLX owns its native caches. | No; native caches do not expose Werk named state, snapshots or restore. |
 | Werk-owned Transformers or ONNX GenAI CPU-fallback worker | Exact model/tokenizer entries use independent bounded LRUs. | Generator, prompt and KV state are request-local. | No. |
 | External ONNX runner, MLX or MLX-VLM command | One process is invoked per request; Werk has no validated resident cache. | No declared cross-request reuse. | No. |
 | Generic media and managed Qwen workers | Separate bounded pipeline/model LRUs remain warm while their workers live. | Not a text KV-state contract. | No; durable media jobs are request/status/result records only. |
@@ -118,9 +119,9 @@ the installed loader as well. Model probe results are not globally cached.
 A model such as `Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX` with
 `model_type=deepseek_v4` and mixed MXFP4/MXFP8 quantization is rejected when the
 selected installed `mlx-lm` cannot resolve that architecture or support that
-layout. This routing fix adds no DeepSeek adapter, inference engine or automatic
-backend download. Regression fixtures simulate compatibility outcomes; they do
-not establish real DeepSeek or oMLX inference support.
+layout. That candidate's rejection does not rule out the separate oMLX runtime
+described below. Regression fixtures simulate compatibility outcomes; they do
+not establish successful inference of the actual DeepSeek checkpoint.
 
 Use diagnostics before a large request:
 
@@ -168,6 +169,81 @@ werk video generate VIDEO_MODEL \
   --precision bf16 \
   --verbose --debug
 ~~~
+
+## Optional local oMLX backend
+
+On Apple Silicon, `auto` considers an installed oMLX after MLX-LM for compatible
+MLX and Hugging Face safetensors text models. A supported MLX-LM model stays on
+MLX-LM. If its actual loader cannot accept a model but oMLX's loader can, Werk
+selects oMLX and reports the MLX-LM rejection and compatible fallback on stderr.
+`--backend omlx` binds execution to oMLX; `--backend mlx` retains its existing
+MLX-LM/MLX-VLM meaning.
+
+~~~bash
+werk --backend auto run MODEL "Hello"
+werk --backend omlx run MODEL "Hello"
+werk --backend omlx serve
+werk backend doctor --debug
+werk doctor --model MODEL --task text-generation --debug
+werk --backend omlx doctor --model MODEL --task text-generation --debug
+~~~
+
+Install the [upstream oMLX CLI](https://github.com/jundot/omlx#install) separately.
+Werk discovers `omlx` on `PATH`, or the exact executable specified by
+`WERK_OMLX_BIN`. The macOS application alone does not install that CLI. Werk
+does not install or upgrade oMLX, change the normal MLX-LM environment, manage a
+system service, or connect to an external oMLX server. `omlx` is not a
+`werk backend install` target, including when automatic provisioning is enabled.
+
+Werk captures the executable and its Python environment together. Recognized
+Python console entry points can be verified; opaque custom wrappers fail with
+an explanation. The same captured installation is used for model preflight and
+execution. The integration is based on upstream v0.6.4 loader and API behavior;
+a package version string alone is not proof of model compatibility.
+
+An independent bounded probe activates installed oMLX pre-load patches, resolves
+the model architecture and validates metadata and quantization support without
+constructing the model, loading weights or executing model-repository Python.
+Mixed MXFP4/MXFP8 layouts are preserved. This matters for DeepSeek V4 because
+oMLX provides architecture and loader patches absent from some vanilla MLX-LM
+installations. Unverifiable loader contracts remain explicit compatibility
+failures. Safetensors headers with raw `F8_E8M0` tensors are rejected because the
+upstream loader can temporarily rewrite those files; use an already converted
+MLX checkpoint. Werk does not convert or modify model files.
+
+Only after selection does Werk start an oMLX child on loopback with a free port,
+the actual local model directory and an isolated `--base-path`. It verifies the
+physical model path advertised by `/v1/models/status`, then loads that exact
+model before generation. Startup and loading share a 900-second default
+deadline; `WERK_OMLX_HEALTH_TIMEOUT_SECONDS` accepts a positive integer override.
+No duplicate weight download or model-directory copy is required. Exact model
+and runtime processes are reused while their backend lives and stopped when
+Werk releases them. Failed startup and load attempts retain their diagnostics.
+
+Text, chat, streaming and native tool calls use `/v1/chat/completions`. Tool
+requests require a verified model parser; the initial verified tool path is
+DeepSeek V4's native DSML parser and template. Other models remain text-only
+until their native tool wiring is verified. The verified oMLX API supports
+omitted, `auto` and `none` tool choice; required/named choices, explicit
+`parallel_tool_calls` and strict function schemas are rejected because their
+constraints are not enforced by that upstream API. Image, embedding and media requests
+are outside this adapter's scope. Separate upstream reasoning fields are not
+rendered as answer text; empty reasoning-only results are errors. Errors after
+text or tool-call fragments have been emitted never trigger another generation.
+oMLX's internal caches do not imply Werk named Prefill, KV snapshot or restore
+support, and `--persistence` does not enable those operations for oMLX.
+
+A successful metadata probe is not a memory-capacity or inference guarantee.
+Validate a small model on the actual Apple Silicon installation first, then
+test a large DeepSeek checkpoint only with sufficient available memory.
+
+Automated coverage uses installed-loader source fixtures, synthetic quantization
+inputs and local mock HTTP workers. It checks routing, read-only preflight,
+process reuse/teardown, tool calls and stream failures. Run it with
+`python -m unittest discover -s src/backend -p 'test_*mlx*.py'` and
+`cargo test --no-default-features`. These simulations passed on Linux/WSL;
+real Apple Silicon inference with a small model and the Vontra checkpoint has
+not been validated in this environment.
 
 ## vLLM launch arguments and tool calling
 
@@ -232,8 +308,9 @@ tool-result messages to vLLM without translating their contents. It likewise
 preserves structured tool calls in normal and streaming responses. Werk does
 not execute tools or select a vLLM tool parser for the operator.
 
-Other production chat adapters explicitly reject a request that requires tool
-calling with HTTP 400 and error code `unsupported_tool_calling`. Automatic
+The optional oMLX adapter also supports verified native tool configurations as
+described above. Adapters without tool support explicitly reject a request
+that requires it with HTTP 400 and error code `unsupported_tool_calling`. Automatic
 routing treats tool calling as a required backend capability and cannot send
 such a request to an incompatible runtime. An explicit `--backend vllm` route
 is strict and never falls back to a non-vLLM backend. Merely setting
@@ -416,6 +493,7 @@ upstream-unconfirmed paths.
 | llama Metal | Rejected | Rejected | Rejected | Rejected | Rejected | Supported build path |
 | local vLLM | Eligible | Operator-provisioned ROCm environment only; generic managed pip install rejected | Native-Linux eligible; ARM64 package/model support remains upstream-dependent | Installer allowed, local execution currently rejected/cautioned | Rejected | Rejected |
 | remote vLLM | Supported | Supported; declare ROCm | Supported | Supported | Supported | Supported |
+| local oMLX | Rejected | Rejected | Rejected | Rejected | Rejected | Installed CLI and model-specific compatibility required; real inference depends on the available memory and upstream runtime |
 | Qwen-TTS | CUDA is the primary documented path; CPU possible | ROCm/model dependent and hardware-unvalidated | Experimental/upstream-dependent | Experimental/upstream-unconfirmed | Experimental/upstream-unconfirmed | CPU/MPS experimental and upstream-unconfirmed |
 | ONNX targets | Requires matching runner bundle | Requires matching ROCm runner bundle | Requires matching Linux aarch64 runner bundle | Requires matching Linux bundle | Requires matching Windows bundle | Requires matching macOS bundle |
 
@@ -560,6 +638,7 @@ Managed installation is optional. Relevant explicit overrides include:
 | llama.cpp | <code>WERK_LLAMA_SERVER_CUDA</code>, <code>WERK_LLAMA_SERVER_ROCM</code>, <code>WERK_LLAMA_SERVER_VULKAN</code>, <code>WERK_LLAMA_SERVER_METAL</code>, <code>WERK_LLAMA_SERVER_CPU</code> |
 | ONNX | <code>WERK_ONNX_RUNTIME_*</code> for execution and <code>WERK_ONNX_RUNTIME_BUNDLE_*</code> for provisioning bundles |
 | vLLM | <code>WERK_VLLM_PYTHON</code>, or remote <code>WERK_VLLM_HOST</code>, <code>WERK_VLLM_PORT</code> and optional <code>WERK_VLLM_MODEL</code> |
+| oMLX | <code>WERK_OMLX_BIN</code> for the installed local CLI; <code>WERK_OMLX_HEALTH_TIMEOUT_SECONDS</code> for startup and loading |
 | Qwen-TTS | <code>WERK_QWEN_TTS_PYTHON</code> |
 | general media companion | <code>WERK_MEDIA_PYTHON</code> or <code>WERK_MEDIA_COMPANION</code> |
 
