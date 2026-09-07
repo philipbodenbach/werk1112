@@ -1,10 +1,9 @@
 # Beta validation scope
 
-Reference checkout: `82629bfc6d1dfc8c8fac2ccba604c987f13059ae`, Werk Core,
-Media Companion and ComfyUI **1.5.1**, with the new n8n package targeting
-**1.6.0**. Existing server routes and component version files are unchanged.
-Server contracts were checked against the actual Rust DTOs/tests and the
-ComfyUI 1.5.1 client, including Werk Protocol **1.0**.
+Release reference: `release/v1-6-0`, with Werk Core, Media Companion,
+ComfyUI and the n8n package at **1.6.0**. Server contracts are based on the
+actual Rust DTOs/tests and ComfyUI client in the repository. Werk Protocol
+remains **1.0**, and all n8n node versions remain **1**.
 
 ## Environment and commands
 
@@ -25,6 +24,7 @@ npm ci
 npm run build
 npm run lint
 npm test
+npm pack --dry-run
 N8N_BIN=/tmp/werk-n8n-host/node_modules/n8n/bin/n8n npm run test:loader
 ```
 
@@ -34,11 +34,22 @@ and lock to npm 11.19.1 produced a successful clean install.
 
 ## Checks
 
+The Werk **1.6.0** release-preparation pass re-ran the package checks with
+Node.js **24.12.0** and npm **11.19.1**:
+
 | Executed check | Result |
 | --- | --- |
 | Clean locked package install (npm 11.19.1) | Passed |
 | Build, ESLint and strict TypeScript | Passed |
 | Package contract/unit/example suite | 89 passed |
+| `npm pack --dry-run` | Passed; complete dist, license, docs and eight example workflows |
+
+The following results were recorded during the earlier integration
+validation. The separate pinned n8n host was absent during release
+preparation, so the real-loader checks were not re-run in this pass:
+
+| Earlier integration check | Recorded result |
+| --- | --- |
 | Real n8n native custom-directory loader | Passed; all 8 Beta IDs and credential |
 | Imported Image → Vision workflow | Passed; real expression, authentication and filesystem binary helpers |
 | Absolute `N8N_CUSTOM_EXTENSIONS` loader | Passed; same node IDs |
@@ -66,8 +77,9 @@ action was triggered as part of the local implementation.
 - **Examples/parity:** every public ComfyUI registration has exactly one table
   row (30); eight workflow files contain no credentials and use real node
   versions, parameter IDs and graph references.
-- **Existing ComfyUI regression:** 190 tests passed; no server modification
-  required an additional Rust test matrix.
+- **Existing ComfyUI regression:** the earlier integration validation
+  recorded 190 passing tests. Repository-wide release checks are separate
+  from this n8n package validation.
 
 The loader smoke is a distinct integration check. It copies only `dist`
 into a newly created temporary `.n8n/custom/werk1112`, starts the actual n8n
@@ -112,5 +124,6 @@ Capability discovery can truthfully report unsupported, unavailable,
 externally managed or metadata-only. The package does not install missing
 adapters or invent a successful execution. See [contract clarifications and
 the text-readiness distinction](comfyui-parity.md#contract-clarifications-checked-in-source).
+The package remains private and manually installed for Werk **1.6.0**.
 No npm publication, Registry submission, cloud verification, Docker image,
-tag, release or component-version synchronization was performed.
+tag or release was performed by these validation commands.

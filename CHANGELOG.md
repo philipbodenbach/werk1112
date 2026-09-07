@@ -5,6 +5,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-07
+
 ### Added
 
 - Added optional local oMLX text, chat, streaming and native tool-call support
@@ -12,12 +14,17 @@ All notable changes to Werk1112 are documented in this file. The project uses
   priority; model-specific oMLX preflight enables compatible fallbacks and
   explicit `--backend omlx` selection. Werk reuses owned oMLX processes without
   installing the runtime, copying weights or exposing named KV-state support.
-- Added the unpublished `n8n-nodes-werk1112` 1.6.0 Beta under `utils/n8n`:
+- Added the `n8n-nodes-werk1112` 1.6.0 Beta under `utils/n8n`:
   eight native discovery, text, image, vision, video, audio, jobs and runtime
   nodes; shared credentials, native binary data, combined in-memory
   prefill/decode, manual custom-directory installation and example workflows.
-  Existing Core, Companion and ComfyUI version files remain at 1.5.1 pending
-  the later 1.6.0 release preparation. See the [n8n guide](utils/n8n/README.md).
+  The package remains private and manually installed. See the
+  [n8n guide](utils/n8n/README.md).
+
+### Changed
+
+- Synchronized Werk Core, Werk Media Companion, the ComfyUI package and the
+  n8n package at `1.6.0`. ComfyUI and n8n retain their Beta status.
 
 ### Fixed
 
@@ -38,8 +45,25 @@ All notable changes to Werk1112 are documented in this file. The project uses
   report compatible fallbacks on stderr without verbose/debug flags, with
   repeated server diagnostics deduplicated. Media runtime retries preserve the
   actual route and failure reasons; streaming text/tool errors do not restart
-  generation. Added simulated DeepSeek metadata and routing regressions without
-  introducing new architecture support or inference engines.
+  generation. Added simulated DeepSeek metadata and routing regressions; the
+  separate oMLX integration supplies DeepSeek V4 support through the installed
+  upstream runtime.
+
+### Compatibility notes
+
+- Werk Protocol remains `1.0`; media protocol, transport, manifest, workflow
+  and persisted-state schema versions are unchanged.
+- oMLX requires an installed compatible CLI on Apple Silicon. Explicit
+  `--backend omlx` still runs model preflight and fails without switching
+  backends. Raw `F8_E8M0` checkpoints are rejected before loading because the
+  upstream loader can rewrite their headers; use an MLX-converted checkpoint.
+- Native oMLX tool calls require verified model-parser wiring. The initial
+  verified path is DeepSeek V4 DSML; required/named tool choices, explicit
+  `parallel_tool_calls` and strict schemas remain unsupported. Model residency
+  does not expose Werk named KV snapshots, Prefill or restore operations.
+- oMLX acceptance tests cover source fixtures and simulated HTTP workers.
+  Real Apple Silicon inference with a small model and the Vontra checkpoint
+  remains unvalidated in the Linux/WSL development environment.
 
 ## [1.5.1] - 2026-09-05
 
@@ -192,7 +216,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/philipbodenbach/werk1112/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/philipbodenbach/werk1112/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/philipbodenbach/werk1112/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/philipbodenbach/werk1112/compare/v1.3.3...v1.4.0

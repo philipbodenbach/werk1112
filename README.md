@@ -10,7 +10,7 @@ Applications use one CLI and HTTP service; Werk resolves models, parameters,
 hardware and installed runtimes, then selects an executable backend.
 
 Werk supports text, image, video and audio workflows without coupling clients
-to llama.cpp, vLLM, Candle, MLX, ONNX Runtime, Diffusers, Transformers or
+to llama.cpp, vLLM, Candle, MLX, oMLX, ONNX Runtime, Diffusers, Transformers or
 architecture-specific companion runtimes.
 
 ## Core capabilities
@@ -21,7 +21,7 @@ architecture-specific companion runtimes.
 - workload estimation, parameter validation and provenance
 - an OpenAI-compatible subset plus Werk-native media and job APIs
 - optional ComfyUI nodes with native IMAGE, VIDEO and AUDIO values
-- unpublished [native n8n nodes (Beta)](utils/n8n/README.md), planned for 1.6.0,
+- optional [native n8n nodes (Beta)](utils/n8n/README.md),
   with manual installation, binary media and runtime operations
 
 Werk is an inference runtime and router, not an agent framework, workflow
@@ -41,32 +41,27 @@ werk doctor --model MODEL --task TASK --debug
 The detailed support levels and known gaps are documented rather than hidden
 behind an “all models supported” claim.
 
-## What’s new in v1.5.1
+## What’s new in v1.6.0
 
-v1.5.1 is a maintenance release that restores macOS builds and uses Darwin
-Mach VM statistics for bounded available-memory telemetry. Werk Core, the
-ComfyUI package and Media Companion remain version-synchronized.
+Werk Core, Media Companion, ComfyUI and the new n8n package now share release
+version **1.6.0**. ComfyUI and n8n remain Beta integrations.
 
-The v1.5 feature set introduced in v1.5.0 extends Werk's routing architecture
-with a backend-aware runtime/control layer:
+- Optional local oMLX on Apple Silicon supports text, chat, streaming and
+  verified native tool calls. Compatible MLX-LM remains preferred; use
+  `--backend omlx` to select oMLX explicitly. Model preflight checks the
+  installed oMLX patches, including DeepSeek V4 support, before loading weights.
+- Eight native n8n nodes cover discovery, inference, jobs and runtime control,
+  with binary media, example workflows and manual custom-directory installation.
+- MLX-LM preflight checks the actual loader, architecture and quantization
+  metadata, including supported MXFP4 layouts. Routing preserves explicit
+  backend/device choices and explains compatible fallbacks.
 
-- runtime-state lifecycle and persistence infrastructure, memory telemetry and
-  pressure-aware runtime management, plus capability-gated state and expert
-  controls that preserve `unsupported` as a valid backend result
-- experimental split prefill/decode primitives for supported runtimes; state
-  restore remains capability-gated and cross-restart restore remains
-  unavailable
-- vLLM tool-call passthrough, hardened `WERK_VLLM_ARGS` handling and delegated
-  native functionality; vLLM continues to own Automatic Prefix Caching and its
-  internal KV cache
-- ten new ComfyUI runtime-control nodes and `werk temp` inspection and cleanup
-  commands
-
-See the [v1.5.1 changelog](CHANGELOG.md#151---2026-09-05),
-[runtime persistence and memory architecture](docs/concepts/runtime-persistence-and-memory.md),
-[vLLM launch and tool-calling guide](docs/backends.md#vllm-launch-arguments-and-tool-calling),
-and [ComfyUI integration](docs/integrations/comfyui.md) for details and backend
-support boundaries.
+See the [v1.6.0 changelog](CHANGELOG.md#160---2026-09-07),
+[oMLX backend guide](docs/backends.md#optional-local-omlx-backend),
+[n8n integration](utils/n8n/README.md) and
+[runtime persistence and memory architecture](docs/concepts/runtime-persistence-and-memory.md)
+for support boundaries. The oMLX tests use source fixtures and mock servers;
+real Apple Silicon and Vontra-checkpoint inference remains to be validated.
 
 ## Install
 

@@ -4,7 +4,7 @@ const { WerkProtocolClient, WerkProtocolError, requireCapability, CAPABILITY_STA
 const { runRuntime, persistencePolicy, runtimeIds } = require('../dist/shared/runtime');
 const { sanitize } = require('../dist/shared/validation');
 
-const info = () => ({ service: 'werk1112', service_version: '1.5.1', protocol: { major: 1, minor: 0 }, active_backend: 'test', limits: { max_page_size: 100, max_state_ids_per_operation: 100, max_expert_ids_per_operation: 256, max_request_bytes: 1048576, max_handoff_bytes: 4096, max_ttl_seconds: 2592000 } });
+const info = () => ({ service: 'werk1112', service_version: '1.6.0', protocol: { major: 1, minor: 0 }, active_backend: 'test', limits: { max_page_size: 100, max_state_ids_per_operation: 100, max_expert_ids_per_operation: 256, max_request_bytes: 1048576, max_handoff_bytes: 4096, max_ttl_seconds: 2592000 } });
 const cap = (id, status = 'supported') => ({ id, status, detail: `Status: ${status}`, operations: ['read'] });
 const caps = () => ({ capabilities: ['runtime.pd.prefill', 'runtime.pd.decode', 'runtime.pd.handoff', 'runtime.experts.residency'].map(id => cap(id)) });
 const state = (id = 'st_one') => ({ id, model_id: 'model', tier: 'ram', status: 'ready', bytes: 100, created_unix_ms: 1, last_accessed_unix_ms: 2, expires_unix_ms: null, pinned: true, backend: 'test', reusable: true });
@@ -46,7 +46,7 @@ const posts = t => t.calls.filter(call => call.method === 'POST');
 test('runtime validates service and protocol versions independently, all six capability statuses and memory', async () => {
   const f = fixture({ '/werk/v1/capabilities': async () => response({ capabilities: CAPABILITY_STATUSES.map((status, i) => cap(`cap_${i}`, status)) }) });
   const result = await run(f);
-  assert.equal(result.info.service_version, '1.5.1');
+  assert.equal(result.info.service_version, '1.6.0');
   assert.deepEqual(result.capabilities.map(c => c.status), [...CAPABILITY_STATUSES]);
   assert.equal((await run(f, { operation: 'memory' })).accelerator.capacity_bytes, null);
   assert.equal((await run(f, { operation: 'memory' })).counters.demotions, 1);

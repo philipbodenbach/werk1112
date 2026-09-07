@@ -117,7 +117,7 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 `HSA_OVERRIDE_GFX_VERSION`; the ROCm stack and binary must support the real
 `gfx1151` target.
 
-## vLLM, ONNX, MLX and Transformers
+## vLLM, ONNX, MLX, oMLX and Transformers
 
 | Variable | Meaning |
 | --- | --- |
@@ -137,10 +137,21 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_ONNX_EXPORTER` | Executable used by `werk artifacts build` before `optimum-cli` or Python module discovery. |
 | `WERK_MLX_PYTHON`, `WERK_MLX_MODULE`, `WERK_MLX_GENERATE` | MLX-LM interpreter, module (default `mlx_lm.generate`), and executable override. An explicit module takes precedence over the executable; an explicit Python alone uses its own default module. Model preflight and generation use the same resolved environment. |
 | `WERK_MLX_VLM_PYTHON`, `WERK_MLX_VLM_MODULE`, `WERK_MLX_VLM_GENERATE` | MLX-VLM equivalents; the default module is `mlx_vlm`. |
+| `WERK_OMLX_BIN` | Installed local oMLX Python CLI launcher on macOS Apple Silicon. Takes precedence over `omlx` on `PATH`; an empty or invalid override fails discovery. Werk uses the launcher's own interpreter for compatibility checks and execution. |
+| `WERK_OMLX_HEALTH_TIMEOUT_SECONDS` | Positive integer timeout shared by oMLX startup, health checks and model loading. Default: `900` seconds; invalid values fail discovery. It does not change the fixed 20-second metadata-probe limit or generation timeouts. |
 | `WERK_TRANSFORMERS_PYTHON` | Python interpreter containing PyTorch and Transformers for the compatibility backend. |
 | `WERK_TRANSFORMERS_DEVICE` | Device override; `auto` chooses CUDA, then MPS, then CPU. |
 | `WERK_TRANSFORMERS_DTYPE` | `auto`, `float32`/`fp32`/`f32`, `bfloat16`/`bf16`, or `float16`/`fp16`/`f16`/`half`. |
 | `WERK_TRANSFORMERS_MODEL_CACHE_SIZE` | Exact model/tokenizer entries retained by the Werk-owned Transformers compatibility worker. Default: `1`; values are clamped to `0..8`; `0` disables model caching without disabling the worker. |
+
+The [local oMLX adapter](../backends.md#optional-local-omlx-backend) captures its
+launcher, Python environment and working directory for both preflight and
+execution. Werk excludes inherited upstream `OMLX_*` settings and supplies an
+isolated base directory, loopback address, free port and private child API key.
+It sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` and
+`PYTHONDONTWRITEBYTECODE=1` for the probe and worker. There is no oMLX remote
+endpoint or extra-launch-arguments override; install the CLI separately and
+select it with `--backend omlx` or compatible automatic routing.
 
 `WERK_VLLM_ARGS` is a list of arguments, not a shell command. Quoting and
 backslash escaping follow POSIX shell-word rules, including quoted empty

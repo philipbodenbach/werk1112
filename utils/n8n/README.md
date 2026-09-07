@@ -1,12 +1,12 @@
 # WERK native n8n nodes (Beta)
 
-`n8n-nodes-werk1112` **1.6.0** is an **unpublished, manually installed Beta**
-feature for the future Werk 1.6.0 release. Werk remains the inference/runtime
+`n8n-nodes-werk1112` **1.6.0** is a **manually installed Beta**
+integration included with Werk **1.6.0**. Werk remains the inference/runtime
 server; n8n owns workflows, item expressions, credentials and binary storage.
 This package does not install Werk, models, backends, Python or media codecs.
 It uses the repository's [Elastic License 2.0](LICENSE).
 
-Core, Media Companion and ComfyUI remain at **1.5.1** in this feature branch.
+Core, Media Companion, ComfyUI and this package share release version **1.6.0**.
 Compatibility is checked through required endpoints and Werk Protocol 1.0,
 not equality with the package version. All internal n8n node versions start at
 **1**; saved node/operation/parameter IDs are stable contracts.
@@ -35,22 +35,23 @@ The supported validation target is **Node.js 24.12.0**, **npm 11.19.1** and
 in `package-lock.json`, including `@n8n/node-cli` **0.46.4**. Other n8n majors
 and node-loading mechanisms require separate validation.
 
-Build from a repository checkout containing this feature using Node.js 24.
-Until the feature branch is shared or merged, use the supplied local checkout;
-the 1.5.1 `main` checkout does not contain this unpublished package. The clone
-and branch-selection commands below apply once that branch is available:
+Build from the Werk **1.6.0** release checkout using Node.js 24. After the
+release tag is available:
 
 ```bash
 npm install --global npm@11.19.1
 git clone https://github.com/philipbodenbach/werk1112.git
 cd werk1112
-git switch feat/n8n-custom-nodes
+git switch --detach v1.6.0
 cd utils/n8n
 npm ci
 npm run build
 npm run lint
 npm test
 ```
+
+During release preparation, use `git switch release/v1-6-0` in place of the
+tag checkout.
 
 The npm version is intentional: npm 11.6.2 rejected its own generated
 dependency lock during a clean install; the pinned newer npm is used for
@@ -349,6 +350,6 @@ the loader smoke. It has read-only repository permissions and no publishing.
 | Runtime capability failure | Inspect exact capability/reason and explicit experimental opt-in. Unsupported or metadata-only is a valid result. |
 | Job wait times out | Use the reported job ID with Get/Wait; increase the job budget independently of HTTP/inference limits. |
 
-Later release preparation must synchronize component versions, review Beta
-status and release notes, and separately approve any publication/tag/release.
-None of those release actions is part of this integration.
+The Werk 1.6.0 release keeps these nodes in Beta with manual installation.
+The package remains private; the release does not publish it to npm or change
+the saved node, operation or parameter IDs.
