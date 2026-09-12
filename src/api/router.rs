@@ -136,6 +136,12 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
 
 pub async fn serve(addr: SocketAddr, state: ApiState) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    serve_with_listener(listener, state).await
+}
+
+/// Serve on a listener reserved before potentially expensive model preparation.
+pub async fn serve_with_listener(listener: TcpListener, state: ApiState) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
     println!("Server running at http://{addr}");
     if state.api_key_auth_enabled() {
         println!(

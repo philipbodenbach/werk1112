@@ -134,3 +134,31 @@ test('text supports ordered messages and structural tools but fixes stream false
 	assert.throws(() => buildTextRequest('text', { message: [{ role: 'tool', content: 'x' }] }), /tool call ID/);
 	assert.throws(() => buildTextRequest('text', { message: [] }), /at least one/);
 });
+
+test('text oMLX controls preserve inheritance, false and zero in the dedicated wire namespace', () => {
+	const messages = { message: [{ role: 'user', content: 'hello' }] };
+	const baseline = buildTextRequest('text', messages);
+	assert.equal(Object.hasOwn(baseline, 'werk'), false);
+	assert.deepEqual(buildTextRequest('text', messages, { omlxThinking: 'inherit', omlxExpertOffload: 'inherit' }), baseline);
+	assert.deepEqual(buildTextRequest('text', messages, { omlxThinking: 'disabled', omlxExpertOffload: 'enabled', omlxExpertCacheMb: 8192 }).werk, { omlx: { thinking: false, expert_cache_mb: 8192 } });
+	assert.deepEqual(buildTextRequest('text', messages, { omlxThinking: 'enabled', omlxExpertOffload: 'disabled' }).werk, { omlx: { thinking: true, expert_cache_mb: 0 } });
+	assert.deepEqual(buildTextRequest('text', messages, { omlxThinking: 'disabled' }).werk, { omlx: { thinking: false } });
+	assert.deepEqual(buildTextRequest('text', messages, { omlxExpertOffload: 'enabled' }).werk, { omlx: { expert_cache_mb: 8192 } });
+	for (const budget of [1, 1048576]) assert.equal(buildTextRequest('text', messages, { omlxExpertOffload: 'enabled', omlxExpertCacheMb: budget }).werk.omlx.expert_cache_mb, budget);
+	// A hidden value retained after toggling offload does not activate it.
+	assert.deepEqual(buildTextRequest('text', messages, { omlxExpertOffload: 'inherit', omlxExpertCacheMb: 128 }), baseline);
+	assert.deepEqual(buildTextRequest('text', messages, { omlxExpertOffload: 'disabled', omlxExpertCacheMb: 128 }).werk, { omlx: { expert_cache_mb: 0 } });
+});
+
+test('text oMLX options reject invalid budgets and choices; vision never accepts these controls', () => {
+	const messages = { message: [{ role: 'user', content: 'hello' }] };
+	for (const budget of [0, -1, 0.5, 1048577, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, true, false, null, '8192', {}, []]) {
+		assert.throws(() => buildTextRequest('text', messages, { omlxExpertOffload: 'enabled', omlxExpertCacheMb: budget }), /oMLX Expert Cache/);
+	}
+	for (const key of ['omlxThinking', 'omlxExpertOffload']) {
+		for (const value of ['', 'true', true, false, 0, null]) assert.throws(() => buildTextRequest('text', messages, { [key]: value }), /oMLX/);
+		assert.throws(() => buildVisionRequest('vision', 'test', '', [png], { [key]: 'enabled' }), /unsupported fields/);
+	}
+	assert.throws(() => buildVisionRequest('vision', 'test', '', [png], { omlxExpertCacheMb: 8192 }), /unsupported fields/);
+	assert.throws(() => buildTextRequest('text', messages, { werk: { omlx: { thinking: false } } }), /unsupported fields/);
+});

@@ -4,6 +4,7 @@ import { api } from "../../scripts/api.js";
 const CONNECTION_CLASS = "WerkConnection";
 const IMAGE_MODELS_CLASS = "WerkImageModels";
 const VISION_MODELS_CLASS = "WerkVisionModels";
+const TEXT_MODELS_CLASS = "WerkTextModels";
 const VIDEO_MODELS_CLASS = "WerkVideoModels";
 const AUDIO_MODELS_CLASS = "WerkAudioModels";
 const STATUS_MARGIN = 4;
@@ -241,6 +242,23 @@ function updateVideoModelsNode(node, discovery) {
     node._werkModelStatus?.setWerkStatus?.(message, values.length ? "success" : "error");
 }
 
+function updateTextModelsNode(node, discovery) {
+    if (!node?._werkModelCombo || !node?._werkModelBacking) return;
+    const requireAvailable = Boolean(widget(node, "require_available")?.value ?? false);
+    const models = discovery?.text_models;
+    const raw = requireAvailable ? models?.available : models?.declared;
+    const values = Array.isArray(raw) ? raw.filter((value) => typeof value === "string") : [];
+    setComboValues(node, node._werkModelCombo, node._werkModelBacking, values);
+    const declared = models?.declared?.length ?? 0;
+    const available = models?.available?.length ?? 0;
+    const message = values.length
+        ? `${available} available · ${declared} declared · text-generation`
+        : requireAvailable && declared
+          ? `No runtime-available text model (${declared} declared)`
+          : "No text-generation model found";
+    node._werkModelStatus?.setWerkStatus?.(message, values.length ? "success" : "error");
+}
+
 function updateAudioModelsNode(node, discovery) {
     if (!node?._werkModelCombo || !node?._werkModelBacking) return;
     const requireAvailable = Boolean(widget(node, "require_available")?.value ?? true);
@@ -268,6 +286,7 @@ function propagateDiscovery(connectionNode, discovery) {
         const className = nodeClass(node);
         if (className === IMAGE_MODELS_CLASS) updateImageModelsNode(node, discovery);
         if (className === VISION_MODELS_CLASS) updateVisionModelsNode(node, discovery);
+        if (className === TEXT_MODELS_CLASS) updateTextModelsNode(node, discovery);
         if (className === VIDEO_MODELS_CLASS) updateVideoModelsNode(node, discovery);
         if (className === AUDIO_MODELS_CLASS) updateAudioModelsNode(node, discovery);
     }
@@ -347,7 +366,7 @@ function installImageModelsUi(nodeType) {
     });
 }
 
-function installVisionModelsUi(nodeType) {
+function installVisionModelsUi(nodeType, updateModels = updateVisionModelsNode) {
     chainLifecycle(nodeType, "onNodeCreated", function () {
         const backing = widget(this, "preferred_model");
         if (!backing) return;
@@ -370,7 +389,7 @@ function installVisionModelsUi(nodeType) {
                 const result = original?.apply(this, args);
                 const connectionNode = linkedConnection(node);
                 if (connectionNode?._werkDiscovery) {
-                    updateVisionModelsNode(node, connectionNode._werkDiscovery);
+                    updateModels(node, connectionNode._werkDiscovery);
                 }
                 return result;
             };
@@ -385,7 +404,7 @@ function installVisionModelsUi(nodeType) {
             button.disabled = true;
             try {
                 const discovery = await verifyConnection(connectionNode);
-                updateVisionModelsNode(this, discovery);
+                updateModels(this, discovery);
                 const refresh = widget(this, "refresh_token");
                 if (refresh) refresh.value = Number(refresh.value ?? 0) + 1;
             } catch (error) {
@@ -399,7 +418,7 @@ function installVisionModelsUi(nodeType) {
     });
     chainLifecycle(nodeType, "onConnectionsChange", function () {
         const connectionNode = linkedConnection(this);
-        if (connectionNode?._werkDiscovery) updateVisionModelsNode(this, connectionNode._werkDiscovery);
+        if (connectionNode?._werkDiscovery) updateModels(this, connectionNode._werkDiscovery);
     });
 }
 
@@ -527,6 +546,7 @@ app.registerExtension({
         if (nodeData.name === CONNECTION_CLASS) installConnectionUi(nodeType);
         if (nodeData.name === IMAGE_MODELS_CLASS) installImageModelsUi(nodeType);
         if (nodeData.name === VISION_MODELS_CLASS) installVisionModelsUi(nodeType);
+        if (nodeData.name === TEXT_MODELS_CLASS) installVisionModelsUi(nodeType, updateTextModelsNode);
         if (nodeData.name === VIDEO_MODELS_CLASS) installVideoModelsUi(nodeType);
         if (nodeData.name === AUDIO_MODELS_CLASS) installAudioModelsUi(nodeType);
     },
@@ -536,6 +556,7 @@ app.registerExtension({
             className === CONNECTION_CLASS
             || className === IMAGE_MODELS_CLASS
             || className === VISION_MODELS_CLASS
+            || className === TEXT_MODELS_CLASS
             || className === VIDEO_MODELS_CLASS
             || className === AUDIO_MODELS_CLASS
         ) {

@@ -4,7 +4,8 @@ import { requireChatModel } from '../../shared/discovery';
 import { chatOutputs } from '../../shared/mediaOutputs';
 import { chatOptionsProperty } from '../../shared/mediaProperties';
 import { buildTextRequest } from '../../shared/mediaRequests';
-import { choice, optionsProperty, stringProperty } from '../../shared/parameters';
+import { choice, optionsProperty, record, stringProperty } from '../../shared/parameters';
+import { WerkProtocolClient } from '../../shared/protocol';
 
 export class WerkText implements INodeType {
 	description = nodeDescription('werkText', 'WERK Text (Beta)', [
@@ -22,6 +23,14 @@ export class WerkText implements INodeType {
 			choice(this.getNodeParameter('operation', index), 'Operation', ['complete']);
 			const request = buildTextRequest(this.getNodeParameter('model', index, undefined, { extractValue: true }), this.getNodeParameter('messages', index), this.getNodeParameter('options', index, {}));
 			await requireChatModel(client, request.model as string);
+			if (request.werk !== undefined) {
+				const requested = Object.keys(record(record(request.werk, 'Werk chat options').omlx, 'oMLX chat options'));
+				const capabilities = await new WerkProtocolClient(client).capabilities();
+				const capability = capabilities.find((entry) => entry.id === 'api.chat.omlx_options');
+				if (capability?.status !== 'supported' || requested.some((option) => !capability.operations.includes(option))) {
+					throw new Error('oMLX request options are unsupported by this Werk server; update and restart Werk before using these options');
+				}
+			}
 			return chatOutputs(index, await client.api('POST', '/v1/chat/completions', request), request, 'text-generation');
 		});
 	}

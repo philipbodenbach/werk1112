@@ -396,6 +396,15 @@ fn capabilities_for_descriptor(
     for capability in descriptor.capabilities {
         capabilities.insert(capability.id.clone(), capability);
     }
+    capabilities.insert(
+        "api.chat.omlx_options".into(),
+        Capability {
+            id: "api.chat.omlx_options".into(),
+            status: CapabilityStatus::Supported,
+            detail: "Chat requests accept werk.omlx.thinking and expert_cache_mb; the selected runtime and model must support oMLX. This does not declare native state persistence.".into(),
+            operations: vec!["thinking".into(), "expert_cache_mb".into()],
+        },
+    );
     let memory = memory_status_for(inner);
     capabilities.insert(
         "runtime.memory.telemetry.host".to_string(),
@@ -2777,7 +2786,10 @@ fn validate_decode(request: &DecodeRequest) -> ProtocolResult<()> {
     Ok(())
 }
 
-fn validate_expert_filter(filter: &ExpertListFilter, max_page_size: u16) -> ProtocolResult<()> {
+pub(crate) fn validate_expert_filter(
+    filter: &ExpertListFilter,
+    max_page_size: u16,
+) -> ProtocolResult<()> {
     if filter.model_id.as_deref().is_some_and(|id| {
         id.trim().is_empty()
             || id.len() > 256
@@ -2804,7 +2816,7 @@ fn validate_expert_filter(filter: &ExpertListFilter, max_page_size: u16) -> Prot
     Ok(())
 }
 
-fn validate_expert_list_response(
+pub(crate) fn validate_expert_list_response(
     response: &ExpertListResponse,
     filter: &ExpertListFilter,
     max_page_size: u16,
@@ -2822,7 +2834,7 @@ fn validate_expert_list_response(
     Ok(())
 }
 
-fn validate_expert_action_response(
+pub(crate) fn validate_expert_action_response(
     response: &ExpertActionResponse,
     request: &ExpertActionRequest,
 ) -> ProtocolResult<()> {

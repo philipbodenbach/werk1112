@@ -27,6 +27,51 @@ spec = importlib.util.spec_from_file_location("werk_omlx_probe", Path(__file__).
 probe_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe_module)
 
+
+class ProbeDependencyInventoryTests(unittest.TestCase):
+    def test_optional_inventory_size_limits_preserve_a_valid_probe(self):
+        for paths in (["/runtime/module.py"] * 8193, ["/" + "a" * (2 * 1024 * 1024)]):
+            result = {"ok": True, "detail": "compatible runtime"}
+            with patch.object(probe_module, "probe_cache_paths", return_value=paths):
+                probe_module.add_probe_cache_paths(result)
+            self.assertEqual(result, {"ok": True, "detail": "compatible runtime"})
+        paths = ["/runtime/" + "module" * 20 + ".py"] * 1000
+        self.assertGreater(len(json.dumps(paths)), 65536)
+        result = {"ok": True}
+        with patch.object(probe_module, "probe_cache_paths", return_value=paths):
+            probe_module.add_probe_cache_paths(result)
+        self.assertEqual(result["cache_paths"], paths)
+        self.assertTrue(result["ok"])
+
+    def test_inventory_tracks_runtime_code_import_paths_and_package_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "sample_runtime"
+            package.mkdir()
+            code = package / "runtime.py"
+            code.write_text("runtime = True\n")
+            hook = root / "runtime.pth"
+            hook.write_text("sample_runtime\n")
+            metadata = root / "sample_runtime.dist-info" / "METADATA"
+            metadata.parent.mkdir()
+            metadata.write_text("Version: 1\n")
+            archive = root / "runtime.zip"
+            archive.write_bytes(b"fixture")
+            distribution = types.SimpleNamespace(
+                files=[Path("sample_runtime.dist-info/METADATA")],
+                locate_file=lambda entry: root / entry,
+            )
+            module = types.SimpleNamespace(__file__=str(code), __path__=[str(package)])
+            with patch.dict(sys.modules, {"sample_probe_runtime": module}), \
+                 patch.object(sys, "path", [str(root), str(archive)]), \
+                 patch.object(probe_module.importlib.metadata, "distribution", return_value=distribution), \
+                 patch.object(Path, "read_bytes", side_effect=AssertionError("no file data reads")), \
+                 patch.object(Path, "read_text", side_effect=AssertionError("no file data reads")):
+                paths = set(probe_module.probe_cache_paths())
+            for path in (root, package, code, hook, metadata, archive):
+                self.assertIn(str(path), paths)
+
+
 # Readable installed-source fixtures: these are never copied into model folders.
 STOCK = {
     "load_model": r'''
@@ -802,6 +847,38 @@ def quantize(model, group_size=64, bits=4, mode="affine", class_predicate=None):
 
 
 class OmlxProbeTests(unittest.TestCase):
+    def test_requested_expert_cache_is_validated_without_loading_weights(self):
+        calls = []
+        helper = types.ModuleType("_werk_omlx_experts")
+        def inspect_model(path, budget):
+            calls.append((path, budget))
+            return {"cache_budget_bytes": budget, "resident_estimate_bytes": 123}
+        helper.inspect_model = inspect_model
+        with self.runtime() as runtime, patch.dict(sys.modules, {"_werk_omlx_experts": helper}):
+            result = probe_module.probe({"launcher": str(runtime.launcher),
+                "model_dir": str(runtime.model_dir), "expert_cache_bytes": 8192})
+            self.assertEqual(calls, [(runtime.model_dir.resolve(), 8192)])
+            self.assertEqual(result["runtime"]["expert_offload"]["cache_budget_bytes"], 8192)
+
+    def test_homebrew_launcher_normalization(self):
+        source = "import sys\nfrom omlx.cli import main\nif __name__ == '__main__':\n    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n    sys.exit(main())\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "omlx"
+            path.write_text(source)
+            self.assertEqual(probe_module.launcher_module(path), "omlx.cli")
+            legacy = source.replace("import sys\n", "import sys\nimport re\n").replace(
+                "sys.argv[0].removesuffix('.exe')",
+                r"re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])",
+            )
+            path.write_text(legacy)
+            self.assertEqual(probe_module.launcher_module(path), "omlx.cli")
+            path.write_text(source.replace("    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n", ""))
+            self.assertEqual(probe_module.launcher_module(path), "omlx.cli")
+            for changed in (source.replace("'.exe'", "main()"), source + "main()\n"):
+                path.write_text(changed)
+                with self.assertRaisesRegex(ValueError, "cannot verify custom oMLX launcher"):
+                    probe_module.launcher_module(path)
+
     @contextlib.contextmanager
     def runtime(self, config=None):
         with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules), patch.object(sys, "path", list(sys.path)):
@@ -1027,7 +1104,7 @@ class Model:
     def test_symlinked_model_repository_module_rejected_before_import(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules), patch.object(sys, "path", list(sys.path)):
             root = Path(directory)
-            model = root / "model"
+            model = root.resolve() / "model"
             model.mkdir()
             library = root / "site"
             library.mkdir()

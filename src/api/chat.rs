@@ -8,7 +8,10 @@ use axum::{
     },
 };
 use serde_json::json;
-use std::convert::Infallible;
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+};
 use tokio_stream::{StreamExt, once};
 
 use crate::{
@@ -20,8 +23,9 @@ use crate::{
     model_store::{ModelManifest, unix_ts},
     openai::{
         AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ModelListResponse, ModelObject, Usage, generation_messages_for_prompt,
-        image_urls_from_messages, messages_to_prompt_for_model_with_template,
+        ChatTemplateOptions, ChatTemplateSource, ModelListResponse, ModelObject, Usage,
+        generation_messages_for_prompt, image_urls_from_messages,
+        messages_to_prompt_for_model_with_template,
     },
 };
 
@@ -81,12 +85,21 @@ fn model_object(manifest: ModelManifest) -> ModelObject {
 }
 
 pub(super) async fn chat_completions_handler(
-    State(state): State<ApiState>,
+    State(mut state): State<ApiState>,
     headers: HeaderMap,
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Response {
     if let Err(response) = state.authorize(&headers) {
         return response;
+    }
+    if let Some(options) = &request.werk
+        && let Err(error) = options.validate()
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+            Some("werk.omlx".into()),
+        );
     }
     let model_id = match request.model.as_deref().or(state.default_model.as_deref()) {
         Some(model) => model,
@@ -156,6 +169,43 @@ pub(super) async fn chat_completions_handler(
     }
 
     let image_urls = image_urls_from_messages(&request.messages);
+    let runtime_options = request.werk.as_ref().filter(|options| !options.is_empty());
+    let explicit_runtime_options = runtime_options.is_some();
+    if let Some(options) = runtime_options {
+        if !image_urls.is_empty() {
+            return api_error_with_code(
+                StatusCode::BAD_REQUEST,
+                "werk.omlx options currently support text chat only".into(),
+                Some("werk.omlx".into()),
+                Some("unsupported_chat_options".into()),
+            );
+        }
+        let backend = state.backend.clone();
+        let selected_model = manifest.clone();
+        let options = options.clone();
+        // Compatibility probing may invoke Python. Keep it off the async
+        // executor, and never modify the process environment for a request.
+        match tokio::task::spawn_blocking(move || {
+            backend.with_chat_options(&selected_model, &options)
+        })
+        .await
+        {
+            Ok(Ok(backend)) => state.backend = backend,
+            result => {
+                let message = match result {
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(error) => format!("chat runtime configuration failed: {error}"),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                return api_error_with_code(
+                    StatusCode::BAD_REQUEST,
+                    message,
+                    Some("werk.omlx".into()),
+                    Some("unsupported_chat_options".into()),
+                );
+            }
+        }
+    }
     let requires_tool_calling = request.requires_tool_calling();
     if requires_tool_calling
         && !state
@@ -171,15 +221,39 @@ pub(super) async fn chat_completions_handler(
         );
     }
     let stream = request.stream.unwrap_or(false);
-    state.log_verbose(format!(
-        "[werk serve] POST /v1/chat/completions model={} stream={} messages={} images={} max_tokens={}",
-        manifest.id,
-        yes_no(stream),
-        request.messages.len(),
-        image_urls.len(),
-        request.max_completion_tokens()
-    ));
-    let prompt_options = match state.prompt_options(&manifest, !image_urls.is_empty()) {
+    if state.verbose {
+        let tools = request.tools.as_deref().unwrap_or_default();
+        // Clients can attach a large tool catalog to a single short message.
+        // Report its size without logging schemas, prompts or credentials.
+        let tool_schema_bytes = if tools.is_empty() {
+            0
+        } else {
+            serde_json::to_vec(tools)
+                .map(|bytes| bytes.len())
+                .unwrap_or_default()
+        };
+        state.log_verbose(format!(
+            "[werk serve] POST /v1/chat/completions model={} stream={} messages={} images={} max_tokens={} tools={} tool_schema_bytes={}",
+            manifest.id,
+            yes_no(stream),
+            request.messages.len(),
+            image_urls.len(),
+            max_tokens,
+            tools.len(),
+            tool_schema_bytes,
+        ));
+    }
+    let prompt_options = match if explicit_runtime_options {
+        // These options select the native oMLX text route. A resolver for the
+        // server's default route must not template or redirect this request.
+        Ok(ChatTemplateOptions {
+            default_source: ChatTemplateSource::Model,
+            model_template_preferred: true,
+            override_name: Some("model"),
+        })
+    } else {
+        state.prompt_options(&manifest, !image_urls.is_empty())
+    } {
         Ok(options) => options,
         Err(err) => {
             eprintln!(
@@ -223,9 +297,19 @@ pub(super) async fn chat_completions_handler(
     };
 
     if stream {
-        stream_chat_response(state, manifest, generate_request)
+        let include_usage = request
+            .stream_options
+            .as_ref()
+            .is_some_and(|options| options.include_usage);
+        stream_chat_response(
+            state,
+            manifest,
+            generate_request,
+            explicit_runtime_options,
+            include_usage,
+        )
     } else {
-        complete_chat_response(state, manifest, generate_request).await
+        complete_chat_response(state, manifest, generate_request, explicit_runtime_options).await
     }
 }
 
@@ -353,6 +437,7 @@ async fn complete_chat_response(
     state: ApiState,
     manifest: ModelManifest,
     generate_request: GenerateRequest,
+    explicit_runtime_options: bool,
 ) -> Response {
     let backend = state.backend.clone();
     let verbose = state.verbose;
@@ -362,7 +447,7 @@ async fn complete_chat_response(
     // persistent backends still retain their model/server and may reuse their own prefix cache.
     let has_images = !generate_request.image_urls.is_empty();
     let requires_tool_calling = generate_request.requires_tool_calling();
-    let chat_session = match if has_images || requires_tool_calling {
+    let chat_session = match if has_images || requires_tool_calling || explicit_runtime_options {
         Ok(None)
     } else {
         state.chat_session(&manifest, generate_request.seed)
@@ -397,6 +482,7 @@ async fn complete_chat_response(
                     format_duration(response.timings.load_seconds),
                     format_token_rate(response.completion_tokens, response.timings.decode_seconds)
                 );
+                log_generation_phases(response.prompt_tokens, response.timings);
                 log_backend_diagnostics(&response.backend_diagnostics);
             }
             Json(to_chat_completion(model, response)).into_response()
@@ -412,6 +498,8 @@ fn stream_chat_response(
     state: ApiState,
     manifest: ModelManifest,
     generate_request: GenerateRequest,
+    explicit_runtime_options: bool,
+    include_usage: bool,
 ) -> Response {
     let model = manifest.id.clone();
     let created = unix_ts();
@@ -442,7 +530,7 @@ fn stream_chat_response(
     let verbose = state.verbose;
     let has_images = !generate_request.image_urls.is_empty();
     let requires_tool_calling = generate_request.requires_tool_calling();
-    let body_stream = match if has_images || requires_tool_calling {
+    let body_stream = match if has_images || requires_tool_calling || explicit_runtime_options {
         Ok(None)
     } else {
         state.chat_session(&manifest, generate_request.seed)
@@ -451,6 +539,8 @@ fn stream_chat_response(
         Ok(None) => state.backend.generate_stream(manifest, generate_request),
         Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
     };
+    let final_usage = Arc::new(Mutex::new(None));
+    let body_usage = final_usage.clone();
     let body = body_stream.map(move |event| {
             let data = match event {
                 Ok(GenerateStreamEvent::TextChunk(text)) => json!({
@@ -482,6 +572,14 @@ fn stream_chat_response(
                     timings,
                     backend_diagnostics,
                 }) => {
+                    if include_usage {
+                        *body_usage.lock().expect("stream usage mutex poisoned") = Some(json!({
+                            "id": body_id, "object": "chat.completion.chunk", "created": created,
+                            "model": body_model, "choices": [],
+                            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                                      "total_tokens": prompt_tokens.saturating_add(completion_tokens)}
+                        }));
+                    }
                     if verbose {
                         eprintln!(
                             "[werk serve] stream model={} finish={} prompt_tokens={} completion_tokens={} total={} load={} eval_rate={}",
@@ -493,6 +591,7 @@ fn stream_chat_response(
                             format_duration(timings.load_seconds),
                             format_token_rate(completion_tokens, timings.decode_seconds)
                         );
+                        log_generation_phases(prompt_tokens, timings);
                         log_backend_diagnostics(&backend_diagnostics);
                     }
                     json!({
@@ -523,7 +622,16 @@ fn stream_chat_response(
         });
 
     let done = once(Ok::<Event, Infallible>(Event::default().data("[DONE]")));
-    let stream = role.chain(body).chain(done);
+    let usage = once(()).filter_map(move |_| {
+        final_usage
+            .lock()
+            .expect("stream usage mutex poisoned")
+            .take()
+            .map(|value: serde_json::Value| {
+                Ok::<Event, Infallible>(Event::default().data(value.to_string()))
+            })
+    });
+    let stream = role.chain(body).chain(usage).chain(done);
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -560,6 +668,22 @@ fn trim_float(mut value: String) -> String {
         value.pop();
     }
     value
+}
+
+fn log_generation_phases(prompt_tokens: usize, timings: crate::backend::GenerationTimings) {
+    let Some(cached) = timings.cached_prompt_tokens.filter(|n| *n <= prompt_tokens) else {
+        return;
+    };
+    eprintln!(
+        "[werk serve] phases {}",
+        json!({
+            "first_token_seconds": timings.first_token_seconds,
+            "prompt_seconds": timings.prompt_seconds,
+            "decode_seconds": timings.decode_seconds,
+            "cached_prompt_tokens": cached,
+            "evaluated_prompt_tokens": prompt_tokens - cached,
+        })
+    );
 }
 
 fn log_backend_diagnostics(diagnostics: &[String]) {

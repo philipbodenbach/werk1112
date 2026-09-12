@@ -10,6 +10,8 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<ChatStreamOptions>,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -28,6 +30,54 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<ToolChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub werk: Option<ChatRuntimeOptions>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ChatStreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+/// Explicit per-request runtime controls. Empty objects inherit server defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatRuntimeOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omlx: Option<OmlxChatOptions>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OmlxChatOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    /// MiB; zero explicitly disables SSD expert offload, omitted inherits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_cache_mb: Option<u64>,
+}
+
+impl ChatRuntimeOptions {
+    pub fn is_empty(&self) -> bool {
+        self.omlx.as_ref().is_none_or(OmlxChatOptions::is_empty)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(options) = &self.omlx {
+            anyhow::ensure!(
+                options.expert_cache_mb.is_none_or(|mb| mb <= 1_048_576),
+                "werk.omlx.expert_cache_mb must be an integer from 0 to 1048576 MiB (0 disables expert offload)"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl OmlxChatOptions {
+    pub fn is_empty(&self) -> bool {
+        self.thinking.is_none() && self.expert_cache_mb.is_none()
+    }
 }
 
 impl ChatCompletionRequest {

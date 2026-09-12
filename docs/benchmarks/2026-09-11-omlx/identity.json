@@ -1,0 +1,12 @@
+{
+  "baseline_installed_binary_sha256": "fa20d709f8e664dc34340a629ee705595fc562517f60473cd33012a10917abba",
+  "candidate_binary_sha256": "b2576c1585ef6ea3efa34f52a66f1c8b4861f759e4b51b8d858e89bda6e9eaff",
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "omlx_version": "0.6.4",
+  "metal": "Apple M4 Pro",
+  "ram_gib": 48,
+  "notes": "Baseline was the installed prior helper. Candidate includes grouped execution and telemetry. Working tree contains additional pre-existing changes; no clean release commit is implied.",
+  "installed_binary_sha256": "faca3af1799377d79b6dba9e48101dba08326b9ed79dfdc3f652d65e4a3c7b38",
+  "installed_matches_current_release": true,
+  "final_revision_notes": "Final installed binary additionally includes verified probe caching and bounded large-probe-JSON transport; successful real startup confirmed."
+}

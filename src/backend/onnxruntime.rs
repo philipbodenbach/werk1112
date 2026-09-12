@@ -730,6 +730,7 @@ impl OnnxRuntimeBackend {
                 .unwrap_or("stop")
                 .to_string(),
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds: 0.0,
                 warmup_seconds: 0.0,
                 first_token_seconds: 0.0,
@@ -882,6 +883,7 @@ impl OnnxRuntimeBackend {
                 .unwrap_or("stop")
                 .to_string(),
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds,
                 warmup_seconds: 0.0,
                 first_token_seconds,

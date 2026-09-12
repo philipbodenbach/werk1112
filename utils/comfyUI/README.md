@@ -154,6 +154,14 @@ is not required by these HTTP-backed Werk nodes.
   Click **Verify Connection** to perform a real request and show a visible
   success or error status directly on the node.
 - **WERK Server Info** reports installed models and server capabilities.
+- **WERK Text Models** discovers models declaring `text-generation` and offers
+  the same connection-backed model dropdown as the media discovery nodes.
+- **WERK Text Config** supplies chat sampling controls and optional oMLX
+  thinking and MoE expert-cache settings. Its output is `WERK_TEXT_CONFIG`.
+- **WERK Text Generate** sends a prompt, optional system prompt and prior text
+  messages to `/v1/chat/completions`. It returns `text`, `metadata_json`,
+  `completion_id`, `finish_reason`, and `model_id`; its text is also returned
+  in ComfyUI history. Config is optional; omitted oMLX options inherit the server.
 - **WERK Runtime Info** performs strict Werk Protocol 1.0 discovery. It reports
   the active backend, negotiated limits, and every capability using the exact
   `supported`, `unsupported`, `unavailable`, `experimental`,
@@ -311,9 +319,90 @@ operational, `experimental` requires the node's explicit opt-in, and
 `unsupported`, `unavailable`, and `metadata_only` fail closed. Expert Control
 never derives a selection from hotness or from the current page; the model and
 all IDs must be supplied explicitly, and the server enforces its advertised ID
-bound. No current production adapter advertises operational expert residency,
-so these nodes currently report the truthful capability failure without
-claiming that a backend action succeeded.
+bound.
+
+For experimental oMLX expert offload, enable **omlx_expert_offload** in
+**WERK Text Config**, set **omlx_expert_cache_mb** (for example `8192`), and
+generate once with that config. Connect **Text Generate.model_id** to
+**Runtime Experts.model_id** and **Expert Control.model_id** to ensure those
+nodes run after the model loads. An alternative is a server-wide default:
+
+```bash
+WERK_OMLX_EXPERT_CACHE_MB=8192 werk --backend omlx serve
+```
+
+This selects an 8 GiB expert cache. An unset server variable or `0` selects
+ordinary oMLX loading unless the Text Config explicitly overrides it.
+Dense/shared weights, attention, KV cache and working buffers need
+additional memory. The existing media Routing Config `allow_disk_offload`
+switch does not configure this text-model cache.
+
+Expert nodes do not load the model themselves. Once the worker reports `runtime.experts.residency` as
+`experimental`, enable **allow_experimental** on Runtime Experts and Expert
+Control. `external` lists checkpoint-backed experts outside the cache; `ram`
+lists experts cached in Apple unified memory. For prefetch choose `ram`;
+oMLX rejects `vram`. Pin/unpin/evict use `unchanged`. Evict frees cached weights
+while retaining their model files for subsequent inference. Pinning and
+prefetch remain bounded by the configured budget. Keep `dry_run` enabled to
+preview an explicit action before applying it.
+
+The node fields and workflow format are unchanged. Other backends retain their
+capability checks and supported targets. This experimental cache path needs
+generation validation with the actual checkpoint and installed runtime;
+capability discovery alone does not establish successful inference.
+
+### Text generation and oMLX controls
+
+Connect **WERK Connection** to **WERK Text Models** and **WERK Text Generate**,
+then connect **Text Models.model** and **Text Config.config** to Text Generate.
+Start a reachable Werk server with `werk serve` or `werk --backend omlx serve`;
+these nodes make HTTP requests and never start a local server or change its
+environment variables.
+
+Text Models defaults **require_available** to false: it selects an installed
+model declaring `text-generation`. Enable the switch to require the server's
+default runtime probe as well. Leave it disabled when Text Config changes
+oMLX offload, because that default probe does not include the request's cache
+configuration. The generation request validates its actual configured route.
+
+| Text Config control | `inherit` | `enabled` | `disabled` |
+| --- | --- | --- | --- |
+| `omlx_thinking` | Omit override | Send `thinking: true` | Send `thinking: false` |
+| `omlx_expert_offload` | Omit override | Send the chosen cache budget | Send `expert_cache_mb: 0` |
+
+The cache budget is an integer from `1` to `1048576` MiB when enabled; `8192`
+is 8 GiB. It covers cached experts, with additional memory required for dense
+weights, attention, KV and working buffers. Turning thinking off can reduce
+generation before the visible answer for models that honor this setting.
+These options apply to oMLX text generation. The server selects oMLX when its
+backend is `auto`; an explicitly different server backend rejects the override.
+Vision and media configurations retain their existing controls.
+
+For example, disabling thinking and enabling an 8 GiB expert cache adds:
+
+```json
+{"werk":{"omlx":{"thinking":false,"expert_cache_mb":8192}}}
+```
+
+With both controls inherited, the `werk` extension is omitted and no versioned
+capability query is added. Explicit options first require the server's
+`api.chat.omlx_options` capability and matching operations. If an older server
+lacks it, the node asks you to update and restart Werk before it submits a
+generation request, so the selected controls cannot be silently ignored.
+
+`messages_json` optionally supplies prior text messages as an array of
+`{"role":"user","content":"..."}` or assistant/system objects. The node
+prepends a nonempty `system_prompt`, preserves the supplied history order and
+appends `prompt` as the final user message. It sends one non-streaming request;
+the node does not create a named persistence session or Prefill state.
+
+The [oMLX text API example](examples/werk_text_omlx_api.json) configures
+DeepSeek-V4-Flash with thinking disabled, an 8 GiB expert cache and 64 output
+tokens. Replace the model ID with a compatible installed model. It connects
+Text Generate's `model_id` output to Runtime Experts and an Expert Control
+dry-run, enforcing generation before inspection. The final action only previews
+eviction of the listed experts. Remove nodes `5` and `6` for text generation
+alone; explicit expert controls still require a loaded experimental adapter.
 
 ### Recommended image workflow
 

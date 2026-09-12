@@ -38,16 +38,17 @@ cross-restart restore.
 | In-process Candle, Burn and compiled llama.cpp adapters | Exact model entries remain in Werk-owned process caches where the concrete runtime is available. | Backend-specific; no generic cross-backend KV contract. | No. |
 | Local Werk-started vLLM | The exact vLLM model process is reused. | vLLM-owned APC. `werk serve --persistence` supplies `--enable-prefix-caching` unless explicit `WERK_VLLM_ARGS` wins. | No; Werk cannot name, snapshot, restore, move or prune APC entries. |
 | Remote vLLM | The remote operator owns process and model lifetime. | Opaque to Werk; the OpenAI endpoint does not prove its cache configuration. | No. |
-| Local oMLX | Werk starts an installed oMLX CLI on demand and reuses its exact model/runtime process. | oMLX owns its native caches. | No; native caches do not expose Werk named state, snapshots or restore. |
+| Local oMLX | Werk starts an installed oMLX CLI on demand and reuses its exact model/runtime process. | oMLX owns its native caches. `serve --persistence` also enables verified short exact-prefix reuse in the worker with `auto`/`disk` mode and reuse enabled. | No; native caches do not expose Werk named state, snapshots or restore. |
 | Werk-owned Transformers or ONNX GenAI CPU-fallback worker | Exact model/tokenizer entries use independent bounded LRUs. | Generator, prompt and KV state are request-local. | No. |
 | External ONNX runner, MLX or MLX-VLM command | One process is invoked per request; Werk has no validated resident cache. | No declared cross-request reuse. | No. |
 | Generic media and managed Qwen workers | Separate bounded pipeline/model LRUs remain warm while their workers live. | Not a text KV-state contract. | No; durable media jobs are request/status/result records only. |
 
-`werk serve --persistence` has two deliberately narrow effects: it supplies
-defaults for omitted fields on `POST /werk/v1/prefill`, and it supplies the
-native APC default for a local Werk-started vLLM process. It does not activate
-automatic model residency, modify remote vLLM, make MLX or an external ONNX
-runner persistent, or route ordinary `/v1` and media calls through Prefill.
+`werk serve --persistence` supplies defaults for omitted fields on
+`POST /werk/v1/prefill` and the native APC default for a local Werk-started vLLM
+process. With `auto` or `disk` mode and reuse enabled, it also enables verified
+short exact-prefix caching in local oMLX workers. Model residency remains
+automatic; remote vLLM, MLX and external ONNX execution remain unchanged.
+Ordinary `/v1` and media calls continue through their normal inference routes.
 Consult the live capability response before using optional runtime controls.
 
 ## Runtime selection
@@ -186,7 +187,7 @@ werk --backend omlx run MODEL "Hello"
 werk --backend omlx serve
 werk backend doctor --debug
 werk doctor --model MODEL --task text-generation --debug
-werk --backend omlx doctor --model MODEL --task text-generation --debug
+werk --backend omlx doctor --model MODEL --task text-generation
 ~~~
 
 Install the [upstream oMLX CLI](https://github.com/jundot/omlx#install) separately.
@@ -240,19 +241,173 @@ outside this adapter's scope. Separate upstream reasoning fields are not
 rendered as answer text; empty reasoning-only results are errors. Errors after
 text or tool-call fragments have been emitted never trigger another generation.
 oMLX's internal caches do not imply Werk named Prefill, KV snapshot or restore
-support, and `--persistence` does not enable those operations for oMLX.
+support.
+
+On oMLX 0.6.4, `werk serve --persistence` enables the same verified short
+exact-prefix helper used by persistent CLI chat. It applies with persistence
+mode `auto` or `disk` and reuse other than `disabled`, including when `auto`
+routing selects oMLX. Configuration is applied before model preparation and
+covers normal chat, supported tool requests and request-specific oMLX options.
+Clients send their ordinary messages; no conversation ID or cache metadata is
+required. Reuse requires matching token prefixes.
+Startup reports whether the native short-prefix cache is active. Unsupported
+runtime versions or cache types continue with the already loaded worker and
+ordinary oMLX caching.
+
+The server helper stores native SSD cache data under the private worker's
+`cache/prefix-cache` directory with a 4 GB native cache limit. It lasts for that
+worker and is included in managed worker cache inventory and cleanup. It does
+not save conversation history or promise reuse after a server restart. Modes
+`memory` and `ephemeral`, or reuse `disabled`, leave this additional helper off.
+TTL, pinning and `required` reuse retain their named Prefill policy meaning;
+ordinary OpenAI chat requests with a cold cache still perform normal prefill.
+
+`werk chat --persistence` separately saves portable conversation messages for
+every backend. On oMLX 0.6.4 it also enables an optional durable native SSD
+prefix cache in a private namespace tied to the exact checkpoint, tokenizer,
+runtime and chat settings. The worker is still stopped on chat exit; compatible native
+cache files remain for the next invocation. Werk's additional exact-prefix
+index covers short prefixes up to the native block size (typically 2048 tokens
+for DeepSeek V4, capped at 8192); longer inputs retain ordinary oMLX caching.
+Cache misses, unsupported cache types or failed writes fall back to normal
+prefill. The sampler and token streaming stay on the normal oMLX path. Verbose
+output reports `cached prompt tokens` when the runtime supplies the count.
+This does not expose named Werk Prefill/KV-state handles or change their
+capability status.
 
 A successful metadata probe is not a memory-capacity or inference guarantee.
 Validate a small model on the actual Apple Silicon installation first, then
-test a large DeepSeek checkpoint only with sufficient available memory.
+test a large DeepSeek checkpoint only with sufficient available memory for the
+selected loading mode.
+
+### Experimental oMLX expert offload
+
+For supported DeepSeek V4 affine checkpoints on oMLX 0.6.4, Werk now selects
+an automatic SSD-backed expert cache when `WERK_OMLX_EXPERT_CACHE_MB` is unset
+or `auto`. Both `chat` and `serve` use the same selection: at worker startup,
+retain at most the model's expert bytes and the space left by current available
+system memory and the effective Metal cap, reserving base weights, workspace,
+and system headroom. Native admission further reduces residency for KV/attention
+work. There is no fixed 24 GiB budget or 1 TiB cap on automatic selection.
+On unsupported architectures/runtime versions, auto leaves the native loader
+in place. `WERK_OMLX_EXPERT_CACHE_MB=0` explicitly selects native loading.
+
+Positive MiB values remain explicit ceilings, including small-machine budgets.
+For example, an 8 GiB expert cache is selected with:
+
+~~~bash
+WERK_OMLX_EXPERT_CACHE_MB=8192 \
+  werk --backend omlx chat mlx-community/DeepSeek-V4-Flash-2bit-DQ --verbose
+~~~
+
+Routed expert weights remain backed by the existing local checkpoint and are
+read into a bounded cache when needed. Dense and shared weights, attention,
+the KV cache and temporary computation buffers still need memory in addition
+to this budget. This setting is an expert-cache limit, not a total-process
+memory limit or a guarantee that every MoE checkpoint fits. It does not raise
+the system's Metal limit. Model layout and the installed runtime must pass the
+offload checks; unsupported layouts fail explicitly.
+
+Expert offload uses `grouped` execution by default. It materializes the nine
+weight, scale and bias tensors for one expert in a single MLX evaluation,
+holds active expert groups in the cache until their GPU computation finishes,
+and evaluates outputs in bounded groups. The cache budget still constrains
+which experts can be retained. Temporary allocator storage is recycled between
+loads; the grouped path clears it when retained allocator memory exceeds
+64 MiB. This temporary storage belongs to the additional workspace allowance.
+
+For a controlled comparison, select the serial execution path before starting
+Werk:
+
+~~~bash
+WERK_OMLX_EXPERT_EXECUTION=serial \
+WERK_OMLX_EXPERT_CACHE_MB=8192 \
+  werk --backend omlx chat mlx-community/DeepSeek-V4-Flash-2bit-DQ --verbose
+~~~
+
+`WERK_OMLX_EXPERT_EXECUTION` accepts `grouped` or `serial`; omission selects
+`grouped`. Changing execution mode changes the worker configuration and the
+durable CLI prefix-cache namespace. Keep cache budget, prompts and sampling
+settings identical when comparing modes. This control applies to expert
+offload; the expert cache budget remains separate from native prompt/KV caching.
+
+With `--verbose` or `--debug`, generation diagnostics include the explicitly
+sent sampling and thinking controls and, when available, expert counters from
+the worker before and after generation. These cover cache hits, misses and
+evictions, logical bytes read, tensor materializations, output evaluations,
+allocator clears and selected timing counters. `disk_bytes_read` measures
+logical `pread` bytes, which can be served by the OS file cache; it does not
+measure physical SSD traffic. Counters describe the whole worker during the
+measurement interval, so overlapping requests or expert actions may contribute.
+Timing counters can contain overlapping work and must not be summed as
+independent request phases. Missing diagnostics do not indicate a zero count.
+
+Use the [HTTP chat benchmark](../utils/benchmarks/README.md) to compare repeated
+prompts and multi-turn conversations through the API used by Open WebUI and
+werkStation. Review generated answers alongside latency and token counts.
+
+The initial implementation supports oMLX **0.6.4** and sanitized DeepSeek V4
+checkpoints with stacked affine expert tensors. It rejects custom quantization
+loaders, embedded speculative drafters and unsupported layouts before admitting
+the smaller working set. The ordinary, non-offloaded adapter retains its
+existing runtime compatibility checks.
+
+For ComfyUI, n8n or another HTTP client, the same variable supplies a default
+for the persistent Werk service:
+
+~~~bash
+WERK_OMLX_EXPERT_CACHE_MB=8192 werk --backend omlx serve
+~~~
+
+Alternatively, configure expert offload and its cache budget in the ComfyUI
+**WERK Text Config** node or n8n **WERK Text → Chat Options**.
+The nodes send `werk.omlx.expert_cache_mb` on the chat request: a positive
+integer enables offload, `0` disables it, and omission inherits the server
+default. **oMLX Thinking** similarly overrides the server's thinking default
+for that request. Thinking changes reuse the worker; different expert budgets
+use separate worker configurations and may require loading the model again.
+These options work with `auto` or `omlx` server routing and still require a
+compatible runtime and model. The [chat API contract](api.md#omlx-chat-options)
+describes validation and the capability check used by both integrations.
+
+Use the normal generation path to load the chosen model first. Expert telemetry
+and actions do not start a model. After the worker confirms that offload is
+active, `runtime.experts.residency` reports `experimental`; expert requests must
+include `allow_experimental: true`. Existing ComfyUI and n8n runtime nodes
+already expose this opt-in and the required fields.
+
+When a model has been used with several cache configurations, subsequent
+expert requests target the worker most recently used for that model. In
+ComfyUI, connect **Werk Text Generate**'s `model_id` output to the expert
+node's model input to ensure generation runs first.
+
+The existing expert tiers describe oMLX's two locations: `external` means
+checkpoint-backed outside the active expert cache, and `ram` means present in
+the Apple unified-memory cache. This tier label is separate from the capability
+status `externally_managed`. Prefetch accepts `ram`; `vram` is rejected because
+this adapter has one shared memory pool. Pin and unpin control cache retention;
+evict releases a cached expert while keeping its checkpoint source available
+for later inference. Dry-run previews do not perform those cache operations.
+Pins and prefetches remain constrained by the configured cache budget.
+
+On 2026-09-10, the local `mlx-community/DeepSeek-V4-Flash-2bit-DQ` checkpoint
+completed a real 16-token request through Werk and oMLX with an 8 GiB expert
+cache. The API test also completed dry-run, prefetch, pin, unpin and eviction.
+Sampled peak RSS across the test process tree was approximately 12.3 GiB;
+the request took about 19.4 seconds including preparation. This is a short
+functional smoke test, not a long-context, quality or throughput benchmark.
+RSS is not a complete measurement of all system or GPU memory use.
 
 Automated coverage uses installed-loader source fixtures, synthetic quantization
 inputs and local mock HTTP workers. It checks routing, read-only preflight,
 process reuse/teardown, tool calls and stream failures. Run it with
 `python -m unittest discover -s src/backend -p 'test_*mlx*.py'` and
-`cargo test --no-default-features`. These simulations passed on Linux/WSL;
-real Apple Silicon inference with a small model and the Vontra checkpoint has
-not been validated in this environment.
+`cargo test --no-default-features`. Optional numerical tests run with
+`WERK_TEST_MLX_EXPERTS=1` using the installed oMLX Python interpreter and
+`python -m unittest discover -s src/backend -p 'test_omlx_experts.py'`.
+These compare streamed expert outputs and a complete tiny DeepSeek model
+against resident MLX computations on Metal. The Vontra checkpoint and long
+contexts remain unvalidated.
 
 ## vLLM launch arguments and tool calling
 

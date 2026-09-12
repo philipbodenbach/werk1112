@@ -49,12 +49,15 @@ struct RuntimeRoutedChatSession {
     session: Box<dyn ChatGenerationSession>,
     runtime: Arc<RoutedRuntimeAdapter>,
     adapter: Arc<dyn BackendRuntimeAdapter>,
+    manifest: ModelManifest,
 }
 
 impl ChatGenerationSession for RuntimeRoutedChatSession {
     fn generate(&self, request: GenerateRequest) -> anyhow::Result<GenerateResponse> {
         let response = self.session.generate(request)?;
-        let _ = self.runtime.set_active(self.adapter.clone());
+        let _ = self
+            .runtime
+            .record_model_adapter(&self.manifest, false, self.adapter.clone());
         Ok(response)
     }
 
@@ -62,11 +65,12 @@ impl ChatGenerationSession for RuntimeRoutedChatSession {
         let stream = self.session.generate_stream(request);
         let runtime = self.runtime.clone();
         let mut adapter = Some(self.adapter.clone());
+        let manifest = self.manifest.clone();
         Box::pin(stream.map(move |event| {
             if event.is_ok()
                 && let Some(adapter) = adapter.take()
             {
-                let _ = runtime.set_active(adapter);
+                let _ = runtime.record_model_adapter(&manifest, false, adapter);
             }
             event
         }))
@@ -265,8 +269,28 @@ impl RoutedRuntimeAdapter {
         Ok(adapter)
     }
 
-    fn set_active(&self, adapter: Arc<dyn BackendRuntimeAdapter>) -> Result<(), ProtocolError> {
-        self.lock_routes()?.active = adapter;
+    fn record_model_adapter(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+        adapter: Arc<dyn BackendRuntimeAdapter>,
+    ) -> Result<(), ProtocolError> {
+        let fingerprint = manifest_fingerprint(manifest)?;
+        let mut routes = self.lock_routes()?;
+        routes.models.retain(|route| {
+            route.manifest_fingerprint != fingerprint || route.has_images != has_images
+        });
+        push_bounded(
+            &mut routes.models,
+            ModelRoute {
+                model_id: manifest.id.clone(),
+                manifest_fingerprint: fingerprint,
+                has_images,
+                adapter: adapter.clone(),
+            },
+            MAX_MODEL_ROUTES,
+        );
+        routes.active = adapter;
         Ok(())
     }
 
@@ -520,6 +544,15 @@ impl Drop for StateRouteReservation<'_> {
 }
 
 impl GenerationBackend for RuntimeRoutedGenerationBackend {
+    fn with_chat_options(
+        &self,
+        manifest: &ModelManifest,
+        options: &crate::openai::ChatRuntimeOptions,
+    ) -> anyhow::Result<Arc<dyn GenerationBackend>> {
+        let backend = self.backend.with_chat_options(manifest, options)?;
+        Ok(Arc::new(Self::new(backend, self.runtime.clone())))
+    }
+
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         self.runtime.clone()
     }
@@ -548,10 +581,9 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
     }
 
     fn prepare(&self, manifest: &ModelManifest) -> anyhow::Result<()> {
-        let selected = self.runtime.adapter_for_model(manifest).ok();
         self.backend.prepare(manifest)?;
-        if let Some(adapter) = selected {
-            let _ = self.runtime.set_active(adapter);
+        if let Ok(adapter) = self.backend.runtime_control_adapter_for(manifest) {
+            let _ = self.runtime.record_model_adapter(manifest, false, adapter);
         }
         Ok(())
     }
@@ -561,15 +593,18 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
         manifest: &ModelManifest,
         seed: Option<u64>,
     ) -> anyhow::Result<Option<Box<dyn ChatGenerationSession>>> {
-        let selected = self.runtime.adapter_for_model(manifest).ok();
         let session = self.backend.start_chat_session(manifest, seed)?;
+        let selected = self.backend.runtime_control_adapter_for(manifest).ok();
         match (session, selected) {
             (Some(session), Some(adapter)) => {
-                let _ = self.runtime.set_active(adapter.clone());
+                let _ = self
+                    .runtime
+                    .record_model_adapter(manifest, false, adapter.clone());
                 Ok(Some(Box::new(RuntimeRoutedChatSession {
                     session,
                     runtime: self.runtime.clone(),
                     adapter,
+                    manifest: manifest.clone(),
                 })))
             }
             (session, _) => Ok(session),
@@ -590,24 +625,34 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
         request: GenerateRequest,
     ) -> anyhow::Result<GenerateResponse> {
         let has_images = !request.image_urls.is_empty();
-        let selected = self.runtime.adapter_for_request(manifest, has_images).ok();
         let response = self.backend.generate(manifest, request)?;
-        if let Some(adapter) = selected {
-            let _ = self.runtime.set_active(adapter);
+        // Resolve after execution so process-owning backends expose the worker
+        // that actually loaded, including request-specific configuration.
+        if let Ok(adapter) = self
+            .backend
+            .runtime_control_adapter_for_request(manifest, has_images)
+        {
+            let _ = self
+                .runtime
+                .record_model_adapter(manifest, has_images, adapter);
         }
         Ok(response)
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
         let has_images = !request.image_urls.is_empty();
-        let mut selected = self.runtime.adapter_for_request(&manifest, has_images).ok();
-        let stream = self.backend.generate_stream(manifest, request);
+        let mut recorded = false;
+        let stream = self.backend.generate_stream(manifest.clone(), request);
+        let backend = self.backend.clone();
         let runtime = self.runtime.clone();
         Box::pin(stream.map(move |event| {
-            if event.is_ok()
-                && let Some(adapter) = selected.take()
-            {
-                let _ = runtime.set_active(adapter);
+            if event.is_ok() && !recorded {
+                recorded = true;
+                if let Ok(adapter) =
+                    backend.runtime_control_adapter_for_request(&manifest, has_images)
+                {
+                    let _ = runtime.record_model_adapter(&manifest, has_images, adapter);
+                }
             }
             event
         }))
@@ -1764,6 +1809,120 @@ mod tests {
             .generate(&manifest("first"), generation_request(true))
             .unwrap();
         assert_eq!(runtime.descriptor().backend, "second");
+    }
+
+    #[tokio::test]
+    async fn chat_options_refresh_loaded_worker_routes_and_defaults_switch_them_back() {
+        struct OptionsBackend {
+            current: Arc<RecordingAdapter>,
+            configured: Arc<RecordingAdapter>,
+            loaded: AtomicBool,
+        }
+        impl GenerationBackend for OptionsBackend {
+            fn with_chat_options(
+                &self,
+                _: &ModelManifest,
+                options: &crate::openai::ChatRuntimeOptions,
+            ) -> anyhow::Result<Arc<dyn GenerationBackend>> {
+                assert_eq!(options.omlx.as_ref().unwrap().thinking, Some(false));
+                Ok(Arc::new(Self {
+                    current: self.configured.clone(),
+                    configured: self.current.clone(),
+                    loaded: AtomicBool::new(false),
+                }))
+            }
+            fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
+                if self.loaded.load(Ordering::SeqCst) {
+                    self.current.clone()
+                } else {
+                    Arc::new(UnsupportedRuntimeAdapter::new("not-yet-loaded"))
+                }
+            }
+            fn generate(
+                &self,
+                _: &ModelManifest,
+                _: GenerateRequest,
+            ) -> anyhow::Result<GenerateResponse> {
+                self.loaded.store(true, Ordering::SeqCst);
+                Ok(GenerateResponse {
+                    text: "answer".into(),
+                    assistant_message: None,
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    finish_reason: "stop".into(),
+                    timings: GenerationTimings::default(),
+                    backend_diagnostics: Vec::new(),
+                })
+            }
+            fn generate_stream(&self, _: ModelManifest, _: GenerateRequest) -> GenerateStream {
+                self.loaded.store(true, Ordering::SeqCst);
+                Box::pin(tokio_stream::iter([Ok(
+                    crate::backend::GenerateStreamEvent::TextChunk("answer".into()),
+                )]))
+            }
+        }
+        let first = Arc::new(RecordingAdapter::new("default-worker", "default-instance"));
+        let second = Arc::new(RecordingAdapter::new(
+            "configured-worker",
+            "configured-instance",
+        ));
+        let backend = Arc::new(OptionsBackend {
+            current: first,
+            configured: second,
+            loaded: AtomicBool::new(false),
+        });
+        let runtime = Arc::new(RoutedRuntimeAdapter::new(backend.clone()));
+        let generation = RuntimeRoutedGenerationBackend::new(backend, runtime.clone());
+        let model = manifest("same-model");
+        // A prior metadata request cached an adapter before any worker existed.
+        assert_eq!(
+            runtime.descriptor_for_model(&model).unwrap().backend,
+            "not-yet-loaded"
+        );
+        generation
+            .generate(&model, generation_request(false))
+            .unwrap();
+        assert_eq!(
+            runtime.descriptor_for_model(&model).unwrap().instance_id,
+            "default-instance"
+        );
+        let controls = crate::openai::ChatRuntimeOptions {
+            omlx: Some(crate::openai::OmlxChatOptions {
+                thinking: Some(false),
+                expert_cache_mb: None,
+            }),
+        };
+        let configured = generation.with_chat_options(&model, &controls).unwrap();
+        assert_eq!(runtime.descriptor().instance_id, "default-instance");
+        let mut stream = configured.generate_stream(model.clone(), generation_request(false));
+        assert!(stream.next().await.unwrap().is_ok());
+        assert_eq!(
+            runtime.descriptor_for_model(&model).unwrap().instance_id,
+            "configured-instance"
+        );
+        assert_eq!(
+            runtime
+                .known_model_adapter(&model.id)
+                .unwrap()
+                .descriptor()
+                .instance_id,
+            "configured-instance"
+        );
+        generation
+            .generate(&model, generation_request(false))
+            .unwrap();
+        assert_eq!(
+            runtime.descriptor_for_model(&model).unwrap().instance_id,
+            "default-instance"
+        );
+        assert_eq!(
+            runtime
+                .known_model_adapter(&model.id)
+                .unwrap()
+                .descriptor()
+                .instance_id,
+            "default-instance"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ not equality with the package version. All internal n8n node versions start at
 | WERK Jobs (Beta) | Get, wait, cooperative cancel and download by output ID |
 | WERK Runtime (Beta) | Info, capabilities, memory, states, state action, prune, experts, expert action, combined Prefill & Decode |
 
-[All 30 ComfyUI registrations are mapped here](docs/comfyui-parity.md).
+[All 33 ComfyUI registrations are mapped here](docs/comfyui-parity.md).
 Text is an ordinary workflow node; it cannot connect to an AI Agent's
 Chat Model socket. Returned model tool calls are data and are never executed.
 
@@ -198,6 +198,26 @@ TTS forbids a negative prompt and uses asynchronous speech submission.
 Vision uses ordered images in one user message and offers chat options only:
 the current chat endpoint does not apply per-request media routing overrides.
 
+WERK Text / **Chat Options** additionally exposes **oMLX Thinking** and
+**oMLX Expert Offload**, each with `inherit` / `enabled` / `disabled`.
+Enabled expert offload uses **oMLX Expert Cache (MiB)**: an integer from 1 to
+1048576, default 8192 (8 GiB). A retained budget is applied only while offload
+is enabled. Disabling thinking sends `false`; disabling expert offload sends
+`0`. Inherited controls remain absent, preserving existing workflows and
+server defaults. For example, thinking disabled with an 8 GiB expert cache
+adds this to the normal `/v1/chat/completions` body:
+
+```json
+{"werk":{"omlx":{"thinking":false,"expert_cache_mb":8192}}}
+```
+
+Explicit oMLX controls first check `api.chat.omlx_options` and its requested
+operations through `/werk/v1/capabilities`. If support is absent, the node
+requires updating/restarting Werk before submitting generation, so an older
+server cannot silently ignore the options. The capability confirms request
+handling; the selected model/runtime can still reject an unsupported setting.
+Vision does not expose or accept these text-only oMLX controls.
+
 Every input item evaluates its own parameters and expressions. Multiple
 generated outputs use `pairedItem` to identify their source. Heavy jobs are
 submitted in item order, with per-item n8n error handling; one item's bytes
@@ -282,15 +302,41 @@ header must agree with the envelope. No runtime error falls back to `/v1`.
 Capability statuses remain `supported`, `unsupported`, `unavailable`,
 `experimental`, `externally_managed` or `metadata_only`. State/expert actions
 are gated by those statuses and server limits. `externally_managed` permits
-only the specified read-only expert telemetry. Current production adapters
-do not provide operative expert residency; this integration does not turn
-metadata into working MoE management.
+only the specified read-only expert telemetry. The oMLX SSD expert cache
+advertises `experimental` only after its loaded worker confirms offload is
+active. Other adapters retain their declared capabilities.
 
 State action, prune and expert action default to **dry-run true**. Promote
 allows RAM/VRAM; demote RAM/disk; other state actions have no target tier.
 Prune requires explicit IDs, real filters or explicit all plus confirmation.
 It touches runtime states only. Expert actions require an explicit model and
 unique expert IDs; prefetch requires RAM/VRAM and other actions forbid a tier.
+
+To use experimental oMLX expert offload, enable it in **WERK Text / Chat
+Options**, choose the cache budget and generate once. Connect that Text node
+to Runtime / List Experts or Expert Action and use its original requested
+model (`{{ $json.werk.request.model }}`) as the Runtime Model ID. This ensures generation
+loads the configured worker before the runtime node executes. Enable
+**Allow Experimental** in the Runtime node. Runtime expert operations do not
+load or configure a model themselves.
+
+Server defaults remain available through `WERK_OMLX_EXPERT_CACHE_MB` and
+`WERK_OMLX_THINKING`; inherited Text controls use those settings. Other weights,
+attention, KV cache and temporary buffers need additional memory beyond the
+expert-cache budget. The Image/Video/Audio `allow_disk_offload` routing option
+does not configure this text-model cache. Expert offload also does not enable
+Runtime Prefill & Decode or named KV snapshot capabilities.
+
+Expert tier `external` means checkpoint-backed outside
+the cache, while `ram` means present in Apple unified memory; this is separate
+from the read-only capability status `externally_managed`. Choose **ram** for
+oMLX prefetch, and **unchanged** for pin/unpin/evict. oMLX rejects VRAM targets.
+Eviction retains the checkpoint source for future inference; pins and
+prefetch remain subject to cache capacity. Dry Run stays true by default.
+
+Existing node IDs, fields and workflow JSON remain compatible. This path is
+experimental and requires inference validation with the actual model/runtime;
+an advertised capability alone is not a successful generation test.
 
 **Prefill & Decode** performs both calls in one execution. Its single-use
 handoff exists only in a local variable and is never returned in item JSON,

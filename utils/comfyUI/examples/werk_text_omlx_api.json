@@ -1,0 +1,68 @@
+{
+  "1": {
+    "class_type": "WerkConnection",
+    "inputs": {
+      "server_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout_seconds": 900,
+      "verify_tls": true
+    }
+  },
+  "2": {
+    "class_type": "WerkTextModels",
+    "inputs": {
+      "connection": ["1", 0],
+      "refresh_token": 0,
+      "preferred_model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+      "require_available": false
+    }
+  },
+  "3": {
+    "class_type": "WerkTextConfig",
+    "inputs": {
+      "temperature": 0.2,
+      "top_p": 1.0,
+      "max_completion_tokens": 64,
+      "seed": 0,
+      "stop_sequences_json": "[]",
+      "omlx_thinking": "disabled",
+      "omlx_expert_offload": "enabled",
+      "omlx_expert_cache_mb": 8192
+    }
+  },
+  "4": {
+    "class_type": "WerkTextGenerate",
+    "inputs": {
+      "connection": ["1", 0],
+      "model": ["2", 0],
+      "config": ["3", 0],
+      "prompt": "Hello. Reply with one short sentence.",
+      "system_prompt": "Be concise.",
+      "messages_json": "[]"
+    }
+  },
+  "5": {
+    "class_type": "WerkRuntimeExperts",
+    "inputs": {
+      "connection": ["1", 0],
+      "model_id": ["4", 4],
+      "tier": "all",
+      "limit": 10,
+      "cursor": "",
+      "allow_experimental": true,
+      "refresh_token": 0
+    }
+  },
+  "6": {
+    "class_type": "WerkExpertControl",
+    "inputs": {
+      "connection": ["1", 0],
+      "model_id": ["4", 4],
+      "expert_ids": ["5", 1],
+      "action": "evict",
+      "target_tier": "unchanged",
+      "dry_run": true,
+      "allow_experimental": true
+    }
+  }
+}

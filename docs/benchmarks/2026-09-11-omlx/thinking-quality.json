@@ -1,0 +1,61 @@
+{
+  "samples": [
+    {
+      "first_text_seconds": 5.545889499990153,
+      "total_seconds": 5.547253457989427,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "104",
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 25,
+        "total_tokens": 26
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 25,
+      "completion_tokens": 1,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "thinking": false,
+      "checks": [
+        {
+          "type": "exact_text",
+          "passed": false
+        }
+      ]
+    },
+    {
+      "first_text_seconds": 19.534823292007786,
+      "total_seconds": 20.396072957999422,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "12",
+      "usage": {
+        "completion_tokens": 54,
+        "prompt_tokens": 25,
+        "total_tokens": 79
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 25,
+      "completion_tokens": 54,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "thinking": true,
+      "checks": [
+        {
+          "type": "exact_text",
+          "passed": true
+        }
+      ]
+    }
+  ],
+  "note": "Same arithmetic task and seed, with explicit thinking false/true; exploratory quality check.",
+  "notes": [
+    "The public API hides reasoning deltas but counts them in completion_tokens. No visible-text decode estimate is valid for the thinking-enabled sample.",
+    "Thinking on corrected this one arithmetic case. This does not establish the cause of all past failures or a universal quality guarantee."
+  ]
+}

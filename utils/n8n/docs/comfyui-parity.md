@@ -2,8 +2,8 @@
 
 The reference is the Werk/ComfyUI **1.6.0** release checkout, including `nodes.py`,
 `runtime_nodes.py`, their request builders, protocol client, and the actual
-Rust routes/DTOs in this checkout. `__init__.py` merges **20 inference and
-configuration registrations + 10 runtime registrations = 30 public nodes**.
+Rust routes/DTOs in this checkout. `__init__.py` merges **23 inference and
+configuration registrations + 10 runtime registrations = 33 public nodes**.
 The test suite checks the table against those registrations without importing
 Torch or ComfyUI.
 
@@ -16,6 +16,9 @@ node versioning or a documented migration.
 | --- | --- | --- |
 | `WerkConnection` | WERK API credential | Base URL, masked API key, explicit unauthenticated mode, real read-only discovery test. n8n stores credentials; no connection JSON items or environment-key fallback. |
 | `WerkServerInfo` | Discovery / Server Info | Models plus capabilities, joined by exact model ID; structured metadata replaces JSON strings. |
+| `WerkTextModels` | Discovery / Models; Text model selector | Exact installed text-model selection; declared task support remains distinct from actual chat execution readiness. |
+| `WerkTextConfig` | Text / Chat Options | Sampling, completion budget and optional oMLX thinking/expert-cache controls. Inherit omits the override; disabled retains false/0. Explicit controls require advertised API support. |
+| `WerkTextGenerate` | Text / Complete | Ordered messages and assistant text, model, completion ID, finish reason and usage. Use Text's `werk.request.model` output as Runtime Model ID to order expert inspection after generation with the original selected model. |
 | `WerkImageModels` | Discovery / Models; Image model selector | `image-generation`, installed/declared/available distinction, exact IDs and task statuses. Expressions/manual IDs replace ComfyUI sockets. |
 | `WerkVisionModels` | Discovery / Models; Vision model selector | `image-understanding`, authoritative task discovery and unavailable reasons, never model-name heuristics. |
 | `WerkImageParameters` | Discovery / Parameters | Complete schema for explicit task/model/backend, preserved as structured JSON. |
@@ -47,7 +50,7 @@ node versioning or a documented migration.
 
 ## Deliberate interface differences
 
-- **Text** adds ordinary non-streaming chat beyond ComfyUI parity. It is a
+- **Text** provides ordinary non-streaming chat with ordered messages. It is a
   workflow node, not an n8n AI-Agent chat-model subnode. Tool calls are returned
   as data; this package never executes them.
 - **Jobs** exposes get/wait/cancel/output-download independently of submission.
@@ -70,8 +73,19 @@ exactly, while task hyphens/underscores normalize only for comparison.
 raw bytes unless `async: true` selects the job path. Runtime service versions
 are independent of Protocol 1.0 and optional response version headers remain
 compatible when absent. Embedded image `b64_json` can outlive its temporary
-Werk output ID, which may already have been removed. Current production expert
-adapters do not promise operational expert residency; metadata remains metadata.
+Werk output ID, which may already have been removed. Experimental oMLX SSD
+expert offload and thinking are configurable through Text options using
+`werk.omlx.expert_cache_mb` and `werk.omlx.thinking`. Inherited options preserve
+the server's existing environment defaults; explicit options require the
+`api.chat.omlx_options` capability and each requested operation before generation.
+That check confirms API support, not model/runtime compatibility. Both
+integrations preserve the separate explicit experimental expert capability
+gate and report checkpoint-backed experts as `external` and cached unified
+memory as `ram`. oMLX prefetch accepts `ram`; generic VRAM targets remain
+available for other adapters. Expert requests do not load a model; connect
+Text's `werk.request.model` output to the Runtime node to run it after generation. Expert
+offload does not imply support for Prefill/Decode or named KV snapshots.
+Capability discovery alone does not verify inference correctness.
 
 Text discovery has an additional server-specific distinction:
 `src/inference_service/service.rs` augments generation-backend readiness for

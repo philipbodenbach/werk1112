@@ -36,12 +36,23 @@ def launcher_module(path):
         if isinstance(node, ast.If) and ast.unparse(node.test) == "__name__ == '__main__'":
             # pip's launchers optionally normalize sys.argv[0] before main().
             body = node.body
+            # uv entry points normalize Windows suffixes with an if/elif.
+            # Match the complete inert AST, never arbitrary launcher code.
+            uv_normalization = ast.parse("""
+if sys.argv[0].endswith("-script.pyw"):
+    sys.argv[0] = sys.argv[0][:-11]
+elif sys.argv[0].endswith(".exe"):
+    sys.argv[0] = sys.argv[0][:-4]
+""").body[0]
+            if body and ast.dump(body[0]) == ast.dump(uv_normalization):
+                body = body[1:]
             if body and isinstance(body[0], ast.Assign):
                 assignment = body[0]
                 if len(assignment.targets) != 1 or ast.unparse(assignment.targets[0]) != "sys.argv[0]":
                     raise ValueError("cannot verify custom MLX launcher assignments")
                 expected = ast.parse(r"re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])", mode="eval").body
-                if ast.dump(assignment.value) != ast.dump(expected):
+                homebrew = ast.parse("sys.argv[0].removesuffix('.exe')", mode="eval").body
+                if ast.dump(assignment.value) not in (ast.dump(expected), ast.dump(homebrew)):
                     raise ValueError("cannot verify custom MLX launcher argv handling")
                 body = body[1:]
             if not node.orelse and len(body) == 1 and ast.unparse(body[0]) == "sys.exit(main())":

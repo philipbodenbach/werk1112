@@ -74,10 +74,55 @@ for a complete curl request and continuation shape.
 Structured response formats, audio/video message content, log probabilities
 and stream usage summaries are not implemented by this endpoint.
 
+The native n8n and ComfyUI Text nodes also expose oMLX thinking and expert-cache
+options through the `werk.omlx` request extension. Other compatible clients can
+send `{"werk":{"omlx":{"thinking":false,"expert_cache_mb":8192}}}` alongside
+the normal chat fields. Omitted settings inherit the server defaults; expert
+cache `0` explicitly disables offload. See the
+[chat runtime option contract](../api.md#post-v1chatcompletions) for compatibility
+checks and the discovery capability required by updated nodes.
+
+To reuse short prompt prefixes with local oMLX 0.6.4, start the server with
+`werk --backend omlx serve --model MODEL --persistence`. Automatic routing to
+oMLX supports this too. With persistence mode `auto` or `disk` and reuse
+enabled, normal chat and supported tool requests use a verified exact-prefix
+cache in the worker. Clients need no additional cache or conversation fields.
+The cache has a 4 GB native SSD limit and lasts for the worker; it does not
+save chat history or guarantee reuse after restart. A first uncached request
+still performs normal prompt processing.
+
+The verbose `cached prompt tokens` count measures reused prompt/KV state.
+`WERK_OMLX_EXPERT_CACHE_MB` controls a separate cache of MoE expert weights.
+Increasing that expert budget does not enable prompt reuse. For a useful
+comparison with `werk chat --persistence`, compare cached prompt counts as well
+as prefill and decode times.
+
 Unknown OpenAI chat fields are currently ignored during deserialization. A
 request being accepted therefore does not prove that every supplied field was
 applied. Use only the fields listed in the
 [chat request contract](../api.md#post-v1chatcompletions).
+
+## Open WebUI: slow first answer with expert offload
+
+Open WebUI 0.10 defaults to native function calling and can attach its built-in
+tool schemas even to a short chat message. Those schemas become part of the
+model's prompt. With SSD expert offload, processing thousands of extra tokens
+can take minutes before the first answer token appears. The CLI's shorter
+prompt is therefore not an equivalent workload.
+
+For a model intended for plain chat, open **Workspace → Models → Edit →
+Capabilities** in Open WebUI and turn **Builtin Tools** off for that model.
+Leave it enabled when those tools are needed. See Open WebUI's
+[tool capability documentation](https://docs.openwebui.com/features/extensibility/plugin/tools/#disabling-builtin-tools-per-model).
+Title, tag and follow-up generation are separate requests; their switches and
+task model are under **Settings → Admin → Interface**.
+
+With `werk --verbose serve`, the request log includes `tools` and
+`tool_schema_bytes` so a large catalog is visible without logging its contents.
+The completion log's `prompt_tokens` includes the model-rendered tools. A
+nonstreaming `complete` log does not establish that a separate `stream` request
+has finished. In Open WebUI 0.10, a stored assistant response can use
+`output[].content[].text` while the older `content` field remains empty.
 
 ## Python SDK: image generation
 

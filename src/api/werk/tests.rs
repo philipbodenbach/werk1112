@@ -42,6 +42,7 @@ impl GenerationBackend for TestGenerationBackend {
             completion_tokens: 0,
             finish_reason: "stop".to_string(),
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds: 0.0,
                 warmup_seconds: 0.0,
                 first_token_seconds: 0.0,

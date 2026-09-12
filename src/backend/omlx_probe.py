@@ -48,7 +48,8 @@ def launcher_module(path):
                 if len(assignment.targets) != 1 or ast.unparse(assignment.targets[0]) != "sys.argv[0]":
                     raise ValueError("cannot verify custom oMLX launcher assignments")
                 expected = ast.parse(r"re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])", mode="eval").body
-                if ast.dump(assignment.value) != ast.dump(expected):
+                homebrew = ast.parse("sys.argv[0].removesuffix('.exe')", mode="eval").body
+                if ast.dump(assignment.value) not in (ast.dump(expected), ast.dump(homebrew)):
                     raise ValueError("cannot verify custom oMLX launcher argv handling")
                 body = body[1:]
             if not node.orelse and len(body) == 1 and ast.unparse(body[0]) == "sys.exit(main())":
@@ -551,6 +552,69 @@ def supports_tools(config, tokenizer_config, root, utils):
     return False
 
 
+def probe_cache_paths():
+    """Files and import directories whose changes invalidate this preflight.
+
+    Only paths are returned. Werk compares filesystem metadata without reading
+    weights or importing Python again for each request. Search directories and
+    .pth files cover new shadowing modules and installation changes as well as
+    edits to the modules actually imported by this successful probe.
+    """
+    paths = {Path(sys.executable).absolute()}
+    for module in tuple(sys.modules.values()):
+        namespace = getattr(module, "__dict__", {})
+        filename = namespace.get("__file__")
+        if isinstance(filename, str) and Path(filename).exists():
+            path = Path(filename).absolute()
+            paths.add(path)
+            paths.add(path.parent)
+        for directory in namespace.get("__path__", ()) or ():
+            if isinstance(directory, str) and Path(directory).is_dir():
+                paths.add(Path(directory).absolute())
+    for directory in sys.path:
+        if not isinstance(directory, str):
+            continue
+        root = Path(directory).absolute()
+        if root.exists():
+            paths.add(root)
+        if root.is_dir():
+            paths.update(root.glob("*.pth"))
+        elif root.parent.is_dir():
+            # Python also searches zip archives, including paths which do not
+            # yet exist. Their parent detects a newly installed archive.
+            paths.add(root.parent)
+    for name in ("omlx", "mlx", "mlx-lm"):
+        distribution = importlib.metadata.distribution(name)
+        found_metadata = False
+        for entry in distribution.files or ():
+            if entry.name == "METADATA" and str(entry.parent).endswith(".dist-info"):
+                paths.add(Path(distribution.locate_file(entry)).absolute())
+                found_metadata = True
+        if not found_metadata:
+            # Homebrew omits RECORD, making Distribution.files return None.
+            # Its standard PathDistribution still exposes the metadata folder.
+            metadata_root = getattr(distribution, "_path", None)
+            if metadata_root is None:
+                raise ValueError("runtime package metadata path is unavailable")
+            metadata_root = Path(metadata_root)
+            metadata_files = [metadata_root / filename for filename in ("METADATA", "PKG-INFO")]
+            metadata_files = [path.absolute() for path in metadata_files if path.is_file()]
+            if not metadata_files:
+                raise ValueError("runtime package metadata file is unavailable")
+            paths.update(metadata_files)
+    return sorted(map(str, paths))
+
+
+def add_probe_cache_paths(result):
+    """Optional optimization metadata must fit the bounded JSON transport."""
+    try:
+        paths = probe_cache_paths()
+        if len(paths) <= 8192 and len(json.dumps(paths).encode("utf-8")) <= 2 * 1024 * 1024:
+            result["cache_paths"] = paths
+    except Exception:
+        pass
+
+
 def probe(payload):
     if not isinstance(payload, dict):
         raise ValueError("oMLX preflight input must be an object")
@@ -606,6 +670,22 @@ def probe(payload):
         except Exception as error:
             result["tool_calling_detail"] = f"oMLX tool parser is unverified: {error}"
         result["model_type"] = config["model_type"]
+        expert_budget = payload.get("expert_cache_bytes")
+        # Auto applies only to the verified adapter. Preserve native loading
+        # for other architectures, runtime versions and quantization layouts.
+        auto_eligible = (runtime["omlx_version"] == "0.6.4"
+                         and config.get("model_type") == "deepseek_v4"
+                         and not config.get("model_file")
+                         and isinstance(config.get("quantization"), dict)
+                         and config["quantization"].get("mode", "affine") == "affine")
+        if expert_budget is not None and (expert_budget > 0 or auto_eligible):
+            if runtime["omlx_version"] != "0.6.4":
+                raise ValueError("experimental expert streaming currently requires oMLX 0.6.4")
+            from _werk_omlx_experts import inspect_model
+            result["runtime"]["expert_offload"] = inspect_model(root, payload["expert_cache_bytes"])
+    # A missing dependency inventory disables the Rust-side optimization; it
+    # must never make an otherwise valid runtime incompatible.
+    add_probe_cache_paths(result)
     return result
 
 

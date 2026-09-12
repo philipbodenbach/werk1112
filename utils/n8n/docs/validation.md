@@ -74,8 +74,8 @@ action was triggered as part of the local implementation.
   server bounds, dry-run defaults, explicit prune/expert selectors, policy
   omission, experimental prefill probe, capability recheck and private
   single-use handoff handling.
-- **Examples/parity:** every public ComfyUI registration has exactly one table
-  row (30); eight workflow files contain no credentials and use real node
+- **Examples/parity:** every current public ComfyUI registration has exactly one
+  table row (33, including the three Text nodes); eight workflow files contain no credentials and use real node
   versions, parameter IDs and graph references.
 - **Existing ComfyUI regression:** the earlier integration validation
   recorded 190 passing tests. Repository-wide release checks are separate

@@ -1,3 +1,4 @@
+mod chat_persistence;
 mod media_diagnostics;
 mod terminal_activity;
 
@@ -22,6 +23,8 @@ use std::{
 };
 use tokio_stream::StreamExt;
 
+use self::chat_persistence::ChatPersistence;
+
 use self::media_diagnostics::{
     MediaCliTimings, write_media_backend_debug, write_media_failed_attempts,
     write_media_routing_debug, write_media_verbose_stats,
@@ -32,7 +35,7 @@ use self::terminal_activity::{
 #[cfg(feature = "burn-experimental")]
 use crate::backend::burn_doctor_checks;
 use crate::{
-    api::{ApiState, CorsOrigin, serve},
+    api::{ApiState, CorsOrigin, serve_with_listener},
     api_keys,
     backend::{
         BackendAccelerator, BackendRuntime, BurnBackend, BurnMode, CandleBackend, CandleDeviceMode,
@@ -53,6 +56,7 @@ use crate::{
         vllm_rocm_signals,
     },
     banner::print_banner,
+    cache::{self, CacheKind, CachePurgeReport, CacheSelection},
     capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
     inference::{
         InferenceInput, InferenceInputSource, InferenceRequest, OverrideBool, ParameterPolicy,
@@ -73,7 +77,7 @@ use crate::{
     },
     openai::{
         ChatMessage, ChatTemplateOptions, ChatTemplateSource, ContentPart, ImageUrlSpec,
-        MessageContent, PromptSpec, image_urls_from_messages, messages_to_prompt_for_model,
+        MessageContent, PromptSpec, image_urls_from_messages,
         messages_to_prompt_for_model_with_template,
     },
     runtime_control::ServerPersistenceConfig,
@@ -88,6 +92,8 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::cache::CacheEntry;
 #[cfg(test)]
 use crate::runtime_planner::plan_runtime;
 
@@ -434,11 +440,71 @@ impl From<DeviceArg> for CandleDeviceMode {
 }
 
 #[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
+#[group(
+    id = "chat_persistence",
+    multiple = true,
+    conflicts_with = "no_history"
+)]
+pub struct ChatPersistenceArgs {
+    #[arg(
+        long,
+        help = "Save and resume completed chat turns across restarts for every backend; native KV reuse depends on the backend"
+    )]
+    pub persistence: bool,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Persistent conversation name for this model (default: default); implies --persistence"
+    )]
+    pub session: Option<String>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Conversation reuse: prefer resumes if present, required needs a saved conversation, disabled starts fresh; implies --persistence"
+    )]
+    pub persistence_reuse: Option<ServePersistenceReuseArg>,
+}
+
+impl ChatPersistenceArgs {
+    fn is_enabled(&self) -> bool {
+        self.persistence || self.session.is_some() || self.persistence_reuse.is_some()
+    }
+
+    fn open(
+        &self,
+        store: &ModelStore,
+        model_id: &str,
+    ) -> Result<Option<(ChatPersistence, Vec<ChatMessage>)>> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        let policy = PersistencePolicy {
+            mode: PersistenceMode::Disk,
+            reuse: self
+                .persistence_reuse
+                .map(Into::into)
+                .unwrap_or(ReuseMode::Prefer),
+            ttl_seconds: None,
+            pin: false,
+        };
+        ChatPersistence::open(
+            store.home(),
+            self.session.as_deref().unwrap_or("default"),
+            model_id,
+            policy,
+        )
+        .map(Some)
+    }
+}
+
+#[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
 pub struct ServePersistenceArgs {
     #[arg(
         long,
         action = ArgAction::SetTrue,
-        help = "Enable persistence defaults for /werk/v1/prefill and automatic prefix caching for local Werk-managed vLLM; remote vLLM remains externally managed"
+        help = "Enable persistence defaults for /werk/v1/prefill, oMLX native short-prefix caching during the worker lifetime (auto/disk modes), and automatic prefix caching for local Werk-managed vLLM; remote vLLM remains externally managed"
     )]
     pub persistence: bool,
 
@@ -452,7 +518,7 @@ pub struct ServePersistenceArgs {
     #[arg(
         long,
         value_enum,
-        help = "Default prefill reuse policy when policy is omitted; disabled also disables the managed local-vLLM prefix-cache default; implies --persistence"
+        help = "Default prefill reuse policy when policy is omitted; disabled also disables the managed local-vLLM prefix-cache default and oMLX native short-prefix caching; implies --persistence"
     )]
     pub persistence_reuse: Option<ServePersistenceReuseArg>,
 
@@ -691,6 +757,9 @@ pub enum Commands {
 
         #[arg(long, help = "Print backend internals and resolved runtime details")]
         debug: bool,
+
+        #[command(flatten)]
+        persistence: ChatPersistenceArgs,
     },
 
     #[command(about = "Generate, edit, or upscale images")]
@@ -804,6 +873,12 @@ pub enum Commands {
         #[arg(long, help = "Print machine-readable benchmark JSON")]
         json: bool,
 
+        #[arg(
+            long,
+            help = "Include generated text in benchmark JSON for quality review"
+        )]
+        include_output: bool,
+
         #[arg(long, help = "Print backend internals during benchmark runs")]
         debug: bool,
     },
@@ -849,6 +924,12 @@ pub enum Commands {
     Temp {
         #[command(subcommand)]
         command: TempCommands,
+    },
+
+    #[command(about = "List and remove local persistence caches")]
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
     },
 
     #[command(about = "Inspect and control a running Werk runtime")]
@@ -1049,6 +1130,73 @@ pub enum TempCommands {
 
     #[command(about = "Print the temporary-files directory")]
     Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CacheKindArg {
+    ChatKv,
+    ChatHistory,
+    OmlxWorker,
+    RuntimeState,
+}
+
+impl From<CacheKindArg> for CacheKind {
+    fn from(kind: CacheKindArg) -> Self {
+        match kind {
+            CacheKindArg::ChatKv => Self::ChatKv,
+            CacheKindArg::ChatHistory => Self::ChatHistory,
+            CacheKindArg::OmlxWorker => Self::OmlxWorker,
+            CacheKindArg::RuntimeState => Self::RuntimeState,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CacheCommands {
+    #[command(about = "List local caches and saved chat histories by type and size")]
+    List {
+        #[arg(long, value_enum, help = "Show only this storage type")]
+        kind: Option<CacheKindArg>,
+
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
+    },
+
+    #[command(
+        about = "Remove a listed cache, or all inactive caches with --all",
+        after_help = "Saved chat histories are excluded from --all unless --include-history or --kind chat-history is supplied. Active or protected entries are skipped. Model weights are never removed.",
+        group(clap::ArgGroup::new("cache_selection").required(true).args(["id", "all"]))
+    )]
+    Purge {
+        #[arg(value_name = "CACHE", help = "Exact cache ID from werk cache list")]
+        id: Option<String>,
+
+        #[arg(long, help = "Remove all inactive, unprotected caches")]
+        all: bool,
+
+        #[arg(
+            long,
+            value_enum,
+            requires = "all",
+            conflicts_with = "id",
+            help = "Limit --all to this storage type"
+        )]
+        kind: Option<CacheKindArg>,
+
+        #[arg(
+            long,
+            requires = "all",
+            conflicts_with = "id",
+            help = "Also delete saved chat histories with --all"
+        )]
+        include_history: bool,
+
+        #[arg(long, help = "Show what would be removed without deleting anything")]
+        dry_run: bool,
+
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1332,12 +1480,19 @@ pub async fn run(cli: Cli) -> Result<()> {
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let ip: IpAddr = host.parse()?;
             let addr = SocketAddr::new(ip, port);
+            // Reserve the port before preparing a potentially very large model.
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("cannot listen on {addr}"))?;
             let server_persistence = persistence.server_config();
             let vllm_automatic_prefix_caching = server_persistence
                 .is_enabled()
                 .then(|| server_persistence.defaults().reuse != ReuseMode::Disabled);
-            let selection_options =
-                selection_options.with_vllm_automatic_prefix_caching(vllm_automatic_prefix_caching);
+            let selection_options = selection_options
+                .with_vllm_automatic_prefix_caching(vllm_automatic_prefix_caching)
+                .with_omlx_server_prefix_cache(server_omlx_prefix_cache_enabled(
+                    &server_persistence,
+                ));
             let backend = build_generation_backend(
                 store.clone(),
                 backend_choice,
@@ -1397,7 +1552,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             if let Some(summary) = server_persistence_summary {
                 println!("{summary}");
             }
-            serve(addr, api_state).await
+            serve_with_listener(listener, api_state).await
         }
         Commands::Run {
             model,
@@ -1494,16 +1649,24 @@ pub async fn run(cli: Cli) -> Result<()> {
             stream_granularity,
             verbose,
             debug,
+            persistence,
         } => {
+            let selection_options = selection_options
+                .with_vllm_automatic_prefix_caching(persistence.is_enabled().then_some(true));
             let images = normalize_cli_image_sources(&images)?;
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
+            let persistence = persistence.open(&store, &manifest.id)?;
+            let has_images = !images.is_empty()
+                || persistence
+                    .as_ref()
+                    .is_some_and(|(_, messages)| !image_urls_from_messages(messages).is_empty());
             let selected_route = routed_backend_for_request_with_tools(
                 &store,
                 backend_choice,
                 &manifest,
-                !images.is_empty(),
+                has_images,
                 false,
                 selection_options,
             )?;
@@ -1513,7 +1676,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &store,
                 backend_override,
                 &manifest,
-                !images.is_empty(),
+                has_images,
                 &selected_route,
                 debug,
             );
@@ -1536,6 +1699,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 verbose,
                 debug,
                 terminal_spinner_enabled(debug),
+                persistence,
             )
             .await
         }
@@ -1622,6 +1786,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             compare,
             print_native_info,
             json,
+            include_output,
             debug,
         } => {
             let store = ModelStore::resolve(model_home)?;
@@ -1640,6 +1805,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 top_p,
                 seed,
                 compare,
+                include_output,
                 debug,
                 selection_options,
             )?;
@@ -1803,6 +1969,61 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 TempCommands::Path => {
                     println!("{}", store.tmp_dir().display());
+                    Ok(())
+                }
+            }
+        }
+        Commands::Cache { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            match command {
+                CacheCommands::List { kind, json } => {
+                    let mut inventory = cache::list(store.home())?;
+                    if let Some(kind) = kind {
+                        inventory.entries.retain(|entry| entry.kind == kind.into());
+                    }
+                    if json {
+                        print_runtime_json(&inventory)
+                    } else {
+                        println!("{}", format_cache_list(&inventory));
+                        Ok(())
+                    }
+                }
+                CacheCommands::Purge {
+                    id,
+                    all,
+                    kind,
+                    include_history,
+                    dry_run,
+                    json,
+                } => {
+                    let selection = match (id, all) {
+                        (Some(id), false) => CacheSelection::Id(id),
+                        (None, true) => CacheSelection::All {
+                            kind: kind.map(Into::into),
+                            include_history,
+                        },
+                        _ => bail!("select a cache ID or --all"),
+                    };
+                    let report = cache::purge(store.home(), &selection, dry_run)?;
+                    if json {
+                        print_runtime_json(&report)?;
+                    } else {
+                        println!("{}", format_cache_purge(&report));
+                        if matches!(
+                            selection,
+                            CacheSelection::All {
+                                kind: None,
+                                include_history: false
+                            }
+                        ) {
+                            println!(
+                                "Saved chat histories were retained; select a chat-history ID or add --include-history to remove them."
+                            );
+                        }
+                    }
+                    if matches!(selection, CacheSelection::Id(_)) && !report.blocked.is_empty() {
+                        bail!("selected cache could not be purged");
+                    }
                     Ok(())
                 }
             }
@@ -4290,6 +4511,7 @@ fn should_print_startup_banner_for(
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
+        | Commands::Cache { .. }
         | Commands::Runtime { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
@@ -4318,6 +4540,7 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         | Commands::Auth { .. }
         | Commands::Temp { .. }
         | Commands::Runtime { .. }
+        | Commands::Cache { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
         | Commands::Inspect { .. }
@@ -6501,11 +6724,63 @@ async fn chat_loop(
     verbose: bool,
     debug: bool,
     show_loading_spinner: bool,
+    persistence: Option<(ChatPersistence, Vec<ChatMessage>)>,
 ) -> Result<()> {
+    let (mut persistence, mut archive) = match persistence {
+        Some((storage, archive)) => (Some(storage), archive),
+        None => (None, Vec::new()),
+    };
+    if let Some(storage) = persistence.as_ref() {
+        eprintln!(
+            "[werk chat] persistence enabled: {} saved messages{}",
+            archive.len(),
+            if storage.resumed() { " restored" } else { "" }
+        );
+        if let Some(path) = storage.path() {
+            eprintln!("[werk chat] conversation: {}", path.display());
+        }
+        if let Some(notice) = storage.notice() {
+            eprintln!("[werk chat] {notice}");
+        }
+    }
+    let has_images = !images.is_empty() || !image_urls_from_messages(&archive).is_empty();
+    let native_session = if !has_images
+        && let Some(storage) = persistence.as_ref().filter(|storage| storage.is_durable())
+    {
+        match with_activity(
+            show_loading_spinner,
+            ActivityKind::Chat,
+            &format!("Preparing persistent chat for {}", manifest.id),
+            || {
+                let cache_directory = storage.native_cache_directory()?;
+                backend.start_persistent_chat_session(&manifest, seed, &cache_directory)
+            },
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("[werk chat] native KV cache unavailable: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if persistence.is_some() {
+        eprintln!(
+            "[werk chat] {}",
+            if native_session.is_some() {
+                "native KV cache enabled; reuse depends on the prompt and backend"
+            } else {
+                "conversation persistence active; native KV persistence unavailable on this route"
+            }
+        );
+    }
     // Session selection predates multimodal request capabilities. Keep image
     // chats on the request-aware backend path so a llama.cpp server is started
     // with its projector and no cached text-only session can pin the route.
-    let chat_session = if images.is_empty() {
+    let chat_session = if native_session.is_some() {
+        native_session
+    } else if !has_images {
         prepare_backend_for_chat(backend.as_ref(), &manifest, seed, show_loading_spinner)?
     } else {
         None
@@ -6515,7 +6790,7 @@ async fn chat_loop(
         "Chatting with {}. Type /exit or /quit to stop.",
         manifest.id
     );
-    let mut messages = Vec::new();
+    let mut messages = archive.clone();
     let mut input_reader = ChatInputReader::new();
 
     loop {
@@ -6534,7 +6809,7 @@ async fn chat_loop(
         let user_message = vision_user_message(input, &images);
 
         let mut request_messages =
-            request_messages_for_turn(&mut messages, user_message, history_enabled);
+            request_messages_for_turn(&mut messages, user_message.clone(), history_enabled);
         let removed_messages = trim_chat_history_to_context(
             &manifest,
             selected_backend,
@@ -6562,7 +6837,7 @@ async fn chat_loop(
             prompt_diagnostics(&prompt, request_messages.len(), Some(history_enabled));
         let generation_messages = generation_request_messages(&prompt, &request_messages);
         let request_image_urls = if generation_messages.is_empty() {
-            images.clone()
+            image_urls_from_messages(&request_messages)
         } else {
             image_urls_from_messages(&generation_messages)
         };
@@ -6590,6 +6865,7 @@ async fn chat_loop(
         let mut finish_reason = String::new();
         let mut timings = None;
         let mut backend_diagnostics = Vec::new();
+        let mut completed = false;
         let mut last_flush = Instant::now();
         let mut pending_spinner =
             AssistantPendingSpinner::new(io::stdout().is_terminal() && !debug);
@@ -6641,6 +6917,7 @@ async fn chat_loop(
                     timings: response_timings,
                     backend_diagnostics: response_backend_diagnostics,
                 }) => {
+                    completed = true;
                     finish_reason = response_finish_reason;
                     prompt_tokens = tokens_in;
                     completion_tokens = tokens;
@@ -6680,17 +6957,52 @@ async fn chat_loop(
             )?;
         }
 
-        if history_enabled && !assistant.trim().is_empty() {
-            messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(MessageContent::Text(assistant)),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
+        finish_chat_turn(
+            &mut messages,
+            &mut archive,
+            persistence.as_mut(),
+            user_message,
+            assistant,
+            history_enabled,
+            completed,
+        )?;
     }
 
+    Ok(())
+}
+
+fn finish_chat_turn(
+    messages: &mut Vec<ChatMessage>,
+    archive: &mut Vec<ChatMessage>,
+    persistence: Option<&mut ChatPersistence>,
+    user_message: ChatMessage,
+    assistant: String,
+    history_enabled: bool,
+    completed: bool,
+) -> Result<()> {
+    if history_enabled && !assistant.trim().is_empty() && (persistence.is_none() || completed) {
+        let assistant_message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text(assistant)),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        if let Some(storage) = persistence {
+            let mut next_archive = archive.clone();
+            next_archive.push(user_message);
+            next_archive.push(assistant_message.clone());
+            storage
+                .save_completed_turn(&next_archive)
+                .context("chat answer was generated but the conversation could not be saved")?;
+            *archive = next_archive;
+        }
+        messages.push(assistant_message);
+    } else if persistence.is_some() {
+        // An interrupted or failed answer must not become the context of a
+        // later successful turn or replace the last complete disk archive.
+        messages.clone_from(archive);
+    }
     Ok(())
 }
 
@@ -7006,6 +7318,10 @@ struct BenchSample {
     prompt_seconds: f64,
     decode_seconds: f64,
     eval_tokens_per_second: f64,
+    finish_reason: String,
+    backend_diagnostics: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7022,6 +7338,7 @@ fn bench_model(
     top_p: Option<f64>,
     seed: u64,
     compare: BenchCompareArg,
+    include_output: bool,
     debug: bool,
     selection_options: SelectionOptions,
 ) -> Result<BenchReport> {
@@ -7029,16 +7346,13 @@ fn bench_model(
         bail!("--runs must be greater than 0");
     }
 
-    let prompt_spec = messages_to_prompt_for_model(
-        &manifest,
-        &[ChatMessage {
-            role: "user".to_string(),
-            content: Some(MessageContent::Text(prompt.clone())),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-        }],
-    );
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: Some(MessageContent::Text(prompt.clone())),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }];
     let choices = benchmark_choices(backend_choice, &manifest, compare);
     let mut results = Vec::with_capacity(choices.len());
 
@@ -7050,14 +7364,14 @@ fn bench_model(
             &manifest,
             choice,
             runtime_options.clone(),
-            &prompt_spec.prompt,
-            &prompt_spec.stop,
+            &messages,
             max_tokens,
             runs,
             warmups,
             temperature,
             top_p,
             seed,
+            include_output,
             debug,
             selection_options,
         );
@@ -7115,43 +7429,41 @@ fn run_benchmark_choice(
     manifest: &ModelManifest,
     choice: BackendChoice,
     runtime_options: LlamaRuntimeOptions,
-    prompt: &str,
-    stop: &[String],
+    messages: &[ChatMessage],
     max_tokens: usize,
     runs: usize,
     warmups: usize,
     temperature: f64,
     top_p: Option<f64>,
     seed: u64,
+    include_output: bool,
     debug: bool,
     selection_options: SelectionOptions,
 ) -> Result<Vec<BenchSample>> {
-    let backend = build_concrete_backend(store, choice, runtime_options, selection_options)?;
+    let selected_route = routed_backend_for_request_with_tools(
+        &store,
+        choice,
+        manifest,
+        false,
+        false,
+        selection_options,
+    )?;
+    let prompt = prompt_for_backend(manifest, messages, selected_route.choice, None);
+    let backend = selected_route.build(store, runtime_options, selection_options)?;
     backend.prepare(manifest)?;
     let session = backend.start_chat_session(manifest, Some(seed))?;
 
     let mut samples = Vec::with_capacity(runs);
     for index in 0..warmups + runs {
-        let request = GenerateRequest {
-            prompt: prompt.to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: Some(MessageContent::Text(prompt.to_string())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            image_urls: Vec::new(),
+        let request = benchmark_generate_request(
+            &prompt,
+            messages,
             max_tokens,
-            temperature: Some(temperature),
+            temperature,
             top_p,
-            stop: stop.to_vec(),
-            seed: Some(seed),
-            stream_granularity: StreamGranularity::Chunk,
-            verbose: false,
+            seed,
             debug,
-            tool_config: None,
-        };
+        );
         let response = if let Some(session) = session.as_ref() {
             session.generate(request)?
         } else {
@@ -7172,10 +7484,40 @@ fn run_benchmark_choice(
                     response.completion_tokens,
                     response.timings.decode_seconds,
                 ),
+                finish_reason: response.finish_reason,
+                backend_diagnostics: response.backend_diagnostics,
+                output: include_output.then_some(response.text),
             });
         }
     }
     Ok(samples)
+}
+
+fn benchmark_generate_request(
+    prompt: &PromptSpec,
+    messages: &[ChatMessage],
+    max_tokens: usize,
+    temperature: f64,
+    top_p: Option<f64>,
+    seed: u64,
+    debug: bool,
+) -> GenerateRequest {
+    GenerateRequest {
+        prompt: prompt.prompt.clone(),
+        // Model-native templates need the original conversation, exactly as run/chat do.
+        // Putting prompt.prompt here would template an already rendered prompt twice.
+        messages: generation_request_messages(prompt, messages),
+        image_urls: Vec::new(),
+        max_tokens,
+        temperature: Some(temperature),
+        top_p,
+        stop: prompt.stop.clone(),
+        seed: Some(seed),
+        stream_granularity: StreamGranularity::Chunk,
+        verbose: false,
+        debug,
+        tool_config: None,
+    }
 }
 
 fn benchmark_choices(
@@ -7708,10 +8050,28 @@ fn write_verbose_stats<W: Write>(
             format_duration(timings.warmup_seconds)
         )?;
     }
+    let evaluated_prompt_tokens = timings
+        .cached_prompt_tokens
+        .filter(|cached| *cached <= prompt_tokens)
+        .map(|cached| prompt_tokens - cached);
+    if let Some(evaluated) = evaluated_prompt_tokens {
+        writeln!(
+            writer,
+            "{:<22}{} token(s)",
+            "prompt total count:", prompt_tokens
+        )?;
+        writeln!(
+            writer,
+            "{:<22}{} token(s)",
+            "prompt cached count:",
+            prompt_tokens - evaluated
+        )?;
+    }
+    let prompt_eval_tokens = evaluated_prompt_tokens.unwrap_or(prompt_tokens);
     writeln!(
         writer,
         "{:<22}{} token(s)",
-        "prompt eval count:", prompt_tokens
+        "prompt eval count:", prompt_eval_tokens
     )?;
     writeln!(
         writer,
@@ -7724,7 +8084,7 @@ fn write_verbose_stats<W: Write>(
             writer,
             "{:<22}{:.2} tokens/s",
             "prompt eval rate:",
-            rate(prompt_tokens, timings.prompt_seconds)
+            rate(prompt_eval_tokens, timings.prompt_seconds)
         )?;
     } else {
         writeln!(writer, "{:<22}N/A", "prompt eval rate:")?;
@@ -7844,10 +8204,13 @@ impl std::fmt::Debug for RoutedBackend {
 
 /// Share configuration-identical instances while their CLI/server owner lives.
 /// Weak entries cannot keep child processes alive after that owner shuts down.
-fn configured_omlx_backend(store: &ModelStore) -> Result<Arc<OmlxBackend>> {
+fn configured_omlx_backend(
+    store: &ModelStore,
+    server_prefix_cache: bool,
+) -> Result<Arc<OmlxBackend>> {
     type Cache = HashMap<(PathBuf, String), Weak<OmlxBackend>>;
     static BACKENDS: OnceLock<Mutex<Cache>> = OnceLock::new();
-    let discovered = OmlxBackend::new(store.clone());
+    let discovered = OmlxBackend::new(store.clone()).with_server_prefix_cache(server_prefix_cache);
     let key = (store.home().to_path_buf(), discovered.cache_identity());
     let mut backends = BACKENDS
         .get_or_init(Mutex::default)
@@ -7966,6 +8329,7 @@ struct SelectionOptions {
     provision_missing_backends: bool,
     verbose_backend_installs: bool,
     vllm_automatic_prefix_caching: Option<bool>,
+    omlx_server_prefix_cache: bool,
 }
 
 impl SelectionOptions {
@@ -7975,6 +8339,7 @@ impl SelectionOptions {
             provision_missing_backends: !no_auto_install && (auto_install || default_provision),
             verbose_backend_installs: false,
             vllm_automatic_prefix_caching: None,
+            omlx_server_prefix_cache: false,
         }
     }
 
@@ -7988,6 +8353,13 @@ impl SelectionOptions {
     fn with_vllm_automatic_prefix_caching(self, enabled: Option<bool>) -> Self {
         Self {
             vllm_automatic_prefix_caching: enabled,
+            ..self
+        }
+    }
+
+    fn with_omlx_server_prefix_cache(self, enabled: bool) -> Self {
+        Self {
+            omlx_server_prefix_cache: enabled,
             ..self
         }
     }
@@ -8123,6 +8495,28 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn with_chat_options(
+        &self,
+        manifest: &ModelManifest,
+        options: &crate::openai::ChatRuntimeOptions,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        options.validate()?;
+        if options.is_empty() {
+            bail!("explicit chat runtime controls are empty");
+        }
+        if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
+            bail!("werk.omlx controls require an MLX or Hugging Face safetensors text model");
+        }
+        // Explicit oMLX controls choose oMLX before its configured model probe;
+        // ordinary auto selection might otherwise select a different runtime.
+        let base =
+            configured_omlx_backend(&self.store, self.selection_options.omlx_server_prefix_cache)?;
+        let configured = base.with_chat_options(manifest, options)?;
+        // The server owner retains the shared worker registry across requests.
+        retain_omlx_backend(&self.omlx_backends, base)?;
+        Ok(configured)
+    }
+
     fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
         self.backend_for_capabilities(manifest, has_images, true)
             .is_ok_and(|backend| backend.supports_tool_calling(manifest, has_images))
@@ -8156,6 +8550,16 @@ impl GenerationBackend for AutoBackend {
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         self.backend_for_execution(manifest, false, false)?
             .start_chat_session(manifest, seed)
+    }
+
+    fn start_persistent_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+        cache_directory: &std::path::Path,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for_execution(manifest, false, false)?
+            .start_persistent_chat_session(manifest, seed, cache_directory)
     }
 
     fn task_readiness(
@@ -8340,6 +8744,16 @@ impl GenerationBackend for GgufPreferredBackend {
             .start_chat_session(manifest, seed)
     }
 
+    fn start_persistent_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+        cache_directory: &std::path::Path,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for_execution(manifest, false, false)?
+            .start_persistent_chat_session(manifest, seed, cache_directory)
+    }
+
     fn task_readiness(
         &self,
         manifest: &ModelManifest,
@@ -8471,6 +8885,16 @@ impl GenerationBackend for MlxPreferredBackend {
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         self.backend_for_request(manifest, false)?
             .start_chat_session(manifest, seed)
+    }
+
+    fn start_persistent_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+        cache_directory: &std::path::Path,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for_request(manifest, false)?
+            .start_persistent_chat_session(manifest, seed, cache_directory)
     }
 
     fn task_readiness(
@@ -8641,6 +9065,16 @@ impl GenerationBackend for VllmPreferredBackend {
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         self.backend_for_request(manifest, false)?
             .start_chat_session(manifest, seed)
+    }
+
+    fn start_persistent_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+        cache_directory: &std::path::Path,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for_request(manifest, false)?
+            .start_persistent_chat_session(manifest, seed, cache_directory)
     }
 
     fn task_readiness(
@@ -8817,7 +9251,10 @@ fn build_concrete_backend(
         BackendChoice::Burn(mode) => Ok(Arc::new(BurnBackend::new(store, mode))),
         BackendChoice::Mlx => Ok(Arc::new(MlxBackend::new(store))),
         BackendChoice::MlxVlm => Ok(Arc::new(MlxVlmBackend::new(store))),
-        BackendChoice::Omlx => Ok(configured_omlx_backend(&store)?),
+        BackendChoice::Omlx => Ok(configured_omlx_backend(
+            &store,
+            selection_options.omlx_server_prefix_cache,
+        )?),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
         BackendChoice::TransformersCompat => Ok(Arc::new(TransformersCompatBackend::new(store))),
         BackendChoice::Vllm => Ok(Arc::new(
@@ -8932,7 +9369,7 @@ fn select_backend_from_runtime_candidates(
 ) -> Result<RoutedBackend> {
     let omlx = candidates
         .contains(&RuntimeId::Omlx)
-        .then(|| configured_omlx_backend(store))
+        .then(|| configured_omlx_backend(store, selection_options.omlx_server_prefix_cache))
         .transpose()?;
     let availability = candidates
         .iter()
@@ -9083,10 +9520,12 @@ fn backend_unavailability_reason(
             .probe_model(manifest)
             .err()
             .map(|error| compact_reason(&format!("{error:#}"))),
-        BackendChoice::Omlx => configured_omlx_backend(store)
-            .and_then(|backend| backend.probe_model(manifest))
-            .err()
-            .map(|error| compact_reason(&format!("{error:#}"))),
+        BackendChoice::Omlx => {
+            configured_omlx_backend(store, selection_options.omlx_server_prefix_cache)
+                .and_then(|backend| backend.probe_model(manifest))
+                .err()
+                .map(|error| compact_reason(&format!("{error:#}")))
+        }
         BackendChoice::MlxVlm => MlxVlmBackend::probe().err().map(|_| {
             "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
         }),
@@ -9379,7 +9818,7 @@ fn select_backend_with_planner(
     let requested = requested_backend_for_choice(backend);
     let omlx = runtime_candidate_ids_for_selection(store, manifest, requested)
         .contains(&RuntimeId::Omlx)
-        .then(|| configured_omlx_backend(store))
+        .then(|| configured_omlx_backend(store, selection_options.omlx_server_prefix_cache))
         .transpose()?;
     let availability = runtime_availabilities_for_request_with_omlx(
         store,
@@ -9540,10 +9979,12 @@ fn runtime_unavailability_reason(
     match runtime_id {
         RuntimeId::Omlx => match omlx {
             Some(backend) => omlx_unavailability_reason(backend, manifest, capabilities),
-            None => match configured_omlx_backend(store) {
-                Ok(backend) => omlx_unavailability_reason(&backend, manifest, capabilities),
-                Err(error) => Some(compact_reason(&format!("{error:#}"))),
-            },
+            None => {
+                match configured_omlx_backend(store, selection_options.omlx_server_prefix_cache) {
+                    Ok(backend) => omlx_unavailability_reason(&backend, manifest, capabilities),
+                    Err(error) => Some(compact_reason(&format!("{error:#}"))),
+                }
+            }
         },
         RuntimeId::VllmCuda => vllm_probe_unavailability_reason(VllmBackend::probe(store)),
         RuntimeId::VllmRocm => vllm_probe_unavailability_reason(VllmBackend::probe_rocm(store)),
@@ -10290,6 +10731,98 @@ fn format_bytes(bytes: u64) -> String {
     format_bytes_f64(bytes as f64)
 }
 
+fn cache_kind_label(kind: CacheKind) -> &'static str {
+    match kind {
+        CacheKind::ChatKv => "chat-kv",
+        CacheKind::ChatHistory => "chat-history",
+        CacheKind::OmlxWorker => "omlx-worker",
+        CacheKind::RuntimeState => "runtime-state",
+    }
+}
+
+fn format_cache_list(inventory: &cache::CacheInventory) -> String {
+    let entries = &inventory.entries;
+    if entries.is_empty() && inventory.blocked.is_empty() {
+        return "No local persistence caches or saved chat histories found.".to_string();
+    }
+    let mut lines = Vec::new();
+    for entry in entries {
+        let status = if let Some(reason) = &entry.blocked_reason {
+            reason.as_str()
+        } else if entry.active {
+            "active"
+        } else if entry.kind == CacheKind::ChatHistory {
+            "saved history (excluded from --all)"
+        } else {
+            "available"
+        };
+        lines.push(entry.id.clone());
+        lines.push(format!(
+            "  type: {} | backend: {} | size: {} | status: {status}",
+            cache_kind_label(entry.kind),
+            entry.backend.as_deref().unwrap_or("-"),
+            entry
+                .bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".into()),
+        ));
+    }
+    for blocked in &inventory.blocked {
+        lines.push(format!(
+            "Could not inspect {}: {}",
+            blocked.id, blocked.reason
+        ));
+    }
+    lines.push(format!(
+        "{} entries. Purge one ID, or use --all for inactive caches; saved histories require explicit selection.",
+        entries.len(),
+    ));
+    lines.join("\n")
+}
+
+fn format_cache_purge(report: &CachePurgeReport) -> String {
+    let mut lines = Vec::new();
+    let successful: Vec<_> = report
+        .entries
+        .iter()
+        .filter(|entry| {
+            !report.blocked.iter().any(|blocked| blocked.id == entry.id)
+                && (report.dry_run || report.removed.contains(&entry.id))
+        })
+        .collect();
+    let bytes = successful
+        .iter()
+        .try_fold(0_u64, |total, entry| total.checked_add(entry.bytes?));
+    let action = if report.dry_run {
+        "Would purge"
+    } else {
+        "Purged"
+    };
+    for entry in &successful {
+        lines.push(format!("{action} {}", entry.id));
+    }
+    for blocked in &report.blocked {
+        lines.push(format!("Skipped {}: {}", blocked.id, blocked.reason));
+    }
+    let size = bytes
+        .map(|bytes| format!(" ({})", format_bytes(bytes)))
+        .unwrap_or_default();
+    let entry_label = if successful.len() == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
+    lines.push(format!(
+        "{action} {} {entry_label}{size}; skipped {}.",
+        successful.len(),
+        report.blocked.len()
+    ));
+    if report.dry_run {
+        lines.push("Dry run: nothing was deleted.".into());
+    }
+    lines.join("\n")
+}
+
 fn format_temp_purge_summary(summary: &TempPurgeSummary, dry_run: bool) -> String {
     if summary.entries == 0 {
         return if dry_run {
@@ -10331,6 +10864,15 @@ fn format_temp_list(entries: &[PathBuf]) -> String {
         .join("\n")
 }
 
+fn server_omlx_prefix_cache_enabled(config: &ServerPersistenceConfig) -> bool {
+    config.is_enabled()
+        && matches!(
+            config.defaults().mode,
+            PersistenceMode::Auto | PersistenceMode::Disk
+        )
+        && config.defaults().reuse != ReuseMode::Disabled
+}
+
 fn format_server_persistence_config(config: &ServerPersistenceConfig) -> Option<String> {
     if !config.is_enabled() {
         return None;
@@ -10353,6 +10895,11 @@ fn format_server_persistence_config(config: &ServerPersistenceConfig) -> Option<
     } else {
         "enabled"
     };
+    let omlx_prefix_cache = if server_omlx_prefix_cache_enabled(config) {
+        "requested for compatible models during the worker lifetime"
+    } else {
+        "not requested"
+    };
     let ttl = defaults
         .ttl_seconds
         .map(|seconds| seconds.to_string())
@@ -10361,7 +10908,8 @@ fn format_server_persistence_config(config: &ServerPersistenceConfig) -> Option<
     Some(format!(
         "Werk persistence enabled: prefill defaults mode={mode} reuse={reuse} \
          ttl_seconds={ttl} pin={}; automatic model/pipeline residency remains active on \
-         supported Werk-managed runtimes; local vLLM automatic prefix caching defaults to \
+         supported Werk-managed runtimes; oMLX native short-prefix caching {omlx_prefix_cache}; \
+         local vLLM automatic prefix caching defaults to \
          {vllm_prefix_cache} unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM \
          remains externally managed.",
         defaults.pin
@@ -11045,6 +11593,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chat_persistence_flags_are_available_for_every_backend() {
+        for backend in BackendArg::value_variants() {
+            let value = backend.to_possible_value().unwrap();
+            let cli = Cli::try_parse_from([
+                "werk",
+                "--backend",
+                value.get_name(),
+                "chat",
+                "model",
+                "--persistence",
+                "--session",
+                "project",
+                "--persistence-reuse",
+                "required",
+            ])
+            .unwrap();
+            let Some(Commands::Chat { persistence, .. }) = cli.command else {
+                panic!("expected chat");
+            };
+            assert!(persistence.persistence);
+            assert_eq!(persistence.session.as_deref(), Some("project"));
+            assert_eq!(
+                persistence.persistence_reuse,
+                Some(ServePersistenceReuseArg::Required)
+            );
+        }
+    }
+
+    #[test]
+    fn chat_persistence_conflicts_with_single_turn_and_is_opt_in() {
+        for option in ["--no-history", "--single-turn"] {
+            for persistence in [
+                vec!["--persistence"],
+                vec!["--session", "project"],
+                vec!["--persistence-reuse", "prefer"],
+            ] {
+                let mut args = vec!["werk", "chat", "model", option];
+                args.extend(persistence);
+                assert!(Cli::try_parse_from(args).is_err());
+            }
+        }
+        let cli = Cli::try_parse_from(["werk", "chat", "model"]).unwrap();
+        let Some(Commands::Chat { persistence, .. }) = cli.command else {
+            panic!("expected chat");
+        };
+        assert_eq!(persistence, ChatPersistenceArgs::default());
+        assert!(Cli::try_parse_from(["werk", "chat", "model", "--session", "project"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["werk", "chat", "model", "--persistence-reuse", "invalid"])
+                .is_err()
+        );
+    }
+
     fn parse_serve_persistence(args: &[&str]) -> ServePersistenceArgs {
         let mut argv = vec!["werk", "serve"];
         argv.extend_from_slice(args);
@@ -11105,6 +11707,7 @@ mod tests {
         let help = serve.render_long_help().to_string();
         assert!(help.contains("persistence defaults for /werk/v1/prefill"));
         assert!(help.contains("automatic prefix caching for local Werk-managed vLLM"));
+        assert!(help.contains("oMLX native short-prefix caching during the worker lifetime"));
         assert!(help.contains("remote vLLM remains externally managed"));
         assert!(help.contains("policy is omitted; implies --persistence"));
         assert!(help.contains("disabled also disables the managed local-vLLM prefix-cache"));
@@ -11128,7 +11731,8 @@ mod tests {
             Some(
                 "Werk persistence enabled: prefill defaults mode=disk reuse=required \
                  ttl_seconds=900 pin=true; automatic model/pipeline residency remains active on \
-                 supported Werk-managed runtimes; local vLLM automatic prefix caching defaults to \
+                 supported Werk-managed runtimes; oMLX native short-prefix caching requested for \
+                 compatible models during the worker lifetime; local vLLM automatic prefix caching defaults to \
                  enabled unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM \
                  remains externally managed."
             )
@@ -11180,6 +11784,48 @@ mod tests {
     }
 
     #[test]
+    fn serve_omlx_prefix_cache_requires_enabled_disk_capable_reuse() {
+        let base = SelectionOptions::from_cli(BackendArg::Auto, false, false);
+        assert!(!base.omlx_server_prefix_cache);
+        let cases: &[(&[&str], bool)] = &[
+            (&[], false),
+            (&["--persistence"], true),
+            (&["--persistence-mode", "auto"], true),
+            (&["--persistence-mode", "disk"], true),
+            (&["--persistence-mode", "memory"], false),
+            (&["--persistence-mode", "ephemeral"], false),
+            (&["--persistence-reuse", "disabled"], false),
+            (&["--persistence-reuse", "required"], true),
+            (
+                &[
+                    "--persistence-mode",
+                    "disk",
+                    "--persistence-reuse",
+                    "disabled",
+                ],
+                false,
+            ),
+        ];
+        for (arguments, expected) in cases {
+            let config = parse_serve_persistence(arguments).server_config();
+            let options =
+                base.with_omlx_server_prefix_cache(server_omlx_prefix_cache_enabled(&config));
+            assert_eq!(options.omlx_server_prefix_cache, *expected, "{arguments:?}");
+            if let Some(summary) = format_server_persistence_config(&config) {
+                let expected_summary = if *expected {
+                    "oMLX native short-prefix caching requested for compatible models during the worker lifetime"
+                } else {
+                    "oMLX native short-prefix caching not requested"
+                };
+                assert!(
+                    summary.contains(expected_summary),
+                    "{arguments:?}: {summary}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn vllm_args_are_not_a_backend_selection_input() {
         let cli = Cli::try_parse_from(["werk", "serve"]).unwrap();
         assert_eq!(cli.backend, BackendArg::Auto);
@@ -11187,6 +11833,134 @@ mod tests {
             backend_arg_to_choice(cli.backend),
             BackendChoice::Auto
         ));
+    }
+
+    #[test]
+    fn cache_commands_require_an_explicit_selection_and_support_filters() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "cache",
+            "list",
+            "--kind",
+            "chat-kv",
+            "--json",
+            "--model-home",
+            "/tmp/werk-cache-home",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.model_home.as_deref(),
+            Some(Path::new("/tmp/werk-cache-home"))
+        );
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Cache {
+                command: CacheCommands::List {
+                    kind: Some(CacheKindArg::ChatKv),
+                    json: true
+                }
+            })
+        ));
+
+        let id = format!("chat-kv:{}", "a".repeat(64));
+        let cli = Cli::try_parse_from(["werk", "cache", "purge", &id]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Cache {
+            command: CacheCommands::Purge { id: Some(selected), all: false, dry_run: false, .. }
+        }) if selected == id));
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "cache",
+            "purge",
+            "--all",
+            "--kind",
+            "runtime-state",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Cache {
+                command: CacheCommands::Purge {
+                    id: None,
+                    all: true,
+                    kind: Some(CacheKindArg::RuntimeState),
+                    include_history: false,
+                    dry_run: true,
+                    json: true,
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["werk", "cache", "purge", "--all", "--include-history",]).is_ok()
+        );
+        for arguments in [
+            vec!["werk", "cache", "purge"],
+            vec!["werk", "cache", "purge", &id, "--all"],
+            vec!["werk", "cache", "purge", "--kind", "chat-kv"],
+            vec!["werk", "cache", "purge", &id, "--kind", "chat-kv"],
+            vec!["werk", "cache", "purge", &id, "--include-history"],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn cache_commands_keep_machine_readable_output_free_of_banners() {
+        for arguments in [
+            vec!["werk", "cache", "list", "--json"],
+            vec!["werk", "cache", "purge", "--all", "--dry-run", "--json"],
+        ] {
+            let command = Cli::try_parse_from(arguments).unwrap().command.unwrap();
+            assert!(!should_print_startup_banner_for(&command, true, true));
+        }
+    }
+
+    #[test]
+    fn cache_output_distinguishes_histories_and_never_counts_blocked_entries_as_removed() {
+        let entry = CacheEntry {
+            id: format!("chat-kv:{}", "a".repeat(64)),
+            kind: CacheKind::ChatKv,
+            backend: Some("omlx".into()),
+            bytes: Some(1024),
+            modified_unix_seconds: None,
+            active: false,
+            blocked_reason: None,
+        };
+        let history = CacheEntry {
+            id: format!("chat-history:{}", "a".repeat(64)),
+            kind: CacheKind::ChatHistory,
+            backend: None,
+            ..entry.clone()
+        };
+        let output = format_cache_list(&cache::CacheInventory {
+            entries: vec![entry.clone(), history],
+            blocked: Vec::new(),
+        });
+        assert!(output.contains("type: chat-kv | backend: omlx | size: 1.00 KiB"));
+        assert!(output.contains("type: chat-history"));
+        assert!(output.contains("saved history (excluded from --all)"));
+
+        let mut report = CachePurgeReport {
+            entries: vec![entry.clone()],
+            removed: Vec::new(),
+            blocked: vec![cache::CacheBlocked {
+                id: "omlx-worker:busy".into(),
+                reason: "worker is active".into(),
+            }],
+            dry_run: true,
+        };
+        let output = format_cache_purge(&report);
+        assert!(output.contains("Would purge 1 entry (1.00 KiB); skipped 1."));
+        assert!(output.contains("nothing was deleted"));
+        assert!(output.contains("Skipped omlx-worker:busy: worker is active"));
+
+        report.dry_run = false;
+        report.removed.push(entry.id);
+        let output = format_cache_purge(&report);
+        assert!(output.contains("Purged 1 entry (1.00 KiB); skipped 1."));
+        assert!(!output.contains("Would purge"));
     }
 
     #[test]
@@ -12493,6 +13267,7 @@ mod tests {
             stream_granularity: StreamGranularityArg::Token,
             verbose: false,
             debug: false,
+            persistence: ChatPersistenceArgs::default(),
         };
         assert!(!command_backend_install_verbose(&quiet_chat));
 
@@ -12508,6 +13283,7 @@ mod tests {
             stream_granularity: StreamGranularityArg::Token,
             verbose: true,
             debug: false,
+            persistence: ChatPersistenceArgs::default(),
         };
         assert!(command_backend_install_verbose(&verbose_chat));
 
@@ -12845,11 +13621,11 @@ mod tests {
     #[test]
     fn omlx_route_retains_probed_instance_and_weak_cache_does_not_own_workers() {
         let store = test_store("omlx-selected-instance");
-        let backend = configured_omlx_backend(&store).unwrap();
-        let repeated = configured_omlx_backend(&store).unwrap();
+        let backend = configured_omlx_backend(&store, false).unwrap();
+        let repeated = configured_omlx_backend(&store, false).unwrap();
         assert!(Arc::ptr_eq(&backend, &repeated));
         let other_store = test_store("omlx-other-store");
-        let other = configured_omlx_backend(&other_store).unwrap();
+        let other = configured_omlx_backend(&other_store, false).unwrap();
         assert!(!Arc::ptr_eq(&backend, &other));
         let weak = Arc::downgrade(&backend);
         let route = RoutedBackend {
@@ -12872,19 +13648,119 @@ mod tests {
     }
 
     #[test]
+    fn omlx_server_prefix_cache_configuration_is_shared_without_aliasing_cli_workers() {
+        let store = test_store("omlx-server-prefix-cache-configuration");
+        let ordinary = configured_omlx_backend(&store, false).unwrap();
+        let persistent = configured_omlx_backend(&store, true).unwrap();
+        let repeated = configured_omlx_backend(&store, true).unwrap();
+        assert!(!Arc::ptr_eq(&ordinary, &persistent));
+        assert!(Arc::ptr_eq(&persistent, &repeated));
+
+        let options = SelectionOptions::default().with_omlx_server_prefix_cache(true);
+        let expected: Arc<dyn GenerationBackend> = persistent.clone();
+        let explicit = build_concrete_backend(
+            store.clone(),
+            BackendChoice::Omlx,
+            LlamaRuntimeOptions::default(),
+            options,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&expected, &explicit));
+
+        // Auto selection retains the configured instance used while probing.
+        let route = RoutedBackend {
+            choice: BackendChoice::Omlx,
+            selection: None,
+            omlx: Some(persistent.clone()),
+        };
+        let routed = route
+            .build(store.clone(), LlamaRuntimeOptions::default(), options)
+            .unwrap();
+        assert!(Arc::ptr_eq(&expected, &routed));
+
+        let owner = Mutex::new(Vec::new());
+        retain_omlx_backend(&owner, persistent.clone()).unwrap();
+        retain_omlx_backend(&owner, repeated).unwrap();
+        assert_eq!(owner.lock().unwrap().len(), 1);
+        // Configuration alone must not start a model worker or create cache data.
+        assert!(!store.home().exists());
+    }
+
+    #[test]
     fn omlx_server_route_owner_reuses_and_releases_its_configured_backend() {
         let store = test_store("omlx-server-route-owner");
-        let backend = configured_omlx_backend(&store).unwrap();
+        let backend = configured_omlx_backend(&store, false).unwrap();
         let weak = Arc::downgrade(&backend);
         let owner = Mutex::new(Vec::new());
         let executed = retain_omlx_backend(&owner, backend.clone()).unwrap();
         drop((backend, executed));
-        let repeated = configured_omlx_backend(&store).unwrap();
+        let repeated = configured_omlx_backend(&store, false).unwrap();
         assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &repeated));
         let executed = retain_omlx_backend(&owner, repeated.clone()).unwrap();
         assert_eq!(owner.lock().unwrap().len(), 1);
         drop((repeated, executed, owner));
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn explicit_other_backends_reject_omlx_node_controls_before_loading() {
+        let store = test_store("omlx-node-explicit-backend");
+        let model = test_manifest(ModelFormat::Mlx, Some("deepseek_v4"));
+        let controls = crate::openai::ChatRuntimeOptions {
+            omlx: Some(crate::openai::OmlxChatOptions {
+                thinking: Some(false),
+                expert_cache_mb: Some(8),
+            }),
+        };
+        let backends: Vec<Arc<dyn GenerationBackend>> = vec![
+            Arc::new(MlxPreferredBackend::new(store.clone())),
+            Arc::new(VllmPreferredBackend::new(
+                store.clone(),
+                SelectionOptions::default(),
+            )),
+            Arc::new(GgufPreferredBackend::new(
+                store.clone(),
+                LlamaCppMode::Cpu,
+                CandleDeviceMode::Cpu,
+                LlamaRuntimeOptions::default(),
+                SelectionOptions::default(),
+            )),
+        ];
+        for backend in backends {
+            let error = backend.with_chat_options(&model, &controls).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not support werk.omlx controls")
+            );
+        }
+        assert!(!store.home().exists());
+    }
+
+    #[test]
+    fn auto_omlx_node_controls_validate_requested_runtime_before_any_fallback() {
+        let store = test_store("omlx-node-auto-format");
+        let model = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let backend = AutoBackend::new(
+            store.clone(),
+            LlamaRuntimeOptions::default(),
+            SelectionOptions::default(),
+        );
+        let controls = crate::openai::ChatRuntimeOptions {
+            omlx: Some(crate::openai::OmlxChatOptions {
+                thinking: Some(false),
+                expert_cache_mb: None,
+            }),
+        };
+        let error = backend.with_chat_options(&model, &controls).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("werk.omlx controls require an MLX")
+        );
+        assert!(backend.backends.lock().unwrap().is_empty());
+        assert!(backend.omlx_backends.lock().unwrap().is_empty());
+        assert!(!store.home().exists());
     }
 
     #[test]
@@ -13570,6 +14446,7 @@ mod tests {
             stream_granularity: StreamGranularityArg::Token,
             verbose: false,
             debug: false,
+            persistence: ChatPersistenceArgs::default(),
         };
         assert!(should_print_startup_banner_for(&chat, true, true));
         assert!(!should_print_startup_banner_for(&chat, true, false));
@@ -13618,6 +14495,7 @@ mod tests {
             compare: BenchCompareArg::None,
             print_native_info: false,
             json: true,
+            include_output: false,
             debug: false,
         };
         assert!(!should_print_startup_banner_for(&bench, true, true));
@@ -13851,6 +14729,43 @@ mod tests {
     }
 
     #[test]
+    fn verbose_stats_distinguish_cached_context_from_evaluated_tokens() {
+        let mut output = Vec::new();
+        write_verbose_stats(
+            &mut output,
+            Some("oMLX"),
+            778,
+            256,
+            "length",
+            GenerationTimings {
+                cached_prompt_tokens: Some(757),
+                prompt_seconds: 9.25,
+                decode_seconds: 115.29,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("prompt total count:") && l.contains("778 token(s)"))
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("prompt cached count:") && l.contains("757 token(s)"))
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("prompt eval count:") && l.contains("21 token(s)"))
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("prompt eval rate:") && l.contains("2.27 tokens/s"))
+        );
+    }
+
+    #[test]
     fn verbose_stats_report_stop_reason_and_unknown_prompt_eval() {
         let mut output = Vec::new();
         write_verbose_stats(
@@ -13860,6 +14775,7 @@ mod tests {
             24,
             "stop_sequence",
             GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds: 0.25,
                 warmup_seconds: 0.0,
                 first_token_seconds: 0.5,
@@ -13935,6 +14851,45 @@ mod tests {
                 .map(MessageContent::as_text),
             Some("hello".to_string())
         );
+    }
+
+    #[test]
+    fn benchmark_preserves_native_conversation_and_sampling_controls() {
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some(MessageContent::Text("Reply in German.".into())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("hello".into())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let prompt = prompt_for_backend(
+            &manifest,
+            &messages,
+            BackendChoice::LlamaServer(LlamaCppMode::Metal),
+            None,
+        );
+        let request = benchmark_generate_request(&prompt, &messages, 64, 0.0, Some(0.95), 42, true);
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, "system");
+        assert_eq!(
+            request.messages[1].content.as_ref().unwrap().as_text(),
+            "hello"
+        );
+        assert_eq!(request.max_tokens, 64);
+        assert_eq!(request.temperature, Some(0.0));
+        assert_eq!(request.top_p, Some(0.95));
+        assert_eq!(request.seed, Some(42));
+        assert!(request.debug);
     }
 
     #[test]
@@ -14058,6 +15013,132 @@ mod tests {
         assert!(!prompt.chat_template.applied_by_werk);
         assert_eq!(request_messages.len(), 1);
         assert_eq!(prompt.prompt, "hello");
+    }
+
+    #[test]
+    fn persistent_chat_archive_survives_request_context_trimming() {
+        let store = test_store("chat-archive-context-trimming");
+        let (mut storage, _) = ChatPersistence::open(
+            store.home(),
+            "default",
+            "owner/model",
+            PersistencePolicy::default(),
+        )
+        .unwrap();
+        let mut old_answer = vision_user_message("old answer", &[]);
+        old_answer.role = "assistant".to_string();
+        let mut archive = vec![
+            vision_user_message(&"old prompt ".repeat(300), &[]),
+            old_answer,
+        ];
+        storage.save_completed_turn(&archive).unwrap();
+        let mut messages = archive.clone();
+        let user = vision_user_message("new question", &[]);
+        let mut request_messages = request_messages_for_turn(&mut messages, user.clone(), true);
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let removed = trim_chat_history_to_context(
+            &manifest,
+            BackendChoice::LlamaServer(LlamaCppMode::Cpu),
+            None,
+            &mut request_messages,
+            Some(512),
+            64,
+        )
+        .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(request_messages.len(), 1);
+        messages.clone_from(&request_messages);
+        finish_chat_turn(
+            &mut messages,
+            &mut archive,
+            Some(&mut storage),
+            user,
+            "new answer".to_string(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(archive.len(), 4);
+        drop(storage);
+        let (storage, resumed) = ChatPersistence::open(
+            store.home(),
+            "default",
+            "owner/model",
+            PersistencePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&resumed).unwrap(),
+            serde_json::to_value(&archive).unwrap()
+        );
+        drop(storage);
+        let _ = fs::remove_dir_all(store.home());
+    }
+
+    #[test]
+    fn persistent_chat_failed_or_empty_stream_turns_never_enter_later_history() {
+        let store = test_store("chat-archive-failed-stream");
+        let (mut storage, _) = ChatPersistence::open(
+            store.home(),
+            "default",
+            "owner/model",
+            PersistencePolicy::default(),
+        )
+        .unwrap();
+        let mut answer = vision_user_message("saved answer", &[]);
+        answer.role = "assistant".to_string();
+        let mut archive = vec![vision_user_message("saved question", &[]), answer];
+        storage.save_completed_turn(&archive).unwrap();
+        let original = fs::read(storage.path().unwrap()).unwrap();
+        let mut messages = archive.clone();
+        for (partial, completed) in [("unfinished answer", false), ("", false), ("", true)] {
+            let failed_user = vision_user_message("failed question", &[]);
+            request_messages_for_turn(&mut messages, failed_user.clone(), true);
+            finish_chat_turn(
+                &mut messages,
+                &mut archive,
+                Some(&mut storage),
+                failed_user,
+                partial.to_string(),
+                true,
+                completed,
+            )
+            .unwrap();
+            assert_eq!(fs::read(storage.path().unwrap()).unwrap(), original);
+            assert_eq!(
+                serde_json::to_value(&messages).unwrap(),
+                serde_json::to_value(&archive).unwrap()
+            );
+            assert_eq!(archive.len(), 2);
+        }
+        let user = vision_user_message("next question", &[]);
+        request_messages_for_turn(&mut messages, user.clone(), true);
+        finish_chat_turn(
+            &mut messages,
+            &mut archive,
+            Some(&mut storage),
+            user,
+            "next answer".to_string(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(archive.len(), 4);
+        let saved = fs::read_to_string(storage.path().unwrap()).unwrap();
+        assert!(!saved.contains("failed question"));
+        assert!(!saved.contains("unfinished answer"));
+        drop(storage);
+        let (storage, resumed) = ChatPersistence::open(
+            store.home(),
+            "default",
+            "owner/model",
+            PersistencePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(resumed.len(), 4);
+        drop(storage);
+        let _ = fs::remove_dir_all(store.home());
     }
 
     #[test]

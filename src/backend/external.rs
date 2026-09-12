@@ -1213,6 +1213,7 @@ impl LlamaCppBackend {
             completion_tokens,
             finish_reason,
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds,
                 warmup_seconds: 0.0,
                 first_token_seconds: 0.0,
@@ -1311,6 +1312,7 @@ impl LlamaCppChatState {
             completion_tokens,
             finish_reason,
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds: 0.0,
                 warmup_seconds: 0.0,
                 first_token_seconds: 0.0,
@@ -2578,6 +2580,7 @@ fn external_response(
         assistant_message: None,
         finish_reason,
         timings: GenerationTimings {
+            cached_prompt_tokens: None,
             load_seconds,
             warmup_seconds: 0.0,
             first_token_seconds: 0.0,
@@ -2646,6 +2649,7 @@ fn transformers_response(
         assistant_message: None,
         finish_reason,
         timings: GenerationTimings {
+            cached_prompt_tokens: None,
             load_seconds,
             warmup_seconds: 0.0,
             first_token_seconds: 0.0,

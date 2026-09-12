@@ -1184,6 +1184,8 @@ pub struct GeneratedAssistantMessage {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GenerationTimings {
+    /// Total prompt tokens already present in a verified native prefix cache.
+    pub cached_prompt_tokens: Option<usize>,
     pub load_seconds: f64,
     pub warmup_seconds: f64,
     pub first_token_seconds: f64,
@@ -1246,6 +1248,18 @@ pub trait ChatGenerationSession: Send + Sync {
 }
 
 pub trait GenerationBackend: Send + Sync {
+    /// Applies explicit API runtime controls without changing process-wide
+    /// environment or silently routing them to an unrelated backend.
+    fn with_chat_options(
+        &self,
+        _manifest: &ModelManifest,
+        _options: &crate::openai::ChatRuntimeOptions,
+    ) -> Result<std::sync::Arc<dyn GenerationBackend>> {
+        anyhow::bail!(
+            "the selected backend does not support werk.omlx controls; use --backend auto or --backend omlx"
+        )
+    }
+
     /// Returns the runtime-control adapter owned by this generation backend.
     ///
     /// Backends that do not expose operational persistence, memory, expert,
@@ -1301,6 +1315,23 @@ pub trait GenerationBackend: Send + Sync {
         &self,
         _manifest: &ModelManifest,
         _seed: Option<u64>,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        Ok(None)
+    }
+
+    /// Starts a streaming chat session with a backend-owned persistent cache.
+    ///
+    /// The caller owns and isolates `cache_directory` and retains the portable
+    /// conversation separately. `Some` means this backend configured a real
+    /// cache that can survive session shutdown; it does not imply named Werk
+    /// state snapshots, restore, or guaranteed reuse for every prompt. `None`
+    /// leaves the normal chat path available without claiming native cache
+    /// persistence. Call before `prepare` to avoid loading a second worker.
+    fn start_persistent_chat_session(
+        &self,
+        _manifest: &ModelManifest,
+        _seed: Option<u64>,
+        _cache_directory: &std::path::Path,
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         Ok(None)
     }

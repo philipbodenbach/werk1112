@@ -142,6 +142,15 @@ request-level opt-in. A client can send it explicitly; for Prefill only, a
 server started with `--persistence` can supply it when the member is absent.
 That server option does not opt other protocol operations in.
 
+`api.chat.omlx_options` reports whether the chat endpoint accepts the
+`werk.omlx.thinking` and `werk.omlx.expert_cache_mb` request fields. Its
+operations are `thinking` and `expert_cache_mb`. A `supported` status means
+the API understands and validates these fields; model and runtime
+compatibility are checked when the chat request is made. It does not imply
+expert residency, named state or Prefill support. Clients must require this
+capability before sending explicit options, because older servers may ignore
+unknown chat fields. See the [chat API contract](../api.md#omlx-chat-options).
+
 `runtime.model_residency` is deliberately independent of every
 `runtime.state.*` capability. Its `automatic_reuse` operation reports that an
 exact model or pipeline can remain loaded between ordinary requests. It does
@@ -374,9 +383,30 @@ bounded by `max_expert_ids_per_operation`. Target handling is strict:
 
 The response contains `experts`, `changed` and `dry_run`.
 
-These routes define a backend-neutral contract, but no current production
-adapter implements operational expert residency. Current requests therefore
-fail with `unsupported`; route presence is not a support claim.
+The oMLX adapter implements these operations experimentally when
+`WERK_OMLX_EXPERT_CACHE_MB` or a positive `werk.omlx.expert_cache_mb` chat
+option enables SSD expert offload and a loaded worker has
+confirmed the cache is active. Start the model through normal generation in
+the same persistent Werk service before requesting expert telemetry; these
+routes do not load a model. Both list and action requests must explicitly set
+`allow_experimental: true`. Capability discovery remains authoritative.
+
+ComfyUI and n8n text nodes can configure the chat options directly. For a
+model used with multiple cache budgets, subsequent expert requests target
+the worker most recently used for that model. A prepared expert operation
+remains bound to its original worker while it executes.
+
+For this adapter, `external` denotes experts backed by the local checkpoint
+outside the cache, and `ram` denotes its active Apple unified-memory cache.
+The tier is independent of the capability status `externally_managed`, which
+still permits read-only telemetry. oMLX accepts only `ram` as the prefetch
+target; `vram` is rejected. Pin, unpin and evict omit `target_tier`. Eviction
+releases cache residency and retains the checkpoint source for future loads;
+it does not delete model files. Cache capacity also applies to pin and
+prefetch. A dry-run does not load, evict or change pins.
+
+Other adapters retain their declared capability and target-tier behavior.
+Route presence or a model architecture alone is not a support claim.
 
 ## Prefill, policy and decode
 
@@ -433,11 +463,14 @@ protocol defaults rather than the server's granular defaults. An explicitly
 supplied `allow_experimental` value also wins, including `false`. Server
 defaults do not change capability status or bypass backend validation.
 
-This behavior exists only at `POST /werk/v1/prefill`. It has no silent effect
-on OpenAI-compatible `/v1` routes, media inference, semantic output caching,
-whole-model persistence or cross-restart restore. Runtime state remains an
-opaque backend-owned value governed and compatibility-checked by Werk. Current
-named persistence and prefill/decode support is experimental and limited to a
+This policy-default behavior exists only at `POST /werk/v1/prefill`.
+Separately, the server flag configures local vLLM APC defaults and, with
+`auto`/`disk` mode and reuse enabled, verified short exact-prefix caching in
+local oMLX 0.6.4 workers. Those native caches do not redirect `/v1` calls through
+Prefill, cache complete answers, persist model weights or guarantee
+cross-restart restore. Media inference is unchanged. Named runtime state
+remains an opaque backend-owned value governed and compatibility-checked by
+Werk. Current named persistence and prefill/decode support is experimental and limited to a
 functionally validated Werk-managed llama-server process for the exact
 installed GGUF model; clients must still use capability discovery.
 

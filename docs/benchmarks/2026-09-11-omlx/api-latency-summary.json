@@ -1,0 +1,26 @@
+[
+  {
+    "label": "before",
+    "first_text_median": 1.993452166003408,
+    "total_median": 3.049027584012947,
+    "total_min": 3.034142750009778,
+    "total_max": 4.022955124994041,
+    "n": 5
+  },
+  {
+    "label": "after-auto",
+    "first_text_median": 1.279620375004015,
+    "total_median": 2.323018333001528,
+    "total_min": 2.3018666669959202,
+    "total_max": 2.331302250007866,
+    "n": 5
+  },
+  {
+    "label": "after-omlx",
+    "first_text_median": 0.35291437500563916,
+    "total_median": 1.390318625009968,
+    "total_min": 1.3823676250030985,
+    "total_max": 1.4017172919993754,
+    "n": 5
+  }
+]

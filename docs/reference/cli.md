@@ -129,6 +129,59 @@ Models, artifacts, managed outputs, jobs, authentication data, backends, files
 at the store root and output paths outside the store are persistent boundaries
 and are not touched by temporary-file purging.
 
+## Local persistence caches
+
+Inspect local persistence storage and remove one listed entry or all eligible
+caches in the active `WERK_HOME` (or global `--model-home PATH`):
+
+```bash
+werk cache list
+werk cache list --kind chat-kv
+werk cache list --json
+werk cache purge <CACHE-ID>
+werk cache purge --all --dry-run
+werk cache purge --all
+werk cache purge --all --kind chat-kv
+werk cache purge --all --include-history
+```
+
+Copy the exact ID from `cache list`; paths and wildcard selectors are not
+accepted. `purge` requires either that ID or `--all`. Deletion takes effect
+immediately unless `--dry-run` is supplied. Both subcommands support `--json`;
+list JSON separates `entries` from `blocked` storage-provider errors so one
+unavailable catalog does not hide the remaining caches.
+
+| Kind | Storage beneath the Werk home | Cleanup scope |
+| --- | --- | --- |
+| `chat-kv` | `chat-sessions/<session-hash>.cache/` | Rebuildable native KV caches for one persistent conversation, across its runtime namespaces. |
+| `chat-history` | `chat-sessions/<session-hash>.json` | Saved conversation messages; excluded from `--all` unless `--include-history` or `--kind chat-history` is supplied. An exact history ID also explicitly selects its deletion. |
+| `omlx-worker` | `backends/omlx/workers/<worker>/cache/` | Inactive worker cache files only; settings, credentials and logs are retained. |
+| `runtime-state` | `runtime-state/v1/` | Individual disk states from the managed runtime catalog; pinned or in-use states are protected. |
+
+The inventory reports each entry's kind, backend when known, size and protection
+status. Active chats and workers are skipped; runtime-state cleanup is blocked
+while a runtime holds the catalog open. An explicitly selected protected entry
+returns an error; bulk cleanup reports skipped entries and continues. Unknown
+or unsafe storage is protected. For legacy oMLX worker caches without a lifetime
+lock, Werk can remove the known empty directory layout when its native
+`_boundary_snapshots` process markers identify owners that have all exited.
+This removes directories only: any file (including zero-byte files), live or
+unverifiable owner, or unknown layout blocks the legacy cleanup. Existing
+lifetime locks continue to protect active workers even when their caches are
+empty. Legacy runtime-state catalogs without a usage lease
+also remain protected: use `werk runtime prune` on their running server, or
+initialize the lease through a state mutation in a current runtime and stop
+that runtime before offline cleanup. Stop older Werk processes and their
+workers before using cache cleanup; they predate the new runtime usage locks.
+
+Chat KV and history entries share a session hash but can be removed separately.
+Deleting KV data retains the conversation and triggers prompt recomputation on
+the next run. Deleting history removes the saved messages. Lock files remain
+to preserve process coordination. Model weights, original SSD-backed MoE expert
+tensors, installed backends, remote/runtime-owned RAM caches and authentication
+data are outside this command's scope. Temporary downloads remain managed by
+`werk temp`; live named state operations remain available through `werk runtime`.
+
 ## Runtime control
 
 `werk runtime` is a quiet, pretty-JSON client for the versioned `/werk/v1`
@@ -350,6 +403,55 @@ werk chat model-id --max-tokens 128
 chat streams decoded pieces by default. Use `--stream-granularity chunk` to
 reduce terminal flushes and `--verbose` for prompt/decode timing and throughput.
 
+### Persistent terminal chat
+
+`--persistence` saves completed conversation turns and resumes them on the
+next invocation. It is available for every chat backend, including automatic
+routing, and preserves the normal streaming path:
+
+```bash
+werk chat model-id --persistence
+werk --backend mlx chat model-id --persistence --session project
+werk --backend omlx chat model-id --session project --verbose
+```
+
+The model ID and session name identify the conversation; changing the backend
+does not create a different transcript. The default session name is `default`.
+`--session NAME` implies persistence. `--persistence-reuse prefer` resumes if
+the conversation exists (the default), `required` fails if it does not exist,
+and `disabled` starts a fresh conversation that replaces the previous archive
+only after a completed answer. The reuse option also implies persistence.
+These options conflict with `--no-history` and its `--single-turn` alias.
+For terminal chat, the reuse policy controls the saved conversation; it does
+not disable a backend's independently managed prefix cache.
+
+Private conversation archives live under `$WERK_HOME/chat-sessions/`, or the
+equivalent default Werk home. Only one process may open a given model/session
+at once. Writes are atomic; failed or interrupted streams do not replace the
+last completed conversation. Context-window trimming affects the model input
+and preserves the full saved transcript. Archives are limited to 4096 messages
+and 16 MiB; corrupt or oversized archives fail explicitly. Image parts remain
+in the saved conversation and require an image-capable backend when resumed.
+
+Conversation history is portable text/message data, not a model or KV snapshot.
+Werk reports whether the selected route also enables persistent native KV
+caching. Unsupported native caches leave conversation persistence operational
+and the backend recomputes the prompt. Local vLLM receives the same validated
+automatic-prefix-cache default as `serve --persistence`; explicit runtime
+arguments still win. This cache remains vLLM-owned and does not survive its
+process restart. Exiting the chat still stops its owned backend workers.
+
+Archives and supported native KV caches survive exit. Use
+[`werk cache list` and `werk cache purge`](#local-persistence-caches) to inspect
+or remove them; deleting just the KV entry preserves the conversation.
+
+The server's `--persistence-mode`, `--persistence-ttl-seconds` and
+`--persistence-pin` govern Werk Protocol Prefill state, and are not terminal
+conversation options. Ordinary chat persistence does not create named
+`/werk/v1/prefill` state handles.
+
+### Vision input
+
 Attach one or more images to a compatible vision-language model with repeatable
 `--image` values:
 
@@ -368,6 +470,40 @@ The model manifest must advertise image understanding and an image-capable
 runtime must pass its probe. For GGUF, the llama.cpp server path additionally
 requires a manifest-listed multimodal projector. See
 [Vision and visual quality assurance](../integrations/vision.md).
+
+## Text benchmarks
+
+Benchmark an installed model with a fixed prompt and sampling settings:
+
+```bash
+werk --backend omlx bench model-id \
+  --prompt "Write one English sentence about Rust." \
+  --max-tokens 64 --runs 3 --warmups 1 \
+  --temperature 0 --top-p 0.95 --seed 42 \
+  --json --include-output --debug
+```
+
+`--runs` defaults to 5 measured runs after 1 unmeasured `--warmups` run.
+Temperature defaults to 0 and seed to 42; omitted `--top-p` inherits the
+backend's behavior. A warmup does not guarantee that every later request
+reuses its prompt cache. Keep runtime settings and system load consistent
+between comparisons.
+
+JSON samples contain token counts, timings, `finish_reason` and
+`backend_diagnostics`. Add `--include-output` with `--json` to retain generated
+text in each sample's `output` field for quality review. Without that flag,
+the field is omitted. Inspect `finish_reason: "length"` for truncation before
+comparing answer quality or total duration. `--debug` requests additional
+backend diagnostics, including available oMLX expert counters.
+
+The benchmark sends the original structured user message through the selected
+backend's prompt handling, as `run` and `chat` do. Runtime-owned chat templates
+therefore receive the original message instead of an already formatted prompt.
+
+For HTTP streaming and multi-turn conversations, use the separate
+[HTTP chat benchmark](../../utils/benchmarks/README.md). It records time to first
+visible text, final API usage when supplied, answers and declared quality checks
+through the same endpoint used by Open WebUI and werkStation.
 
 ## Media inference
 
@@ -407,7 +543,7 @@ through `--api-key`, `WERK_API_KEY`, `--api-keys` or the default key file.
 Browser CORS is disabled by default. Add exact trusted origins with repeatable
 `--cors-origin`; wildcard and opaque `null` origins are rejected.
 
-Enable server-side persistence defaults for Werk Protocol Prefill requests:
+Enable persistence defaults and supported backend prefix caching:
 
 ```bash
 werk serve --model chat-model --persistence
@@ -420,6 +556,38 @@ local vLLM process started by this server, it defaults vLLM's native automatic
 prefix cache on. Werk verifies that the installed vLLM help advertises the
 generated flag before starting the process. A remote vLLM endpoint remains
 externally managed and receives no generated launch argument.
+
+For local oMLX 0.6.4, persistence mode `auto` or `disk` with reuse other than
+`disabled` also enables verified short exact-prefix caching. This applies to
+ordinary OpenAI chat and supported tool requests, including when `auto`
+routing selects oMLX. The native SSD cache is limited to 4 GB in the private
+worker's `cache/prefix-cache` directory and lasts for that worker. It does not
+save chat history or guarantee reuse after restart. Use `chat --persistence` for
+durable CLI conversation history and its supported native KV cache.
+
+For compatible oMLX expert offload, set the expert cache and thinking default
+when starting the service:
+
+```bash
+WERK_OMLX_THINKING=0 \
+WERK_OMLX_EXPERT_CACHE_MB=8192 \
+  werk --backend omlx serve --model chat-model --persistence --verbose
+```
+
+The expert cache budget is in MiB and is separate from the native prompt/KV
+cache. Expert execution defaults to `grouped`; set
+`WERK_OMLX_EXPERT_EXECUTION=serial` before starting the service for a comparison.
+Grouped execution batches tensor materialization, retains active expert groups
+through GPU evaluation and reduces allocator clearing. These settings apply to
+ordinary HTTP chat clients as well as CLI generation. See
+[experimental oMLX expert offload](../backends.md#experimental-omlx-expert-offload)
+for runtime and model compatibility requirements.
+
+With `serve --verbose`, available expert diagnostics describe the whole
+worker's measurement interval. Overlapping requests can contribute to those
+counters. Logical read bytes include reads served by the OS file cache and do
+not establish physical SSD throughput; nested timing counters are not
+independent phases to add together.
 
 The defaults can be selected individually; any granular option implies
 `--persistence`:
@@ -444,8 +612,12 @@ caching off. An explicit `--enable-prefix-caching` or
 default. These backend-native cache entries remain opaque: they are not named
 Werk state and cannot be listed, moved, persisted or pruned by Werk.
 
-Apart from that local-vLLM default, these flags affect only omitted fields on
-`/werk/v1/prefill`. They do not redirect OpenAI-compatible `/v1` or media
+For oMLX, modes `memory` and `ephemeral`, or reuse `disabled`, leave the
+additional exact-prefix helper off. TTL and pinning apply to named Prefill
+state; `required` reuse does not make an ordinary OpenAI cache miss an error.
+Existing native backend caching remains independent of this helper.
+
+These flags do not redirect OpenAI-compatible `/v1` or media
 requests through Prefill, add semantic output caching, or enable cross-restart
 restore. Exact model/pipeline residency is already automatic in supported
 Werk-owned in-process and resident-worker paths. Current named state/prefill

@@ -1,0 +1,291 @@
+{
+  "label": "grouped12",
+  "worker": "f2e4eed83601aeb91bf258b3d1d54b3d3d9067a613a34894",
+  "sampling": {
+    "temperature": 0,
+    "top_p": 0.95,
+    "seed": 42,
+    "enable_thinking": false
+  },
+  "samples": [
+    {
+      "case": "rust",
+      "repeat": 0,
+      "first_text_s": 9.091441875003511,
+      "total_s": 24.502085791013087,
+      "usage": {
+        "prompt_tokens": 14,
+        "completion_tokens": 38,
+        "total_tokens": 52,
+        "input_tokens": 14,
+        "output_tokens": 38,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "time_to_first_token": 9.08,
+        "total_time": 24.49,
+        "prompt_eval_duration": 9.08,
+        "generation_duration": 15.41,
+        "prompt_tokens_per_second": 1.54,
+        "generation_tokens_per_second": 2.47
+      },
+      "finish": "stop",
+      "answer": "A sentence about Rust: \"Rust is a systems-level programming language that combines memory safety with high performance, leveraging a robust ownership model to prevent data races and ensure thread-safe concurrency.\"",
+      "expert_interval": {
+        "cache_hits": 7532,
+        "cache_misses": 4502,
+        "disk_bytes_read": 37708890112,
+        "disk_read_seconds": 13.348529643772054,
+        "materialize_seconds": 1.8781516979361186,
+        "cache_evictions": 2964,
+        "allocator_clears": 1,
+        "forward_seconds": 23.676603440209874,
+        "routing_seconds": 3.337376405543182,
+        "output_evaluations": 1954,
+        "tensor_materializations": 4502
+      },
+      "resident_cache_bytes": 12881231872
+    },
+    {
+      "case": "rust",
+      "repeat": 1,
+      "first_text_s": 1.8848787909955718,
+      "total_s": 17.598739624998416,
+      "usage": {
+        "prompt_tokens": 14,
+        "completion_tokens": 38,
+        "total_tokens": 52,
+        "input_tokens": 14,
+        "output_tokens": 38,
+        "prompt_tokens_details": {
+          "cached_tokens": 13
+        },
+        "time_to_first_token": 1.88,
+        "total_time": 17.6,
+        "prompt_eval_duration": 1.88,
+        "generation_duration": 15.71,
+        "prompt_tokens_per_second": 7.43,
+        "generation_tokens_per_second": 2.42
+      },
+      "finish": "stop",
+      "answer": "A sentence about Rust: \"Rust is a systems-level programming language that combines memory safety with high performance, leveraging a robust ownership model to prevent data races and ensure thread-safe concurrency.\"",
+      "expert_interval": {
+        "cache_hits": 7386,
+        "cache_misses": 2934,
+        "disk_bytes_read": 24574951424,
+        "disk_read_seconds": 8.921654142570333,
+        "materialize_seconds": 1.2570144165074453,
+        "cache_evictions": 2934,
+        "allocator_clears": 1,
+        "forward_seconds": 16.990673969921772,
+        "routing_seconds": 3.1983535502367886,
+        "output_evaluations": 1720,
+        "tensor_materializations": 2934
+      },
+      "resident_cache_bytes": 12881231872
+    },
+    {
+      "case": "german",
+      "repeat": 0,
+      "first_text_s": 9.648560083005577,
+      "total_s": 32.3525280419999,
+      "usage": {
+        "prompt_tokens": 23,
+        "completion_tokens": 64,
+        "total_tokens": 87,
+        "input_tokens": 23,
+        "output_tokens": 64,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "time_to_first_token": 9.65,
+        "total_time": 32.35,
+        "prompt_eval_duration": 9.65,
+        "generation_duration": 22.7,
+        "prompt_tokens_per_second": 2.38,
+        "generation_tokens_per_second": 2.82
+      },
+      "finish": "length",
+      "answer": "Rust bietet Speichersicherheit, weil es durch ein striktes Ownership-Modell mit klaren Regeln für Besitz, Leihgaben und Lebenszyklen sicherstellt, dass Speicherfehler wie Use-After-Free, Doppel-Frees oder Datenrace zur Compile-Zeit ver",
+      "expert_interval": {
+        "cache_hits": 13270,
+        "cache_misses": 5678,
+        "disk_bytes_read": 47563407360,
+        "disk_read_seconds": 17.01256600608758,
+        "materialize_seconds": 2.4352470255689695,
+        "cache_evictions": 5678,
+        "allocator_clears": 3,
+        "forward_seconds": 31.268037802132312,
+        "routing_seconds": 5.212681892968249,
+        "output_evaluations": 3092,
+        "tensor_materializations": 5678
+      },
+      "resident_cache_bytes": 12883853312
+    },
+    {
+      "case": "german",
+      "repeat": 1,
+      "first_text_s": 1.7474511670006905,
+      "total_s": 23.480391874996712,
+      "usage": {
+        "prompt_tokens": 23,
+        "completion_tokens": 64,
+        "total_tokens": 87,
+        "input_tokens": 23,
+        "output_tokens": 64,
+        "prompt_tokens_details": {
+          "cached_tokens": 22
+        },
+        "time_to_first_token": 1.75,
+        "total_time": 23.48,
+        "prompt_eval_duration": 1.75,
+        "generation_duration": 21.73,
+        "prompt_tokens_per_second": 13.17,
+        "generation_tokens_per_second": 2.94
+      },
+      "finish": "length",
+      "answer": "Rust bietet Speichersicherheit, weil es durch ein striktes Ownership-Modell mit klaren Regeln für Besitz, Leihgaben und Lebenszyklen sicherstellt, dass Speicherfehler wie Use-After-Free, Doppel-Frees oder Datenrace zur Compile-Zeit ver",
+      "expert_interval": {
+        "cache_hits": 13062,
+        "cache_misses": 3708,
+        "disk_bytes_read": 31062491136,
+        "disk_read_seconds": 10.99600091233151,
+        "materialize_seconds": 1.5925541931501357,
+        "cache_evictions": 3708,
+        "allocator_clears": 1,
+        "forward_seconds": 22.584996963720187,
+        "routing_seconds": 4.705541911782348,
+        "output_evaluations": 2795,
+        "tensor_materializations": 3708
+      },
+      "resident_cache_bytes": 12883853312
+    },
+    {
+      "case": "json",
+      "repeat": 0,
+      "first_text_s": 9.521718584001064,
+      "total_s": 15.864248334008153,
+      "usage": {
+        "prompt_tokens": 23,
+        "completion_tokens": 16,
+        "total_tokens": 39,
+        "input_tokens": 23,
+        "output_tokens": 16,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "time_to_first_token": 9.52,
+        "total_time": 15.86,
+        "prompt_eval_duration": 9.52,
+        "generation_duration": 6.34,
+        "prompt_tokens_per_second": 2.42,
+        "generation_tokens_per_second": 2.52
+      },
+      "finish": "stop",
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "expert_interval": {
+        "cache_hits": 3513,
+        "cache_misses": 3250,
+        "disk_bytes_read": 27206352896,
+        "disk_read_seconds": 9.74644180634641,
+        "materialize_seconds": 1.40635303457384,
+        "cache_evictions": 3249,
+        "allocator_clears": 2,
+        "forward_seconds": 15.398019801083137,
+        "routing_seconds": 1.6284455019485904,
+        "output_evaluations": 1060,
+        "tensor_materializations": 3250
+      },
+      "resident_cache_bytes": 12882280448
+    },
+    {
+      "case": "json",
+      "repeat": 1,
+      "first_text_s": 1.0908391249977285,
+      "total_s": 6.079700125003001,
+      "usage": {
+        "prompt_tokens": 23,
+        "completion_tokens": 16,
+        "total_tokens": 39,
+        "input_tokens": 23,
+        "output_tokens": 16,
+        "prompt_tokens_details": {
+          "cached_tokens": 22
+        },
+        "time_to_first_token": 1.09,
+        "total_time": 6.08,
+        "prompt_eval_duration": 1.09,
+        "generation_duration": 4.99,
+        "prompt_tokens_per_second": 21.11,
+        "generation_tokens_per_second": 3.21
+      },
+      "finish": "stop",
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "expert_interval": {
+        "cache_hits": 3549,
+        "cache_misses": 1095,
+        "disk_bytes_read": 9161932800,
+        "disk_read_seconds": 2.754927612200845,
+        "materialize_seconds": 0.4636235160578508,
+        "cache_evictions": 1095,
+        "allocator_clears": 1,
+        "forward_seconds": 5.781118796061492,
+        "routing_seconds": 1.165775414032396,
+        "output_evaluations": 774,
+        "tensor_materializations": 1095
+      },
+      "resident_cache_bytes": 12882280448
+    }
+  ],
+  "hw.memsize": "51539607552",
+  "machdep.cpu.brand_string": "Apple M4 Pro",
+  "vm.swapusage": "total = 1024.00M  used = 0.25M  free = 1023.75M  (encrypted)",
+  "worker_rss_bytes_max_sampled": 17652596736,
+  "worker_rss_sample_count": 119,
+  "final_experts": {
+    "architecture": "deepseek_v4",
+    "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+    "base_bytes": 4312736860,
+    "expert_bytes": 92207579136,
+    "checkpoint_bytes": 96520315996,
+    "cache_budget_bytes": 12884901888,
+    "workspace_bytes": 1073741824,
+    "resident_estimate_bytes": 18271380572,
+    "expert_count": 11008,
+    "largest_expert_bytes": 8388608,
+    "active": true,
+    "model_id": "files",
+    "resident_cache_bytes": 12882280448,
+    "resident_experts": 1539,
+    "cache_hits": 48312,
+    "cache_misses": 21167,
+    "disk_bytes_read": 181590762588,
+    "execution": "grouped",
+    "cache_evictions": 19628,
+    "allocator_clears": 9,
+    "allocator_cache_bytes": 11010336,
+    "allocator_cache_limit_bytes": 67108864,
+    "tensor_materializations": 23390,
+    "disk_read_seconds": 63.84966249167337,
+    "materialize_seconds": 9.066157558001578,
+    "forward_calls": 10707,
+    "forward_seconds": 115.69945077312877,
+    "routing_seconds": 19.248174676511553,
+    "output_evaluations": 11395
+  },
+  "final_prefix": {
+    "installed": true,
+    "active": true,
+    "format": "omlx-exact-prefix-v1",
+    "model_id": "files",
+    "max_prefix_tokens": 2048,
+    "stores": 9,
+    "restores": 3,
+    "restored_tokens": 57,
+    "failures": 0,
+    "indexed_prefixes": 6,
+    "reason": null
+  },
+  "final_swapusage": "total = 1024.00M  used = 0.25M  free = 1023.75M  (encrypted)",
+  "final_vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                     3700.\nPages active:                                 838544.\nPages inactive:                               760815.\nPages speculative:                             79018.\nPages throttled:                                   0.\nPages wired down:                            1250303.\nPages purgeable:                                 449.\n\"Translation faults\":                      629635068.\nPages copy-on-write:                        14419341.\nPages zero filled:                         631479616.\nPages reactivated:                           2132003.\nPages purged:                                2714763.\nFile-backed pages:                           1152703.\nAnonymous pages:                              525674.\nPages stored in compressor:                   443522.\nPages occupied by compressor:                 155402.\nDecompressions:                              2479799.\nCompressions:                                5417807.\nPageins:                                   195874945.\nPageouts:                                      91939.\nSwapins:                                          12.\nSwapouts:                                         16.\n"
+}

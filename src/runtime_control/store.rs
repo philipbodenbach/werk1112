@@ -40,6 +40,9 @@ const DEFAULT_MAX_NAMESPACE_ENTRIES: usize = 1024;
 const DEFAULT_MAX_QUARANTINE_BYTES: u64 = DEFAULT_MAX_PAYLOAD_BYTES + 4 * 1024 * 1024;
 const DEFAULT_MAX_QUARANTINE_ENTRIES: usize = 64;
 const MAX_QUARANTINE_TREE_ENTRIES: usize = 64;
+const USAGE_LOCK_FILE: &str = ".in-use";
+const MAX_CACHE_NAMESPACES: usize = 1024;
+const MAX_CACHE_STATES: usize = 16384;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StateStoreLimits {
@@ -164,6 +167,19 @@ pub(crate) struct StatePruneResult {
     pub matched_states: Vec<StateSummary>,
 }
 
+/// Local cache administration exposes only opaque IDs and size/timing metadata.
+/// It never returns the compatibility envelope, model paths, or payload contents.
+#[derive(Debug)]
+pub(crate) struct StoredCacheEntry {
+    pub namespace: String,
+    pub id: String,
+    pub backend: Option<String>,
+    pub bytes: Option<u64>,
+    pub modified_unix_ms: Option<u64>,
+    pub active: bool,
+    pub blocked_reason: Option<String>,
+}
+
 impl fmt::Debug for LoadedStoredState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -200,6 +216,10 @@ pub(crate) struct StateStore {
     root: PathBuf,
     limits: StateStoreLimits,
     process_gate: Mutex<StoreProcessState>,
+    // A runtime may retain a restored state after its short catalog transaction
+    // ends. Hold this shared lease for the entire owning StateStore lifetime so
+    // offline cache removal cannot invalidate that runtime's persisted overlay.
+    usage_lease: Mutex<Option<File>>,
 }
 
 #[derive(Default)]
@@ -217,6 +237,7 @@ impl StateStore {
             root: home.join("runtime-state").join("v1"),
             limits,
             process_gate: Mutex::new(StoreProcessState::default()),
+            usage_lease: Mutex::new(None),
         }
     }
 
@@ -669,25 +690,168 @@ impl StateStore {
         states.retain(|state| !state.expires_unix_ms.is_some_and(|expires| expires <= now));
         states.retain(|state| selector_matches(&request.selector, state));
         states.sort_by(|left, right| left.id.cmp(&right.id));
-        let matched = states.len() as u64;
-        let bytes = states.iter().fold(0u64, |total, state| {
-            total.saturating_add(state.bytes.unwrap_or(0))
-        });
-        if !request.dry_run {
-            for state in &states {
-                remove_state_dir(&namespace.join(&state.id))?;
+        prune_matched_states_locked(&namespace, states, request.dry_run)
+    }
+
+    /// Read-only local inventory across principal namespaces. Payload sizes use
+    /// the same validated metadata as quota accounting; listing does not read
+    /// every multi-gigabyte payload or update access times.
+    pub(crate) fn cache_inventory(&self) -> Result<Vec<StoredCacheEntry>, ProtocolError> {
+        let _process = self.process_gate.lock().map_err(|_| internal())?;
+        let Some(_catalog) = self.existing_locked_root()? else {
+            return Ok(Vec::new());
+        };
+        let usage = self.cache_usage_lock()?;
+        let mut entries = Vec::new();
+        for namespace in read_dir_bounded(&self.root, MAX_CACHE_NAMESPACES.saturating_add(8))? {
+            let Some(name) = namespace.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_principal_id(&name).is_err() {
+                continue;
             }
-            sync_directory(&namespace)?;
+            let path = namespace.path();
+            validate_existing_owned_directory(&path)?;
+            for state in read_dir_bounded(&path, self.namespace_entry_scan_limit())? {
+                let Some(id) = state.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if validate_state_id(&id).is_err() {
+                    continue;
+                }
+                if entries.len() >= MAX_CACHE_STATES {
+                    return Err(resource("runtime state cache inventory limit exceeded"));
+                }
+                entries.push(cache_entry_from_state(
+                    &name,
+                    &id,
+                    read_state(&state.path(), self.limits.max_payload_bytes),
+                    &usage,
+                ));
+            }
         }
-        Ok(StatePruneResult {
-            summary: PruneStatesResponse {
-                matched,
-                removed: if request.dry_run { 0 } else { matched },
-                bytes: Some(bytes),
-                dry_run: request.dry_run,
-            },
-            matched_states: states,
-        })
+        entries
+            .sort_by(|left, right| (&left.namespace, &left.id).cmp(&(&right.namespace, &right.id)));
+        Ok(entries)
+    }
+
+    /// Remove exactly one unpinned disk entry while both the catalog lock and
+    /// the exclusive runtime-lifetime lease are held. This deliberately does
+    /// not reconcile unrelated states, expire pins, or purge quarantine files.
+    pub(crate) fn cache_prune(
+        &self,
+        principal_id: &str,
+        state_id: &str,
+        dry_run: bool,
+    ) -> Result<StoredCacheEntry, ProtocolError> {
+        validate_principal_id(principal_id)?;
+        validate_state_id(state_id)?;
+        let _process = self.process_gate.lock().map_err(|_| internal())?;
+        let Some(_catalog) = self.existing_locked_root()? else {
+            return Err(not_found());
+        };
+        let namespace = self.root.join(principal_id);
+        if !validate_existing_owned_directory(&namespace)?
+            || !has_exact_child_name(&namespace, state_id, self.namespace_entry_scan_limit())?
+        {
+            return Err(not_found());
+        }
+        let usage = self.cache_usage_lock()?;
+        let state_dir = namespace.join(state_id);
+        let (metadata, pinned) = read_state(&state_dir, self.limits.max_payload_bytes)?;
+        let entry = cache_entry_from_state(
+            principal_id,
+            state_id,
+            Ok((metadata.clone(), pinned)),
+            &usage,
+        );
+        if let Some(reason) = &entry.blocked_reason {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Conflict,
+                reason.clone(),
+            ));
+        }
+        // read_state verified metadata checksums and the exact, private regular
+        // file layout. Removal needs no multi-gigabyte payload checksum scan:
+        // even a damaged payload is safe to discard through the same targeted
+        // mutation/accounting path used by runtime pruning.
+        prune_matched_states_locked(
+            &namespace,
+            vec![summary_from_metadata(&metadata, pinned)],
+            dry_run,
+        )?;
+        Ok(entry)
+    }
+
+    fn retain_usage_lease(&self, create: bool) -> Result<(), ProtocolError> {
+        let mut retained = self.usage_lease.lock().map_err(|_| internal())?;
+        if retained.is_none()
+            && let Some(file) = self.open_usage_lock(create)?
+        {
+            FileExt::try_lock_shared(&file)
+                .map_err(|_| unavailable("runtime state cache is being removed"))?;
+            *retained = Some(file);
+        }
+        Ok(())
+    }
+
+    fn cache_usage_lock(&self) -> Result<CacheUsageLock, ProtocolError> {
+        let Some(file) = self.open_usage_lock(false)? else {
+            return Ok(CacheUsageLock::Legacy);
+        };
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(CacheUsageLock::Idle { _guard: file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(CacheUsageLock::Active)
+            }
+            Err(_) => Err(unavailable("cannot lock runtime state cache usage")),
+        }
+    }
+
+    fn open_usage_lock(&self, create: bool) -> Result<Option<File>, ProtocolError> {
+        let path = self.root.join(USAGE_LOCK_FILE);
+        let exists = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata_is_link_or_reparse(&metadata)
+                    || !metadata.is_file()
+                    || !metadata_is_owned_private(&metadata)
+                {
+                    return Err(forbidden("runtime state usage lock is unsafe"));
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    return Ok(None);
+                }
+                false
+            }
+            Err(_) => return Err(internal()),
+        };
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        if !exists {
+            options.create_new(true);
+        }
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        #[cfg(windows)]
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        let file = options.open(&path).map_err(|_| internal())?;
+        let metadata = file.metadata().map_err(|_| internal())?;
+        if metadata_is_link_or_reparse(&metadata)
+            || !metadata.is_file()
+            || !metadata_is_owned_private(&metadata)
+        {
+            return Err(forbidden("runtime state usage lock is unsafe"));
+        }
+        if !exists {
+            file.sync_all().map_err(|_| internal())?;
+            sync_directory(&self.root)?;
+        }
+        Ok(Some(file))
     }
 
     fn lock_root(&self) -> Result<RootLock, ProtocolError> {
@@ -742,6 +906,7 @@ impl StateStore {
             .retryable(true)
         })?;
         let lock = RootLock(file);
+        self.retain_usage_lease(true)?;
         self.maintain_quarantine_locked()?;
         Ok(lock)
     }
@@ -754,6 +919,18 @@ impl StateStore {
         principal_id: &str,
     ) -> Result<Option<(RootLock, PathBuf)>, ProtocolError> {
         validate_principal_id(principal_id)?;
+        let Some(lock) = self.existing_locked_root()? else {
+            return Ok(None);
+        };
+        let namespace = self.root.join(principal_id);
+        if !validate_existing_owned_directory(&namespace)? {
+            return Ok(None);
+        }
+        self.retain_usage_lease(false)?;
+        Ok(Some((lock, namespace)))
+    }
+
+    fn existing_locked_root(&self) -> Result<Option<RootLock>, ProtocolError> {
         let parent = self.root.parent().ok_or_else(internal)?;
         if !validate_existing_owned_directory(parent)?
             || !validate_existing_owned_directory(&self.root)?
@@ -801,11 +978,7 @@ impl StateStore {
         FileExt::try_lock_exclusive(&file)
             .map_err(|_| unavailable("runtime state catalog is locked by another process"))?;
 
-        let namespace = self.root.join(principal_id);
-        if !validate_existing_owned_directory(&namespace)? {
-            return Ok(None);
-        }
-        Ok(Some((RootLock(file), namespace)))
+        Ok(Some(RootLock(file)))
     }
 
     fn ensure_namespace(&self, principal_id: &str) -> Result<PathBuf, ProtocolError> {
@@ -1239,6 +1412,86 @@ impl StateStore {
                 .saturating_add(self.limits.max_payload_bytes),
         )
     }
+}
+
+enum CacheUsageLock {
+    Idle { _guard: File },
+    Active,
+    Legacy,
+}
+
+fn cache_entry_from_state(
+    namespace: &str,
+    id: &str,
+    state: Result<(StoredStateMetadata, bool), ProtocolError>,
+    usage: &CacheUsageLock,
+) -> StoredCacheEntry {
+    let mut entry = StoredCacheEntry {
+        namespace: namespace.into(),
+        id: id.into(),
+        backend: None,
+        bytes: None,
+        modified_unix_ms: None,
+        active: matches!(usage, CacheUsageLock::Active),
+        blocked_reason: None,
+    };
+    match state {
+        Ok((metadata, pinned)) => {
+            entry.backend = Some(metadata.backend);
+            entry.bytes = Some(metadata.payload_bytes);
+            entry.modified_unix_ms = Some(metadata.last_accessed_unix_ms);
+            if pinned {
+                entry.blocked_reason = Some(
+                    "runtime state is pinned; unpin it through runtime state controls first".into(),
+                );
+            }
+        }
+        Err(_) => {
+            entry.blocked_reason = Some(
+                "runtime state metadata is invalid; runtime reconciliation is required".into(),
+            );
+        }
+    }
+    match usage {
+        CacheUsageLock::Active => {
+            entry.blocked_reason = Some(
+                "runtime state catalog is in use; stop its Werk runtime before purging".into(),
+            );
+        }
+        CacheUsageLock::Legacy => {
+            entry.blocked_reason = Some(
+                "legacy runtime state catalog has no usage lease; stop older Werk processes, then initialize it with a current runtime state mutation before purging".into(),
+            );
+        }
+        CacheUsageLock::Idle { .. } => {}
+    }
+    entry
+}
+
+fn prune_matched_states_locked(
+    namespace: &Path,
+    states: Vec<StateSummary>,
+    dry_run: bool,
+) -> Result<StatePruneResult, ProtocolError> {
+    let matched = states.len() as u64;
+    let bytes = states.iter().fold(0u64, |total, state| {
+        total.saturating_add(state.bytes.unwrap_or(0))
+    });
+    if !dry_run {
+        for state in &states {
+            remove_state_dir(&namespace.join(&state.id))?;
+        }
+        sync_directory(namespace)?;
+    }
+    Ok(StatePruneResult {
+        summary: PruneStatesResponse {
+            matched,
+            removed: if dry_run { 0 } else { matched },
+            bytes: Some(bytes),
+            dry_run,
+        },
+        matched_states: states,
+    })
 }
 
 struct RootLock(File);
@@ -2109,6 +2362,180 @@ mod tests {
         let mut bytes = Vec::new();
         loaded.payload_file.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"secret kv");
+    }
+
+    #[test]
+    fn cache_inventory_and_dry_run_never_initialize_missing_storage() {
+        let temp = TestDir::new();
+        let store = StateStore::new(&temp.0);
+        assert!(store.cache_inventory().unwrap().is_empty());
+        assert_eq!(
+            store
+                .cache_prune("local", "st_missing", true)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::NotFound
+        );
+        assert!(!temp.0.join("runtime-state").exists());
+    }
+
+    #[test]
+    fn cache_inventory_lists_namespaces_and_protects_live_catalogs_and_pins() {
+        let temp = TestDir::new();
+        let runtime = StateStore::new(&temp.0);
+        let pinned = runtime.commit("p_alice", new_state(b"secret kv")).unwrap();
+        let mut state = new_state(b"other payload");
+        state.pinned = false;
+        let unpinned = runtime.commit("p_bob", state).unwrap();
+        let admin = StateStore::new(&temp.0);
+        let active = admin.cache_inventory().unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().all(|entry| entry.active));
+        assert!(
+            active
+                .iter()
+                .all(|entry| entry.blocked_reason.as_deref().unwrap().contains("in use"))
+        );
+        assert_eq!(active[0].namespace, "p_alice");
+        assert_eq!(active[0].id, pinned.id);
+        assert_eq!(active[0].bytes, Some(9));
+        let debug = format!("{active:?}");
+        assert!(!debug.contains("secret kv"));
+        assert!(!debug.contains(temp.0.to_string_lossy().as_ref()));
+        for dry_run in [true, false] {
+            assert!(admin.cache_prune("p_bob", &unpinned.id, dry_run).is_err());
+        }
+        drop(runtime);
+        let idle = admin.cache_inventory().unwrap();
+        assert!(idle.iter().all(|entry| !entry.active));
+        assert!(
+            idle[0]
+                .blocked_reason
+                .as_deref()
+                .unwrap()
+                .contains("pinned")
+        );
+        assert!(idle[1].blocked_reason.is_none());
+        assert!(admin.cache_prune("p_alice", &pinned.id, false).is_err());
+    }
+
+    #[test]
+    fn cache_prune_uses_exact_catalog_entry_and_preserves_dry_run_and_accounting() {
+        let temp = TestDir::new();
+        let runtime = StateStore::new(&temp.0);
+        let pinned = runtime.commit("local", new_state(b"keep")).unwrap();
+        let mut state = new_state(b"remove");
+        state.pinned = false;
+        let unpinned = runtime.commit("local", state).unwrap();
+        drop(runtime);
+        let namespace = temp.0.join("runtime-state/v1/local");
+        let selected = namespace.join(&unpinned.id);
+        let staging = namespace.join(".staging-unrelated");
+        fs::create_dir(&staging).unwrap();
+        let model = temp.0.join("model.safetensors");
+        fs::write(&model, b"model weights").unwrap();
+        let admin = StateStore::new(&temp.0);
+        let before = fs::read(selected.join(METADATA_FILE)).unwrap();
+        let preview = admin.cache_prune("local", &unpinned.id, true).unwrap();
+        assert_eq!(preview.bytes, Some(6));
+        assert_eq!(before, fs::read(selected.join(METADATA_FILE)).unwrap());
+        assert!(!selected.join(LAST_ACCESSED_FILE).exists());
+        assert!(!temp.0.join("runtime-state/v1/.quarantine").exists());
+        let removed = admin.cache_prune("local", &unpinned.id, false).unwrap();
+        assert_eq!(removed.bytes, preview.bytes);
+        assert!(!selected.exists());
+        assert!(namespace.join(&pinned.id).exists());
+        assert!(staging.exists());
+        assert_eq!(fs::read(model).unwrap(), b"model weights");
+        assert_eq!(admin.cache_inventory().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn read_only_runtime_access_retains_usage_lease_until_store_is_dropped() {
+        let temp = TestDir::new();
+        let writer = StateStore::new(&temp.0);
+        let mut state = new_state(b"restore");
+        state.pinned = false;
+        let state = writer.commit("local", state).unwrap();
+        drop(writer);
+        let reader = StateStore::new(&temp.0);
+        reader.inspect("local", &state.id).unwrap();
+        let admin = StateStore::new(&temp.0);
+        assert!(admin.cache_inventory().unwrap()[0].active);
+        assert!(admin.cache_prune("local", &state.id, false).is_err());
+        drop(reader);
+        assert!(!admin.cache_inventory().unwrap()[0].active);
+        admin.cache_prune("local", &state.id, false).unwrap();
+    }
+
+    #[test]
+    fn legacy_catalog_purge_is_blocked_until_runtime_migration_without_read_mutation() {
+        let temp = TestDir::new();
+        let writer = StateStore::new(&temp.0);
+        let state = writer.commit("local", new_state(b"legacy")).unwrap();
+        drop(writer);
+        let usage = temp.0.join("runtime-state/v1").join(USAGE_LOCK_FILE);
+        fs::remove_file(&usage).unwrap();
+        let admin = StateStore::new(&temp.0);
+        let entry = admin.cache_inventory().unwrap().remove(0);
+        assert!(!entry.active);
+        assert!(entry.blocked_reason.unwrap().contains("legacy"));
+        for dry_run in [true, false] {
+            assert!(admin.cache_prune("local", &state.id, dry_run).is_err());
+        }
+        let reader = StateStore::new(&temp.0);
+        reader.inspect("local", &state.id).unwrap();
+        assert!(!usage.exists());
+        drop(reader);
+        let current_runtime = StateStore::new(&temp.0);
+        current_runtime
+            .set_pinned("local", &state.id, false, false)
+            .unwrap();
+        assert!(usage.is_file());
+        drop(current_runtime);
+        admin.cache_prune("local", &state.id, false).unwrap();
+    }
+
+    #[test]
+    fn cache_prune_can_discard_damaged_payload_without_scanning_its_contents() {
+        let temp = TestDir::new();
+        let writer = StateStore::new(&temp.0);
+        let mut state = new_state(b"valid!");
+        state.pinned = false;
+        let state = writer.commit("local", state).unwrap();
+        drop(writer);
+        let payload = temp
+            .0
+            .join("runtime-state/v1/local")
+            .join(&state.id)
+            .join(PAYLOAD_FILE);
+        fs::write(&payload, b"broken").unwrap();
+        let admin = StateStore::new(&temp.0);
+        assert_eq!(admin.cache_inventory().unwrap()[0].bytes, Some(6));
+        assert_eq!(
+            admin.cache_prune("local", &state.id, false).unwrap().bytes,
+            Some(6)
+        );
+        assert!(!payload.exists());
+        assert!(!temp.0.join("runtime-state/v1/.quarantine").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cache_inventory_and_purge_refuse_symlink_usage_locks() {
+        let temp = TestDir::new();
+        let writer = StateStore::new(&temp.0);
+        let state = writer.commit("local", new_state(b"keep")).unwrap();
+        drop(writer);
+        let usage = temp.0.join("runtime-state/v1").join(USAGE_LOCK_FILE);
+        let outside = temp.0.join("outside-file");
+        fs::write(&outside, b"untouched").unwrap();
+        fs::remove_file(&usage).unwrap();
+        std::os::unix::fs::symlink(&outside, &usage).unwrap();
+        let admin = StateStore::new(&temp.0);
+        assert!(admin.cache_inventory().is_err());
+        assert!(admin.cache_prune("local", &state.id, false).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"untouched");
     }
 
     #[test]

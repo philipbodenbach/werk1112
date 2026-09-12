@@ -70,7 +70,7 @@ cells show both truthful outcomes.
 | `runtime.state.restore.cross_restart` | `unavailable` | `unavailable` | Not advertised; no Werk adapter | Not advertised; no Werk adapter | Not advertised; no Werk adapter |
 | `runtime.state.tier.ram`, `runtime.state.tier.vram` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | `unsupported` |
 | `runtime.pd.prefill`, `runtime.pd.decode`, `runtime.pd.handoff` | `experimental` | `unavailable` | `unsupported` | `unsupported` | `unsupported` |
-| `runtime.experts.residency` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | `unsupported` |
+| `runtime.experts.residency` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | `experimental` for a loaded oMLX worker with explicit expert offload; otherwise `unsupported` or `unavailable` |
 
 For vLLM, `runtime.state.prefix_cache` describes backend-owned automatic reuse,
 not a Werk state handle. With no active process it is `unavailable`. It is
@@ -90,6 +90,23 @@ adapter and are not inferred from APC.
 
 ### Execution lifetime and reuse matrix
 
+`werk chat --persistence` adds backend-independent conversation save/resume.
+Its private message archives survive restart and can be used with a different
+runtime for the same model. This does not imply that native KV tensors or
+resident weights were restored; terminal startup reports native cache support
+separately. The [terminal chat options](../reference/cli.md#persistent-terminal-chat)
+do not alter the named state capability matrix above.
+
+Local storage cleanup is available through `werk cache list` and
+`werk cache purge <CACHE-ID>` or `werk cache purge --all`. The inventory
+separates persistent chat KV data and message archives under `chat-sessions/`,
+owned oMLX worker caches under `backends/omlx/workers/`, and managed disk states
+under `runtime-state/v1/`. Bulk cleanup preserves conversation archives unless
+explicitly included and skips active or pinned storage. It does not evict
+in-memory backend caches or remove model weights. See the
+[cache CLI reference](../reference/cli.md#local-persistence-caches) for filters,
+preview and process-lock behavior.
+
 The runtime-control capabilities above are only one kind of persistence. The
 following matrix separates four mechanisms that otherwise look similar during
 a warm benchmark:
@@ -106,7 +123,7 @@ a warm benchmark:
 | ONNX Runtime Python GenAI fallback | One serialized Werk-owned Python worker is reused for CPU execution. | Yes; exact model and tokenizer entries use a bounded LRU, default capacity `1`. | No; each request gets a new generator and prompt state. | No. | No. |
 | Transformers compatibility | One serialized Werk-owned Python worker is reused. | Yes; exact model/tokenizer entries use a bounded LRU, default capacity `1`. | Only generation-local cache; prompts and generator state are not shared across requests. | No. | No. |
 | MLX / MLX-VLM | The configured command or Python module is invoked per request. | No Werk resident model cache; the subprocess reloads. | No cross-request prefix/KV reuse. | No. | No. |
-| oMLX | Werk starts an already installed CLI on demand and reuses its exact model/runtime child while the backend lives. | Supported while the owned process is active; unavailable before startup or after it exits. | Native oMLX caches remain backend-owned; Werk exposes no prefix-state contract. | No; no named KV snapshots, persistence, restore or split prefill/decode. | No. |
+| oMLX | Werk starts an already installed CLI on demand and reuses its exact model/runtime child while the backend lives. | Supported while the owned process is active; unavailable before startup or after it exits. | Native oMLX caches remain backend-owned. `serve --persistence` adds verified short exact-prefix reuse for the worker with `auto`/`disk` mode and reuse enabled. | No; no named KV snapshots, persistence, restore or split prefill/decode. | No. |
 | Generic media companion | One serialized resident execution worker is reused while `werk serve` lives. | Yes; a bounded Diffusers/Transformers LRU, default capacity `1`. | Not applicable; this is model/pipeline residency, not a text KV cache. | No. | Yes on job-backed media routes; direct routes remain synchronous. |
 | Managed Qwen3-TTS media | A separate serialized resident Qwen execution worker is reused while `werk serve` lives. | Yes; a separate bounded Qwen LRU, also default capacity `1`. | Not applicable. | No. | Yes when speech is requested asynchronously, as the ComfyUI node does. |
 
@@ -185,8 +202,11 @@ werk serve --model my-gguf-model --persistence
 This means `auto` retention, `prefer` reuse, no TTL and no pinning. It also
 supplies the experimental opt-in when `allow_experimental` is omitted. For a
 local vLLM selected by this server, it additionally defaults the native
-automatic prefix cache on. Model/pipeline residency in Werk-owned in-process
-backends and resident workers is automatic and does not require this flag.
+automatic prefix cache on. For local oMLX 0.6.4, `auto` or `disk` mode with
+reuse other than `disabled` enables verified short exact-prefix caching in the
+worker, including ordinary OpenAI chat requests. Model/pipeline residency in
+Werk-owned in-process backends and resident workers is automatic and does not
+require this flag.
 Granular controls select a different default policy, and any one of them
 implies `--persistence`:
 
@@ -199,8 +219,8 @@ werk serve --model my-gguf-model \
 ~~~
 
 The modes are `ephemeral`, `memory`, `disk` and `auto`; reuse is `disabled`,
-`prefer` or `required`; TTL is bounded to 1 through 2592000 seconds. These are
-defaults only for absent top-level members of `POST /werk/v1/prefill`. A
+`prefer` or `required`; TTL is bounded to 1 through 2592000 seconds. These
+policy defaults apply to absent top-level members of `POST /werk/v1/prefill`. A
 present `policy` object owns the complete request policy, and a present
 `allow_experimental` Boolean owns the opt-in decision. Explicit `false` is
 never promoted to `true` by server configuration.
@@ -208,6 +228,15 @@ never promoted to `true` by server configuration.
 For local vLLM, `--persistence-reuse disabled` defaults the native prefix cache
 off; an explicit enable or disable in `WERK_VLLM_ARGS` wins. Remote vLLM stays
 externally managed and receives no generated process argument.
+
+The additional oMLX cache uses the same exact-prefix helper as persistent CLI
+chat, with a 4 GB native SSD cache under the private worker's `cache/prefix-cache`
+directory. It reuses matching token prefixes across requests while that worker
+lives. It does not persist conversation history or guarantee cross-restart
+reuse. Modes `memory` and `ephemeral`, or reuse `disabled`, leave this helper
+off. TTL, pinning and `required` reuse remain named Prefill policy controls;
+an ordinary OpenAI cache miss falls back to normal prefill. The worker cache
+is covered by existing managed cache inventory and cleanup.
 
 This switch does not create a generic Werk KV format or make one-shot external
 commands persistent. Today the positive named-state path is experimental and
@@ -346,12 +375,20 @@ sizes are kept unknown and are never assumed to fit a target tier.
 
 That policy engine does not discover MoE modules or move tensors itself. A
 production adapter must supply stable expert identities, truthful residency
-observations and the actual movement operation. No current production adapter,
-including vLLM, supplies that integration, so expert routes return
-`unsupported`. ComfyUI exposes capability-gated expert telemetry and explicit,
-dry-run-first control nodes, but they fail closed while that status is active
-and never convert route presence into a support claim. There is no in-process
-or external Krasis connector in this version.
+observations and the actual movement operation. The optional oMLX expert
+adapter supplies these for supported DeepSeek V4 affine checkpoints when
+automatic selection is active (the default on oMLX 0.6.4) or a positive
+`WERK_OMLX_EXPERT_CACHE_MB` budget is configured before loading. It uses a bounded LRU
+cache of actual expert tensors, loads slices from the original safetensors
+files, and reports disk-backed experts as `external` and cached experts as
+`ram` on Apple unified memory. This worker-local cache does not activate the
+separate core RAM/VRAM pressure-policy engine or named KV-state operations.
+
+The adapter reports `experimental` only after the worker confirms active
+offload. ComfyUI and n8n expert nodes require explicit experimental opt-in;
+prefetch targets `ram`, and eviction removes the cached copy while preserving
+the checkpoint. Other adapters, including vLLM, still report expert controls
+as unsupported. There is no in-process or external Krasis connector.
 
 ## Prefill/decode handoff
 

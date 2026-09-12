@@ -1,0 +1,58 @@
+{
+  "cases": [
+    {
+      "id": "rust-english",
+      "max_tokens": 128,
+      "turns": [
+        {
+          "prompt": "Write me a sentence about the programming language Rust. Use one English sentence.",
+          "checks": [{"type": "manual", "criterion": "One coherent, factually correct English sentence about Rust; no repetition or unrelated text."}]
+        }
+      ]
+    },
+    {
+      "id": "rust-german",
+      "max_tokens": 128,
+      "turns": [
+        {
+          "prompt": "Erkläre in genau einem deutschen Satz, warum Rust Speichersicherheit bietet.",
+          "checks": [{"type": "manual", "criterion": "One coherent German sentence correctly explaining ownership/borrowing or compiler checks; no repetition."}]
+        }
+      ]
+    },
+    {
+      "id": "structured-json",
+      "max_tokens": 64,
+      "turns": [
+        {
+          "prompt": "Return only JSON with the keys language and safe. Set language to Rust and safe to true. Do not use Markdown.",
+          "checks": [{"type": "json_equals", "value": {"language": "Rust", "safe": true}}]
+        }
+      ]
+    },
+    {
+      "id": "arithmetic",
+      "max_tokens": 32,
+      "turns": [
+        {
+          "prompt": "There are three boxes with four pencils each. How many pencils are there? Reply with the number only.",
+          "checks": [{"type": "exact_text", "value": "12"}]
+        }
+      ]
+    },
+    {
+      "id": "conversation",
+      "max_tokens": 128,
+      "turns": [
+        {
+          "prompt": "My project is named Cedar and is written in Rust. Acknowledge this in one short English sentence.",
+          "checks": [{"type": "manual", "criterion": "Acknowledges Cedar and Rust in coherent English."}]
+        },
+        {
+          "prompt": "What are the name and language of my project? Reply only with JSON containing project and language, without Markdown.",
+          "checks": [{"type": "json_equals", "value": {"project": "Cedar", "language": "Rust"}}]
+        }
+      ]
+    }
+  ]
+}

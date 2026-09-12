@@ -383,6 +383,7 @@ Accepted top-level fields:
 | <code>model</code> | Conditional | string | May be omitted when the server has a default chat model |
 | <code>messages</code> | Yes | array | Chat messages |
 | <code>stream</code> | No | boolean | Default false |
+| <code>stream_options.include_usage</code> | No | boolean | With streaming, request a final usage chunk before <code>[DONE]</code> |
 | <code>temperature</code> | No | number | Backend dependent |
 | <code>top_p</code> | No | number | Backend dependent |
 | <code>max_tokens</code> | No | integer | Legacy response budget |
@@ -392,6 +393,52 @@ Accepted top-level fields:
 | <code>tools</code> | No | array | OpenAI function-tool definitions; supported by the vLLM adapter |
 | <code>tool_choice</code> | No | string or object | <code>none</code>, <code>auto</code>, <code>required</code>, or a named function selection |
 | <code>parallel_tool_calls</code> | No | boolean | Forwarded unchanged to vLLM |
+| <code>werk</code> | No | object | Validated Werk chat runtime options; currently <code>omlx.thinking</code> and <code>omlx.expert_cache_mb</code> |
+
+#### oMLX chat options
+
+Text requests can configure oMLX from a workflow without changing the server's
+environment:
+
+```json
+{
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "messages": [{"role": "user", "content": "Antworte bitte auf Deutsch: Was ist MoE?"}],
+  "max_completion_tokens": 128,
+  "werk": {
+    "omlx": {"thinking": false, "expert_cache_mb": 8192}
+  }
+}
+```
+
+`thinking` is a JSON boolean: `false` corresponds to `WERK_OMLX_THINKING=0`.
+`expert_cache_mb` is an integer from 0 to 1048576 MiB; `8192` enables the
+experimental SSD expert loader with an 8 GiB RAM cache, and `0` explicitly
+disables expert offload. Omitted fields inherit the server's captured
+environment settings. Empty `werk` or `omlx` objects do not override anything.
+Unknown members or invalid types/ranges inside `werk` are rejected.
+
+Explicit oMLX options select the compatible oMLX route when Werk runs with
+`--backend auto`, and configure the existing oMLX adapter with `--backend omlx`.
+Other explicitly selected backends and image-bearing requests reject these
+options instead of ignoring them. The installed model/runtime must still pass
+oMLX compatibility checks; expert offload retains its experimental architecture
+and version requirements. No environment variables are changed for other
+requests. Thinking is applied per request without reloading weights. Changing
+the expert budget selects a separate worker configuration and can require a
+model load; it does not resize a worker serving another request.
+
+Updated servers advertise `api.chat.omlx_options` through
+`GET /werk/v1/capabilities`. This capability confirms that the API understands
+the fields, not that a model is compatible or loaded. The n8n Text and ComfyUI
+Text nodes check it before sending explicit overrides; update and restart an
+older Werk server if it is absent. Unchanged workflows that inherit settings
+continue to use their existing requests. After generation, the existing expert
+nodes address the worker most recently used for that model; already prepared
+expert actions remain bound to their original worker. These options create no
+named Prefill/KV persistence capability.
+
+#### Messages and token budget
 
 The response-token default is 256 when neither field is present. Werk does not
 silently clamp an explicit response budget; the selected model context and
@@ -548,7 +595,6 @@ Not implemented:
 - choice count <code>n</code>
 - log probabilities
 - frequency and presence penalties
-- stream usage summaries
 
 Unknown chat fields are currently ignored by deserialization. Clients should
 not interpret acceptance as support.
@@ -561,7 +607,13 @@ With <code>stream: true</code>, the response content type is
 1. assistant-role chunk;
 2. zero or more content and/or tool-call delta chunks;
 3. finish chunk;
-4. literal <code>data: [DONE]</code>.
+4. optional usage chunk when `stream_options: {"include_usage": true}` was requested;
+5. literal <code>data: [DONE]</code>.
+
+The usage chunk has an empty `choices` array and backend-reported `prompt_tokens`,
+`completion_tokens`, and `total_tokens`. It is omitted when generation fails
+without a completion event. Cached-token counts and phase timings are not exposed
+in this chunk; use backend diagnostics for those measurements.
 
 Output chunks are buffered text pieces rather than necessarily one token each.
 Tool-call deltas preserve each call's `index`, optional ID and type, partial

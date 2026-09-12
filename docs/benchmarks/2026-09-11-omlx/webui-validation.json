@@ -1,0 +1,15 @@
+{
+  "chat_id": "1bbaa9a3-0378-460e-a7d5-70adf0e768c8",
+  "url": "http://localhost:8080/c/1bbaa9a3-0378-460e-a7d5-70adf0e768c8",
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "prompt": "Write me a sentence about the programming language rust.",
+  "done": true,
+  "error": null,
+  "answer": "Your sentence: Rust is a powerful systems programming language that combines memory safety with a focus on performance and reliability.",
+  "verification": "Created by Safari Open WebUI query workflow; inspected this test chat only in read-only WebUI DB. Completed assistant output is stored under output[].content[].text; legacy content field is empty by design.",
+  "backend_total_seconds": 14.645482,
+  "backend_completion_tokens": 22,
+  "backend_decode_tokens_per_second": 3.0,
+  "backend_cached_prompt_tokens": 0,
+  "visual_capture": "Window screenshot could not be created in this environment; visible pixels were not independently inspected. The Safari workflow and completed Open WebUI chat record were verified."
+}

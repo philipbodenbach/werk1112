@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping
 try:
     from .client import WerkApiError, WerkClient
     from .config import WerkConnection
+    from .text_nodes import classify_text_models
     from .nodes import (
         classify_audio_models,
         classify_image_models,
@@ -21,6 +22,7 @@ try:
 except ImportError:  # pragma: no cover - direct-module development
     from client import WerkApiError, WerkClient
     from config import WerkConnection
+    from text_nodes import classify_text_models
     from nodes import (
         classify_audio_models,
         classify_image_models,
@@ -65,6 +67,7 @@ def discover_connection(
         warning = str(error)
     classification = classify_image_models(models, capabilities)
     vision_classification = classify_vision_models(models, capabilities)
+    text_classification = classify_text_models(models, capabilities)
     video_classification = classify_video_models(models, capabilities)
     audio_classification = classify_audio_models(models, capabilities)
     model_count = len(classification["installed"])
@@ -97,6 +100,10 @@ def discover_connection(
         "vision_models": {
             "declared": vision_classification["declared"],
             "available": vision_classification["available"],
+        },
+        "text_models": {
+            "declared": text_classification["declared"],
+            "available": text_classification["available"],
         },
         "video_models": {
             "declared": video_classification["declared"],

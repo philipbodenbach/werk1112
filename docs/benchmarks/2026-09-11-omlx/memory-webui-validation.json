@@ -1,0 +1,18 @@
+{
+  "chat_id": "0c402afe-99b5-4a3e-97da-643764f081e6",
+  "created_at": 1789157241,
+  "answers": [
+    {
+      "done": true,
+      "error": null,
+      "text": "Your sentence: Rust is a powerful systems programming language that combines memory safety with a focus on performance and reliability."
+    }
+  ],
+  "validation": "Sent from Safari Open WebUI; completion verified from stored WebUI history, no screenshot verification",
+  "backend_total_seconds": 16.01089,
+  "completion_tokens": 22,
+  "backend_decode_tokens_per_second": 4.51,
+  "configured_expert_cache_mib": 30720,
+  "thinking": false,
+  "installed_werk_sha256": "3626308a751f01cd312f440a0fb2530a4b7ba5b040bbc2039eaf59eb56c4c7e7"
+}

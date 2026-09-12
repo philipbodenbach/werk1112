@@ -486,6 +486,29 @@ class MlxMetadataProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot verify custom MLX launcher"):
                 probe_module.launcher_module(path)
 
+    def test_uv_launcher_accepts_only_exact_suffix_normalization(self):
+        source = '''import sys
+from mlx_lm.generate import main
+if __name__ == "__main__":
+    if sys.argv[0].endswith("-script.pyw"):
+        sys.argv[0] = sys.argv[0][:-11]
+    elif sys.argv[0].endswith(".exe"):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(main())
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mlx_lm.generate"
+            path.write_text(source)
+            self.assertEqual(probe_module.launcher_module(path), "mlx_lm.generate")
+            for changed in (
+                source.replace("[:-11]", "[:-10]"),
+                source.replace('sys.argv[0][:-4]', 'main()'),
+                source + "raise AssertionError('must not execute')\n",
+            ):
+                path.write_text(changed)
+                with self.assertRaisesRegex(ValueError, "cannot verify custom MLX launcher"):
+                    probe_module.launcher_module(path)
+
     def test_launcher_imports_use_its_directory_like_real_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mlx_lm.generate"

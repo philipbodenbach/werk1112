@@ -104,9 +104,74 @@ test('text preserves null-content tool calls, finish reason and usage without ex
 	const toolCalls = [{ id: 'call1', type: 'function', function: { name: 'lookup', arguments: '{"query":"hello"}' } }];
 	const f = fixture(WerkText, [parameters({ operation: 'complete', messages: { message: [{ role: 'user', content: 'hello' }] } })], ({ path, body }) => {
 		assert.equal(path, '/v1/chat/completions'); assert.equal(body.stream, false);
+		assert.equal(Object.hasOwn(body, 'werk'), false);
 		return { id: 'chat2', model: body.model, choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: toolCalls }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 1, completion_tokens: 3, total_tokens: 4 } };
 	});
 	const [[item]] = await f.run(); assert.equal(item.json.text, ''); assert.deepEqual(item.json.toolCalls, toolCalls); assert.equal(item.json.finishReason, 'tool_calls');
+	assert.equal(f.requests.filter((request) => request.method === 'POST').length, 1);
+	assert.equal(f.requests.filter((request) => request.path.startsWith('/werk/')).length, 0);
+});
+
+const omlxCapability = (overrides = {}) => ({ id: 'api.chat.omlx_options', status: 'supported', detail: 'oMLX request options accepted', operations: ['thinking', 'expert_cache_mb'], ...overrides });
+const capabilityEnvelope = (capabilities) => ({ protocol: { major: 1, minor: 0 }, request_id: 'req_omlx', data: { capabilities } });
+const textCompletion = (model) => ({ id: 'chat-omlx', model, choices: [{ index: 0, message: { role: 'assistant', content: 'answer' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } });
+
+test('text exposes optional oMLX controls while vision retains its existing option surface', () => {
+	const text = new WerkText().description.properties.find((property) => property.name === 'options').options;
+	const vision = new WerkVision().description.properties.find((property) => property.name === 'options').options;
+	for (const name of ['omlxThinking', 'omlxExpertOffload']) {
+		const property = text.find((property) => property.name === name);
+		assert.equal(property.default, 'inherit');
+		assert.deepEqual(property.options.map((option) => option.value), ['inherit', 'enabled', 'disabled']);
+		assert.equal(vision.some((property) => property.name === name), false);
+	}
+	const budget = text.find((property) => property.name === 'omlxExpertCacheMb');
+	assert.equal(budget.default, 8192); assert.equal(budget.typeOptions.minValue, 1); assert.equal(budget.typeOptions.maxValue, 1048576);
+	assert.deepEqual(budget.displayOptions.show, { omlxExpertOffload: ['enabled'] });
+	assert.equal(vision.some((property) => property.name === budget.name), false);
+});
+
+test('text executes each item with its explicit oMLX settings after the protocol capability check', async () => {
+	const messages = { message: [{ role: 'user', content: 'hello' }] };
+	const settings = [
+		{ omlxThinking: 'disabled', omlxExpertOffload: 'enabled', omlxExpertCacheMb: 8192 },
+		{ omlxThinking: 'enabled', omlxExpertOffload: 'disabled' },
+	];
+	const expected = [{ thinking: false, expert_cache_mb: 8192 }, { thinking: true, expert_cache_mb: 0 }];
+	const f = fixture(WerkText, settings.map((options, index) => parameters({ operation: 'complete', messages, options }, index)), ({ path, body, authenticated }) => {
+		assert.equal(authenticated, true);
+		if (path === '/werk/v1/capabilities') return capabilityEnvelope([omlxCapability()]);
+		assert.equal(path, '/v1/chat/completions');
+		assert.deepEqual(body.werk, { omlx: expected[Number(body.model.slice(-1))] });
+		return textCompletion(body.model);
+	});
+	const [items] = await f.run();
+	assert.equal(items.length, 2); assert.deepEqual(items.map((item) => item.json.text), ['answer', 'answer']);
+	assert.equal(f.requests.filter((request) => request.path === '/werk/v1/capabilities').length, 2);
+	assert.equal(f.requests.filter((request) => request.method === 'POST').length, 2);
+});
+
+test('text refuses missing or incomplete oMLX support before submitting generation', async () => {
+	for (const capabilities of [[], [omlxCapability({ status: 'unsupported' })], [omlxCapability({ status: 'experimental' })], [omlxCapability({ operations: ['expert_cache_mb'] })]]) {
+		const f = fixture(WerkText, [parameters({ operation: 'complete', messages: { message: [{ role: 'user', content: 'hello' }] }, options: { omlxThinking: 'disabled' } })], ({ path }) => {
+			assert.equal(path, '/werk/v1/capabilities'); return capabilityEnvelope(capabilities);
+		});
+		await assert.rejects(f.run(), /update and restart Werk/);
+		assert.equal(f.requests.filter((request) => request.method === 'POST').length, 0);
+	}
+});
+
+test('text validates oMLX inputs before requests and surfaces unsupported model errors without retry', async () => {
+	const messages = { message: [{ role: 'user', content: 'hello' }] };
+	for (const options of [{ omlxThinking: true }, { omlxExpertOffload: 'enabled', omlxExpertCacheMb: false }, { omlxExpertOffload: 'enabled', omlxExpertCacheMb: 1.5 }]) {
+		const f = fixture(WerkText, [parameters({ operation: 'complete', messages, options })], () => { throw new Error('unexpected request'); });
+		await assert.rejects(f.run(), /oMLX/); assert.equal(f.requests.length, 0);
+	}
+	const f = fixture(WerkText, [parameters({ operation: 'complete', messages, options: { omlxExpertOffload: 'enabled' } })], ({ path }) => {
+		if (path === '/werk/v1/capabilities') return capabilityEnvelope([omlxCapability()]);
+		return { statusCode: 400, json: { error: { message: 'oMLX request options are unsupported for the selected model' } } };
+	});
+	await assert.rejects(f.run(), /unsupported for the selected model/);
 	assert.equal(f.requests.filter((request) => request.method === 'POST').length, 1);
 });
 

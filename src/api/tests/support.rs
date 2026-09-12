@@ -54,6 +54,7 @@ impl GenerationBackend for MockBackend {
             completion_tokens: 1,
             finish_reason: "stop".to_string(),
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds: 0.0,
                 warmup_seconds: 0.0,
                 first_token_seconds: 0.0,
@@ -77,6 +78,7 @@ impl GenerationBackend for MockBackend {
                 prompt_tokens: 2,
                 completion_tokens: 1,
                 timings: GenerationTimings {
+                    cached_prompt_tokens: None,
                     load_seconds: 0.0,
                     warmup_seconds: 0.0,
                     first_token_seconds: 0.0,
@@ -107,6 +109,7 @@ impl GenerationBackend for PromptEchoBackend {
             completion_tokens: 1,
             finish_reason: "stop".to_string(),
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds: 0.0,
                 warmup_seconds: 0.0,
                 first_token_seconds: 0.0,
@@ -130,6 +133,7 @@ impl GenerationBackend for PromptEchoBackend {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 timings: GenerationTimings {
+                    cached_prompt_tokens: None,
                     load_seconds: 0.0,
                     warmup_seconds: 0.0,
                     first_token_seconds: 0.0,
@@ -351,12 +355,17 @@ pub(super) async fn response_json(response: Response) -> Value {
 }
 
 pub(super) fn test_store() -> ModelStore {
+    // The system clock can return the same nanosecond stamp on parallel tests.
+    static NEXT_STORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT_STORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("werk1112-api-test-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "werk1112-api-test-{}-{nanos}-{unique}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&dir);
     ModelStore::resolve(Some(dir)).unwrap()
 }

@@ -137,7 +137,7 @@ export function buildAudioInputRequest(task: string, input: MediaOptions, audio:
 
 function chatOptions(value: unknown, vision: boolean): Fields {
 	const options = record(value ?? {}, 'Chat options');
-	ensureKeys(options, ['temperature', 'topP', 'maxCompletionTokens', 'seed', 'stopSequences', ...(vision ? ['imageDetail'] : ['tools', 'toolChoice', 'parallelToolCalls'])], 'Chat options');
+	ensureKeys(options, ['temperature', 'topP', 'maxCompletionTokens', 'seed', 'stopSequences', ...(vision ? ['imageDetail'] : ['tools', 'toolChoice', 'parallelToolCalls', 'omlxThinking', 'omlxExpertOffload', 'omlxExpertCacheMb'])], 'Chat options');
 	const request: Fields = {};
 	if (options.temperature !== undefined) request.temperature = finite(options.temperature, 'Temperature');
 	if (options.topP !== undefined) request.top_p = finite(options.topP, 'Top P', 0, 1);
@@ -173,6 +173,14 @@ function chatOptions(value: unknown, vision: boolean): Fields {
 		}
 		const parallel = tristate(options.parallelToolCalls, 'Parallel tool calls');
 		if (parallel !== undefined) request.parallel_tool_calls = parallel;
+		const thinking = tristate(options.omlxThinking, 'oMLX Thinking');
+		const offload = tristate(options.omlxExpertOffload, 'oMLX Expert Offload');
+		const budget = options.omlxExpertCacheMb === undefined ? 8192 : integer(options.omlxExpertCacheMb, 'oMLX Expert Cache (MiB)', 1);
+		if (budget > 1048576) throw new Error('oMLX Expert Cache (MiB) must be between 1 and 1048576');
+		const omlx: Fields = {};
+		if (thinking !== undefined) omlx.thinking = thinking;
+		if (offload !== undefined) omlx.expert_cache_mb = offload ? budget : 0;
+		if (Object.keys(omlx).length) request.werk = { omlx };
 	}
 	return request;
 }

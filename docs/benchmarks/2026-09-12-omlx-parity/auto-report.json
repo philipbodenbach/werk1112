@@ -1,0 +1,58 @@
+{
+  "date": "2026-09-12T08:53:25.615906+00:00",
+  "binary_sha256": "3515978ad6fdcf7845ce8e71d56e832fb531d815622f85c8614bad01a695367b",
+  "budget": "auto",
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "temperature": 0,
+  "top_p": 0.95,
+  "seed": 42,
+  "thinking": false,
+  "max_tokens": 64,
+  "cli_answers": [
+    "Hey, gerne! Hier ist ein informativer Satz über die Programmiersprache Rust:\n\n**Rust ist eine systemnahe Programmiersprache, die sich durch Speichersicherheit, Nebenläufigkeit und eine starke Typisierung auszeichnet – sie wurde entwickelt, um zuverlässige",
+    "Zuverlässige und effiziente Software zu schreiben, ohne Kompromisse bei der Kontrolle über Hardware-Ressourcen einzugehen."
+  ],
+  "serve": [
+    {
+      "first_text_seconds": 10.853503958001966,
+      "total_seconds": 27.2159646670043,
+      "finish_reason": "length",
+      "truncated": true,
+      "answer": "Hey, gerne! Hier ist ein informativer Satz über die Programmiersprache Rust:\n\n**Rust ist eine systemnahe Programmiersprache, die sich durch Speichersicherheit, Nebenläufigkeit und eine starke Typisierung auszeichnet – sie wurde entwickelt, um zuverlässige",
+      "usage": {
+        "completion_tokens": 64,
+        "prompt_tokens": 22,
+        "total_tokens": 86
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 22,
+      "completion_tokens": 64,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "matches_cli": true
+    },
+    {
+      "first_text_seconds": 4.019351833994733,
+      "total_seconds": 8.84353816699877,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Zuverlässige und effiziente Software zu schreiben, ohne Kompromisse bei der Kontrolle über Hardware-Ressourcen einzugehen.",
+      "usage": {
+        "completion_tokens": 31,
+        "prompt_tokens": 108,
+        "total_tokens": 139
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 108,
+      "completion_tokens": 31,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "matches_cli": true
+    }
+  ],
+  "cli_log_reused": false
+}
