@@ -86,6 +86,7 @@ def build_text_config(
     omlx_thinking: str = "inherit",
     omlx_expert_offload: str = "inherit",
     omlx_expert_cache_mb: int = 8192,
+    inherit_sampling: bool = False,
 ) -> WerkTextConfig:
     # Reuse validation for the common /v1/chat/completions sampling fields.
     common = build_vision_config(
@@ -95,6 +96,12 @@ def build_text_config(
         seed=seed,
         stop_sequences_json=stop_sequences_json,
     )
+    if type(inherit_sampling) is not bool:
+        raise ValueError("inherit_sampling must be a boolean")
+    fields = dict(common.request_fields)
+    if inherit_sampling:
+        for key in ("temperature", "top_p", "seed"):
+            fields.pop(key, None)
     options: dict[str, Any] = {}
     thinking = _tristate(omlx_thinking, "omlx_thinking")
     offload = _tristate(omlx_expert_offload, "omlx_expert_offload")
@@ -106,7 +113,7 @@ def build_text_config(
         if type(omlx_expert_cache_mb) is not int or not 1 <= omlx_expert_cache_mb <= 1048576:
             raise ValueError("enabled oMLX expert cache must be an integer from 1 to 1048576 MiB")
         options["expert_cache_mb"] = omlx_expert_cache_mb
-    return WerkTextConfig(request_fields=common.request_fields, omlx_options=options)
+    return WerkTextConfig(request_fields=fields, omlx_options=options)
 
 
 def text_config_payload(config: WerkTextConfig) -> dict[str, Any]:
@@ -151,12 +158,12 @@ def build_text_request(
             not isinstance(message, dict)
             or set(message) != {"role", "content"}
             or not isinstance(message["role"], str)
-            or message["role"] not in {"system", "user", "assistant"}
+            or message["role"] not in {"system", "developer", "user", "assistant"}
             or not isinstance(message["content"], str)
         ):
-            raise ValueError("messages_json entries require a system/user/assistant role and string content")
+            raise ValueError("messages_json entries require a system/developer/user/assistant role and string content")
     messages = []
-    if system_prompt.strip():
+    if system_prompt.strip() and (not history or history[0] != {"role": "system", "content": system_prompt}):
         messages.append({"role": "system", "content": system_prompt})
     messages.extend(history)
     messages.append({"role": "user", "content": prompt})
@@ -271,13 +278,13 @@ class WerkTextConfigNode:
                 "default": "inherit", "tooltip": "Override oMLX thinking for this request. Inherit uses the Werk server default.",
             }),
             "omlx_expert_offload": (["inherit", "enabled", "disabled"], {
-                "default": "inherit", "tooltip": "oMLX text only: enable checkpoint-backed MoE experts, disable explicitly, or inherit the server setting.",
+                "default": "inherit", "tooltip": "Inherit uses the server default: automatic hardware/model sizing unless a fixed server budget is configured. Enabled sets a manual cache ceiling; disabled selects native loading. This is separate from prompt/KV persistence.",
             }),
             "omlx_expert_cache_mb": ("INT", {
                 "default": 8192, "min": 1, "max": 1048576,
-                "tooltip": "Expert cache budget in MiB when offload is enabled; 8192 is 8 GiB. Other model allocations require additional memory.",
+                "tooltip": "Manual expert cache ceiling, used only when offload is enabled. Inherit ignores this field and keeps server Auto sizing. Native memory guards may shrink residency; other weights, KV and workspace need additional memory.",
             }),
-        }}
+        }, "optional": {"inherit_sampling": ("BOOLEAN", {"default": False, "tooltip": "Use server temperature, top-p and seed. Completion limit and explicit stop sequences still apply."})}}
 
     RETURN_TYPES = ("WERK_TEXT_CONFIG", "STRING")
     RETURN_NAMES = ("config", "config_json")
@@ -305,8 +312,8 @@ class WerkTextGenerateNode:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("text", "metadata_json", "completion_id", "finish_reason", "model_id")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("text", "metadata_json", "completion_id", "finish_reason", "model_id", "messages_json")
     FUNCTION = "generate"
     CATEGORY = "WERK/Text"
     OUTPUT_NODE = True
@@ -317,7 +324,8 @@ class WerkTextGenerateNode:
             config=config, messages_json=messages_json,
         )
         result = execute_text_request(connection, request)
-        return {"ui": {"text": [result[0]]}, "result": (*result, request["model"])}
+        history = [*request["messages"], {"role": "assistant", "content": result[0]}]
+        return {"ui": {"text": [result[0]]}, "result": (*result, request["model"], _json_text(history))}
 
 
 NODE_CLASS_MAPPINGS = {

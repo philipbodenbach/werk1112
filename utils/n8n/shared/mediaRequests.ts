@@ -185,13 +185,13 @@ function chatOptions(value: unknown, vision: boolean): Fields {
 	return request;
 }
 
-export function buildTextRequest(model: unknown, messages: unknown, options?: unknown): Fields {
+export function buildTextRequest(model: unknown, messages: unknown, options?: unknown, history?: unknown): Fields {
 	const group = record(messages, 'Messages'); ensureKeys(group, ['message'], 'Messages');
 	if (!Array.isArray(group.message) || !group.message.length) throw new Error('Provide at least one message');
 	const normalized = group.message.map((value) => {
 		const entry = record(value, 'Message'); ensureKeys(entry, ['role', 'content', 'name', 'toolCallId', 'toolCalls'], 'Message');
-		const role = choice(entry.role, 'Message role', ['system', 'user', 'assistant', 'tool']);
-		const result: Fields = { role, content: textValue(entry.content ?? '', 'Message content', true) };
+		const role = choice(entry.role, 'Message role', ['system', 'developer', 'user', 'assistant', 'tool']);
+		const result: Fields = { role, content: entry.content === null && role === 'assistant' ? null : textValue(entry.content ?? '', 'Message content', true) };
 		if (entry.name !== undefined && textValue(entry.name, 'Message name', true).trim()) result.name = entry.name;
 		if (entry.toolCallId !== undefined && textValue(entry.toolCallId, 'Tool call ID', true).trim()) result.tool_call_id = entry.toolCallId;
 		if (role === 'tool' && !result.tool_call_id) throw new Error('Tool messages require a tool call ID');
@@ -209,7 +209,20 @@ export function buildTextRequest(model: unknown, messages: unknown, options?: un
 		}
 		return result;
 	});
-	return { model: textValue(model, 'Model').trim(), messages: normalized, stream: false, ...chatOptions(options, false) };
+	if (typeof history === 'string' && Buffer.byteLength(history) > 16 * 1024 * 1024) throw new Error('Chat history exceeds 16 MiB');
+	const prior = history === undefined ? [] : jsonValue(history, 'Conversation history');
+	if (!Array.isArray(prior)) throw new Error('Conversation history must be an array of OpenAI messages');
+	if (prior.length + normalized.length > 4096) throw new Error('Chat history exceeds 4096 messages');
+	const priorMessages = prior.length ? buildTextRequest(model, { message: prior.map((value) => {
+		const entry = record(value, 'History message');
+		ensureKeys(entry, ['role', 'content', 'name', 'tool_call_id', 'tool_calls'], 'History message');
+		return { role: entry.role, content: entry.content, ...(entry.name !== undefined ? { name: entry.name } : {}),
+			...(entry.tool_call_id !== undefined ? { toolCallId: entry.tool_call_id } : {}),
+			...(entry.tool_calls !== undefined ? { toolCalls: entry.tool_calls } : {}) };
+	}) }).messages as Fields[] : [];
+	const conversation = [...priorMessages, ...normalized];
+	if (conversation.length > 4096 || Buffer.byteLength(JSON.stringify(conversation)) > 16 * 1024 * 1024) throw new Error('Chat history exceeds 4096 messages or 16 MiB');
+	return { model: textValue(model, 'Model').trim(), messages: conversation, stream: false, ...chatOptions(options, false) };
 }
 
 export function buildVisionRequest(model: unknown, prompt: unknown, systemPrompt: unknown, images: MediaBytes[], options?: unknown): Fields {

@@ -38,8 +38,8 @@ export function chatOptionsProperty(vision: boolean): INodeProperties {
 			{ name: 'toolChoice', displayName: 'Tool Choice (JSON)', type: 'json' as const, default: '"auto"', description: '"none", "auto", "required", or a named function selector object' },
 			triProperty('parallelToolCalls', 'Parallel Tool Calls'),
 			{ ...triProperty('omlxThinking', 'oMLX Thinking'), description: 'Inherit the server setting, enable thinking, or disable it for this text request. Requires a Werk server with oMLX request controls.' },
-			{ ...triProperty('omlxExpertOffload', 'oMLX Expert Offload'), description: 'Inherit the server setting, enable the experimental SSD expert cache, or disable it for this text request' },
-			{ ...numberProperty('omlxExpertCacheMb', 'oMLX Expert Cache (MiB)', 8192, 1), typeOptions: { minValue: 1, maxValue: 1048576, numberPrecision: 0 }, displayOptions: { show: { omlxExpertOffload: ['enabled'] } }, description: 'Expert cache capacity in unified memory; used only with oMLX Expert Offload enabled. Other weights, KV and temporary buffers need additional memory.' },
+			{ ...triProperty('omlxExpertOffload', 'oMLX Expert Offload'), options: [{ name: 'Server Default (Auto Unless Configured)', value: 'inherit' }, { name: 'Manual Cache Limit', value: 'enabled' }, { name: 'Disabled (Native Loading)', value: 'disabled' }], description: 'Server Default omits the override and uses automatic hardware/model sizing on supported Werk/oMLX setups unless the server has an explicit budget. Manual preserves small-machine budgets. This controls expert weights, not the prompt/KV cache.' },
+			{ ...numberProperty('omlxExpertCacheMb', 'oMLX Expert Cache (MiB)', 8192, 1), typeOptions: { minValue: 1, maxValue: 1048576, numberPrecision: 0 }, displayOptions: { show: { omlxExpertOffload: ['enabled'] } }, description: 'Explicit expert cache ceiling in MiB; used only with Manual Cache Limit. The memory guard may reduce residency. Other weights, KV and temporary buffers need additional memory. Uncached experts remain checkpoint-backed.' },
 		]),
 	]);
 }

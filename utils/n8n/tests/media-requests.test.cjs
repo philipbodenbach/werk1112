@@ -1,5 +1,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+
+test('conversation history rejects malformed, unsupported and oversized input', () => {
+	const messages = { message: [{ role: 'user', content: 'Next' }] };
+	for (const history of ['{', '{}', [{ role: 'user', content: 'x', images: [] }], [{ role: 'unknown', content: 'x' }], [{ role: 'tool', content: 'x' }]]) {
+		assert.throws(() => buildTextRequest('model', messages, {}, history));
+	}
+	assert.throws(() => buildTextRequest('model', messages, {}, Array.from({ length: 4096 }, () => ({ role: 'user', content: 'x' }))), /4096/);
+	assert.throws(() => buildTextRequest('model', messages, {}, ' '.repeat(16 * 1024 * 1024 + 1)), /16 MiB/);
+});
 const { normalizeParameters, tristate } = require('../dist/shared/parameters');
 const { buildRouting } = require('../dist/shared/routing');
 const { buildImageRequest, buildVideoRequest, buildAudioRequest, buildAudioInputRequest, buildTextRequest, buildVisionRequest, audioAnalysisTasks, audioProcessTasks } = require('../dist/shared/mediaRequests');

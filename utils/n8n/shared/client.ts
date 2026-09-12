@@ -7,6 +7,7 @@ export type Method = 'GET' | 'POST' | 'DELETE';
 export type Query = Record<string, string | number | boolean>;
 export type RawResponse = { statusCode: number; headers: Record<string, unknown>; body: unknown };
 type RequestLimits = { timeoutMs?: number; ignoreExecutionCancel?: boolean };
+export const DEFAULT_HTTP_TIMEOUT_SECONDS = 600;
 export const JSON_LIMIT = 128 * 1024 * 1024;
 export const BINARY_LIMIT = 512 * 1024 * 1024;
 export const INPUT_LIMIT = 64 * 1024 * 1024;
@@ -92,7 +93,7 @@ export class WerkClient {
 
   static async create(context: HttpContext, index = 0): Promise<WerkClient> {
     const credentials = await context.getCredentials('werkApi', index);
-    const timeout = 'getInputData' in context ? Number(context.getNodeParameter('httpTimeoutSeconds', index, 120)) : 30;
+    const timeout = 'getInputData' in context ? Number(context.getNodeParameter('httpTimeoutSeconds', index, DEFAULT_HTTP_TIMEOUT_SECONDS)) : 30;
     return new WerkClient(context, credentials, timeout);
   }
 

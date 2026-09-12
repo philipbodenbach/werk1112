@@ -64,7 +64,7 @@ test('transport uses n8n authentication helper, bounded streaming, finite timeou
   assert.equal(calls[0].url, 'http://127.0.0.1:11434/prefix/v1/models');
   assert.equal(calls[0].headers.Authorization, `Bearer ${secret}`);
   assert.equal(calls[0].encoding, 'stream');
-  assert.equal(calls[0].timeout, 120000);
+  assert.equal(calls[0].timeout, 600000);
   assert.equal(calls[0].disableFollowRedirect, true);
   const raw = await client.raw('GET', '/werk/v1/info', undefined, undefined, true);
   assert.equal(typeof raw.body, 'string');

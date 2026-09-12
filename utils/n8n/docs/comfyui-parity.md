@@ -1,9 +1,8 @@
 # ComfyUI parity and n8n adaptations
 
 The reference is the Werk/ComfyUI **1.6.0** release checkout, including `nodes.py`,
-`runtime_nodes.py`, their request builders, protocol client, and the actual
-Rust routes/DTOs in this checkout. `__init__.py` merges **23 inference and
-configuration registrations + 10 runtime registrations = 33 public nodes**.
+`text_nodes.py`, `runtime_nodes.py`, their request builders, protocol client, and the actual
+Rust routes/DTOs in this checkout. `__init__.py` merges **20 media/configuration + 3 text + 10 runtime registrations = 33 public nodes**.
 The test suite checks the table against those registrations without importing
 Torch or ComfyUI.
 
@@ -17,8 +16,8 @@ node versioning or a documented migration.
 | `WerkConnection` | WERK API credential | Base URL, masked API key, explicit unauthenticated mode, real read-only discovery test. n8n stores credentials; no connection JSON items or environment-key fallback. |
 | `WerkServerInfo` | Discovery / Server Info | Models plus capabilities, joined by exact model ID; structured metadata replaces JSON strings. |
 | `WerkTextModels` | Discovery / Models; Text model selector | Exact installed text-model selection; declared task support remains distinct from actual chat execution readiness. |
-| `WerkTextConfig` | Text / Chat Options | Sampling, completion budget and optional oMLX thinking/expert-cache controls. Inherit omits the override; disabled retains false/0. Explicit controls require advertised API support. |
-| `WerkTextGenerate` | Text / Complete | Ordered messages and assistant text, model, completion ID, finish reason and usage. Use Text's `werk.request.model` output as Runtime Model ID to order expert inspection after generation with the original selected model. |
+| `WerkTextConfig` | Text / Chat Options | Sampling, completion budget and optional oMLX thinking/expert-cache controls. Inherit keeps server-managed auto sizing unless configured otherwise; manual limits remain available. ComfyUI's optional inherit_sampling matches omitted n8n sampling options. Disabled retains false/0. Explicit controls require advertised API support. |
+| `WerkTextGenerate` | Text / Complete | Ordered history input/output (ComfyUI messages_json, n8n conversation) and assistant text, model, completion ID, finish reason and usage. n8n also preserves tool calls/results. Use Text's `werk.request.model` output as Runtime Model ID to order expert inspection after generation with the original selected model. |
 | `WerkImageModels` | Discovery / Models; Image model selector | `image-generation`, installed/declared/available distinction, exact IDs and task statuses. Expressions/manual IDs replace ComfyUI sockets. |
 | `WerkVisionModels` | Discovery / Models; Vision model selector | `image-understanding`, authoritative task discovery and unavailable reasons, never model-name heuristics. |
 | `WerkImageParameters` | Discovery / Parameters | Complete schema for explicit task/model/backend, preserved as structured JSON. |

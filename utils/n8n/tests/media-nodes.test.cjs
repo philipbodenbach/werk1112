@@ -53,6 +53,47 @@ function binaryInput(values) {
 }
 function completed(id, model, task, outputs) { return { id, status: 'completed', result: { id: 'result1', model, task, outputs } }; }
 
+test('text round-trips conversation per item without duplicating history or forcing a cache budget', async () => {
+	const histories = [
+		[{ role: 'developer', content: ' Be precise.\n' }, { role: 'user', content: 'First' }, { role: 'assistant', content: 'Answer' }],
+		[{ role: 'system', content: 'Independent conversation' }],
+	];
+	const snapshot = structuredClone(histories);
+	const f = fixture(WerkText, histories.map((history, index) => parameters({
+		operation: 'complete',
+		conversationHistory: index ? history : JSON.stringify(history),
+		messages: { message: [{ role: 'user', content: `Next ${index}` }] },
+		options: { omlxExpertOffload: 'inherit', omlxExpertCacheMb: 8192 },
+	}, index)), async ({ body }) => {
+		const index = Number(body.model.at(-1));
+		assert.deepEqual(body.messages, [...histories[index], { role: 'user', content: `Next ${index}` }]);
+		assert.equal(body.werk, undefined);
+		return { choices: [{ message: { role: 'assistant', content: `Reply ${index}` }, finish_reason: 'stop' }] };
+	});
+	const [items] = await f.run();
+	for (let index = 0; index < items.length; index++) {
+		assert.deepEqual(items[index].json.conversation, [...histories[index], { role: 'user', content: `Next ${index}` }, { role: 'assistant', content: `Reply ${index}` }]);
+		assert.deepEqual(items[index].pairedItem, { item: index });
+	}
+	assert.deepEqual(histories, snapshot);
+});
+
+test('text tool-call conversation can be continued with a tool response', async () => {
+	const calls = [{ id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":"Rust"}' } }];
+	const first = fixture(WerkText, [parameters({ operation: 'complete', messages: { message: [{ role: 'user', content: 'Find Rust' }] } })], async () => ({
+		choices: [{ message: { role: 'assistant', content: null, tool_calls: calls }, finish_reason: 'tool_calls' }],
+	}));
+	const [[item]] = await first.run();
+	assert.deepEqual(item.json.conversation.at(-1), { role: 'assistant', content: null, tool_calls: calls });
+	const next = fixture(WerkText, [parameters({ operation: 'complete', conversationHistory: item.json.conversation,
+		messages: { message: [{ role: 'tool', content: 'Found', toolCallId: 'call-1' }] },
+	})], async ({ body }) => {
+		assert.deepEqual(body.messages, [...item.json.conversation, { role: 'tool', content: 'Found', tool_call_id: 'call-1' }]);
+		return { choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }] };
+	});
+	await next.run();
+});
+
 test('image uses per-item parameters, sequential generations, pairedItem and real binary helpers', async () => {
 	let active = 0; let maximum = 0;
 	const f = fixture(WerkImage, [parameters({ operation: 'generate', prompt: 'first' }), parameters({ operation: 'generate', prompt: 'second' }, 1)], async ({ body, method, path }) => {

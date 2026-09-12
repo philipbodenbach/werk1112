@@ -138,11 +138,12 @@ async function startMock() {
 			requests.push({ method: request.method, path: url.pathname, body });
 			let payload;
 			if (request.method === 'GET' && url.pathname === '/proxy/v1/models') {
-				payload = { object: 'list', data: [{ id: 'fixture-image' }, { id: 'fixture-vision' }] };
+				payload = { object: 'list', data: [{ id: 'fixture-image' }, { id: 'fixture-vision' }, { id: 'fixture-text' }] };
 			} else if (request.method === 'GET' && url.pathname === '/proxy/v1/capabilities') {
 				payload = { object: 'werk.capabilities', models: [
 					{ id: 'fixture-image', tasks: ['image_generation'], available_tasks: ['image_generation'] },
 					{ id: 'fixture-vision', tasks: ['image-understanding'], available_tasks: ['image-understanding'] },
+					{ id: 'fixture-text', tasks: ['text-generation'], available_tasks: ['text-generation'] },
 				] };
 			} else if (request.method === 'GET' && url.pathname === '/proxy/v1/parameters') {
 				payload = { task: url.searchParams.get('task'), model: url.searchParams.get('model'), parameters: [] };
@@ -150,6 +151,17 @@ async function startMock() {
 				assert.equal(body.model, 'fixture-image');
 				assert.equal(body.prompt, 'Fixture image 0', 'the real n8n expression engine evaluates per-item parameters');
 				payload = { created: 1, data: [{ b64_json: png.toString('base64') }], model: 'fixture-image', werk: { backend: 'mock', request_id: 'fixture-image-request' } };
+			} else if (request.method === 'POST' && url.pathname === '/proxy/v1/chat/completions' && body.model === 'fixture-text') {
+				assert.equal(body.stream, false);
+				assert.equal(body.werk, undefined, 'server automatic expert budget remains inherited');
+				assert.equal(body.temperature, undefined, 'runtime sampling remains inherited');
+				const followup = requests.filter((entry) => entry.body?.model === 'fixture-text').length === 2;
+				assert.deepEqual(body.messages, followup ? [
+					{ role: 'user', content: 'Explain what an inference server does in one sentence.' },
+					{ role: 'assistant', content: 'First answer.' },
+					{ role: 'user', content: 'Give one practical example of that.' },
+				] : [{ role: 'user', content: 'Explain what an inference server does in one sentence.' }]);
+				payload = { id: 'text-fixture', model: 'fixture-text', choices: [{ message: { role: 'assistant', content: followup ? 'Second answer.' : 'First answer.' }, finish_reason: 'stop' }] };
 			} else if (request.method === 'POST' && url.pathname === '/proxy/v1/chat/completions') {
 				assert.equal(body.model, 'fixture-vision');
 				assert.equal(body.stream, false);
@@ -233,6 +245,26 @@ async function main() {
 	assert.equal(mock.requests.filter((request) => request.error).length, 0, safeLog(JSON.stringify(mock.requests.filter((request) => request.error))));
 	assert.ok(!JSON.stringify(executed).includes(testKey), 'credentials never enter execution output');
 	log('Imported Image → Vision workflow passed: authenticated proxy path, native item expression, actual filesystem binary output/input, no duplicate POSTs');
+
+	const chat = JSON.parse(await fs.readFile(path.join(packageDirectory, 'examples/01-discovery-text.json'), 'utf8'));
+	chat.id = 'WerkLoaderChat01';
+	// The imported example's two text turns run through actual n8n expressions.
+	chat.nodes = chat.nodes.filter((node) => !node.type.endsWith('.werkDiscovery'));
+	delete chat.connections.Discovery;
+	chat.connections['Manual Trigger'] = { main: [[{ node: 'Text', type: 'main', index: 0 }]] };
+	for (const node of chat.nodes.filter((node) => node.type.endsWith('.werkText'))) node.credentials = imageNode.credentials;
+	chat.nodes.find((node) => node.name === 'Text').parameters.model.value = 'fixture-text';
+	const chatFile = path.join(temporaryDirectory, 'chat.json');
+	await fs.writeFile(chatFile, JSON.stringify(chat));
+	await run(binary, ['import:workflow', `--input=${chatFile}`], env, temporaryDirectory);
+	const chatResult = executionJson(await run(binary, ['execute', `--id=${chat.id}`, '--rawOutput'], { ...env, N8N_LOG_LEVEL: 'info' }, temporaryDirectory));
+	assert.equal(chatResult.data.resultData.error, undefined, safeLog(JSON.stringify(chatResult.data.resultData.error)));
+	const finalChat = chatResult.data.resultData.runData['Text Followup'][0].data.main[0][0].json;
+	assert.equal(finalChat.text, 'Second answer.');
+	assert.equal(finalChat.conversation.length, 4);
+	assert.equal(mock.requests.filter((request) => request.body?.model === 'fixture-text').length, 2);
+	assert.equal(mock.requests.filter((request) => request.error).length, 0);
+	log('Imported Text → Text workflow passed: native conversation expression, exact ordered history, inherited sampling/expert cache, two POSTs');
 
 	const extensionDirectory = path.join(temporaryDirectory, 'extension-dist');
 	await fs.cp(path.join(packageDirectory, 'dist'), extensionDirectory, { recursive: true });

@@ -16,7 +16,7 @@ not equality with the package version. All internal n8n node versions start at
 | Visible name | Operations |
 | --- | --- |
 | WERK Discovery (Beta) | Server info, models, one model, capabilities, complete task/model/backend parameters |
-| WERK Text (Beta) | Ordered non-streaming chat messages; text, usage, finish reason and structured tool calls |
+| WERK Text (Beta) | Ordered non-streaming chat and reusable conversation history; text, usage, finish reason and structured tool calls |
 | WERK Image (Beta) | Image generation with native binary output |
 | WERK Vision (Beta) | Ordered binary images in a multimodal chat request |
 | WERK Video (Beta) | Text-to-video and image-to-video; submit only or submit and wait |
@@ -199,12 +199,20 @@ Vision uses ordered images in one user message and offers chat options only:
 the current chat endpoint does not apply per-request media routing overrides.
 
 WERK Text / **Chat Options** additionally exposes **oMLX Thinking** and
-**oMLX Expert Offload**, each with `inherit` / `enabled` / `disabled`.
-Enabled expert offload uses **oMLX Expert Cache (MiB)**: an integer from 1 to
+**oMLX Expert Offload**. Thinking retains `inherit` / `enabled` / `disabled`.
+Expert offload offers **Server Default (Auto Unless Configured)** (`inherit`),
+**Manual Cache Limit** (`enabled`) and **Disabled (Native Loading)** (`disabled`).
+Manual cache limiting uses **oMLX Expert Cache (MiB)**: an integer from 1 to
 1048576, default 8192 (8 GiB). A retained budget is applied only while offload
 is enabled. Disabling thinking sends `false`; disabling expert offload sends
 `0`. Inherited controls remain absent, preserving existing workflows and
-server defaults. For example, thinking disabled with an 8 GiB expert cache
+server defaults. An unset or `auto` server `WERK_OMLX_EXPERT_CACHE_MB` sizes the
+cache from available hardware/model memory for compatible models. A fixed server
+value remains authoritative when inherited. The API has no string `auto` budget;
+the node omits the override. Offloaded experts remain checkpoint-backed, so a
+model can be larger than available memory. The effective RAM budget can shrink
+under memory pressure. Expert RAM cache and KV/prompt cache are separate.
+For example, thinking disabled with an 8 GiB expert cache
 adds this to the normal `/v1/chat/completions` body:
 
 ```json
@@ -217,6 +225,20 @@ requires updating/restarting Werk before submitting generation, so an older
 server cannot silently ignore the options. The capability confirms request
 handling; the selected model/runtime can still reject an unsupported setting.
 Vision does not expose or accept these text-only oMLX controls.
+
+**Conversation History (JSON)** accepts an OpenAI message array or its JSON
+string. Set it to `{{ $json.conversation }}` on a following Text node, and put
+only the new turn in **Messages**. Each output choice includes `conversation`:
+prior messages, current messages and that assistant choice, including structured
+tool calls. Tool results can be appended explicitly with their tool-call IDs.
+System/developer instructions and message order are preserved; do not repeat
+the system prompt each turn. Histories are bounded to 4096 messages / 16 MiB
+and use the same output redaction as other metadata. No global conversation
+is stored or shared across items. Use `werk serve --persistence` for supported
+native prefix reuse during the worker lifetime; reuse depends on the actual
+prompt/model/backend and is not guaranteed by supplying history. This speeds
+reused prompt processing, not the generation of every new token. Standard
+sampling options remain omitted unless selected, inheriting runtime defaults.
 
 Every input item evaluates its own parameters and expressions. Multiple
 generated outputs use `pairedItem` to identify their source. Heavy jobs are
@@ -281,7 +303,7 @@ Client limits are explicit and independent of any tighter server limits:
 
 | Limit | Value |
 | --- | --- |
-| HTTP request/response wait | Default 120 seconds; maximum 3600 seconds |
+| HTTP request/response wait | Default 600 seconds; maximum 3600 seconds (stored explicit values remain unchanged) |
 | Model-option discovery / credential test | 30 seconds / 15 seconds |
 | Inference JSON request/response | 128 MiB each |
 | Runtime protocol request/response | 1 MiB / 8 MiB, also restricted by advertised server limits |
@@ -312,8 +334,9 @@ Prune requires explicit IDs, real filters or explicit all plus confirmation.
 It touches runtime states only. Expert actions require an explicit model and
 unique expert IDs; prefetch requires RAM/VRAM and other actions forbid a tier.
 
-To use experimental oMLX expert offload, enable it in **WERK Text / Chat
-Options**, choose the cache budget and generate once. Connect that Text node
+To use experimental oMLX expert offload, use **Server Default** in **WERK Text /
+Chat Options** for server-managed sizing, or select a **Manual Cache Limit**,
+and generate once. Connect that Text node
 to Runtime / List Experts or Expert Action and use its original requested
 model (`{{ $json.werk.request.model }}`) as the Runtime Model ID. This ensures generation
 loads the configured worker before the runtime node executes. Enable

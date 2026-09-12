@@ -53,6 +53,9 @@ export function chatOutputs(index: number, response: Fields, request: Fields, ta
 			const fn = record(call.function, 'Tool call function'); textValue(fn.name, 'Tool call function name'); textValue(fn.arguments, 'Tool call arguments', true);
 		}
 		if (choice.finish_reason !== null && choice.finish_reason !== undefined && typeof choice.finish_reason !== 'string') throw new Error('Werk finish reason must be a string or null');
-		return { json: sanitize({ model: typeof response.model === 'string' ? response.model : request.model, task, text: message.content ?? '', usage: response.usage ?? null, finishReason: choice.finish_reason ?? null, completionId: response.id ?? null, choiceIndex: integer(choice.index ?? 0, 'Choice index'), toolCalls, werk: { response, request } }) as IDataObject, pairedItem: { item: index } };
+		const conversation = task === 'text-generation' ? [...(request.messages as unknown[]), {
+			role: 'assistant', content: message.content ?? null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+		}] : undefined;
+		return { json: sanitize({ ...(conversation ? { conversation } : {}), model: typeof response.model === 'string' ? response.model : request.model, task, text: message.content ?? '', usage: response.usage ?? null, finishReason: choice.finish_reason ?? null, completionId: response.id ?? null, choiceIndex: integer(choice.index ?? 0, 'Choice index'), toolCalls, werk: { response, request } }) as IDataObject, pairedItem: { item: index } };
 	});
 }

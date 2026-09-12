@@ -11,7 +11,10 @@
   "2": {
     "class_type": "WerkTextModels",
     "inputs": {
-      "connection": ["1", 0],
+      "connection": [
+        "1",
+        0
+      ],
       "refresh_token": 0,
       "preferred_model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
       "require_available": false
@@ -26,16 +29,26 @@
       "seed": 0,
       "stop_sequences_json": "[]",
       "omlx_thinking": "disabled",
-      "omlx_expert_offload": "enabled",
-      "omlx_expert_cache_mb": 8192
+      "omlx_expert_offload": "inherit",
+      "omlx_expert_cache_mb": 8192,
+      "inherit_sampling": true
     }
   },
   "4": {
     "class_type": "WerkTextGenerate",
     "inputs": {
-      "connection": ["1", 0],
-      "model": ["2", 0],
-      "config": ["3", 0],
+      "connection": [
+        "1",
+        0
+      ],
+      "model": [
+        "2",
+        0
+      ],
+      "config": [
+        "3",
+        0
+      ],
       "prompt": "Hello. Reply with one short sentence.",
       "system_prompt": "Be concise.",
       "messages_json": "[]"
@@ -44,8 +57,14 @@
   "5": {
     "class_type": "WerkRuntimeExperts",
     "inputs": {
-      "connection": ["1", 0],
-      "model_id": ["4", 4],
+      "connection": [
+        "1",
+        0
+      ],
+      "model_id": [
+        "4",
+        4
+      ],
       "tier": "all",
       "limit": 10,
       "cursor": "",
@@ -56,9 +75,18 @@
   "6": {
     "class_type": "WerkExpertControl",
     "inputs": {
-      "connection": ["1", 0],
-      "model_id": ["4", 4],
-      "expert_ids": ["5", 1],
+      "connection": [
+        "1",
+        0
+      ],
+      "model_id": [
+        "4",
+        4
+      ],
+      "expert_ids": [
+        "5",
+        1
+      ],
       "action": "evict",
       "target_tier": "unchanged",
       "dry_run": true,

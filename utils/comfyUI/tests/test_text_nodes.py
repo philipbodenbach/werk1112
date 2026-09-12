@@ -52,6 +52,32 @@ def test_inherited_config_omits_extension_and_preserves_standard_chat_contract()
     assert "routing" not in request
 
 
+def test_sampling_can_inherit_runtime_defaults_without_overriding_auto_expert_cache():
+    config = build_text_config(inherit_sampling=True, omlx_thinking="disabled")
+    payload = text_config_payload(config)
+    assert not {"temperature", "top_p", "seed"}.intersection(payload)
+    assert payload["max_completion_tokens"] == 1024
+    assert payload["werk"] == {"omlx": {"thinking": False}}
+    with pytest.raises(ValueError, match="boolean"):
+        build_text_config(inherit_sampling="true")
+
+
+def test_generated_history_can_continue_without_duplicating_system_prompt(servers):
+    server = servers(lambda handler, _server: send(handler, payload=completion()))
+    connection = WerkConnection(server.url, "fixture-token")
+    node = WerkTextGenerateNode()
+    first = node.generate(connection, "deepseek-v4", " First\n", system_prompt="Be concise")
+    history = first["result"][5]
+    assert json.loads(history) == [
+        {"role": "system", "content": "Be concise"},
+        {"role": "user", "content": " First\n"},
+        {"role": "assistant", "content": "Hello"},
+    ]
+    second = node.generate(connection, "deepseek-v4", "Next", system_prompt="Be concise", messages_json=history)
+    assert json.loads(second["result"][5]) == [*json.loads(history),
+        {"role": "user", "content": "Next"}, {"role": "assistant", "content": "Hello"}]
+
+
 @pytest.mark.parametrize("thinking,offload,budget,expected", [
     ("disabled", "enabled", 8192, {"thinking": False, "expert_cache_mb": 8192}),
     ("enabled", "disabled", 8192, {"thinking": True, "expert_cache_mb": 0}),
@@ -145,7 +171,7 @@ def test_explicit_options_preflight_versioned_capability_then_send_exact_http_pa
     assert payload["stream"] is False
     assert result["ui"] == {"text": ["Hello"]}
     assert result["result"][0] == "Hello"
-    assert result["result"][2:] == ("chatcmpl-text-test", "stop", "deepseek-v4")
+    assert result["result"][2:5] == ("chatcmpl-text-test", "stop", "deepseek-v4")
     assert "private reasoning" not in result["result"][1]
     assert "echoed_request" not in result["result"][1]
 
@@ -213,7 +239,8 @@ def test_text_nodes_are_exported_and_api_example_is_executable():
     assert all(NODE_DISPLAY_NAME_MAPPINGS[name].endswith(" (Beta)") for name in expected)
     assert WerkTextGenerateNode.INPUT_TYPES()["optional"]["config"] == ("WERK_TEXT_CONFIG",)
     assert "images" not in WerkTextGenerateNode.INPUT_TYPES()["required"]
-    assert WerkTextGenerateNode.RETURN_NAMES[-1] == "model_id"
+    assert WerkTextGenerateNode.RETURN_NAMES[4] == "model_id"
+    assert WerkTextGenerateNode.RETURN_NAMES[5] == "messages_json"
     path = Path(__file__).parents[1] / "examples/werk_text_omlx_api.json"
     prompt = json.loads(path.read_text())
     for node in prompt.values():
@@ -221,6 +248,8 @@ def test_text_nodes_are_exported_and_api_example_is_executable():
         required = NODE_CLASS_MAPPINGS[node["class_type"]].INPUT_TYPES()["required"]
         assert set(required) <= set(node["inputs"])
     config_inputs = next(node["inputs"] for node in prompt.values() if node["class_type"] == "WerkTextConfig")
-    assert text_config_payload(build_text_config(**config_inputs))["werk"]["omlx"] == {"thinking": False, "expert_cache_mb": 8192}
+    payload = text_config_payload(build_text_config(**config_inputs))
+    assert payload["werk"]["omlx"] == {"thinking": False}
+    assert not {"temperature", "top_p", "seed"}.intersection(payload)
     discovery_inputs = next(node["inputs"] for node in prompt.values() if node["class_type"] == "WerkTextModels")
     assert discovery_inputs["require_available"] is False

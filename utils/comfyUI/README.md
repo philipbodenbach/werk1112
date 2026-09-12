@@ -160,7 +160,7 @@ is not required by these HTTP-backed Werk nodes.
   thinking and MoE expert-cache settings. Its output is `WERK_TEXT_CONFIG`.
 - **WERK Text Generate** sends a prompt, optional system prompt and prior text
   messages to `/v1/chat/completions`. It returns `text`, `metadata_json`,
-  `completion_id`, `finish_reason`, and `model_id`; its text is also returned
+  `completion_id`, `finish_reason`, `model_id`, and reusable `messages_json`; its text is also returned
   in ComfyUI history. Config is optional; omitted oMLX options inherit the server.
 - **WERK Runtime Info** performs strict Werk Protocol 1.0 discovery. It reports
   the active backend, negotiated limits, and every capability using the exact
@@ -321,18 +321,21 @@ never derives a selection from hotness or from the current page; the model and
 all IDs must be supplied explicitly, and the server enforces its advertised ID
 bound.
 
-For experimental oMLX expert offload, enable **omlx_expert_offload** in
-**WERK Text Config**, set **omlx_expert_cache_mb** (for example `8192`), and
-generate once with that config. Connect **Text Generate.model_id** to
+For experimental oMLX expert offload, leave **omlx_expert_offload** at
+**inherit** in **WERK Text Config** for server-managed sizing, or use **enabled**
+with a manual **omlx_expert_cache_mb** upper bound. Generate once with that config. Connect **Text Generate.model_id** to
 **Runtime Experts.model_id** and **Expert Control.model_id** to ensure those
 nodes run after the model loads. An alternative is a server-wide default:
 
 ```bash
-WERK_OMLX_EXPERT_CACHE_MB=8192 werk --backend omlx serve
+WERK_OMLX_EXPERT_CACHE_MB=auto werk --backend omlx serve --persistence
 ```
 
-This selects an 8 GiB expert cache. An unset server variable or `0` selects
-ordinary oMLX loading unless the Text Config explicitly overrides it.
+An unset variable or `auto` selects hardware/model-aware automatic expert-cache
+sizing for compatible models. A positive number sets a manual MiB upper bound;
+`0` selects ordinary loading. Inherited node controls honor a fixed server
+budget if configured. The effective RAM budget may shrink under memory pressure;
+uncached experts remain checkpoint-backed, preserving operation on small machines.
 Dense/shared weights, attention, KV cache and working buffers need
 additional memory. The existing media Routing Config `allow_disk_offload`
 switch does not configure this text-model cache.
@@ -368,7 +371,7 @@ configuration. The generation request validates its actual configured route.
 | Text Config control | `inherit` | `enabled` | `disabled` |
 | --- | --- | --- | --- |
 | `omlx_thinking` | Omit override | Send `thinking: true` | Send `thinking: false` |
-| `omlx_expert_offload` | Omit override | Send the chosen cache budget | Send `expert_cache_mb: 0` |
+| `omlx_expert_offload` | Server default: auto unless configured otherwise | Send a manual cache upper bound | Send `expert_cache_mb: 0` |
 
 The cache budget is an integer from `1` to `1048576` MiB when enabled; `8192`
 is 8 GiB. It covers cached experts, with additional memory required for dense
@@ -391,14 +394,24 @@ lacks it, the node asks you to update and restart Werk before it submits a
 generation request, so the selected controls cannot be silently ignored.
 
 `messages_json` optionally supplies prior text messages as an array of
-`{"role":"user","content":"..."}` or assistant/system objects. The node
-prepends a nonempty `system_prompt`, preserves the supplied history order and
-appends `prompt` as the final user message. It sends one non-streaming request;
+`{"role":"user","content":"..."}` or assistant/system/developer objects. The node
+prepends a nonempty `system_prompt` unless the history already begins with
+that exact message, preserves history order and appends `prompt` as the final
+user message. The new final **messages_json** output includes the assistant
+answer and can connect to the next Text Generate node's **messages_json** input.
+Existing output positions, including **model_id**, remain unchanged. It sends one non-streaming request;
 the node does not create a named persistence session or Prefill state.
+Start Werk with `--persistence` for supported native prompt-cache reuse during
+the worker lifetime. This cache reduces repeated prompt processing; it is
+separate from expert caching and does not directly accelerate token decoding.
+
+Enable **inherit_sampling** in Text Config to omit temperature, top-p and seed
+and use runtime defaults. The output-token limit and stop sequences still apply.
+The switch defaults off to preserve existing workflow sampling settings.
 
 The [oMLX text API example](examples/werk_text_omlx_api.json) configures
-DeepSeek-V4-Flash with thinking disabled, an 8 GiB expert cache and 64 output
-tokens. Replace the model ID with a compatible installed model. It connects
+DeepSeek-V4-Flash with thinking disabled, inherited server expert-cache sizing
+and sampling, and 64 output tokens. Replace the model ID with a compatible installed model. It connects
 Text Generate's `model_id` output to Runtime Experts and an Expert Control
 dry-run, enforcing generation before inspection. The final action only previews
 eviction of the listed experts. Remove nodes `5` and `6` for text generation
