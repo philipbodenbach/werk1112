@@ -143,8 +143,9 @@ server started with `--persistence` can supply it when the member is absent.
 That server option does not opt other protocol operations in.
 
 `api.chat.omlx_options` reports whether the chat endpoint accepts the
-`werk.omlx.thinking` and `werk.omlx.expert_cache_mb` request fields. Its
-operations are `thinking` and `expert_cache_mb`. A `supported` status means
+`werk.omlx.thinking`, `werk.omlx.expert_cache_mb` and
+`werk.omlx.ngram_cache_mb` request fields. Its operations are `thinking`,
+`expert_cache_mb` and `ngram_cache_mb`. The latter accepts a MiB integer or `"auto"`; omission inherits server settings. A `supported` status means
 the API understands and validates these fields; model and runtime
 compatibility are checked when the chat request is made. It does not imply
 expert residency, named state or Prefill support. Clients must require this

@@ -1,0 +1,32 @@
+Error: oMLX startup failed
+oMLX output tail:
+INFO:omlx.settings:Initialized settings with base_path: /Users/philipbodenbach/.local/share/werk1112/backends/omlx/workers/5d5f16c75a26622bbb19988f1bbf610812cfee3d50511e45
+INFO:omlx.settings:Saved settings to /Users/philipbodenbach/.local/share/werk1112/backends/omlx/workers/5d5f16c75a26622bbb19988f1bbf610812cfee3d50511e45/settings.json
+INFO:     Uvicorn running on http://127.0.0.1:60395 (Press CTRL+C to quit)
+INFO:omlx.settings:Saved settings to /Users/philipbodenbach/.local/share/werk1112/backends/omlx/workers/5d5f16c75a26622bbb19988f1bbf610812cfee3d50511e45/settings.json
+INFO:omlx.server:Generated and saved new auth secret key
+INFO:omlx.server:CORS origins: ['*']
+INFO:omlx.model_discovery:Discovered model: files (type: llm, engine: batched, size: 94.39GB)
+INFO:omlx.model_discovery:Discovered model: mlx-community--Llama-3.2-3B-Instruct-4bit (type: llm, engine: batched, size: 1.77GB)
+INFO:omlx.engine_pool:Discovered 2 models
+INFO:omlx.server:Server initialized with 2 models
+INFO:omlx.server:Default model: files
+INFO:omlx.server:Memory guard tier: balanced (guard on)
+INFO:omlx.server:Default max tokens: 32768
+INFO:omlx.server:API key authentication: enabled
+INFO:omlx.server:HF Downloader initialized
+INFO:omlx.server:ModelScope SDK not installed, MS downloader disabled
+INFO:omlx.server:oQ Quantizer initialized
+INFO:omlx.server:HF Uploader initialized
+INFO:     Started server process [10416]
+INFO:     Waiting for application startup.
+INFO:omlx.settings:Saved settings to /Users/philipbodenbach/.local/share/werk1112/backends/omlx/workers/5d5f16c75a26622bbb19988f1bbf610812cfee3d50511e45/settings.json
+INFO:omlx.server:Auto-detected server aliases: ['localhost', '127.0.0.1', 'MacBook-Pro-von-Philip.local', '192.168.200.198']
+WARNING:omlx.process_memory_enforcer:Metal cap (37.4GB, Apple max_recommended_working_set_size) is below the oMLX static ceiling (42.0GB); leaving Apple's default Metal cap active because iogpu.wired_limit_mb is unset. Raise it with: sudo sysctl iogpu.wired_limit_mb=43008
+INFO:omlx.process_memory_enforcer:Process memory enforcer started (tier=balanced, ceiling=21.0GB, interval=1.0s)
+INFO:     Application startup complete.
+WARNING:omlx.server:POST /v1/models/files/load → 507: Model 'files' (29.02GB) does not fit under the dynamic memory ceiling (21.01GB). Close other apps to free RAM (static cap is 42.00GB but only 20.89GB is reclaimable right now), raise memory_guard_tier (safe → balanced → aggressive), or use a smaller model.
+
+Caused by:
+    0: oMLX POST /v1/models/files/load failed
+    1: OpenAI backend HTTP 507: {"error":{"message":"Model 'files' (29.02GB) does not fit under the dynamic memory ceiling (21.01GB). Close other apps to free RAM (static cap is 42.00GB but only 20.89GB is reclaimable right now), raise memory_guard_tier (safe → balanced → aggressive), or use a smaller model.","type":"server_error","param":null,"code":null}}

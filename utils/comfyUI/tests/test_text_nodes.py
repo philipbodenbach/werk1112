@@ -99,6 +99,38 @@ def test_enabled_expert_cache_rejects_invalid_budget(budget):
         build_text_config(omlx_expert_offload="enabled", omlx_expert_cache_mb=budget)
 
 
+@pytest.mark.parametrize("mode,budget,expected", [
+    ("inherit", 128, {}), ("disabled", 128, {"ngram_cache_mb": 0}),
+    ("auto", 128, {"ngram_cache_mb": "auto"}),
+    ("enabled", 1, {"ngram_cache_mb": 1}),
+    ("enabled", 1048576, {"ngram_cache_mb": 1048576}),
+])
+def test_ngram_cache_is_independent_of_experts(mode, budget, expected):
+    config = build_text_config(omlx_ngram_offload=mode, omlx_ngram_cache_mb=budget,
+                               omlx_expert_offload="disabled", omlx_thinking="disabled")
+    assert text_config_payload(config)["werk"]["omlx"] == {
+        "thinking": False, "expert_cache_mb": 0, **expected,
+    }
+
+
+@pytest.mark.parametrize("budget", [0, -1, 1048577, True, 1.5, "1024"])
+def test_enabled_ngram_cache_rejects_invalid_budget(budget):
+    with pytest.raises(ValueError, match="integer from 1 to 1048576"):
+        build_text_config(omlx_ngram_offload="enabled", omlx_ngram_cache_mb=budget)
+
+
+def test_ngram_option_requires_declared_server_operation(servers):
+    def reply(handler, _server):
+        if handler.path == "/werk/v1/capabilities":
+            send(handler, payload=envelope(capability()))
+        else:
+            raise AssertionError("inference must not start on an older server")
+    server = servers(reply)
+    request = build_text_request(model="test", prompt="Hi", config=build_text_config(omlx_ngram_offload="enabled"))
+    with pytest.raises(ValueError, match="Cannot verify oMLX request controls"):
+        execute_text_request(WerkConnection(server.url, "fixture-token"), request)
+
+
 @pytest.mark.parametrize("kwargs", [
     {"omlx_thinking": "auto"}, {"omlx_expert_offload": "yes"},
     {"temperature": float("nan")}, {"top_p": 2}, {"max_completion_tokens": 0},

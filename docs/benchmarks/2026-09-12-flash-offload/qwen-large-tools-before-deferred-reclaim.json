@@ -1,0 +1,10 @@
+{
+  "model": "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": "auto",
+  "tool_count": 34,
+  "tool_schema_bytes": 28425,
+  "samples": [],
+  "passed": false,
+  "error": "Interrupted after telemetry identified delayed weight release poisoning the native transient tracker; no completed response measured."
+}

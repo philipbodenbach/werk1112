@@ -13710,6 +13710,7 @@ mod tests {
             omlx: Some(crate::openai::OmlxChatOptions {
                 thinking: Some(false),
                 expert_cache_mb: Some(8),
+                ngram_cache_mb: None,
             }),
         };
         let backends: Vec<Arc<dyn GenerationBackend>> = vec![
@@ -13750,6 +13751,7 @@ mod tests {
             omlx: Some(crate::openai::OmlxChatOptions {
                 thinking: Some(false),
                 expert_cache_mb: None,
+                ngram_cache_mb: None,
             }),
         };
         let error = backend.with_chat_options(&model, &controls).err().unwrap();

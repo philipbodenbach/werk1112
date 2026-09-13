@@ -1,0 +1,34 @@
+{
+  "bytes_per_pass": 707788800,
+  "reads_per_pass": 2304,
+  "samples": [
+    {
+      "variant": "warmup",
+      "seconds": 0.5842491669900483
+    },
+    {
+      "variant": "before",
+      "seconds": 0.14380258299934212
+    },
+    {
+      "variant": "after",
+      "seconds": 0.04738000000361353
+    },
+    {
+      "variant": "after",
+      "seconds": 0.05083191700396128
+    },
+    {
+      "variant": "before",
+      "seconds": 0.14313137500721496
+    },
+    {
+      "variant": "before",
+      "seconds": 0.1410148750001099
+    },
+    {
+      "variant": "after",
+      "seconds": 0.052193833005730994
+    }
+  ]
+}

@@ -28,6 +28,11 @@ _MAX_INDEX_BYTES = 65536
 _MAX_EXACT_TOKENS = 8192
 _COMMIT_TIMEOUT = 5.0
 _ALLOWED_CACHE_TYPES = {"KVCache", "RotatingKVCache", "PrefillReadyRotatingKVCache", "PoolingCache", "CacheList"}
+_HYBRID_CACHE_MODULES = {
+    "ArraysCache": {"mlx_lm.models.cache", "mlx_vlm.models.qwen4_exp.cache"},
+    "SizedArraysCache": {"omlx.cache.type_handlers"},
+    "QSAKVCache": {"mlx_vlm.models.qwen4_exp.language"},
+}
 _LOG = logging.getLogger("werk.omlx.persistence")
 _MANAGER = None
 
@@ -66,7 +71,9 @@ def _supported_cache_tree(cache):
     if not isinstance(cache, (list, tuple)) or not cache:
         return False
     for layer in cache:
-        if type(layer).__name__ not in _ALLOWED_CACHE_TYPES:
+        kind = type(layer)
+        if (kind.__name__ not in _ALLOWED_CACHE_TYPES
+                and kind.__module__ not in _HYBRID_CACHE_MODULES.get(kind.__name__, set())):
             return False
         if type(layer).__name__ == "CacheList" and not _supported_cache_tree(layer.caches):
             return False
@@ -319,6 +326,12 @@ def install(model_path, cache_directory):
             config = copy.copy(config)
             config.paged_ssd_cache_dir = str(manager.native_directory)
             config.hot_cache_write_through = True
+            if getattr(model, "model_type", None) in ("qwen4_exp", "glm5_next"):
+                # oMLX 0.6.4 explicitly cannot commit terminal exact prefixes
+                # with split GDN sidecars. Keep its typed embedded snapshots in
+                # this persistent worker so recurrent/PLE state stays atomic
+                # with attention state, including prefixes below one block.
+                config.gdn_ssd_split_enabled = False
         original_init(scheduler, model, tokenizer, config, stream)
         manager.attach(scheduler)
 

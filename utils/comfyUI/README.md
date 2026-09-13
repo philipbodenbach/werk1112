@@ -372,6 +372,7 @@ configuration. The generation request validates its actual configured route.
 | --- | --- | --- | --- |
 | `omlx_thinking` | Omit override | Send `thinking: true` | Send `thinking: false` |
 | `omlx_expert_offload` | Server default: auto unless configured otherwise | Send a manual cache upper bound | Send `expert_cache_mb: 0` |
+| `omlx_ngram_offload` | Server N-gram setting | Send `omlx_ngram_cache_mb` as `ngram_cache_mb` | Send `ngram_cache_mb: 0` for resident tables |
 
 The cache budget is an integer from `1` to `1048576` MiB when enabled; `8192`
 is 8 GiB. It covers cached experts, with additional memory required for dense
@@ -387,7 +388,14 @@ For example, disabling thinking and enabling an 8 GiB expert cache adds:
 {"werk":{"omlx":{"thinking":false,"expert_cache_mb":8192}}}
 ```
 
-With both controls inherited, the `werk` extension is omitted and no versioned
+The additional `auto` choice sends `ngram_cache_mb: "auto"`, overriding a fixed server budget with demand-driven sizing. N-gram offload also has a manual budget (default 1024 MiB, range 1–1048576), independent
+of experts and KV persistence. It requires an actual supported table layout;
+a positive budget for a model without such tables is rejected by Werk.
+The verified adapter currently handles Qwen `qwen4_exp` PLE tables in oMLX 0.6.4.
+GLM's checked `glm5_next` checkpoint has no N-gram tables; leave this control
+inherited while configuring its experts. See [backend coverage](../../docs/backends.md).
+
+With all controls inherited, the `werk` extension is omitted and no versioned
 capability query is added. Explicit options first require the server's
 `api.chat.omlx_options` capability and matching operations. If an older server
 lacks it, the node asks you to update and restart Werk before it submits a

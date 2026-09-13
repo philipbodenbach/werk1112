@@ -87,6 +87,8 @@ def build_text_config(
     omlx_expert_offload: str = "inherit",
     omlx_expert_cache_mb: int = 8192,
     inherit_sampling: bool = False,
+    omlx_ngram_offload: str = "inherit",
+    omlx_ngram_cache_mb: int = 1024,
 ) -> WerkTextConfig:
     # Reuse validation for the common /v1/chat/completions sampling fields.
     common = build_vision_config(
@@ -113,6 +115,15 @@ def build_text_config(
         if type(omlx_expert_cache_mb) is not int or not 1 <= omlx_expert_cache_mb <= 1048576:
             raise ValueError("enabled oMLX expert cache must be an integer from 1 to 1048576 MiB")
         options["expert_cache_mb"] = omlx_expert_cache_mb
+    ngram_offload = None if omlx_ngram_offload == "auto" else _tristate(omlx_ngram_offload, "omlx_ngram_offload")
+    if omlx_ngram_offload == "auto":
+        options["ngram_cache_mb"] = "auto"
+    if ngram_offload is False:
+        options["ngram_cache_mb"] = 0
+    elif ngram_offload is True:
+        if type(omlx_ngram_cache_mb) is not int or not 1 <= omlx_ngram_cache_mb <= 1048576:
+            raise ValueError("enabled oMLX N-gram cache must be an integer from 1 to 1048576 MiB")
+        options["ngram_cache_mb"] = omlx_ngram_cache_mb
     return WerkTextConfig(request_fields=fields, omlx_options=options)
 
 
@@ -284,7 +295,11 @@ class WerkTextConfigNode:
                 "default": 8192, "min": 1, "max": 1048576,
                 "tooltip": "Manual expert cache ceiling, used only when offload is enabled. Inherit ignores this field and keeps server Auto sizing. Native memory guards may shrink residency; other weights, KV and workspace need additional memory.",
             }),
-        }, "optional": {"inherit_sampling": ("BOOLEAN", {"default": False, "tooltip": "Use server temperature, top-p and seed. Completion limit and explicit stop sequences still apply."})}}
+        }, "optional": {
+            "inherit_sampling": ("BOOLEAN", {"default": False, "tooltip": "Use server temperature, top-p and seed. Completion limit and explicit stop sequences still apply."}),
+            "omlx_ngram_offload": (["inherit", "enabled", "disabled", "auto"], {"default": "inherit", "tooltip": "N-gram table storage, independent of MoE experts. Auto adapts to memory and row demand; enabled uses the manual MiB limit; disabled keeps tables resident."}),
+            "omlx_ngram_cache_mb": ("INT", {"default": 1024, "min": 1, "max": 1048576, "tooltip": "N-gram row cache in MiB when enabled. Shares the available system memory with experts, dense weights and KV."}),
+        }}
 
     RETURN_TYPES = ("WERK_TEXT_CONFIG", "STRING")
     RETURN_NAMES = ("config", "config_json")

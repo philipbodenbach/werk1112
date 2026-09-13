@@ -230,9 +230,11 @@ Werk releases them. A parent-lifetime pipe also stops the worker if Werk exits
 without normal cleanup. Failed startup and load attempts retain their diagnostics.
 
 Text, chat, streaming and native tool calls use `/v1/chat/completions`. Tool
-requests require a verified model parser; the initial verified tool path is
-DeepSeek V4's native DSML parser and template. Other models remain text-only
-until their native tool wiring is verified. The verified oMLX API supports
+requests require a verified model parser. Verified paths include DeepSeek V4's
+native DSML parser/template and Qwen `qwen4_exp` text offload with the installed
+`qwen3_coder` XML parser. Qwen checks the actual local template, tokenizer-loader
+wiring and typed argument parser without loading model weights. GLM tool wiring
+remains unverified. The verified oMLX API supports
 omitted, `auto` and `none` tool choice; required/named choices, explicit
 `parallel_tool_calls` (either value) and function definitions with `strict: true`
 are rejected because their constraints are not enforced by that upstream API.
@@ -351,6 +353,65 @@ checkpoints with stacked affine expert tensors. It rejects custom quantization
 loaders, embedded speculative drafters and unsupported layouts before admitting
 the smaller working set. The ordinary, non-offloaded adapter retains its
 existing runtime compatibility checks.
+
+### Qwen and GLM text offload
+
+The additional private oMLX 0.6.4 text adapters support stacked affine experts
+for `qwen4_exp` and `glm5_next`, preserving each installed architecture's
+activation, routing, normalization and cache implementation. They do not execute
+checkpoint Python files. Mixed 2/4/8-bit projections retain their own metadata;
+vision and MTP tensors are excluded from this text path. Qwen/GLM share the bounded grouping control with DeepSeek: `grouped` batches
+evaluation while `serial` retains the reference order. Tiny budgets reduce the
+group size automatically; no active expert may be evicted.
+
+The Vontra GLM-5.3-Flash oQ2 checkpoint requires two additional loader details:
+removing its vision child through MLX's attribute API before native sanitization,
+and mapping forget-gate weights, affine scales/biases and per-module quantization
+together into the native `forget_gate` namespace. The tiny regression uses the
+checkpoint's flat Q8 forget-gate layout as well as a vision configuration.
+
+Its supplied GLM chat template always starts a reasoning block and does not
+consume `enable_thinking`. Consequently, `WERK_OMLX_THINKING=0` is a request
+that this template does not honor; allow enough generation tokens for reasoning
+and the final answer. This limitation also applies to the equivalent node/API
+thinking setting. The text adapter does not enable GLM tool calling, vision or MTP.
+
+Qwen PLE N-gram tables have a separate row cache, controlled through
+`WERK_OMLX_NGRAM_CACHE_MB` or API `werk.omlx.ngram_cache_mb`:
+
+- Unset/`auto`: demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
+- API `ngram_cache_mb: "auto"`: explicitly override a fixed server setting with Auto. Omission inherits.
+- Positive integer: manual upper bound in MiB; the API accepts 1–1048576.
+- `0`: resident tables. It does not disable expert offload.
+
+Both caches share the native memory limit and leave room for base weights,
+attention, recurrent states and workspace. Changing either request budget
+selects a separate worker. Verbose diagnostics expose separate N-gram row,
+hit/miss/eviction and residency counters; bytes read are logical file reads.
+
+```sh
+WERK_OMLX_EXPERT_CACHE_MB=8192 WERK_OMLX_NGRAM_CACHE_MB=1024 \
+WERK_OMLX_THINKING=0 werk --backend omlx chat \
+  pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit --verbose
+```
+
+The checked DeepSeek V4 and Vontra GLM-5.3-Flash tensor inventories contain no
+N-gram tables. For them this feature is not applicable; their independent MoE
+offload remains available. An explicit positive N-gram budget on an unsupported
+layout is rejected, rather than ignored. ComfyUI and n8n expose the same controls.
+
+Native exact-prefix persistence now includes installed Qwen Arrays/QSA and GLM
+hybrid cache states. Persistent Qwen/GLM workers use complete embedded native
+snapshots because oMLX 0.6.4 cannot commit short exact prefixes with split GDN
+sidecars. Cache entries remain managed by `werk cache` and their existing locks.
+
+Validation includes tiny installed models with forced eviction, joint and
+independent offload, ten decode steps, exact continuation after SSD-index restart,
+and real private workers producing complete HTTP streams. Full checkpoint
+acceptance and measured limitations are tracked in the
+[implementation report](qwen-glm-offload-plan.md); tiny tests alone are not a
+large-model quality or speed claim. Tool parsing and vision are not enabled by
+these text adapters.
 
 For ComfyUI, n8n or another HTTP client, the same variable supplies a default
 for the persistent Werk service:

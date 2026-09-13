@@ -1,0 +1,11 @@
+[
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 1602,
+    "disk_bytes_read": 41376228444,
+    "resident_cache_bytes": 25765609472,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 2
+  }
+]

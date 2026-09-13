@@ -159,12 +159,22 @@ test('text oMLX controls preserve inheritance, false and zero in the dedicated w
 	assert.deepEqual(buildTextRequest('text', messages, { omlxExpertOffload: 'disabled', omlxExpertCacheMb: 128 }).werk, { omlx: { expert_cache_mb: 0 } });
 });
 
+test('N-gram options are independent of expert offload and preserve inheritance', () => {
+	const messages = { message: [{ role: 'user', content: 'hello' }] };
+	assert.deepEqual(buildTextRequest('text', messages, { omlxNgramOffload: 'inherit', omlxNgramCacheMb: 128 }), buildTextRequest('text', messages));
+	assert.deepEqual(buildTextRequest('text', messages, { omlxNgramOffload: 'disabled' }).werk, { omlx: { ngram_cache_mb: 0 } });
+	assert.deepEqual(buildTextRequest('text', messages, { omlxNgramOffload: 'auto' }).werk, { omlx: { ngram_cache_mb: 'auto' } });
+	assert.deepEqual(buildTextRequest('text', messages, { omlxNgramOffload: 'enabled', omlxExpertOffload: 'disabled', omlxThinking: 'disabled' }).werk, { omlx: { thinking: false, expert_cache_mb: 0, ngram_cache_mb: 1024 } });
+	for (const budget of [1, 1048576]) assert.equal(buildTextRequest('text', messages, { omlxNgramOffload: 'enabled', omlxNgramCacheMb: budget }).werk.omlx.ngram_cache_mb, budget);
+	for (const budget of [0, -1, 0.5, 1048577, true, null, '1024', NaN, Infinity]) assert.throws(() => buildTextRequest('text', messages, { omlxNgramOffload: 'enabled', omlxNgramCacheMb: budget }), /oMLX/);
+});
+
 test('text oMLX options reject invalid budgets and choices; vision never accepts these controls', () => {
 	const messages = { message: [{ role: 'user', content: 'hello' }] };
 	for (const budget of [0, -1, 0.5, 1048577, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, true, false, null, '8192', {}, []]) {
 		assert.throws(() => buildTextRequest('text', messages, { omlxExpertOffload: 'enabled', omlxExpertCacheMb: budget }), /oMLX Expert Cache/);
 	}
-	for (const key of ['omlxThinking', 'omlxExpertOffload']) {
+	for (const key of ['omlxThinking', 'omlxExpertOffload', 'omlxNgramOffload']) {
 		for (const value of ['', 'true', true, false, 0, null]) assert.throws(() => buildTextRequest('text', messages, { [key]: value }), /oMLX/);
 		assert.throws(() => buildVisionRequest('vision', 'test', '', [png], { [key]: 'enabled' }), /unsupported fields/);
 	}

@@ -1,0 +1,93 @@
+{
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "execution": "grouped",
+  "expert_cache_mb": "16384",
+  "ngram_cache_mb": null,
+  "thinking": false,
+  "temperature": 0,
+  "samples": [
+    {
+      "first_text_seconds": 67.76259591701091,
+      "total_seconds": 68.43718183400051,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "OK",
+      "usage": {
+        "completion_tokens": 82,
+        "prompt_tokens": 26,
+        "total_tokens": 108
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 26,
+      "completion_tokens": 82,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "turn": 1,
+      "prompt": "Merke dir die Zahl 37. Antworte nur mit OK.",
+      "expected": "OK",
+      "correct": true
+    },
+    {
+      "first_text_seconds": 69.33635045900883,
+      "total_seconds": 69.97711662499933,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "37",
+      "usage": {
+        "completion_tokens": 100,
+        "prompt_tokens": 48,
+        "total_tokens": 148
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 48,
+      "completion_tokens": 100,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "turn": 2,
+      "prompt": "Welche Zahl sollst du dir merken? Antworte nur mit der Zahl.",
+      "expected": "37",
+      "correct": true
+    },
+    {
+      "first_text_seconds": 25.510028958000476,
+      "total_seconds": 26.131101042003138,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "5",
+      "usage": {
+        "completion_tokens": 30,
+        "prompt_tokens": 65,
+        "total_tokens": 95
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 65,
+      "completion_tokens": 30,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "turn": 3,
+      "prompt": "Was ist 2 plus 3? Nur die Zahl.",
+      "expected": "5",
+      "correct": true
+    }
+  ],
+  "max_tokens": 256,
+  "all_correct": true,
+  "warm_median_seconds": 48.05410883350123,
+  "tool_probe": {
+    "http_status": 400,
+    "response": {
+      "error": {
+        "message": "the configured backend does not support OpenAI tool calling; use --backend vllm or --backend omlx with a compatible model and native tool parser",
+        "type": "invalid_request_error",
+        "param": "tools",
+        "code": "unsupported_tool_calling"
+      }
+    }
+  }
+}

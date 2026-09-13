@@ -1,0 +1,20 @@
+[
+  {
+    "tokens": 1,
+    "max_abs_error": 0.0,
+    "legacy_median": 0.0010154584961128421,
+    "gather_median": 0.0012031245059915818
+  },
+  {
+    "tokens": 32,
+    "max_abs_error": 0.001953125,
+    "legacy_median": 0.001667645999987144,
+    "gather_median": 0.0015481250011362135
+  },
+  {
+    "tokens": 256,
+    "max_abs_error": 0.00146484375,
+    "legacy_median": 0.005840958496264648,
+    "gather_median": 0.005407666503742803
+  }
+]

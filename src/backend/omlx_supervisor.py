@@ -195,11 +195,23 @@ def main():
     threading.Thread(target=watch_parent, args=(parent_fd,), daemon=True).start()
     expert_bytes = os.environ.pop("WERK_OMLX_EXPERT_CACHE_BYTES", None)
     expert_model = os.environ.pop("WERK_OMLX_EXPERT_MODEL_DIR", None)
+    ngram_bytes = os.environ.pop("WERK_OMLX_NGRAM_CACHE_BYTES", None)
     if expert_bytes is not None:
         if not expert_model:
             raise SystemExit("Werk expert offload requires an exact local model path")
-        from _werk_omlx_experts import install
-        manager = install(expert_model, int(expert_bytes))
+        import json
+        with open(Path(expert_model) / "config.json", "rb") as source:
+            raw = source.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            raise ValueError("offload metadata exceeds 4 MiB")
+        config = json.loads(raw)
+        if config.get("model_type") in ("qwen4_exp", "glm5_next"):
+            from _werk_omlx_text_offload import install
+            manager = install(expert_model, None if expert_bytes == "native" else int(expert_bytes),
+                              None if ngram_bytes is None else int(ngram_bytes))
+        else:
+            from _werk_omlx_experts import install
+            manager = install(expert_model, int(expert_bytes))
         install_expert_routes(manager)
     persistence_directory = os.environ.pop("WERK_OMLX_PERSISTENCE_DIR", None)
     persistence_model = os.environ.pop("WERK_OMLX_PERSISTENCE_MODEL_DIR", None)

@@ -1,0 +1,16 @@
+{
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "session": "offload-validation-glm-local-1789333082570692000-auto",
+  "execution": "grouped",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": null,
+  "thinking": false,
+  "temperature": 0,
+  "max_tokens": 256,
+  "persistence": true,
+  "prompts": [
+    "Welche Zahl habe ich dich am Anfang gebeten zu merken? Antworte nur mit der Zahl."
+  ],
+  "wall_seconds": 18.71558333399298,
+  "exit_code": 0
+}

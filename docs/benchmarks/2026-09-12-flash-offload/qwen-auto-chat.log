@@ -1,0 +1,281 @@
+[werk chat] persistence enabled: 0 saved messages
+[werk chat] conversation: /Users/philipbodenbach/.local/share/werk1112/chat-sessions/7c79e800da6171de918ca2dd3aa82085bdc85a727a5b5d6b9537e893443b7b4e.json
+oMLX expert cache: 21362 MiB (auto) upper budget; SSD offload active, native memory guard may reduce residency
+[werk chat] native KV cache enabled; reuse depends on the prompt and backend
+Chatting with pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit. Type /exit or /quit to stop.
+you> assistant> OK
+
+backend:              oMLX
+total duration:       14.062314s
+load duration:        0us
+prompt total count:   27 token(s)
+prompt cached count:  0 token(s)
+prompt eval count:    27 token(s)
+prompt eval duration: 14.04s
+prompt eval rate:     1.92 tokens/s
+eval count:           1 token(s)
+eval duration:        0us
+first token:          14.04s
+eval rate:            0.00 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 1
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 0
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":9277450,"allocator_clears":2,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":0,"cache_hits":1213,"cache_misses":4575,"disk_bytes_read":12649006400,"disk_read_seconds":10.178327,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":192,"forward_seconds":13.272966,"materialize_seconds":0.123781,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":0,"ngram_cache_misses":464,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":464,"ngram_resident_cache_bytes":389760,"ngram_unique_rows":464,"output_evaluations":851,"prefill_cache_growth_bytes":12021699840,"prefill_samples_corrected":1,"resident_cache_bytes":12648960000,"routing_seconds":0.804744,"tensor_materializations":4575}
+you> assistant> 37
+
+backend:              oMLX
+total duration:       6.137536s
+load duration:        0us
+prompt total count:   58 token(s)
+prompt cached count:  29 token(s)
+prompt eval count:    29 token(s)
+prompt eval duration: 5.84s
+prompt eval rate:     4.97 tokens/s
+eval count:           2 token(s)
+eval duration:        300ms
+first token:          5.84s
+eval rate:            6.67 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 3
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 29
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":9101418,"allocator_clears":2,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":0,"cache_hits":4285,"cache_misses":1468,"disk_bytes_read":4058754400,"disk_read_seconds":3.451711,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":240,"forward_seconds":5.556818,"materialize_seconds":0.042809,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":208,"ngram_cache_misses":280,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":512,"ngram_resident_cache_bytes":624960,"ngram_unique_rows":488,"output_evaluations":883,"prefill_cache_growth_bytes":3351139200,"prefill_samples_corrected":1,"resident_cache_bytes":16707686400,"routing_seconds":0.588287,"tensor_materializations":1468}
+you> assistant> 5
+
+backend:              oMLX
+total duration:       4.234012s
+load duration:        0us
+prompt total count:   86 token(s)
+prompt cached count:  61 token(s)
+prompt eval count:    25 token(s)
+prompt eval duration: 4.23s
+prompt eval rate:     5.91 tokens/s
+eval count:           1 token(s)
+eval duration:        0us
+first token:          4.23s
+eval rate:            0.00 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 5
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 61
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":9134118,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":0,"cache_hits":4468,"cache_misses":936,"disk_bytes_read":2587873600,"disk_read_seconds":2.239346,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":192,"forward_seconds":3.743703,"materialize_seconds":0.028539,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":200,"ngram_cache_misses":208,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":432,"ngram_resident_cache_bytes":799680,"ngram_unique_rows":408,"output_evaluations":804,"prefill_cache_growth_bytes":2397229440,"prefill_samples_corrected":1,"resident_cache_bytes":19295539200,"routing_seconds":0.396547,"tensor_materializations":936}
+you> assistant> 42
+
+backend:              oMLX
+total duration:       4.666658s
+load duration:        0us
+prompt total count:   115 token(s)
+prompt cached count:  88 token(s)
+prompt eval count:    27 token(s)
+prompt eval duration: 4.47s
+prompt eval rate:     6.04 tokens/s
+eval count:           2 token(s)
+eval duration:        190ms
+first token:          4.47s
+eval rate:            10.53 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 7
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 88
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":9134150,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":0,"cache_hits":5496,"cache_misses":966,"disk_bytes_read":2670825600,"disk_read_seconds":2.345269,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":240,"forward_seconds":4.123842,"materialize_seconds":0.027886,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":168,"ngram_cache_misses":288,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":480,"ngram_resident_cache_bytes":1041600,"ngram_unique_rows":456,"output_evaluations":974,"prefill_cache_growth_bytes":2294985600,"prefill_samples_corrected":1,"resident_cache_bytes":21966336000,"routing_seconds":0.461094,"tensor_materializations":966}
+you> assistant> 37
+
+backend:              oMLX
+total duration:       3.169455s
+load duration:        0us
+prompt total count:   142 token(s)
+prompt cached count:  118 token(s)
+prompt eval count:    24 token(s)
+prompt eval duration: 2.97s
+prompt eval rate:     8.08 tokens/s
+eval count:           2 token(s)
+eval duration:        190ms
+first token:          2.97s
+eval rate:            10.53 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 9
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 118
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":15229254,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":440,"cache_hits":5398,"cache_misses":596,"disk_bytes_read":1647828800,"disk_read_seconds":1.412762,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":240,"forward_seconds":2.773615,"materialize_seconds":0.017371,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":328,"ngram_cache_misses":80,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":432,"ngram_resident_cache_bytes":1108800,"ngram_unique_rows":408,"output_evaluations":914,"prefill_cache_growth_bytes":431376000,"prefill_samples_corrected":1,"resident_cache_bytes":22397644800,"routing_seconds":0.402754,"tensor_materializations":596}
+you> assistant> Ja
+
+backend:              oMLX
+total duration:       4.917552s
+load duration:        0us
+prompt total count:   174 token(s)
+prompt cached count:  145 token(s)
+prompt eval count:    29 token(s)
+prompt eval duration: 4.91s
+prompt eval rate:     5.91 tokens/s
+eval count:           1 token(s)
+eval duration:        0us
+first token:          4.91s
+eval rate:            0.00 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 11
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 145
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":15671302,"allocator_clears":2,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":1162,"cache_hits":4861,"cache_misses":1162,"disk_bytes_read":3212721600,"disk_read_seconds":2.737871,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":192,"forward_seconds":4.404232,"materialize_seconds":0.033694,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":232,"ngram_cache_misses":240,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":496,"ngram_resident_cache_bytes":1310400,"ngram_unique_rows":472,"output_evaluations":883,"prefill_cache_growth_bytes":174720,"prefill_samples_corrected":1,"resident_cache_bytes":22397644800,"routing_seconds":0.448657,"tensor_materializations":1162}
+you> assistant> 12
+
+backend:              oMLX
+total duration:       3.655149s
+load duration:        0us
+prompt total count:   202 token(s)
+prompt cached count:  176 token(s)
+prompt eval count:    26 token(s)
+prompt eval duration: 3.44s
+prompt eval rate:     7.56 tokens/s
+eval count:           2 token(s)
+eval duration:        210ms
+first token:          3.44s
+eval rate:            9.52 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 13
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 176
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":26435726,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":737,"cache_hits":5673,"cache_misses":737,"disk_bytes_read":2037671200,"disk_read_seconds":1.758172,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":240,"forward_seconds":3.213465,"materialize_seconds":0.021609,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":304,"ngram_cache_misses":136,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":464,"ngram_resident_cache_bytes":1424640,"ngram_unique_rows":440,"output_evaluations":968,"prefill_cache_growth_bytes":80640,"prefill_samples_corrected":1,"resident_cache_bytes":22397644800,"routing_seconds":0.429989,"tensor_materializations":737}
+you> assistant> Katze
+
+backend:              oMLX
+total duration:       3.997007s
+load duration:        0us
+prompt total count:   227 token(s)
+prompt cached count:  205 token(s)
+prompt eval count:    22 token(s)
+prompt eval duration: 3.78s
+prompt eval rate:     5.82 tokens/s
+eval count:           2 token(s)
+eval duration:        210ms
+first token:          3.78s
+eval rate:            9.52 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 15
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 205
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":21700718,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":880,"cache_hits":4871,"cache_misses":880,"disk_bytes_read":2433042400,"disk_read_seconds":2.072772,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":240,"forward_seconds":3.524701,"materialize_seconds":0.02503,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":192,"ngram_cache_misses":184,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":400,"ngram_resident_cache_bytes":1579200,"ngram_unique_rows":376,"output_evaluations":885,"prefill_cache_growth_bytes":114240,"prefill_samples_corrected":1,"resident_cache_bytes":22397644800,"routing_seconds":0.45628,"tensor_materializations":880}
+you> assistant> 37
+
+backend:              oMLX
+total duration:       4.282269s
+load duration:        0us
+prompt total count:   256 token(s)
+prompt cached count:  230 token(s)
+prompt eval count:    26 token(s)
+prompt eval duration: 4.08s
+prompt eval rate:     6.37 tokens/s
+eval count:           2 token(s)
+eval duration:        200ms
+first token:          4.08s
+eval rate:            10.00 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 17
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 230
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":15704426,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":965,"cache_hits":5428,"cache_misses":965,"disk_bytes_read":2668048800,"disk_read_seconds":2.264962,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":240,"forward_seconds":3.817069,"materialize_seconds":0.029671,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":264,"ngram_cache_misses":168,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":464,"ngram_resident_cache_bytes":1720320,"ngram_unique_rows":432,"output_evaluations":962,"prefill_cache_growth_bytes":141120,"prefill_samples_corrected":1,"resident_cache_bytes":22397644800,"routing_seconds":0.453897,"tensor_materializations":965}
+you> assistant> 13
+
+backend:              oMLX
+total duration:       4.043955s
+load duration:        0us
+prompt total count:   286 token(s)
+prompt cached count:  259 token(s)
+prompt eval count:    27 token(s)
+prompt eval duration: 3.81s
+prompt eval rate:     7.09 tokens/s
+eval count:           2 token(s)
+eval duration:        230ms
+first token:          3.81s
+eval rate:            8.70 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 19
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 259
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":18784406,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":812,"cache_hits":6062,"cache_misses":812,"disk_bytes_read":2245028800,"disk_read_seconds":1.960711,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":240,"forward_seconds":3.574682,"materialize_seconds":0.026577,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":344,"ngram_cache_misses":112,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":480,"ngram_resident_cache_bytes":1814400,"ngram_unique_rows":456,"output_evaluations":1024,"prefill_cache_growth_bytes":67200,"prefill_samples_corrected":1,"resident_cache_bytes":22397644800,"routing_seconds":0.455565,"tensor_materializations":812}
+you> assistant> 37
+
+backend:              oMLX
+total duration:       4.112484s
+load duration:        0us
+prompt total count:   317 token(s)
+prompt cached count:  289 token(s)
+prompt eval count:    28 token(s)
+prompt eval duration: 3.91s
+prompt eval rate:     7.16 tokens/s
+eval count:           2 token(s)
+eval duration:        200ms
+first token:          3.91s
+eval rate:            10.00 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 21
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 289
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":18047642,"allocator_clears":2,"budget_reductions":0,"cache_budget_bytes":22399793128,"cache_budget_mode":"auto","cache_evictions":859,"cache_hits":5862,"cache_misses":859,"disk_bytes_read":2374982400,"disk_read_seconds":2.039909,"effective_cache_budget_bytes":22399793128,"execution":"grouped","forward_calls":240,"forward_seconds":3.616808,"materialize_seconds":0.025791,"ngram_cache_budget_bytes":1073741824,"ngram_cache_evictions":0,"ngram_cache_hits":280,"ngram_cache_misses":192,"ngram_effective_cache_budget_bytes":1073741824,"ngram_requested_rows":496,"ngram_resident_cache_bytes":1975680,"ngram_unique_rows":472,"output_evaluations":1004,"prefill_cache_growth_bytes":161280,"prefill_samples_corrected":1,"resident_cache_bytes":22397644800,"routing_seconds":0.457634,"tensor_materializations":859}
+you> 

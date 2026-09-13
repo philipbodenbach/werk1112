@@ -2586,6 +2586,16 @@ fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
         manifest.metadata.compatible_runtimes.clear();
     }
 
+    if let Some(tasks) = native_flash_tasks(root_config.as_ref()) {
+        // Video processor filenames describe VLM inputs, not video synthesis.
+        // Correct older inferred manifests on read as well as fresh imports.
+        manifest.metadata.tasks = tasks;
+        let (inputs, outputs) = modalities_for_tasks(&manifest.metadata.tasks);
+        manifest.metadata.input_modalities = inputs;
+        manifest.metadata.output_modalities = outputs;
+        manifest.metadata.compatible_runtimes.clear();
+    }
+
     if manifest.metadata.family.is_none() {
         manifest.metadata.family =
             infer_model_family(manifest, model_index.as_ref(), root_config.as_ref());
@@ -3310,11 +3320,29 @@ fn qwen3_tts_family(root_config: Option<&Value>) -> Option<String> {
     )
 }
 
+fn native_flash_tasks(root_config: Option<&Value>) -> Option<Vec<InferenceTask>> {
+    let config = root_config?;
+    if !matches!(
+        config.get("model_type").and_then(Value::as_str),
+        Some("qwen4_exp" | "glm5_next")
+    ) {
+        return None;
+    }
+    let mut tasks = vec![InferenceTask::TextGeneration];
+    if config.get("vision_config").is_some_and(Value::is_object) {
+        tasks.push(InferenceTask::ImageUnderstanding);
+    }
+    Some(tasks)
+}
+
 fn infer_inference_tasks(
     manifest: &ModelManifest,
     model_index: Option<&Value>,
     root_config: Option<&Value>,
 ) -> Vec<InferenceTask> {
+    if let Some(tasks) = native_flash_tasks(root_config) {
+        return tasks;
+    }
     let mut hints = vec![
         manifest.id.to_ascii_lowercase(),
         manifest
@@ -5440,6 +5468,52 @@ mod tests {
                 .contains(&"transformers".to_string())
         );
 
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn flash_vlm_video_processors_do_not_advertise_video_generation() {
+        let tmp = test_dir("flash-vlm-tasks");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        for architecture in ["qwen4_exp", "glm5_next"] {
+            let source = tmp.join(architecture);
+            fs::create_dir_all(&source).unwrap();
+            fs::write(
+                source.join("config.json"),
+                serde_json::json!({"model_type": architecture, "vision_config": {}}).to_string(),
+            )
+            .unwrap();
+            fs::write(source.join("video_preprocessor_config.json"), "{}").unwrap();
+            fs::write(source.join("model.safetensors"), "fixture").unwrap();
+            let mut manifest = store.import_path(&source, architecture).unwrap();
+            let expected = vec![
+                InferenceTask::TextGeneration,
+                InferenceTask::ImageUnderstanding,
+            ];
+            assert_eq!(manifest.metadata.tasks, expected);
+            manifest.metadata.tasks.push(InferenceTask::VideoGeneration);
+            manifest
+                .metadata
+                .output_modalities
+                .push(OutputModality::Video);
+            write_json_pretty(
+                &store.model_dir(architecture).join(MANIFEST_FILE),
+                &manifest,
+            )
+            .unwrap();
+            let refreshed = store.get(architecture).unwrap();
+            assert_eq!(refreshed.metadata.tasks, expected);
+            assert_eq!(
+                refreshed.metadata.output_modalities,
+                vec![OutputModality::Text]
+            );
+        }
+        assert_eq!(
+            native_flash_tasks(Some(
+                &serde_json::json!({"model_type":"glm5_next","vision_config":null})
+            )),
+            Some(vec![InferenceTask::TextGeneration])
+        );
         let _ = fs::remove_dir_all(tmp);
     }
 

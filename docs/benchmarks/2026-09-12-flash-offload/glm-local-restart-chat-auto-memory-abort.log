@@ -1,0 +1,9 @@
+[werk chat] persistence enabled: 22 saved messages restored
+[werk chat] conversation: /Users/philipbodenbach/.local/share/werk1112/chat-sessions/b71e634f0812a01d29aa6345d3d23b7834578a1292bfbd6a42a51e27609ee679.json
+oMLX expert cache: 23937 MiB (auto) upper budget; SSD offload active, native memory guard may reduce residency
+[werk chat] native KV cache enabled; reuse depends on the prompt and backend
+Chatting with Vontra/GLM-5.3-Flash-MLX-oQ2-MTP. Type /exit or /quit to stop.
+you> assistant> 
+error: oMLX upstream error: {"code":"prefill_memory_aborted","limit_bytes":38190851686,"message":"oMLX memory guard aborted this request mid-prefill: Request aborted: process memory limit exceeded (usage 36.5 GB, abort threshold (hard watermark) 35.6 GB, metal_cap ceiling 37.4 GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.","omlx_code":"prefill_memory_aborted","param":null,"type":"invalid_request_error"}
+
+you> 

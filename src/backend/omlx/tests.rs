@@ -755,6 +755,17 @@ fn probe_cache_invalidates_metadata_shards_runtime_and_invocation_changes() {
     assert_new_probe(&backend, &manifest);
     fs::write(directory.join("tokenizer_config.json"), "{}").unwrap();
     assert_new_probe(&backend, &manifest);
+    let template = directory.join("chat_template.jinja");
+    fs::write(&template, "first tool format").unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::write(&template, "changed tool format").unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::remove_file(&template).unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::create_dir(directory.join("chat_templates")).unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::remove_dir(directory.join("chat_templates")).unwrap();
+    assert_new_probe(&backend, &manifest);
     let shard = directory.join("model.safetensors");
     fs::write(&shard, "first fixture header").unwrap();
     assert_new_probe(&backend, &manifest);
@@ -847,6 +858,7 @@ fn chat_options(
         omlx: Some(crate::openai::OmlxChatOptions {
             thinking,
             expert_cache_mb,
+            ngram_cache_mb: None,
         }),
     }
 }
@@ -989,6 +1001,58 @@ fn server_prefix_cache_unavailable_or_disabled_keeps_one_ordinary_worker() {
         assert_eq!(start["cache"].is_string(), expected_cache);
         assert_eq!(backend.servers.lock().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn ngram_budget_is_independent_and_changes_worker_and_persistence_identity() {
+    assert_eq!(ngram_cache_bytes(None).unwrap(), None);
+    assert_eq!(ngram_cache_bytes(Some("auto".into())).unwrap(), None);
+    assert_eq!(ngram_cache_bytes(Some("0".into())).unwrap(), Some(0));
+    assert_eq!(
+        ngram_cache_bytes(Some("1".into())).unwrap(),
+        Some(1024 * 1024)
+    );
+    for value in ["-1", "1.5", "", "true", "18446744073709551615"] {
+        assert!(ngram_cache_bytes(Some(value.into())).is_err());
+    }
+    let fixture = Fixture::new(json!({}));
+    let base = fixture_backend(&fixture);
+    let identity = base.cache_identity();
+    for budget in [0, 1024, 1_048_576] {
+        let mut options = chat_options(None, None);
+        options.omlx.as_mut().unwrap().ngram_cache_mb = Some(budget.into());
+        let configured = base.configured_for_chat(&options).unwrap();
+        assert_eq!(
+            configured.invocation().unwrap().ngram_cache_bytes,
+            Some(budget * 1024 * 1024)
+        );
+        assert_eq!(
+            configured.invocation().unwrap().expert_cache_bytes,
+            base.invocation().unwrap().expert_cache_bytes
+        );
+        assert_ne!(configured.cache_identity(), identity);
+    }
+    assert_eq!(base.cache_identity(), identity);
+}
+
+#[test]
+fn ngram_auto_request_overrides_fixed_server_budget_without_mutating_it() {
+    let fixture = Fixture::new(json!({}));
+    let mut base = fixture_backend(&fixture);
+    base.invocation.as_mut().unwrap().ngram_cache_bytes = Some(1024 * 1024 * 1024);
+    let options: crate::openai::ChatRuntimeOptions =
+        serde_json::from_value(json!({"omlx":{"ngram_cache_mb":"auto"}})).unwrap();
+    let configured = base.configured_for_chat(&options).unwrap();
+    assert_eq!(configured.invocation().unwrap().ngram_cache_bytes, None);
+    assert_eq!(
+        base.invocation().unwrap().ngram_cache_bytes,
+        Some(1024 * 1024 * 1024)
+    );
+    assert_ne!(configured.cache_identity(), base.cache_identity());
+    assert_eq!(
+        serde_json::to_value(options).unwrap()["omlx"]["ngram_cache_mb"],
+        "auto"
+    );
 }
 
 #[test]

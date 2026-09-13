@@ -151,13 +151,19 @@ async fn omlx_chat_options_are_request_scoped_on_json_and_streaming_paths() {
         None,
         Some(resolver),
     ));
-    for (stream, thinking, budget) in [(false, false, 8192), (true, true, 0)] {
+    let cases = [
+        (false, false, 8192, json!(1024)),
+        (true, true, 0, json!(0)),
+        (false, false, 8192, json!("auto")),
+        (true, true, 0, json!("auto")),
+    ];
+    for (stream, thinking, budget, ngram) in &cases {
         let response = post_json(
             &app,
             "/v1/chat/completions",
             request(
-                Some(json!({"omlx":{"thinking":thinking,"expert_cache_mb":budget}})),
-                stream,
+                Some(json!({"omlx":{"thinking":thinking,"expert_cache_mb":budget,"ngram_cache_mb":ngram}})),
+                *stream,
             ),
             None,
         )
@@ -166,22 +172,22 @@ async fn omlx_chat_options_are_request_scoped_on_json_and_streaming_paths() {
         let bytes = body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        if stream {
+        if *stream {
             assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
         }
     }
-    assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.configure_calls.load(Ordering::SeqCst), cases.len());
     assert_eq!(backend.session_calls.load(Ordering::SeqCst), 0);
     let calls = backend.requests.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    for ((selected, generation), (thinking, budget)) in calls.iter().zip([(false, 8192), (true, 0)])
-    {
+    assert_eq!(calls.len(), cases.len());
+    for ((selected, generation), (_, thinking, budget, ngram)) in calls.iter().zip(cases) {
         assert_eq!(
             selected,
             &Some(ChatRuntimeOptions {
                 omlx: Some(OmlxChatOptions {
                     thinking: Some(thinking),
-                    expert_cache_mb: Some(budget)
+                    expert_cache_mb: Some(budget),
+                    ngram_cache_mb: Some(serde_json::from_value(ngram).unwrap()),
                 })
             })
         );
@@ -239,6 +245,12 @@ async fn chat_runtime_options_reject_invalid_values_and_unsupported_backends_bef
         json!({"omlx":{"expert_cache_mb":-1}}),
         json!({"omlx":{"expert_cache_mb":1.5}}),
         json!({"omlx":{"expert_cache_mb":true}}),
+        json!({"omlx":{"ngram_cache_mb":1048577}}),
+        json!({"omlx":{"ngram_cache_mb":-1}}),
+        json!({"omlx":{"ngram_cache_mb":1.5}}),
+        json!({"omlx":{"ngram_cache_mb":true}}),
+        json!({"omlx":{"ngram_cache_mb":"automatic"}}),
+        json!({"omlx":{"ngram_cache_mb":"1024"}}),
         json!({"omlx":{"thinking":0}}),
         json!({"omlx":{"thinking":"false"}}),
         json!({"omlx":{"unknown":1}}),
@@ -292,6 +304,6 @@ async fn discovery_advertises_chat_options_without_claiming_model_compatibility(
     assert_eq!(capability["status"], "supported");
     assert_eq!(
         capability["operations"],
-        json!(["thinking", "expert_cache_mb"])
+        json!(["thinking", "expert_cache_mb", "ngram_cache_mb"])
     );
 }

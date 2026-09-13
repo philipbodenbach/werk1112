@@ -1,0 +1,19 @@
+[
+  {
+    "last_prefill_admission": {
+      "chunk_tokens": 20,
+      "cached_tokens": 0,
+      "current_bytes": 27451573024,
+      "non_weight_bytes": 7331357344,
+      "predicted_peak_bytes": 235238624,
+      "ceiling_bytes": 36180806860,
+      "effective_expert_bytes": 25769803776
+    },
+    "forward_calls": 1810,
+    "disk_bytes_read": 26449897400,
+    "resident_cache_bytes": 21100953600,
+    "ngram_resident_cache_bytes": 893760,
+    "ngram_effective_cache_budget_bytes": 67108864,
+    "prefill_samples_corrected": 1
+  }
+]

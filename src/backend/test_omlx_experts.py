@@ -180,6 +180,7 @@ def memory_guard_fixture(cache_bytes=24 * 1024**3):
             self._prefill_memory_guard = True
             self.current_calls = []
             self.guard_calls = []
+            self.adaptive_calls = []
             self.record_calls = []
             self.check_calls = []
             self.chunk_limit = 1024
@@ -200,6 +201,15 @@ def memory_guard_fixture(cache_bytes=24 * 1024**3):
 
         def _admission_transient_bound(self, n_tokens, kv_len):
             return self.workspace
+
+        def _predicted_chunk_transient(self, n_tokens, kv_len):
+            return self.workspace
+
+        def _adaptive_chunk_size(self, requested, *, request_id, loop_label, kv_len=0):
+            self.adaptive_calls.append((requested, request_id, loop_label, kv_len))
+            if self._current_usage_bytes() + self.workspace > self._prefill_abort_cap():
+                return max(1, requested // 2)
+            return requested
 
         def _guard_prefill_chunk(self, n_tokens, *, kv_len, progress, loop_label, request_id=None):
             self.guard_calls.append((n_tokens, kv_len, progress, loop_label, request_id))
@@ -238,6 +248,25 @@ class ExpertMemoryGuardTests(unittest.TestCase):
         return self.scheduler._guard_prefill_chunk(
             n, kv_len=0, progress=0, loop_label=label, request_id=request_id)
 
+    def test_adaptive_sizing_reclaims_cache_capacity_before_throttling(self):
+        self.scheduler.base_bytes = 8 * self.gib
+        self.scheduler.workspace = 5 * self.gib
+        self.assertEqual(self.guard.original_adaptive(self.scheduler, 2048,
+                         request_id="long-tools", loop_label="external"), 1024)
+        self.assertEqual(self.scheduler._adaptive_chunk_size(2048,
+                         request_id="long-tools", loop_label="external", kv_len=2048), 2048)
+        self.assertLess(self.manager.effective_cache_bytes, 24 * self.gib)
+        self.assertTrue(self.scheduler._prefill_memory_guard)
+        self.assertEqual(self.scheduler.adaptive_calls[-1], (2048, "long-tools", "external", 2048))
+
+    def test_adaptive_sizing_does_not_resize_an_unrelated_model(self):
+        self.manager._model_ref = None
+        self.scheduler.base_bytes = 31 * self.gib
+        self.scheduler.workspace = 5 * self.gib
+        self.assertEqual(self.scheduler._adaptive_chunk_size(2048,
+                         request_id="other", loop_label="external"), 1024)
+        self.assertEqual(self.manager.effective_cache_bytes, 24 * self.gib)
+
     def record_chunk(self, before, after, n=49, request_id="first", label="external"):
         self.scheduler._record_chunk_transient(
             n, before, after, request_id=request_id, loop_label=label,
@@ -273,6 +302,14 @@ class ExpertMemoryGuardTests(unittest.TestCase):
         self.scheduler.workspace = 64 * self.mib
         self.assertIsNone(self.scheduler._preflight_memory_check(request))
         self.assertEqual(self.manager.effective_cache_bytes, 24 * self.gib)
+        self.assertTrue(self.scheduler._prefill_memory_guard)
+
+    def test_adapter_transient_reserve_reclaims_capacity_before_chunk_sizing(self):
+        self.scheduler.workspace = 4 * self.gib
+        self.manager.prefill_transient_reserve = lambda tokens, peak: peak
+        self.assertEqual(self.scheduler._adaptive_chunk_size(
+            2048, request_id="large-tools", loop_label="external"), 2048)
+        self.assertEqual(self.manager.effective_cache_bytes, 19 * self.gib - 2 * self.mib)
         self.assertTrue(self.scheduler._prefill_memory_guard)
 
     def test_unknown_native_caps_preserve_current_budget_without_eviction(self):
@@ -318,6 +355,34 @@ class ExpertMemoryGuardTests(unittest.TestCase):
         self.assertEqual(after - before, 64 * self.mib)
         self.assertEqual(self.manager.prefill_cache_growth_bytes, 0)
         self.assertEqual(self.manager.prefill_samples_corrected, 1)
+
+    def test_delayed_weight_release_is_not_native_transient_reallocation(self):
+        self.guard_chunk()
+        self.guard.deferred_reclaims[self.scheduler] = (8 * self.gib, 28 * self.gib, 0)
+        self.record_chunk(28 * self.gib, 20 * self.gib)
+        self.assertEqual(self.scheduler.record_calls[-1][1:3], (28 * self.gib, 28 * self.gib))
+        self.assertEqual(self.guard.deferred_reclaims[self.scheduler][0], 0)
+
+    def test_delayed_release_cannot_hide_simultaneous_active_memory_growth(self):
+        self.scheduler._last_mlx_active_memory_bytes = 4 * self.gib
+        self.guard_chunk()
+        self.guard.deferred_reclaims[self.scheduler] = (8 * self.gib, 28 * self.gib, 0)
+        self.scheduler._last_mlx_active_memory_bytes += 128 * self.mib
+        self.record_chunk(28 * self.gib, 20 * self.gib)
+        before, after = self.scheduler.record_calls[-1][1:3]
+        self.assertEqual(after - before, 128 * self.mib)
+
+    def test_releases_between_callbacks_consume_deferred_credit(self):
+        self.guard.deferred_reclaims[self.scheduler] = (8 * self.gib, 12 * self.gib, 0)
+        self.guard.prepare(self.scheduler, num_prompt_tokens=50)
+        self.assertEqual(self.guard.deferred_reclaims[self.scheduler][0], 0)
+
+    def test_prepare_records_only_evicted_weights_not_yet_physically_released(self):
+        self.manager._resident = 24 * self.gib
+        self.guard.original_current = lambda *args, **kwargs: 28 * self.gib
+        with patch.object(self.manager, "_resize_cache", side_effect=lambda _: setattr(self.manager, "_resident", 8 * self.gib)):
+            self.guard.prepare(self.scheduler, num_prompt_tokens=50)
+        self.assertEqual(self.guard.deferred_reclaims[self.scheduler][0], 16 * self.gib)
 
     def test_unmatched_or_consumed_sample_cannot_hide_memory_growth(self):
         for mismatch in ({"request_id": "other"}, {"label": "chunked_step"}, {"n": 32}):
@@ -471,6 +536,20 @@ class NativePrefillMemoryAccountingTests(unittest.TestCase):
                           request_id="evict", loop_label="external")
         self.assertEqual(self.scheduler._prefill_transient_tracker.recent_reclaim_bytes, 32 * self.mib)
         self.assertEqual(self.scheduler._prefill_transient_tracker.samples, 0)
+
+    def test_actual_native_reclaim_ledger_excludes_delayed_weight_release(self):
+        scheduler = self.scheduler
+        before, after = 28 * self.gib, 12 * self.gib - 32 * self.mib
+        self.guard.original_record(scheduler, 2048, before, after,
+                                   request_id="delayed", loop_label="external")
+        self.assertGreater(scheduler._prefill_transient_tracker.recent_reclaim_bytes, 16 * self.gib)
+        scheduler._prefill_transient_tracker.reset()
+        self.guard.samples[scheduler] = ("delayed", "external", 2048, 0, None)
+        self.guard.deferred_reclaims[scheduler] = (16 * self.gib, before, 0)
+        self.guard.original_current = lambda _: after
+        self.guard.record(scheduler, 2048, before, after,
+                          request_id="delayed", loop_label="external")
+        self.assertEqual(scheduler._prefill_transient_tracker.recent_reclaim_bytes, 32 * self.mib)
 
     def test_actual_native_guard_keeps_rejecting_genuine_large_transient(self):
         self.guard.samples[self.scheduler] = ("large", "external", 49, 0)

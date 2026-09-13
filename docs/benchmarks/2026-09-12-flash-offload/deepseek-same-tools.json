@@ -1,0 +1,56 @@
+{
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": "auto",
+  "tool_count": 34,
+  "tool_schema_bytes": 28425,
+  "samples": [
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust is a systems-level programming language focused on safety, performance, and concurrency, with a strong emphasis on memory safety through its ownership model and borrow checker."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 190.96907404100057,
+      "usage": {
+        "completion_tokens": 33,
+        "prompt_tokens": 6391,
+        "total_tokens": 6424
+      },
+      "first_text_seconds": 176.631460375007,
+      "backend_phases": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 14.34,
+        "evaluated_prompt_tokens": 6391,
+        "first_token_seconds": 176.6,
+        "prompt_seconds": 176.6
+      }
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "\n\nRust's ownership system ensures each value has exactly one owner, and ownership is transferred (moved) when assigned to another variable, with the compiler enforcing strict rules to prevent dangling references and double-frees."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 53.53810200000589,
+      "usage": {
+        "completion_tokens": 43,
+        "prompt_tokens": 6388,
+        "total_tokens": 6431
+      },
+      "first_text_seconds": 32.422353041009046,
+      "backend_phases": {
+        "cached_prompt_tokens": 6144,
+        "decode_seconds": 21.11,
+        "evaluated_prompt_tokens": 244,
+        "first_token_seconds": 32.4,
+        "prompt_seconds": 32.4
+      }
+    }
+  ],
+  "passed": true
+}

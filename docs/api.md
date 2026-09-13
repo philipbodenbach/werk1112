@@ -393,7 +393,7 @@ Accepted top-level fields:
 | <code>tools</code> | No | array | OpenAI function-tool definitions; supported by the vLLM adapter |
 | <code>tool_choice</code> | No | string or object | <code>none</code>, <code>auto</code>, <code>required</code>, or a named function selection |
 | <code>parallel_tool_calls</code> | No | boolean | Forwarded unchanged to vLLM |
-| <code>werk</code> | No | object | Validated Werk chat runtime options; currently <code>omlx.thinking</code> and <code>omlx.expert_cache_mb</code> |
+| <code>werk</code> | No | object | Validated Werk chat runtime options; currently <code>omlx.thinking</code>, <code>omlx.expert_cache_mb</code> and <code>omlx.ngram_cache_mb</code> |
 
 #### oMLX chat options
 
@@ -414,7 +414,10 @@ environment:
 `thinking` is a JSON boolean: `false` corresponds to `WERK_OMLX_THINKING=0`.
 `expert_cache_mb` is an integer from 0 to 1048576 MiB; `8192` enables the
 experimental SSD expert loader with an 8 GiB RAM cache, and `0` explicitly
-disables expert offload. Omitted fields inherit the server's captured
+disables expert offload. `ngram_cache_mb` independently accepts `"auto"` or the same integer range:
+Auto starts small and grows with row demand within shared memory limits; a positive value caps the cache for supported N-gram tables, and `0` keeps
+those tables resident. It requires a verified table layout when positive;
+models without N-gram tables cannot use a positive override. Omitted fields inherit the server's captured
 environment settings. Empty `werk` or `omlx` objects do not override anything.
 Unknown members or invalid types/ranges inside `werk` are rejected.
 
@@ -425,7 +428,7 @@ options instead of ignoring them. The installed model/runtime must still pass
 oMLX compatibility checks; expert offload retains its experimental architecture
 and version requirements. No environment variables are changed for other
 requests. Thinking is applied per request without reloading weights. Changing
-the expert budget selects a separate worker configuration and can require a
+either cache budget selects a separate worker configuration and can require a
 model load; it does not resize a worker serving another request.
 
 Updated servers advertise `api.chat.omlx_options` through

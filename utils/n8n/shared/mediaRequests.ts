@@ -137,7 +137,7 @@ export function buildAudioInputRequest(task: string, input: MediaOptions, audio:
 
 function chatOptions(value: unknown, vision: boolean): Fields {
 	const options = record(value ?? {}, 'Chat options');
-	ensureKeys(options, ['temperature', 'topP', 'maxCompletionTokens', 'seed', 'stopSequences', ...(vision ? ['imageDetail'] : ['tools', 'toolChoice', 'parallelToolCalls', 'omlxThinking', 'omlxExpertOffload', 'omlxExpertCacheMb'])], 'Chat options');
+	ensureKeys(options, ['temperature', 'topP', 'maxCompletionTokens', 'seed', 'stopSequences', ...(vision ? ['imageDetail'] : ['tools', 'toolChoice', 'parallelToolCalls', 'omlxThinking', 'omlxExpertOffload', 'omlxExpertCacheMb', 'omlxNgramOffload', 'omlxNgramCacheMb'])], 'Chat options');
 	const request: Fields = {};
 	if (options.temperature !== undefined) request.temperature = finite(options.temperature, 'Temperature');
 	if (options.topP !== undefined) request.top_p = finite(options.topP, 'Top P', 0, 1);
@@ -180,6 +180,11 @@ function chatOptions(value: unknown, vision: boolean): Fields {
 		const omlx: Fields = {};
 		if (thinking !== undefined) omlx.thinking = thinking;
 		if (offload !== undefined) omlx.expert_cache_mb = offload ? budget : 0;
+		const ngramOffload = options.omlxNgramOffload === 'auto' ? undefined : tristate(options.omlxNgramOffload, 'oMLX N-Gram Offload');
+		const ngramBudget = options.omlxNgramCacheMb === undefined ? 1024 : integer(options.omlxNgramCacheMb, 'oMLX N-Gram Cache (MiB)', 1);
+		if (ngramBudget > 1048576) throw new Error('oMLX N-Gram Cache (MiB) must be between 1 and 1048576');
+		if (ngramOffload !== undefined) omlx.ngram_cache_mb = ngramOffload ? ngramBudget : 0;
+		if (options.omlxNgramOffload === 'auto') omlx.ngram_cache_mb = 'auto';
 		if (Object.keys(omlx).length) request.werk = { omlx };
 	}
 	return request;

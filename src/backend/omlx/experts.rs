@@ -379,6 +379,7 @@ mod tests {
                 log_tail: Arc::new(Mutex::new(VecDeque::new())),
                 expert_offload,
                 expert_cache_bytes: None,
+                ngram_cache_bytes: None,
                 expert_execution: "grouped",
                 thinking: None,
                 server_prefix_cache: false,

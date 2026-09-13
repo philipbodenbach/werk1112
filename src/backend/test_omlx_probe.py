@@ -847,6 +847,30 @@ def quantize(model, group_size=64, bits=4, mode="affine", class_predicate=None):
 
 
 class OmlxProbeTests(unittest.TestCase):
+    def test_native_text_adapter_receives_independent_budgets_without_repository_code(self):
+        helper = types.ModuleType("_werk_omlx_text_offload")
+        calls = []
+        def inspect_model(path, experts, ngrams):
+            calls.append((path, experts, ngrams))
+            return {"loader": "installed_native_text_port"}
+        helper.inspect_model = inspect_model
+        for architecture in ("qwen4_exp", "glm5_next"):
+            config = {"model_type": architecture, "text_config": {}}
+            if architecture == "qwen4_exp":
+                config["model_file"] = "qwen4_exp.py"
+            with self.runtime(config) as runtime, patch.dict(sys.modules, {"_werk_omlx_text_offload": helper}):
+                (runtime.model_dir / "qwen4_exp.py").write_text("raise AssertionError('must never execute checkpoint code')")
+                for expert_bytes, ngram_bytes in ((0, None), (None, 1024), (8192, 0)):
+                    result = probe_module.probe({"launcher": str(runtime.launcher), "model_dir": str(runtime.model_dir),
+                        "expert_cache_bytes": expert_bytes, "ngram_cache_bytes": ngram_bytes})
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(calls[-1], (runtime.model_dir.resolve(), expert_bytes, ngram_bytes))
+                if architecture == "qwen4_exp":
+                    config["model_file"] = "arbitrary.py"
+                    runtime.write_model(config)
+                    with self.assertRaisesRegex(ValueError, "model_file"):
+                        probe_module.probe({"launcher": str(runtime.launcher), "model_dir": str(runtime.model_dir), "expert_cache_bytes": 0})
+
     def test_requested_expert_cache_is_validated_without_loading_weights(self):
         calls = []
         helper = types.ModuleType("_werk_omlx_experts")
@@ -882,6 +906,11 @@ class OmlxProbeTests(unittest.TestCase):
     @contextlib.contextmanager
     def runtime(self, config=None):
         with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules), patch.object(sys, "path", list(sys.path)):
+            # Other native tests may already have installed architecture
+            # patches. This fixture represents a fresh, unpatched interpreter.
+            for name in list(sys.modules):
+                if name.split('.', 1)[0] in {"omlx", "mlx", "mlx_lm", "mlx_vlm"}:
+                    del sys.modules[name]
             runtime = Runtime(directory)
             runtime.install()
             runtime.write_model(config)

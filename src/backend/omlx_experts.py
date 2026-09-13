@@ -412,7 +412,7 @@ class ExpertManager:
             values = {}
             pending = [] if self.execution == "grouped" else None
             for projection in ("gate_proj", "up_proj", "down_proj"):
-                prefix = f"model.layers.{layer}.ffn.switch_mlp.{projection}"
+                prefix = self._projection_prefix(layer, projection)
                 values[projection] = tuple(self._read(f"{prefix}.{suffix}", expert, pending=pending)
                                            for suffix in ("weight", "scales", "biases"))
             self._materialize(pending)
@@ -423,6 +423,9 @@ class ExpertManager:
             previous = self._usage.get(key, (0, None))
             self._usage[key] = (previous[0] + 1, int(time.time() * 1000))
         return self._cache[key]
+
+    def _projection_prefix(self, layer, projection):
+        return f"model.layers.{layer}.ffn.switch_mlp.{projection}"
 
     def _groups(self, layer, experts):
         """Group routes without exceeding the cache, including persistent pins."""
@@ -448,7 +451,7 @@ class ExpertManager:
         if match is None:
             raise ValueError(f"invalid expert id: {expert_id}")
         key = tuple(map(int, match.groups()))
-        if key[0] >= self.checkpoint.layers or key[1] >= self.checkpoint.experts:
+        if key[0] not in self.checkpoint.expert_bytes or key[1] >= self.checkpoint.experts:
             raise ValueError(f"unknown expert id: {expert_id}")
         return key
 
@@ -487,14 +490,16 @@ class ExpertManager:
                 offset = int(str(cursor)[len(prefix):])
             except ValueError as error:
                 raise ValueError("invalid expert cursor") from error
-        total = self.checkpoint.layers * self.checkpoint.experts
+        routed_layers = sorted(self.checkpoint.expert_bytes)
+        total = len(routed_layers) * self.checkpoint.experts
         if not 0 <= offset <= total:
             raise ValueError("invalid expert cursor offset")
         with self._lock:
             rows = []
             index = offset
             while index < total and len(rows) < limit:
-                key = divmod(index, self.checkpoint.experts)
+                layer_index, expert_index = divmod(index, self.checkpoint.experts)
+                key = (routed_layers[layer_index], expert_index)
                 row = self._summary(key)
                 if tier is None or row["tier"] == tier:
                     rows.append(row)
@@ -535,7 +540,7 @@ class ExpertManager:
                     raise ValueError("requested experts and pins exceed the expert cache budget")
                 # Reserve room for one demand-loaded expert so pinning can never
                 # disable the model's next legitimate routing decision.
-                if action == "pin" and len(required) < self.checkpoint.layers * self.checkpoint.experts:
+                if action == "pin" and len(required) < len(self.checkpoint.expert_bytes) * self.checkpoint.experts:
                     if sum(self.checkpoint.expert_bytes[key[0]] for key in required) + max(self.checkpoint.expert_bytes.values()) > self.effective_cache_bytes:
                         raise ValueError("pins must leave room for at least one demand-loaded expert")
             before = [self._summary(key) for key in keys]
@@ -733,14 +738,17 @@ class _ExpertMemoryGuard:
     def __init__(self, manager, scheduler_class, engine_class):
         self.manager = manager
         self.samples = weakref.WeakKeyDictionary()
+        self.deferred_reclaims = weakref.WeakKeyDictionary()
         self.original_current = scheduler_class._current_usage_bytes
         self.original_guard = scheduler_class._guard_prefill_chunk
+        self.original_adaptive = scheduler_class._adaptive_chunk_size
         self.original_record = scheduler_class._record_chunk_transient
         self.original_check = scheduler_class._preflight_memory_check
         self.original_preflight = engine_class._preflight_or_raise_with_eviction
         contracts = (
             (self.original_current, ("self", "refresh_mlx_active")),
             (self.original_guard, ("self", "n_tokens", "kv_len", "progress", "loop_label", "request_id")),
+            (self.original_adaptive, ("self", "requested", "request_id", "loop_label", "kv_len")),
             (self.original_record, ("self", "n_tokens", "pre_bytes", "post_bytes", "request_id", "loop_label", "kv_len", "requested_step")),
             (self.original_check, ("self", "request")),
             (self.original_preflight, ("self", "scheduler", "num_prompt_tokens", "request_id")),
@@ -753,13 +761,19 @@ class _ExpertMemoryGuard:
         model = self.manager._model_ref() if self.manager._model_ref is not None else None
         return model is not None and getattr(scheduler, "model", None) is model
 
+    def cache_totals(self):
+        extra = getattr(self.manager, "auxiliary_cache_usage", None)
+        resident, capacity = extra() if extra is not None else (0, 0)
+        return self.manager._resident + resident, self.manager.effective_cache_bytes + capacity
+
     def current(self, scheduler, *, refresh_mlx_active=True):
         current = self.original_current(scheduler, refresh_mlx_active=refresh_mlx_active)
         if self.matches(scheduler):
             with self.manager._lock:
                 # Resident weights are already in native current usage. Only
                 # unused capacity is extra; never subtract weights from usage.
-                current += max(0, self.manager.effective_cache_bytes - self.manager._resident)
+                resident, capacity = self.cache_totals()
+                current += max(0, capacity - resident)
                 current += _WORKSPACE_BYTES
         return current
 
@@ -769,12 +783,22 @@ class _ExpertMemoryGuard:
             return
         with self.manager._lock:
             current = self.original_current(scheduler)
+            resident_before, _ = self.cache_totals()
+            credit, previous_usage, previous_resident = self.deferred_reclaims.get(
+                scheduler, (0, current, resident_before))
+            # Consume releases that landed between scheduler callbacks. Account
+            # for intervening weight growth so it cannot hide a delayed release.
+            credit = max(0, credit - max(0, previous_usage + resident_before - previous_resident - current))
             estimate = scheduler._admission_estimate(
                 num_prompt_tokens=num_prompt_tokens, cached_tokens=cached_tokens, current=current)
             peak = estimate.kv_exact + estimate.transient if estimate is not None else 0
             if chunk is not None:
                 n_tokens, kv_len = chunk
-                peak = max(peak, scheduler._admission_transient_bound(n_tokens, kv_len))
+                peak = max(peak, scheduler._admission_transient_bound(n_tokens, kv_len),
+                           scheduler._predicted_chunk_transient(n_tokens, kv_len))
+                reserve = getattr(self.manager, "prefill_transient_reserve", None)
+                if reserve is not None:
+                    peak += reserve(n_tokens, peak)
             hard = scheduler._memory_hard_limit_bytes
             caps = [scheduler._admission_limit_bytes(), scheduler._prefill_abort_cap(),
                     int(hard * scheduler._prefill_headroom_safety)]
@@ -782,12 +806,38 @@ class _ExpertMemoryGuard:
             if not caps:
                 # An unknown ceiling must not be treated as unlimited room.
                 return
-            non_expert = max(0, current - self.manager._resident)
+            resident, _ = self.cache_totals()
+            non_expert = max(0, current - resident)
             available = min(caps) - non_expert - int(peak) - _WORKSPACE_BYTES
+            resize_auxiliary = getattr(self.manager, "resize_auxiliary_cache", None)
+            if resize_auxiliary is not None:
+                available -= resize_auxiliary(available)
             self.manager._resize_cache(available)
+            self.manager.last_prefill_admission = {
+                "chunk_tokens": chunk[0] if chunk else None,
+                "cached_tokens": cached_tokens,
+                "current_bytes": current,
+                "non_weight_bytes": non_expert,
+                "predicted_peak_bytes": int(peak),
+                "ceiling_bytes": min(caps),
+                "effective_expert_bytes": self.manager.effective_cache_bytes,
+            }
             # Refresh executor telemetry after actual eviction. Early HTTP
             # preflight subsequently reads this sample without touching MLX.
-            self.original_current(scheduler)
+            refreshed = self.original_current(scheduler)
+            resident_after = self.cache_totals()[0]
+            deferred = max(0, resident_before - resident_after - max(0, current - refreshed))
+            self.deferred_reclaims[scheduler] = (credit + deferred, refreshed, resident_after)
+
+    def adaptive(self, scheduler, requested, *, request_id, loop_label, kv_len=0):
+        # Native adaptive sizing runs BEFORE the final chunk guard. Reclaim
+        # weight caches here, or that earlier gate throttles against their old
+        # residency and causes extra passes over the offloaded checkpoint.
+        if self.matches(scheduler) and requested > 0:
+            self.prepare(scheduler, num_prompt_tokens=kv_len + requested + 1,
+                         cached_tokens=kv_len, chunk=(requested, kv_len))
+        return self.original_adaptive(scheduler, requested, request_id=request_id,
+                                      loop_label=loop_label, kv_len=kv_len)
 
     def guard(self, scheduler, n_tokens, *, kv_len, progress, loop_label, request_id=None):
         if self.matches(scheduler):
@@ -797,17 +847,32 @@ class _ExpertMemoryGuard:
         n = self.original_guard(scheduler, n_tokens, kv_len=kv_len, progress=progress,
                                 loop_label=loop_label, request_id=request_id)
         if self.matches(scheduler):
-            self.samples[scheduler] = (request_id, loop_label, n, self.manager._resident)
+            self.samples[scheduler] = (request_id, loop_label, n, self.cache_totals()[0],
+                                       getattr(scheduler, "_last_mlx_active_memory_bytes", None))
         return n
 
     def record(self, scheduler, n_tokens, pre_bytes, post_bytes, *, request_id,
                loop_label, kv_len=0, requested_step=None):
         sample = self.samples.pop(scheduler, None)
         if self.matches(scheduler) and sample is not None and sample[:3] == (request_id, loop_label, n_tokens):
-            change = self.manager._resident - sample[3]
+            change = self.cache_totals()[0] - sample[3]
             # Remove residency changes in both directions. Deliberate expert
             # eviction must not train the native pool-reallocation ledger.
             post_bytes -= change
+            credit = self.deferred_reclaims.get(scheduler, (0, 0, 0))[0]
+            if credit:
+                # Physical footprint may fall a chunk AFTER weight eviction.
+                # Do not teach the native allocator tracker to reserve those
+                # deliberately removed weights again as transient workspace.
+                released = min(credit, max(0, pre_bytes - post_bytes))
+                post_bytes += released
+                current = self.original_current(scheduler)
+                active = getattr(scheduler, "_last_mlx_active_memory_bytes", None)
+                if sample[4] is not None and active is not None:
+                    # A simultaneous real MLX growth must remain visible even
+                    # when delayed physical release outweighs it.
+                    post_bytes = max(post_bytes, pre_bytes + active - sample[4] - change)
+                self.deferred_reclaims[scheduler] = (credit - released, current, self.cache_totals()[0])
             self.manager.prefill_cache_growth_bytes += max(0, change)
             self.manager.prefill_samples_corrected += 1
         return self.original_record(scheduler, n_tokens, pre_bytes, post_bytes,
@@ -842,6 +907,8 @@ class _ExpertMemoryGuard:
             return owner.current(scheduler, refresh_mlx_active=refresh_mlx_active)
         def guard(scheduler, n_tokens, **kwargs):
             return owner.guard(scheduler, n_tokens, **kwargs)
+        def adaptive(scheduler, requested, **kwargs):
+            return owner.adaptive(scheduler, requested, **kwargs)
         def record(scheduler, n_tokens, pre_bytes, post_bytes, **kwargs):
             return owner.record(scheduler, n_tokens, pre_bytes, post_bytes, **kwargs)
         def check(scheduler, request):
@@ -850,6 +917,7 @@ class _ExpertMemoryGuard:
             return await owner.preflight(engine, scheduler, **kwargs)
         scheduler_class._current_usage_bytes = current
         scheduler_class._guard_prefill_chunk = guard
+        scheduler_class._adaptive_chunk_size = adaptive
         scheduler_class._record_chunk_transient = record
         scheduler_class._preflight_memory_check = check
         engine_class._preflight_or_raise_with_eviction = preflight

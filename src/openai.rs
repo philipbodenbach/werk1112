@@ -56,6 +56,28 @@ pub struct OmlxChatOptions {
     /// MiB; zero explicitly disables SSD expert offload, omitted inherits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_cache_mb: Option<u64>,
+    /// MiB or "auto" for N-gram rows; zero keeps tables resident, omitted inherits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ngram_cache_mb: Option<NgramCacheBudget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum NgramCacheBudget {
+    Megabytes(u64),
+    Mode(AutomaticCacheBudget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutomaticCacheBudget {
+    Auto,
+}
+
+impl From<u64> for NgramCacheBudget {
+    fn from(value: u64) -> Self {
+        Self::Megabytes(value)
+    }
 }
 
 impl ChatRuntimeOptions {
@@ -69,6 +91,10 @@ impl ChatRuntimeOptions {
                 options.expert_cache_mb.is_none_or(|mb| mb <= 1_048_576),
                 "werk.omlx.expert_cache_mb must be an integer from 0 to 1048576 MiB (0 disables expert offload)"
             );
+            anyhow::ensure!(
+                !matches!(options.ngram_cache_mb, Some(NgramCacheBudget::Megabytes(mb)) if mb > 1_048_576),
+                "werk.omlx.ngram_cache_mb must be auto or an integer from 0 to 1048576 MiB (0 selects resident tables)"
+            );
         }
         Ok(())
     }
@@ -76,7 +102,7 @@ impl ChatRuntimeOptions {
 
 impl OmlxChatOptions {
     pub fn is_empty(&self) -> bool {
-        self.thinking.is_none() && self.expert_cache_mb.is_none()
+        self.thinking.is_none() && self.expert_cache_mb.is_none() && self.ngram_cache_mb.is_none()
     }
 }
 

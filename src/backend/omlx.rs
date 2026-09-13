@@ -41,6 +41,9 @@ const PROBE: &str = include_str!("omlx_probe.py");
 const SUPERVISOR: &str = include_str!("omlx_supervisor.py");
 const EXPERTS: &str = include_str!("omlx_experts.py");
 const PERSISTENCE: &str = include_str!("omlx_persistence.py");
+const OFFLOAD: &str = include_str!("omlx_offload.py");
+const OFFLOAD_RUNTIME: &str = include_str!("omlx_offload_runtime.py");
+const TEXT_OFFLOAD: &str = include_str!("omlx_text_offload.py");
 mod experts;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(900);
@@ -65,11 +68,19 @@ fn console_script_source(source: &str) -> String {
 
 fn worker_script_source(source: &str) -> String {
     // Embed Werk's helper in a private module, never import code from model paths.
-    let literal = serde_json::to_string(EXPERTS).expect("Python source is serializable");
-    let persistence = serde_json::to_string(PERSISTENCE).expect("Python source is serializable");
-    console_script_source(&format!(
-        "import types\n_werk_experts = types.ModuleType('_werk_omlx_experts')\nsys.modules['_werk_omlx_experts'] = _werk_experts\nexec({literal}, _werk_experts.__dict__)\n_werk_persistence = types.ModuleType('_werk_omlx_persistence')\nsys.modules['_werk_omlx_persistence'] = _werk_persistence\nexec({persistence}, _werk_persistence.__dict__)\n{source}"
-    ))
+    let mut script = String::from("import types\n");
+    for (name, helper) in [
+        ("_werk_omlx_experts", EXPERTS),
+        ("_werk_omlx_offload", OFFLOAD),
+        ("_werk_omlx_offload_runtime", OFFLOAD_RUNTIME),
+        ("_werk_omlx_text_offload", TEXT_OFFLOAD),
+        ("_werk_omlx_persistence", PERSISTENCE),
+    ] {
+        let literal = serde_json::to_string(helper).expect("Python source is serializable");
+        script.push_str(&format!("_werk_helper = types.ModuleType('{name}')\nsys.modules['{name}'] = _werk_helper\nexec({literal}, _werk_helper.__dict__)\n"));
+    }
+    script.push_str(source);
+    console_script_source(&script)
 }
 
 #[derive(Clone)]
@@ -95,6 +106,7 @@ struct OmlxInvocation {
     launcher_fingerprint: u64,
     working_directory: PathBuf,
     expert_cache_bytes: Option<u64>,
+    ngram_cache_bytes: Option<u64>,
     expert_execution: &'static str,
     thinking: Option<bool>,
     persistence_dir: Option<PathBuf>,
@@ -117,6 +129,7 @@ impl std::fmt::Debug for OmlxInvocation {
             .field("working_directory", &self.working_directory)
             .field("launcher_fingerprint", &self.launcher_fingerprint)
             .field("expert_cache_bytes", &self.expert_cache_bytes)
+            .field("ngram_cache_bytes", &self.ngram_cache_bytes)
             .field("expert_execution", &self.expert_execution)
             .field("thinking", &self.thinking)
             .field("persistence_dir", &self.persistence_dir)
@@ -197,7 +210,11 @@ impl ModelProbeKey {
                 .is_some_and(|name| {
                     matches!(
                         name,
-                        "config.json" | "tokenizer_config.json" | "generation_config.json"
+                        "config.json"
+                            | "tokenizer_config.json"
+                            | "generation_config.json"
+                            | "chat_template.jinja"
+                            | "chat_templates"
                     ) || (name.starts_with("model") && name.ends_with(".safetensors"))
                 })
         });
@@ -241,6 +258,7 @@ struct OmlxProcess {
     log_tail: Arc<Mutex<VecDeque<String>>>,
     expert_offload: bool,
     expert_cache_bytes: Option<u64>,
+    ngram_cache_bytes: Option<u64>,
     expert_execution: &'static str,
     thinking: Option<bool>,
     server_prefix_cache: bool,
@@ -322,6 +340,12 @@ impl OmlxBackend {
                 invocation.expert_cache_bytes =
                     expert_cache_bytes(Some(megabytes.to_string().into()))?;
             }
+            if let Some(budget) = omlx.ngram_cache_mb {
+                invocation.ngram_cache_bytes = match budget {
+                    crate::openai::NgramCacheBudget::Megabytes(mb) => Some(mb * 1024 * 1024),
+                    crate::openai::NgramCacheBudget::Mode(_) => None,
+                };
+            }
         }
         Ok(configured)
     }
@@ -330,6 +354,7 @@ impl OmlxBackend {
         self.invocation().is_ok_and(|invocation| {
             server.thinking == invocation.thinking
                 && server.expert_cache_bytes == invocation.expert_cache_bytes
+                && server.ngram_cache_bytes == invocation.ngram_cache_bytes
                 && server.expert_execution == invocation.expert_execution
                 && server.server_prefix_cache == invocation.server_prefix_cache
         })
@@ -754,6 +779,7 @@ impl OmlxInvocation {
 
     fn from_launcher(launcher: PathBuf, health_timeout: Duration) -> Result<Self> {
         let expert_cache_bytes = expert_cache_bytes(env::var_os("WERK_OMLX_EXPERT_CACHE_MB"))?;
+        let ngram_cache_bytes = ngram_cache_bytes(env::var_os("WERK_OMLX_NGRAM_CACHE_MB"))?;
         let expert_execution = expert_execution(env::var_os("WERK_OMLX_EXPERT_EXECUTION"))?;
         let mut environment: Vec<_> = env::vars_os()
             .filter(|(name, _)| !name.to_string_lossy().starts_with("OMLX_"))
@@ -850,6 +876,7 @@ impl OmlxInvocation {
             launcher_fingerprint,
             working_directory: env::current_dir()?,
             expert_cache_bytes,
+            ngram_cache_bytes,
             expert_execution,
             thinking,
             persistence_dir: None,
@@ -886,7 +913,8 @@ impl OmlxInvocation {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let payload = json!({"model_dir": model_dir, "launcher": self.launcher,
-            "expert_cache_bytes": self.expert_cache_bytes});
+            "expert_cache_bytes": self.expert_cache_bytes,
+            "ngram_cache_bytes": self.ngram_cache_bytes});
         let mut child = command
             .spawn()
             .context("failed to start selected oMLX metadata probe")?;
@@ -1039,6 +1067,19 @@ fn thinking_enabled(value: Option<OsString>) -> Result<Option<bool>> {
     }
 }
 
+fn ngram_cache_bytes(value: Option<OsString>) -> Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value == "auto" {
+        return Ok(None);
+    }
+    let mb = value.to_str().and_then(|value| value.parse::<u64>().ok())
+        .filter(|mb| *mb <= u64::MAX / (1024 * 1024))
+        .context("WERK_OMLX_NGRAM_CACHE_MB must be auto or a nonnegative MiB integer (0 selects resident tables)")?;
+    Ok(Some(mb * 1024 * 1024))
+}
+
 fn expert_execution(value: Option<OsString>) -> Result<&'static str> {
     match value.as_deref().and_then(|value| value.to_str()) {
         None if value.is_none() => Ok("grouped"),
@@ -1064,6 +1105,11 @@ fn expert_interval_diagnostics(before: &Value, after: &Value) -> Option<String> 
         "budget_reductions",
         "prefill_cache_growth_bytes",
         "prefill_samples_corrected",
+        "ngram_requested_rows",
+        "ngram_unique_rows",
+        "ngram_cache_hits",
+        "ngram_cache_misses",
+        "ngram_cache_evictions",
     ] {
         if let (Some(a), Some(b)) = (
             before.get(name).and_then(Value::as_u64),
@@ -1099,6 +1145,9 @@ fn expert_interval_diagnostics(before: &Value, after: &Value) -> Option<String> 
         "cache_budget_bytes",
         "effective_cache_budget_bytes",
         "allocator_cache_bytes",
+        "ngram_resident_cache_bytes",
+        "ngram_cache_budget_bytes",
+        "ngram_effective_cache_budget_bytes",
     ] {
         if let Some(value) = after.get(name).and_then(Value::as_u64) {
             interval.insert(name.into(), json!(value));
@@ -1111,6 +1160,11 @@ fn expert_interval_diagnostics(before: &Value, after: &Value) -> Option<String> 
     }
     if let Some(mode @ ("serial" | "grouped")) = after.get("execution").and_then(Value::as_str) {
         interval.insert("execution".into(), json!(mode));
+    }
+    if let Some(mode @ ("auto" | "explicit" | "disabled")) =
+        after.get("ngram_cache_budget_mode").and_then(Value::as_str)
+    {
+        interval.insert("ngram_cache_budget_mode".into(), json!(mode));
     }
     Some(format!(
         "oMLX experts (worker interval; reads include OS file cache): {}",
@@ -1175,6 +1229,7 @@ fn persistent_cache_directory(
         "import_working_directory": (!import_environment.is_empty()).then_some(&invocation.working_directory),
         "thinking": invocation.thinking,
         "expert_cache_bytes": invocation.expert_cache_bytes,
+        "ngram_cache_bytes": invocation.ngram_cache_bytes,
         "expert_execution": invocation.expert_execution,
     });
     let namespace = format!("omlx-{:x}", Sha256::digest(serde_json::to_vec(&namespace)?));
@@ -1344,6 +1399,12 @@ impl OmlxProcess {
         let expert_cache = invocation
             .expert_cache_bytes
             .filter(|bytes| *bytes > 0 || report.runtime.get("expert_offload").is_some());
+        let native_weight_adapter = report
+            .runtime
+            .get("expert_offload")
+            .and_then(|entry| entry.get("loader"))
+            .and_then(Value::as_str)
+            == Some("installed_native_text_port");
         let mut lifetime_locks = Vec::new();
         if let Some(directory) = &invocation.persistence_dir {
             // persistent_cache_directory creates exactly one runtime namespace
@@ -1399,6 +1460,7 @@ impl OmlxProcess {
         command
             .env_remove("WERK_OMLX_EXPERT_MODEL_DIR")
             .env_remove("WERK_OMLX_EXPERT_CACHE_BYTES")
+            .env_remove("WERK_OMLX_NGRAM_CACHE_BYTES")
             .env_remove("WERK_OMLX_EXPERT_EXECUTION")
             .env_remove("WERK_OMLX_PERSISTENCE_DIR")
             .env_remove("WERK_OMLX_PERSISTENCE_MODEL_DIR");
@@ -1407,6 +1469,13 @@ impl OmlxProcess {
                 .env("WERK_OMLX_EXPERT_MODEL_DIR", model_dir)
                 .env("WERK_OMLX_EXPERT_EXECUTION", invocation.expert_execution)
                 .env("WERK_OMLX_EXPERT_CACHE_BYTES", bytes.to_string());
+        } else if native_weight_adapter {
+            command
+                .env("WERK_OMLX_EXPERT_MODEL_DIR", model_dir)
+                .env("WERK_OMLX_EXPERT_CACHE_BYTES", "native");
+        }
+        if let Some(bytes) = invocation.ngram_cache_bytes {
+            command.env("WERK_OMLX_NGRAM_CACHE_BYTES", bytes.to_string());
         }
         if let Some(directory) = persistence_directory {
             command
@@ -1457,6 +1526,7 @@ impl OmlxProcess {
             log_tail,
             expert_offload: false,
             expert_cache_bytes: invocation.expert_cache_bytes,
+            ngram_cache_bytes: invocation.ngram_cache_bytes,
             expert_execution: invocation.expert_execution,
             thinking: invocation.thinking,
             server_prefix_cache: invocation.server_prefix_cache,
@@ -1487,6 +1557,52 @@ impl OmlxProcess {
                     "explicit"
                 }
             );
+        }
+        if native_weight_adapter {
+            let status =
+                process.json_request("GET", "/werk/experts/status", None, deadline.remaining()?)?;
+            if status.get("active").and_then(Value::as_bool) != Some(true) {
+                bail!("native text offload worker did not confirm the loaded model");
+            }
+            if let Some(requested) = invocation.ngram_cache_bytes {
+                let mode = status.get("ngram_offload").and_then(Value::as_str);
+                let actual = status
+                    .get("ngram_cache_budget_bytes")
+                    .and_then(Value::as_u64);
+                let capacity = status
+                    .get("ngram_maximum_cache_bytes")
+                    .and_then(Value::as_u64);
+                let confirmed = if requested == 0 {
+                    actual == Some(0) && matches!(mode, Some("disabled" | "not_applicable"))
+                } else {
+                    mode == Some("supported")
+                        && capacity.is_some_and(|bytes| actual == Some(bytes.min(requested)))
+                };
+                if !confirmed {
+                    bail!("oMLX worker did not confirm the requested N-gram cache setting");
+                }
+            }
+            if status.get("ngram_offload").and_then(Value::as_str) == Some("supported") {
+                eprintln!(
+                    "oMLX N-gram cache: {} MiB initial, {} MiB upper budget ({}); shares memory with the expert cache",
+                    status
+                        .get("ngram_initial_cache_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                        / (1024 * 1024),
+                    status
+                        .get("ngram_cache_budget_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                        / (1024 * 1024),
+                    status
+                        .get("ngram_cache_budget_mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                );
+            }
+            process.expert_offload =
+                status.get("experts_offloaded").and_then(Value::as_bool) == Some(true);
         }
         if invocation.server_prefix_cache {
             let active = if server_cache_directory.is_some() {
@@ -1654,7 +1770,9 @@ impl OmlxProcess {
             tx.is_some(),
             thinking.or(self.thinking),
         );
-        let expert_before = (self.expert_offload && (request.verbose || request.debug))
+        let expert_before = ((self.expert_offload
+            || self.ngram_cache_bytes.is_some_and(|bytes| bytes > 0))
+            && (request.verbose || request.debug))
             .then(|| {
                 self.json_request("GET", "/werk/experts/status", None, Duration::from_secs(2))
                     .ok()

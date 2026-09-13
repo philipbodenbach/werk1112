@@ -198,8 +198,8 @@ TTS forbids a negative prompt and uses asynchronous speech submission.
 Vision uses ordered images in one user message and offers chat options only:
 the current chat endpoint does not apply per-request media routing overrides.
 
-WERK Text / **Chat Options** additionally exposes **oMLX Thinking** and
-**oMLX Expert Offload**. Thinking retains `inherit` / `enabled` / `disabled`.
+WERK Text / **Chat Options** additionally exposes **oMLX Thinking**,
+**oMLX Expert Offload** and **oMLX N-Gram Offload**. Thinking retains `inherit` / `enabled` / `disabled`.
 Expert offload offers **Server Default (Auto Unless Configured)** (`inherit`),
 **Manual Cache Limit** (`enabled`) and **Disabled (Native Loading)** (`disabled`).
 Manual cache limiting uses **oMLX Expert Cache (MiB)**: an integer from 1 to
@@ -220,7 +220,14 @@ adds this to the normal `/v1/chat/completions` body:
 ```
 
 Explicit oMLX controls first check `api.chat.omlx_options` and its requested
-operations through `/werk/v1/capabilities`. If support is absent, the node
+operations through `/werk/v1/capabilities`. N-gram offload independently sends
+`ngram_cache_mb: "auto"` when Auto is selected, the manual MiB limit (default 1024, range 1–1048576) when enabled, and `0` for
+resident tables when disabled, and omits the field when inherited. This budget
+does not change the expert or KV cache budget. A positive budget requires a
+supported N-gram table layout: currently Qwen `qwen4_exp` PLE in oMLX 0.6.4.
+The checked GLM `glm5_next` checkpoint has no such tables; expert offload is
+independent. See [backend coverage](../../docs/backends.md).
+If support is absent, the node
 requires updating/restarting Werk before submitting generation, so an older
 server cannot silently ignore the options. The capability confirms request
 handling; the selected model/runtime can still reject an unsupported setting.

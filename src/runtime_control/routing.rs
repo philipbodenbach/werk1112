@@ -1890,6 +1890,7 @@ mod tests {
             omlx: Some(crate::openai::OmlxChatOptions {
                 thinking: Some(false),
                 expert_cache_mb: None,
+                ngram_cache_mb: None,
             }),
         };
         let configured = generation.with_chat_options(&model, &controls).unwrap();

@@ -1,0 +1,56 @@
+{
+  "model": "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": "auto",
+  "tool_count": 34,
+  "tool_schema_bytes": 28425,
+  "samples": [
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust is a modern systems programming language designed for performance and safety, especially safe concurrency, achieved through its unique ownership and borrowing system without requiring a garbage collector."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 339.54099637499894,
+      "usage": {
+        "completion_tokens": 32,
+        "prompt_tokens": 6684,
+        "total_tokens": 6716
+      },
+      "first_text_seconds": 327.5459476660035,
+      "backend_phases": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 11.99,
+        "evaluated_prompt_tokens": 6684,
+        "first_token_seconds": 327.49,
+        "prompt_seconds": 327.49
+      }
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust ownership is a set of compile-time rules where each value has a single owner responsible for freeing it, and ownership can be moved or borrowed but never duplicated, ensuring memory safety without a garbage collector."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 61.61668033400201,
+      "usage": {
+        "completion_tokens": 41,
+        "prompt_tokens": 6682,
+        "total_tokens": 6723
+      },
+      "first_text_seconds": 46.73318491700047,
+      "backend_phases": {
+        "cached_prompt_tokens": 6144,
+        "decode_seconds": 14.88,
+        "evaluated_prompt_tokens": 538,
+        "first_token_seconds": 46.7,
+        "prompt_seconds": 46.7
+      }
+    }
+  ],
+  "passed": true
+}
