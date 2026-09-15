@@ -5,6 +5,58 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- oMLX: use the same automatic device/model-dependent expert cache budget for CLI chat and Serve on supported DeepSeek V4 checkpoints. Preserve explicit small budgets and SSD offload; `0` selects native loading.
+- Report uncached prefill token counts/rates in CLI verbose output and native phase timings in Serve logs for comparable performance measurements.
+
+### Added
+
+- Grouped oMLX expert execution with batched tensor materialization, protected
+  active groups and reduced allocator flushing; `WERK_OMLX_EXPERT_EXECUTION=serial`
+  retains the prior path for comparison. Verbose diagnostics expose worker
+  interval cache, logical-read and evaluation counters.
+- Optional chat SSE usage summaries via `stream_options.include_usage`, benchmark
+  output/finish diagnostics, and a reusable HTTP multi-turn quality/performance harness.
+- Local `werk cache list` and `werk cache purge <CACHE-ID>` / `--all`, with
+  storage-kind filters, size and protection status, JSON output and dry runs.
+  Saved chat histories require explicit inclusion; active caches and pinned
+  runtime states are protected from cleanup.
+- Backend-independent `werk chat --persistence` with named conversations,
+  automatic resume, explicit reuse policy, private atomic archives and
+  protection against concurrent writers and incomplete streamed turns.
+  Local vLLM also receives a validated automatic-prefix-cache default.
+- Optional native exact-prefix KV caching for persistent oMLX 0.6.4 chats,
+  with checkpoint/runtime binding, durable writes and reported cache hits.
+  Other chat backends retain portable conversation persistence.
+- Experimental SSD-backed expert loading for packed affine DeepSeek V4 MLX
+  checkpoints in a private oMLX 0.6.4 worker. `WERK_OMLX_EXPERT_CACHE_MB`
+  enables a bounded cache while ordinary oMLX loading remains the default.
+  Active workers expose expert telemetry and RAM prefetch, pin, unpin and
+  eviction through the existing Werk, ComfyUI and n8n expert controls.
+- Optional `WERK_OMLX_THINKING=0|1` controls thinking for oMLX model templates
+  that support it, including DeepSeek V4. Unset preserves existing defaults.
+- Per-request oMLX thinking and expert-cache settings through the chat API,
+  n8n WERK Text options, and new ComfyUI text model/config/generation nodes.
+  Explicit settings require the server's `api.chat.omlx_options` capability;
+  inherited settings preserve existing workflows. Expert controls follow the
+  worker used for the selected model, including request-specific cache budgets.
+
+### Fixed
+
+- Reuse successful oMLX compatibility probes across chat requests and sessions,
+  with bounded caching and model/runtime dependency invalidation, avoiding
+  repeated Python imports before each HTTP response.
+- Claim the Serve port before loading the default model, so an occupied port
+  fails immediately without starting a second large model worker.
+- Preserve original structured messages in `werk bench` for native templates,
+  avoiding a benchmark-only second application of the chat template.
+- Allow cleanup of empty legacy oMLX worker cache directories when native
+  process markers confirm their owners have exited. Files, active workers and
+  unverifiable legacy layouts remain protected.
+- Accepted standard uv MLX launchers and Homebrew Python console launchers
+  alongside the previously supported entry-point formats.
+- oMLX timing statistics use the runtime's prompt and generation durations
+  when available, so hidden reasoning is no longer reported as prompt work.
+
 ## [1.6.0] - 2026-09-07
 
 ### Added

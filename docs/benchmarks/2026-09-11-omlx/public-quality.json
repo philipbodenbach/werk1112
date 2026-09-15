@@ -1,0 +1,144 @@
+{
+  "samples": [
+    {
+      "first_text_seconds": 10.324756041998626,
+      "total_seconds": 18.554981624998618,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Your sentence: Rust is a powerful systems programming language that combines memory safety with a focus on performance and reliability.",
+      "usage": {
+        "completion_tokens": 22,
+        "prompt_tokens": 14,
+        "total_tokens": 36
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 14,
+      "completion_tokens": 22,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 2.5515704020770364,
+      "case": "english",
+      "temperature": 1.0
+    },
+    {
+      "first_text_seconds": 3.67799825000111,
+      "total_seconds": 21.397620542004006,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Rust bietet Speichersicherheit, weil das Typsystem und die Eigentumsregeln (Ownership, Borrowing, Lifetimes) dafür sorgen, dass Speicherzugriffe kontrolliert erfolgen und häufige Fehler wie Use-After-Free, Dangling Pointers oder Buffer Overflows bereits zur Compile-Zeit verhindert werden.",
+      "usage": {
+        "completion_tokens": 77,
+        "prompt_tokens": 23,
+        "total_tokens": 100
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 77,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 4.289030474103267,
+      "case": "german",
+      "temperature": 1.0
+    },
+    {
+      "first_text_seconds": 4.711656792002032,
+      "total_seconds": 13.923975708996295,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Notice: Code includes in support of Rust and safe to true.\n{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 29,
+        "prompt_tokens": 23,
+        "total_tokens": 52
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 29,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 3.039408454297809,
+      "case": "json",
+      "temperature": 1.0,
+      "checks": [
+        {
+          "type": "json_equals",
+          "passed": false
+        }
+      ]
+    },
+    {
+      "first_text_seconds": 8.339385957995546,
+      "total_seconds": 20.72621129199979,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "A sentence about Rust: \"Rust is a systems-level programming language that prioritizes memory safety and performance, offering a robust alternative to C-like languages with its ownership model and borrow checker.\"",
+      "usage": {
+        "completion_tokens": 38,
+        "prompt_tokens": 14,
+        "total_tokens": 52
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 14,
+      "completion_tokens": 38,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 2.9870446221945026,
+      "case": "english",
+      "temperature": 0.6
+    },
+    {
+      "first_text_seconds": 3.618661666987464,
+      "total_seconds": 29.304372416998376,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Rust bietet Speichersicherheit, weil es durch sein strenges Ownership-System und die damit verbundenen Regeln (jeder Wert hat genau einen Besitzer, der nach dem Ende seiner Lebensdauer automatisch freigegeben wird) sowie durch die integrierte Überprüfung von Referenzen (Borrow-Checker) sicherstellt, dass Speicherzugriffe immer kontrolliert und fehlerfrei erfolgen, wodurch häufige Probleme wie Use-After-Free, Dangling-Pointers oder Buffer-Overflows von vornherein ausgeschlossen werden.",
+      "usage": {
+        "completion_tokens": 122,
+        "prompt_tokens": 23,
+        "total_tokens": 145
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 122,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 4.7107904148593045,
+      "case": "german",
+      "temperature": 0.6
+    },
+    {
+      "first_text_seconds": 4.861338041999261,
+      "total_seconds": 9.623071166992304,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 23,
+        "total_tokens": 39
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 3.1501135419095783,
+      "case": "json",
+      "temperature": 0.6,
+      "checks": [
+        {
+          "type": "json_equals",
+          "passed": true
+        }
+      ]
+    }
+  ],
+  "note": "Public Werk API. Sequential requests. T1 unseeded matches prior worker defaults; T0.6 seed42 is an exploratory profile, not a proven general quality fix.",
+  "measurement_note": "These calls explicitly used a Thinking=0 server. Their historical client decode estimates assume completion_tokens count only visible content. The reusable harness now leaves estimates null by default when reasoning details are missing."
+}

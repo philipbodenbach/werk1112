@@ -1,0 +1,10 @@
+oMLX expert cache: 25159 MiB (auto) upper budget; SSD offload active, native memory guard may reduce residency
+oMLX N-gram cache: 64 MiB initial, 3152 MiB upper budget (auto); shares memory with the expert cache
+oMLX native short-prefix cache active for /Users/philipbodenbach/.local/share/werk1112/models/pipenetwork-Qwen3.8-Flash-Next-MLX-mixed-4_8bit/files; worker lifetime, SSD limit 4GB
+Default model available: pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit
+Werk persistence enabled: prefill defaults mode=disk reuse=prefer ttl_seconds=none pin=false; automatic model/pipeline residency remains active on supported Werk-managed runtimes; oMLX native short-prefix caching requested for compatible models during the worker lifetime; local vLLM automatic prefix caching defaults to enabled unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM remains externally managed.
+Server running at http://127.0.0.1:59258
+API key auth enabled; use Authorization: Bearer <key> or X-API-Key: <key> (A1111 clients may use Basic werk:<key>)
+[werk serve] GET /v1/models -> 3 model(s)
+[werk serve] POST /v1/chat/completions model=pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit stream=yes messages=1 images=0 max_tokens=256 tools=34 tool_schema_bytes=28425
+[werk serve] stream model=pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit -> error: oMLX upstream error: {"code":"prefill_memory_aborted","limit_bytes":38190851686,"message":"oMLX memory guard aborted this request mid-prefill: Request aborted: process memory limit exceeded (usage 36.0 GB, abort threshold (hard watermark) 35.6 GB, metal_cap ceiling 37.4 GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.","omlx_code":"prefill_memory_aborted","param":null,"type":"invalid_request_error"}

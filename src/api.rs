@@ -16,5 +16,5 @@ mod werk;
 mod tests;
 
 pub use cors::CorsOrigin;
-pub use router::{router, serve};
+pub use router::{router, serve, serve_with_listener};
 pub use state::{ApiState, PromptOptionsResolver};

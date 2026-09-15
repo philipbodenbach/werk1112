@@ -1,0 +1,75 @@
+[werk chat] persistence enabled: 0 saved messages
+[werk chat] conversation: /Users/philipbodenbach/.local/share/werk1112/chat-sessions/276fcf1b738b385a3356aff5ee12300bc14422303ccfc8494cd4edbd1caba36d.json
+[werk chat] native KV cache unavailable: oMLX startup failed
+oMLX output tail:
+INFO:omlx.settings:Saved settings to /Users/philipbodenbach/.local/share/werk1112/backends/omlx/workers/ca2ae315eb4b4826fe4137040d2ccb610bb70dc653f6f5d7/settings.json
+INFO:omlx.server:Auto-detected server aliases: ['localhost', '127.0.0.1', 'MacBook-Pro-von-Philip.local', '192.168.200.198']
+WARNING:omlx.process_memory_enforcer:Metal cap (37.4GB, Apple max_recommended_working_set_size) is below the oMLX static ceiling (42.0GB); leaving Apple's default Metal cap active because iogpu.wired_limit_mb is unset. Raise it with: sudo sysctl iogpu.wired_limit_mb=43008
+INFO:omlx.process_memory_enforcer:Process memory enforcer started (tier=balanced, ceiling=36.8GB, interval=1.0s)
+INFO:     Application startup complete.
+INFO:omlx.engine_pool:Loading model: files
+INFO:omlx.utils.model_loading:M5 sorted gather_qmm reroute installed (issue #2267)
+INFO:omlx.patches.bonsai_t5_load:bonsai_t5_load: Module.load_weights and mx.quantized_matmul patched for t5 uint8 weights.
+INFO:omlx.utils.model_loading:Bonsai t5 load patch applied for /Users/philipbodenbach/.local/share/werk1112/models/Vontra-GLM-5.3-Flash-MLX-oQ2-MTP/files (t5 uint8 weights allowed past strict shape check)
+INFO:omlx.engine_core:MLX executor thread initialized: generation_stream = ThreadLocalStream(Device(gpu, 0), 4)
+ERROR:omlx.engine_pool:Model load failed for 'files'; caching failure until next discovery refresh
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/omlx/engine_pool.py", line 2703, in _load_engine
+    await engine.start()
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/omlx/engine/batched.py", line 276, in start
+    self._model, self._tokenizer = await loop.run_in_executor(
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.11/3.11.16/Frameworks/Python.framework/Versions/3.11/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/omlx/engine/batched.py", line 269, in _load_model_sync
+    return lm_load_compat(
+           ^^^^^^^^^^^^^^^
+  File "<string>", line 437, in load
+  File "<string>", line 354, in load_text_model
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/glm5_next.py", line 154, in sanitize
+    if self.vision_model is not None:
+       ^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/mlx/nn/layers/base.py", line 103, in __getattr__
+    super(Module, self).__getattribute__(key)
+AttributeError: 'Model' object has no attribute 'vision_model'
+WARNING:omlx.server:POST /v1/models/files/load → 409: Model 'files' failed to load: 'Model' object has no attribute 'vision_model'. Reload models after fixing the files to retry.: oMLX POST /v1/models/files/load failed: OpenAI backend HTTP 409: {"error":{"message":"Model 'files' failed to load: 'Model' object has no attribute 'vision_model'. Reload models after fixing the files to retry.","type":"invalid_request_error","param":null,"code":null}}
+[werk chat] conversation persistence active; native KV persistence unavailable on this route
+Error: oMLX startup failed
+oMLX output tail:
+INFO:omlx.settings:Saved settings to /Users/philipbodenbach/.local/share/werk1112/backends/omlx/workers/bc51df0c602d5b7cd9e864ccf7e8cd03f2e955889570d065/settings.json
+INFO:omlx.server:Auto-detected server aliases: ['localhost', '127.0.0.1', 'MacBook-Pro-von-Philip.local', '192.168.200.198']
+WARNING:omlx.process_memory_enforcer:Metal cap (37.4GB, Apple max_recommended_working_set_size) is below the oMLX static ceiling (42.0GB); leaving Apple's default Metal cap active because iogpu.wired_limit_mb is unset. Raise it with: sudo sysctl iogpu.wired_limit_mb=43008
+INFO:omlx.process_memory_enforcer:Process memory enforcer started (tier=balanced, ceiling=36.8GB, interval=1.0s)
+INFO:     Application startup complete.
+INFO:omlx.engine_pool:Loading model: files
+INFO:omlx.utils.model_loading:M5 sorted gather_qmm reroute installed (issue #2267)
+INFO:omlx.patches.bonsai_t5_load:bonsai_t5_load: Module.load_weights and mx.quantized_matmul patched for t5 uint8 weights.
+INFO:omlx.utils.model_loading:Bonsai t5 load patch applied for /Users/philipbodenbach/.local/share/werk1112/models/Vontra-GLM-5.3-Flash-MLX-oQ2-MTP/files (t5 uint8 weights allowed past strict shape check)
+INFO:omlx.engine_core:MLX executor thread initialized: generation_stream = ThreadLocalStream(Device(gpu, 0), 4)
+ERROR:omlx.engine_pool:Model load failed for 'files'; caching failure until next discovery refresh
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/omlx/engine_pool.py", line 2703, in _load_engine
+    await engine.start()
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/omlx/engine/batched.py", line 276, in start
+    self._model, self._tokenizer = await loop.run_in_executor(
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.11/3.11.16/Frameworks/Python.framework/Versions/3.11/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/omlx/engine/batched.py", line 269, in _load_model_sync
+    return lm_load_compat(
+           ^^^^^^^^^^^^^^^
+  File "<string>", line 437, in load
+  File "<string>", line 354, in load_text_model
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/glm5_next.py", line 154, in sanitize
+    if self.vision_model is not None:
+       ^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/mlx/nn/layers/base.py", line 103, in __getattr__
+    super(Module, self).__getattribute__(key)
+AttributeError: 'Model' object has no attribute 'vision_model'
+WARNING:omlx.server:POST /v1/models/files/load → 409: Model 'files' failed to load: 'Model' object has no attribute 'vision_model'. Reload models after fixing the files to retry.
+
+Caused by:
+    0: oMLX POST /v1/models/files/load failed
+    1: OpenAI backend HTTP 409: {"error":{"message":"Model 'files' failed to load: 'Model' object has no attribute 'vision_model'. Reload models after fixing the files to retry.","type":"invalid_request_error","param":null,"code":null}}

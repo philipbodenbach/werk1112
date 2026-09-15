@@ -4,14 +4,12 @@ on:
   push:
     paths:
       - "utils/n8n/**"
-      - "utils/comfyUI/nodes.py"
-      - "utils/comfyUI/runtime_nodes.py"
+      - "utils/comfyUI/**"
       - ".github/workflows/n8n.yml"
   pull_request:
     paths:
       - "utils/n8n/**"
-      - "utils/comfyUI/nodes.py"
-      - "utils/comfyUI/runtime_nodes.py"
+      - "utils/comfyUI/**"
       - ".github/workflows/n8n.yml"
   workflow_dispatch:
 

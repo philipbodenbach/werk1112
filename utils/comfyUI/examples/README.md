@@ -21,6 +21,15 @@ Replace its illustrative `qwen3-vl` alias with an installed model that Werk
 reports as runtime-available for `image-understanding`, and upload or rename
 `rendered-page.png` before submitting it.
 
+`werk_text_omlx_api.json` connects Text Models, Text Config and Text Generate.
+It disables thinking and enables an 8192 MiB expert cache for the illustrative
+DeepSeek-V4-Flash model. Replace that ID with a compatible installed model and
+use a Werk server declaring `api.chat.omlx_options`. Generation's `model_id`
+output orders the subsequent Runtime Experts listing and Expert Control
+eviction preview; `dry_run=true` leaves expert residency unchanged. Remove
+nodes `5` and `6` for text generation alone. For other text backends, set both
+oMLX controls to `inherit` to omit the extension entirely.
+
 `werk_video_generation_api.json` and `werk_image_to_video_api.json` are API
 prompts for the new native `VIDEO` path. Both make the task and
 `preferred_model=wan22-ti2v-5b` explicit, leave backend selection at Werk's

@@ -16,7 +16,7 @@ not equality with the package version. All internal n8n node versions start at
 | Visible name | Operations |
 | --- | --- |
 | WERK Discovery (Beta) | Server info, models, one model, capabilities, complete task/model/backend parameters |
-| WERK Text (Beta) | Ordered non-streaming chat messages; text, usage, finish reason and structured tool calls |
+| WERK Text (Beta) | Ordered non-streaming chat and reusable conversation history; text, usage, finish reason and structured tool calls |
 | WERK Image (Beta) | Image generation with native binary output |
 | WERK Vision (Beta) | Ordered binary images in a multimodal chat request |
 | WERK Video (Beta) | Text-to-video and image-to-video; submit only or submit and wait |
@@ -24,7 +24,7 @@ not equality with the package version. All internal n8n node versions start at
 | WERK Jobs (Beta) | Get, wait, cooperative cancel and download by output ID |
 | WERK Runtime (Beta) | Info, capabilities, memory, states, state action, prune, experts, expert action, combined Prefill & Decode |
 
-[All 30 ComfyUI registrations are mapped here](docs/comfyui-parity.md).
+[All 33 ComfyUI registrations are mapped here](docs/comfyui-parity.md).
 Text is an ordinary workflow node; it cannot connect to an AI Agent's
 Chat Model socket. Returned model tool calls are data and are never executed.
 
@@ -198,6 +198,55 @@ TTS forbids a negative prompt and uses asynchronous speech submission.
 Vision uses ordered images in one user message and offers chat options only:
 the current chat endpoint does not apply per-request media routing overrides.
 
+WERK Text / **Chat Options** additionally exposes **oMLX Thinking**,
+**oMLX Expert Offload** and **oMLX N-Gram Offload**. Thinking retains `inherit` / `enabled` / `disabled`.
+Expert offload offers **Server Default (Auto Unless Configured)** (`inherit`),
+**Manual Cache Limit** (`enabled`) and **Disabled (Native Loading)** (`disabled`).
+Manual cache limiting uses **oMLX Expert Cache (MiB)**: an integer from 1 to
+1048576, default 8192 (8 GiB). A retained budget is applied only while offload
+is enabled. Disabling thinking sends `false`; disabling expert offload sends
+`0`. Inherited controls remain absent, preserving existing workflows and
+server defaults. An unset or `auto` server `WERK_OMLX_EXPERT_CACHE_MB` sizes the
+cache from available hardware/model memory for compatible models. A fixed server
+value remains authoritative when inherited. The API has no string `auto` budget;
+the node omits the override. Offloaded experts remain checkpoint-backed, so a
+model can be larger than available memory. The effective RAM budget can shrink
+under memory pressure. Expert RAM cache and KV/prompt cache are separate.
+For example, thinking disabled with an 8 GiB expert cache
+adds this to the normal `/v1/chat/completions` body:
+
+```json
+{"werk":{"omlx":{"thinking":false,"expert_cache_mb":8192}}}
+```
+
+Explicit oMLX controls first check `api.chat.omlx_options` and its requested
+operations through `/werk/v1/capabilities`. N-gram offload independently sends
+`ngram_cache_mb: "auto"` when Auto is selected, the manual MiB limit (default 1024, range 1–1048576) when enabled, and `0` for
+resident tables when disabled, and omits the field when inherited. This budget
+does not change the expert or KV cache budget. A positive budget requires a
+supported N-gram table layout: currently Qwen `qwen4_exp` PLE in oMLX 0.6.4.
+The checked GLM `glm5_next` checkpoint has no such tables; expert offload is
+independent. See [backend coverage](../../docs/backends.md).
+If support is absent, the node
+requires updating/restarting Werk before submitting generation, so an older
+server cannot silently ignore the options. The capability confirms request
+handling; the selected model/runtime can still reject an unsupported setting.
+Vision does not expose or accept these text-only oMLX controls.
+
+**Conversation History (JSON)** accepts an OpenAI message array or its JSON
+string. Set it to `{{ $json.conversation }}` on a following Text node, and put
+only the new turn in **Messages**. Each output choice includes `conversation`:
+prior messages, current messages and that assistant choice, including structured
+tool calls. Tool results can be appended explicitly with their tool-call IDs.
+System/developer instructions and message order are preserved; do not repeat
+the system prompt each turn. Histories are bounded to 4096 messages / 16 MiB
+and use the same output redaction as other metadata. No global conversation
+is stored or shared across items. Use `werk serve --persistence` for supported
+native prefix reuse during the worker lifetime; reuse depends on the actual
+prompt/model/backend and is not guaranteed by supplying history. This speeds
+reused prompt processing, not the generation of every new token. Standard
+sampling options remain omitted unless selected, inheriting runtime defaults.
+
 Every input item evaluates its own parameters and expressions. Multiple
 generated outputs use `pairedItem` to identify their source. Heavy jobs are
 submitted in item order, with per-item n8n error handling; one item's bytes
@@ -261,7 +310,7 @@ Client limits are explicit and independent of any tighter server limits:
 
 | Limit | Value |
 | --- | --- |
-| HTTP request/response wait | Default 120 seconds; maximum 3600 seconds |
+| HTTP request/response wait | Default 600 seconds; maximum 3600 seconds (stored explicit values remain unchanged) |
 | Model-option discovery / credential test | 30 seconds / 15 seconds |
 | Inference JSON request/response | 128 MiB each |
 | Runtime protocol request/response | 1 MiB / 8 MiB, also restricted by advertised server limits |
@@ -282,15 +331,42 @@ header must agree with the envelope. No runtime error falls back to `/v1`.
 Capability statuses remain `supported`, `unsupported`, `unavailable`,
 `experimental`, `externally_managed` or `metadata_only`. State/expert actions
 are gated by those statuses and server limits. `externally_managed` permits
-only the specified read-only expert telemetry. Current production adapters
-do not provide operative expert residency; this integration does not turn
-metadata into working MoE management.
+only the specified read-only expert telemetry. The oMLX SSD expert cache
+advertises `experimental` only after its loaded worker confirms offload is
+active. Other adapters retain their declared capabilities.
 
 State action, prune and expert action default to **dry-run true**. Promote
 allows RAM/VRAM; demote RAM/disk; other state actions have no target tier.
 Prune requires explicit IDs, real filters or explicit all plus confirmation.
 It touches runtime states only. Expert actions require an explicit model and
 unique expert IDs; prefetch requires RAM/VRAM and other actions forbid a tier.
+
+To use experimental oMLX expert offload, use **Server Default** in **WERK Text /
+Chat Options** for server-managed sizing, or select a **Manual Cache Limit**,
+and generate once. Connect that Text node
+to Runtime / List Experts or Expert Action and use its original requested
+model (`{{ $json.werk.request.model }}`) as the Runtime Model ID. This ensures generation
+loads the configured worker before the runtime node executes. Enable
+**Allow Experimental** in the Runtime node. Runtime expert operations do not
+load or configure a model themselves.
+
+Server defaults remain available through `WERK_OMLX_EXPERT_CACHE_MB` and
+`WERK_OMLX_THINKING`; inherited Text controls use those settings. Other weights,
+attention, KV cache and temporary buffers need additional memory beyond the
+expert-cache budget. The Image/Video/Audio `allow_disk_offload` routing option
+does not configure this text-model cache. Expert offload also does not enable
+Runtime Prefill & Decode or named KV snapshot capabilities.
+
+Expert tier `external` means checkpoint-backed outside
+the cache, while `ram` means present in Apple unified memory; this is separate
+from the read-only capability status `externally_managed`. Choose **ram** for
+oMLX prefetch, and **unchanged** for pin/unpin/evict. oMLX rejects VRAM targets.
+Eviction retains the checkpoint source for future inference; pins and
+prefetch remain subject to cache capacity. Dry Run stays true by default.
+
+Existing node IDs, fields and workflow JSON remain compatible. This path is
+experimental and requires inference validation with the actual model/runtime;
+an advertised capability alone is not a successful generation test.
 
 **Prefill & Decode** performs both calls in one execution. Its single-use
 handoff exists only in a local variable and is never returned in item JSON,
@@ -353,3 +429,13 @@ the loader smoke. It has read-only repository permissions and no publishing.
 The Werk 1.6.0 release keeps these nodes in Beta with manual installation.
 The package remains private; the release does not publish it to npm or change
 the saved node, operation or parameter IDs.
+
+### Native reasoning effort
+
+**oMLX Reasoning Effort** in WERK Text → Chat Options offers `inherit`, `low`, `high`, and `max`.
+Inheritance preserves existing workflows. An explicit value sends
+`werk.omlx.reasoning_effort` for this request, independently of thinking and
+expert/N-gram cache budgets. It reuses loaded weights. GLM’s template honors
+reasoning effort while ignoring the thinking switch; `low` still allows reasoning.
+Update the Werk server to a version advertising `reasoning_effort` in
+`api.chat.omlx_options` before using this option.

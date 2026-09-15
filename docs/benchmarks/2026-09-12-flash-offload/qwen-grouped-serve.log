@@ -1,0 +1,6 @@
+oMLX expert cache: 8192 MiB (explicit) upper budget; SSD offload active, native memory guard may reduce residency
+oMLX native short-prefix cache active for /Users/philipbodenbach/.local/share/werk1112/models/pipenetwork-Qwen3.8-Flash-Next-MLX-mixed-4_8bit/files; worker lifetime, SSD limit 4GB
+Default model available: pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit
+Werk persistence enabled: prefill defaults mode=auto reuse=prefer ttl_seconds=none pin=false; automatic model/pipeline residency remains active on supported Werk-managed runtimes; oMLX native short-prefix caching requested for compatible models during the worker lifetime; local vLLM automatic prefix caching defaults to enabled unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM remains externally managed.
+Server running at http://127.0.0.1:57131
+API key auth enabled; use Authorization: Bearer <key> or X-API-Key: <key> (A1111 clients may use Basic werk:<key>)

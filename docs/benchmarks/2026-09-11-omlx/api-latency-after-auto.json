@@ -1,0 +1,162 @@
+{
+  "label": "after-auto",
+  "samples": [
+    {
+      "first_text_seconds": 13.735043666994898,
+      "total_seconds": 18.74834216698946,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 23,
+        "total_tokens": 39
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "warmup": true,
+      "index": 0
+    },
+    {
+      "first_text_seconds": 1.666230208997149,
+      "total_seconds": 2.7042242500028806,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 23,
+        "total_tokens": 39
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "warmup": true,
+      "index": 1
+    },
+    {
+      "first_text_seconds": 1.2642316659912467,
+      "total_seconds": 2.303291290998459,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 23,
+        "total_tokens": 39
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "warmup": false,
+      "index": 2
+    },
+    {
+      "first_text_seconds": 1.2657682499993825,
+      "total_seconds": 2.3018666669959202,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 23,
+        "total_tokens": 39
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "warmup": false,
+      "index": 3
+    },
+    {
+      "first_text_seconds": 1.279620375004015,
+      "total_seconds": 2.323018333001528,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 23,
+        "total_tokens": 39
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "warmup": false,
+      "index": 4
+    },
+    {
+      "first_text_seconds": 1.2927223750011763,
+      "total_seconds": 2.3282006249937695,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 23,
+        "total_tokens": 39
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "warmup": false,
+      "index": 5
+    },
+    {
+      "first_text_seconds": 1.2908292080101091,
+      "total_seconds": 2.331302250007866,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 23,
+        "total_tokens": 39
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 23,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "warmup": false,
+      "index": 6
+    }
+  ],
+  "settings": {
+    "temperature": 0,
+    "top_p": 0.95,
+    "seed": 42,
+    "thinking": false,
+    "warmups": 2,
+    "runs": 5,
+    "expert_cache_gib": 24
+  },
+  "backend_selection": "auto"
+}

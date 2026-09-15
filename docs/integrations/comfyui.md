@@ -56,6 +56,7 @@ expose the unauthenticated service to an untrusted network.
 Use the custom-node package when a workflow needs Werk-native behavior such as:
 
 - installed-model and available-task discovery;
+- text generation with optional oMLX thinking and expert-cache controls;
 - live parameter-schema discovery;
 - explicit backend, accelerator, precision and fallback routing;
 - synchronous image generation;
@@ -69,6 +70,14 @@ Use the custom-node package when a workflow needs Werk-native behavior such as:
 - typed persistence policies and dry-run-first runtime-state maintenance;
 - bounded expert-residency telemetry and explicit dry-run-first expert actions;
 - opaque prefill/decode handoffs that never use a `STRING` or JSON socket.
+
+The text path uses **WERK Text Models**, optional **WERK Text Config**, and
+**WERK Text Generate**. Text Config can enable oMLX expert offload with a MiB
+budget and enable or disable thinking per request. Inherited controls omit the
+extension; explicit controls require the server's `api.chat.omlx_options`
+capability. Connect Text Generate's `model_id` output to runtime expert nodes
+to ensure the model loads first. See the
+[text and expert-preview example](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/examples/werk_text_omlx_api.json).
 
 The vision path uses **WERK Vision Models**, **WERK Vision Config**, and
 **WERK Vision Analyze**. It is intended for inspecting rendered HTML, slides,
@@ -98,8 +107,14 @@ strings, representations, and error messages. Expert nodes are gated by
 `runtime.experts.residency`; they expose all six capability statuses without
 turning route presence into a support claim. The list permits read-only
 `externally_managed` telemetry, while control requires `supported` or an
-explicitly opted-in `experimental` capability. Current production adapters
-remain truthfully unsupported.
+explicitly opted-in `experimental` capability. The oMLX SSD expert cache is
+enabled per request in **WERK Text Config**, or by the server default
+`WERK_OMLX_EXPERT_CACHE_MB`; once Text Generate has loaded the worker and it
+confirms offload, expert nodes can use the experimental capability.
+For oMLX, `external` means checkpoint-backed outside the cache and `ram` means
+cached in Apple unified memory. Prefetch uses `ram`. Existing node fields and
+other adapters' capability checks remain compatible. See the custom-node guide
+for activation and memory-budget details.
 
 The ordinary image, video and audio nodes use Werk's media execution workers
 and their process-local model/pipeline LRUs. Vision Analyze uses the selected
@@ -107,8 +122,10 @@ text or multimodal backend's normal `/v1/chat/completions` path. Neither path
 creates named Prefill state. Only the explicit Prefill and Decode runtime nodes
 use the opaque state-handoff protocol. `werk serve --persistence` supplies
 defaults omitted by Prefill requests and, for a local Werk-started vLLM process,
-supplies the native APC default unless explicit vLLM arguments override it. APC
-still is vLLM-owned and never becomes a named Werk state.
+supplies the native APC default unless explicit vLLM arguments override it.
+For local oMLX 0.6.4, `auto`/`disk` mode with reuse enabled also enables verified
+short exact-prefix caching for the worker, including the normal Text node
+path. These backend-native caches never become named Werk state.
 
 The live `runtime.model_residency` capability describes loaded-weight or
 pipeline reuse only. Werk-owned in-process backends and resident Python workers

@@ -12,6 +12,8 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+if os.name == "posix":
+    import fcntl
 
 
 SOURCE_PATH = Path(__file__).with_name("omlx_supervisor.py")
@@ -81,7 +83,7 @@ class OmlxSupervisorTests(unittest.TestCase):
         child = self.start(launcher, "serve", "--model-dir", "model path")
         detail = json.loads(self.read_ready(child))
         self.assertEqual(detail["argv"], [str(launcher), "serve", "--model-dir", "model path"])
-        self.assertEqual(detail["path"], str(self.root))
+        self.assertEqual(detail["path"], str(self.root.resolve()))
         self.assertEqual(detail["name"], "__main__")
         self.assertEqual(detail["file"], str(launcher))
         self.assertEqual(detail["imported"], "selected launcher directory")
@@ -150,6 +152,67 @@ class OmlxSupervisorTests(unittest.TestCase):
                 patch.object(supervisor, "stop_owned_worker") as stop:
             supervisor.watch_parent(1234)
         stop.assert_called_once_with()
+
+    def test_lifetime_descriptor_is_retained_but_not_inherited_by_subprocesses(self):
+        with (self.root / "lifetime.lock").open("w+b") as lock:
+            os.set_inheritable(lock.fileno(), True)
+            with patch.dict(os.environ, {"WERK_OMLX_LIFETIME_FDS": str(lock.fileno())}):
+                self.assertEqual(supervisor.retain_lifetime_locks(), (lock.fileno(),))
+                self.assertNotIn("WERK_OMLX_LIFETIME_FDS", os.environ)
+            self.assertFalse(os.get_inheritable(lock.fileno()))
+            os.fstat(lock.fileno())  # The inherited descriptor remains open.
+
+    def test_lifetime_descriptor_rejects_invalid_or_stdio_values(self):
+        for raw in ("", "0", "-1", "3,3", "3,4,5", "not-a-descriptor"):
+            with self.subTest(raw=raw), patch.dict(os.environ, {"WERK_OMLX_LIFETIME_FDS": raw}):
+                with self.assertRaises(SystemExit):
+                    supervisor.retain_lifetime_locks()
+
+    def test_stopped_orphan_retains_lifetime_lock_until_it_actually_exits(self):
+        launcher = self.launcher(
+            "import time\nprint('ready', flush=True)\n"
+            "while True:\n    time.sleep(0.05)\n"
+        )
+        lock_path = self.root / "lifetime.lock"
+        lock_path.write_bytes(b"werk-omlx-worker-lifetime-v1\n")
+        parent_source = (
+            "import fcntl, os, pathlib, signal, subprocess, sys\n"
+            "lock = open(sys.argv[3], 'r+b')\n"
+            "fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "environment = dict(os.environ, WERK_OMLX_LIFETIME_FDS=str(lock.fileno()))\n"
+            "source = pathlib.Path(sys.argv[1]).read_text()\n"
+            "worker = subprocess.Popen([sys.executable, '-c', source, sys.argv[2], 'serve'], "
+            "stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, "
+            "pass_fds=(lock.fileno(),), env=environment, start_new_session=True)\n"
+            "assert worker.stdout.readline() == b'ready\\n'\n"
+            "os.kill(worker.pid, signal.SIGSTOP)\n"
+            "print(worker.pid, flush=True)\n"
+            "os._exit(0)\n"
+        )
+        parent = subprocess.run(
+            [sys.executable, "-c", parent_source, str(SOURCE_PATH), str(launcher), str(lock_path)],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        pid = int(parent.stdout.strip())
+        try:
+            with lock_path.open("r+b") as probe:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.kill(pid, signal.SIGCONT)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    try:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        time.sleep(0.02)
+                    else:
+                        return
+                self.fail("exited worker retained its lifetime lock")
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 if __name__ == "__main__":

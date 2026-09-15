@@ -5,9 +5,38 @@ ComfyUI and the n8n package at **1.6.0**. Server contracts are based on the
 actual Rust DTOs/tests and ComfyUI client in the repository. Werk Protocol
 remains **1.0**, and all n8n node versions remain **1**.
 
+## Node refresh validation (2026-09-12)
+
+The node refresh was validated on **macOS arm64**, Node.js **24.12.0**,
+package npm **11.19.1**, and a separate n8n **2.37.10** host installed with
+npm **11.6.2**. A clean locked package install, build, ESLint/strict TypeScript,
+**98 contract/unit/example tests**, and `npm pack --dry-run` passed.
+The actual n8n process loaded all eight nodes and the credential through both
+custom-directory mechanisms. Imported Image → Vision and Text → Text workflows
+passed against authenticated local fixtures. The latter validates real n8n
+conversation expressions, ordered history, exactly two generation POSTs and
+omitted sampling/expert-cache overrides. These are API integration tests, not
+an inference-speed or output-quality benchmark.
+
+The complete ComfyUI suite passed **227 tests** with Python **3.11**, pytest
+**9.1.1**, PyTorch **2.14.0**, NumPy **2.4.6**, Pillow **12.3.0** and PyAV
+**18.1.0** in an isolated environment. This includes text-history round trips,
+sampling inheritance, prior manual settings, and existing media/runtime tests;
+the ComfyUI graphical host itself was not launched.
+
+The failing hosted workflow had scanned only `nodes.py` and `runtime_nodes.py`,
+missing the three registrations moved into `text_nodes.py`. The parity check
+now discovers all mapping providers from ComfyUI's `__init__.py`, and workflow
+path filters cover the full ComfyUI directory. This fixes the reproduced local
+failure; no push or hosted rerun was performed by this validation.
+
+The refresh adds item-scoped history, server-default/manual expert-cache labels,
+optional inherited ComfyUI sampling, and a 600-second default HTTP timeout for
+all n8n nodes. Existing stored timeouts and manual budgets remain valid.
+
 ## Environment and commands
 
-Validation uses **Linux x86_64 under WSL2**, **Node.js 24.12.0**,
+The original integration validation used **Linux x86_64 under WSL2**, **Node.js 24.12.0**,
 **npm 11.19.1**, **n8n 2.37.10**, and host peer **n8n-workflow 2.37.4**.
 The development dependency versions and transitive package graph are recorded
 in `package-lock.json`. The n8n host is installed separately and pinned for
@@ -74,8 +103,8 @@ action was triggered as part of the local implementation.
   server bounds, dry-run defaults, explicit prune/expert selectors, policy
   omission, experimental prefill probe, capability recheck and private
   single-use handoff handling.
-- **Examples/parity:** every public ComfyUI registration has exactly one table
-  row (30); eight workflow files contain no credentials and use real node
+- **Examples/parity:** every current public ComfyUI registration has exactly one
+  table row (33, including the three Text nodes); eight workflow files contain no credentials and use real node
   versions, parameter IDs and graph references.
 - **Existing ComfyUI regression:** the earlier integration validation
   recorded 190 passing tests. Repository-wide release checks are separate
@@ -109,7 +138,7 @@ production database, user credential or installed model is used.
 
 These are contract, loader and workflow/binary-transfer tests, **not real
 model inference**. No GPU, actual media backend, GGUF prefill/decode,
-production MoE expert management, macOS/Windows n8n process, n8n container,
+production MoE expert management, Windows n8n process, n8n container,
 queue worker or external binary-storage service was exercised. External
 binary references are simulated in unit tests; real filesystem storage is
 exercised by n8n itself.

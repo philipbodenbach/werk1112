@@ -1,0 +1,59 @@
+[werk chat] persistence enabled: 0 saved messages
+[werk chat] conversation: /Users/philipbodenbach/.local/share/werk1112/chat-sessions/3a2e4d18693cc6823330b226bb3e6fe4523619b228c91b779629ecacc2ba0cad.json
+oMLX expert cache: 27662 MiB (auto) upper budget; SSD offload active, native memory guard may reduce residency
+[werk chat] native KV cache enabled; reuse depends on the prompt and backend
+Chatting with mlx-community/DeepSeek-V4-Flash-2bit-DQ. Type /exit or /quit to stop.
+you> assistant> Hey, gerne! Hier ist ein informativer Satz über die Programmiersprache Rust:
+
+**Rust ist eine systemnahe Programmiersprache, die sich durch Speichersicherheit, Nebenläufigkeit und eine starke Typisierung auszeichnet – sie wurde entwickelt, um zuverlässige
+note: response reached --max-tokens (64) and may be incomplete; rerun with a larger --max-tokens value for more.
+
+backend:              oMLX
+total duration:       26.751296s
+load duration:        0us
+prompt total count:   22 token(s)
+prompt cached count:  0 token(s)
+prompt eval count:    22 token(s)
+prompt eval duration: 10.59s
+prompt eval rate:     2.08 tokens/s
+eval count:           64 token(s)
+eval duration:        16.15s
+first token:          10.59s
+eval rate:            3.96 tokens/s
+finish reason:        length
+
+backend stats:
+  history messages: 1
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 0
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64,"seed":42,"temperature":0.0,"top_p":0.95}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":21635760,"allocator_clears":0,"budget_reductions":0,"cache_budget_bytes":29006093220,"cache_budget_mode":"auto","cache_evictions":651,"cache_hits":14694,"cache_misses":4114,"disk_bytes_read":34459353088,"disk_read_seconds":12.738788,"effective_cache_budget_bytes":29006093220,"execution":"grouped","forward_calls":2838,"forward_seconds":25.694157,"materialize_seconds":1.772217,"output_evaluations":3071,"prefill_cache_growth_bytes":17066098688,"prefill_samples_corrected":1,"resident_cache_bytes":28998369280,"routing_seconds":3.976818,"tensor_materializations":4114}
+you> assistant> Zuverlässige und effiziente Software zu schreiben, ohne Kompromisse bei der Kontrolle über Hardware-Ressourcen einzugehen.
+
+backend:              oMLX
+total duration:       9.53795s
+load duration:        0us
+prompt total count:   108 token(s)
+prompt cached count:  86 token(s)
+prompt eval count:    22 token(s)
+prompt eval duration: 4.35s
+prompt eval rate:     5.06 tokens/s
+eval count:           31 token(s)
+eval duration:        5.18s
+first token:          4.35s
+eval rate:            5.98 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 3
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 86
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64,"seed":42,"temperature":0.0,"top_p":0.95}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":17448852,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":29006093220,"cache_budget_mode":"auto","cache_evictions":1428,"cache_hits":9034,"cache_misses":1427,"disk_bytes_read":11950620672,"disk_read_seconds":4.556133,"effective_cache_budget_bytes":29006093220,"execution":"grouped","forward_calls":1462,"forward_seconds":8.941936,"materialize_seconds":0.658993,"output_evaluations":1679,"prefill_cache_growth_bytes":1048576,"prefill_samples_corrected":1,"resident_cache_bytes":28998369280,"routing_seconds":1.565683,"tensor_materializations":1427}
+you> 

@@ -1,5 +1,96 @@
 use super::*;
 
+#[test]
+fn expert_cache_defaults_to_auto_with_explicit_small_and_large_overrides() {
+    assert_eq!(expert_cache_bytes(None).unwrap(), Some(0));
+    assert_eq!(expert_cache_bytes(Some("auto".into())).unwrap(), Some(0));
+    assert_eq!(
+        expert_cache_bytes(Some("4194304".into())).unwrap(),
+        Some(4 * 1024_u64.pow(4))
+    );
+    assert_eq!(expert_cache_bytes(Some("0".into())).unwrap(), None);
+    assert_eq!(
+        expert_cache_bytes(Some("8192".into())).unwrap(),
+        Some(8 * 1024 * 1024 * 1024)
+    );
+    for value in ["", "-1", "1.5", "unlimited", "18446744073709551615"] {
+        assert!(expert_cache_bytes(Some(value.into())).is_err());
+    }
+}
+
+#[test]
+fn thinking_override_preserves_defaults_and_rejects_invalid_values() {
+    assert_eq!(thinking_enabled(None).unwrap(), None);
+    assert_eq!(thinking_enabled(Some("0".into())).unwrap(), Some(false));
+    assert_eq!(thinking_enabled(Some("1".into())).unwrap(), Some(true));
+    for value in ["", "true", "false", "2", "-1", " 0", "1 "] {
+        let error = thinking_enabled(Some(value.into())).unwrap_err();
+        assert!(error.to_string().contains("WERK_OMLX_THINKING"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        assert!(thinking_enabled(Some(OsString::from_vec(vec![0xff]))).is_err());
+    }
+}
+
+#[test]
+fn expert_execution_mode_is_explicit_and_part_of_cache_identity() {
+    assert_eq!(expert_execution(None).unwrap(), "grouped");
+    assert_eq!(expert_execution(Some("serial".into())).unwrap(), "serial");
+    for invalid in ["", "auto", "SERIAL", "grouped "] {
+        assert!(expert_execution(Some(invalid.into())).is_err());
+    }
+    let fixture = Fixture::new(json!({}));
+    let base = fixture_backend(&fixture);
+    let mut other = base.clone();
+    other.invocation.as_mut().unwrap().expert_execution =
+        if base.invocation().unwrap().expert_execution == "grouped" {
+            "serial"
+        } else {
+            "grouped"
+        };
+    assert_ne!(base.cache_identity(), other.cache_identity());
+}
+
+#[test]
+fn expert_diagnostics_are_allowlisted_worker_intervals_and_reject_resets() {
+    let before =
+        json!({"cache_hits":10,"cache_misses":3,"disk_bytes_read":500,"disk_read_seconds":1.0});
+    let after = json!({"cache_hits":14,"cache_misses":5,"disk_bytes_read":700,"disk_read_seconds":1.125,
+        "resident_cache_bytes":100,"execution":"grouped","api_key":"never print this"});
+    let line = expert_interval_diagnostics(&before, &after).unwrap();
+    assert!(line.contains("worker interval"));
+    assert!(line.contains("\"cache_hits\":4"));
+    assert!(line.contains("\"disk_bytes_read\":200"));
+    assert!(line.contains("\"disk_read_seconds\":0.125"));
+    assert!(line.contains("\"resident_cache_bytes\":100"));
+    assert!(!line.contains("api_key") && !line.contains("never print this"));
+    assert!(expert_interval_diagnostics(&after, &before).is_none());
+    assert!(expert_interval_diagnostics(&json!({}), &after).is_none());
+}
+
+#[test]
+fn thinking_override_changes_only_explicit_omlx_template_kwargs() {
+    let request = request();
+    for stream in [false, true] {
+        let baseline = chat_completion_body("model", &request, stream);
+        assert_eq!(
+            omlx_chat_completion_body("model", &request, stream, None, None),
+            baseline
+        );
+        for thinking in [false, true] {
+            let mut body =
+                omlx_chat_completion_body("model", &request, stream, Some(thinking), None);
+            assert_eq!(
+                body.as_object_mut().unwrap().remove("chat_template_kwargs"),
+                Some(json!({"enable_thinking": thinking}))
+            );
+            assert_eq!(body, baseline);
+        }
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     store: ModelStore,
@@ -41,6 +132,7 @@ impl Fixture {
                 tools: true,
                 tool_calling_detail: None,
                 runtime: json!({}),
+                cache_paths: vec![],
             },
         )
     }
@@ -55,8 +147,10 @@ const MOCK_SERVER: &str = r#"
 import argparse, json, os, sys, time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
-p=argparse.ArgumentParser(); p.add_argument('serve'); p.add_argument('--model-dir'); p.add_argument('--base-path'); p.add_argument('--host'); p.add_argument('--port', type=int); p.add_argument('--api-key'); a=p.parse_args()
+p=argparse.ArgumentParser(); p.add_argument('serve'); p.add_argument('--model-dir'); p.add_argument('--base-path'); p.add_argument('--host'); p.add_argument('--port', type=int); p.add_argument('--api-key'); p.add_argument('--paged-ssd-cache-dir'); p.add_argument('--paged-ssd-cache-max-size'); a=p.parse_args()
 root=Path(a.model_dir); settings=json.loads((root/'fixture.json').read_text()); loaded=False
+with (root/'starts.jsonl').open('a') as log:
+    log.write(json.dumps({'base':a.base_path,'cache':a.paged_ssd_cache_dir,'limit':a.paged_ssd_cache_max_size,'env_cache':os.environ.get('WERK_OMLX_PERSISTENCE_DIR'),'env_model':os.environ.get('WERK_OMLX_PERSISTENCE_MODEL_DIR')})+'\n')
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
     def reply(self,value,status=200):
@@ -67,6 +161,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply({'status':'healthy'})
         if self.headers.get('Authorization') != 'Bearer '+a.api_key: return self.reply({'error':'unauthorized'},401)
         if self.path=='/api/status': return self.reply({'version':settings.get('version','test-0.6.4')})
+        if self.path=='/werk/persistence/status': return self.reply({'installed':True,'active':settings.get('cache_active',True),'format':'omlx-exact-prefix-v1','model_id':'physical / model'})
+        if self.path=='/werk/experts/status':
+            budget=int(os.environ.get('WERK_OMLX_EXPERT_CACHE_BYTES','0'))
+            return self.reply({'active':True,'cache_budget_bytes':budget or 8*1024**3,'cache_budget_mode':'explicit' if budget else 'auto'})
         if self.path=='/v1/models/status':
             entries=[{'id':'virtual-doc','model_type':'llm','model_path':'builtin://markitdown','loaded':True}, {'id':'physical / model','model_type':'llm','model_path':str(root),'loaded':loaded}]
             if settings.get('duplicate'): entries.append(dict(entries[-1],id='duplicate'))
@@ -157,6 +255,8 @@ fn failed_load_preserves_http_cause_and_cleans_worker_directory() {
     assert_eq!(
         fs::read_dir(fixture.root.join("backends/omlx/workers"))
             .unwrap()
+            // Stable lifetime lock inodes survive disposable worker bases.
+            .filter(|entry| entry.as_ref().unwrap().file_name() != ".locks")
             .count(),
         0
     );
@@ -332,6 +432,172 @@ fn captured_environment_identity_is_opaque_and_command_uses_snapshot() {
     assert!(invocation.python.is_absolute());
 }
 
+#[tokio::test]
+async fn thinking_override_is_captured_by_worker_and_changes_cache_identity() {
+    tokio::task::spawn_blocking(|| {
+        let mut fixture = Fixture::new(json!({}));
+        fixture.invocation.thinking = None;
+        let default_identity = format!("{:?}", fixture.invocation);
+        let mut previous_identity = default_identity.clone();
+        for thinking in [false, true] {
+            fixture.invocation.thinking = Some(thinking);
+            let identity = format!("{:?}", fixture.invocation);
+            assert_ne!(identity, default_identity);
+            assert_ne!(identity, previous_identity);
+            previous_identity = identity;
+            let server = fixture.start().unwrap();
+            // A worker keeps the selected setting even if later selection changes.
+            fixture.invocation.thinking = Some(!thinking);
+            for stream in [false, true] {
+                let (tx, _rx) = mpsc::channel(8);
+                server.generate(&request(), stream.then_some(tx)).unwrap();
+                let sent: Value =
+                    serde_json::from_slice(&fs::read(fixture.model.join("request.json")).unwrap())
+                        .unwrap();
+                assert_eq!(sent["stream"], stream);
+                assert_eq!(
+                    sent["chat_template_kwargs"],
+                    json!({"enable_thinking": thinking})
+                );
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn omlx_usage_timings_include_reasoning_and_override_visible_token_delay() {
+    let mut completion = OpenAiCompletion::default();
+    let mut timings = OmlxUsageTimings::default();
+    update_omlx_completion_from_event(
+        &mut completion,
+        &mut timings,
+        &json!({"choices": [{"delta": {"reasoning_content": "hidden"}}]}),
+        Some(2.0),
+    );
+    assert_eq!(completion.first_token_seconds, 2.0);
+    assert!(completion.text.is_empty());
+    update_omlx_completion_from_event(
+        &mut completion,
+        &mut timings,
+        &json!({"choices": [], "usage": {
+            "prompt_tokens": 267, "completion_tokens": 173,
+            "time_to_first_token": 1.9, "prompt_eval_duration": 1.8,
+            "generation_duration": 148.1, "total_time": 150.0
+        }}),
+        Some(150.2),
+    );
+    assert!(
+        finalize_omlx_completion_stats(&mut completion, &request(), 150.266, &timings).is_empty()
+    );
+    assert_eq!(completion.first_token_seconds, 1.9);
+    assert_eq!(completion.prompt_seconds, 1.8);
+    assert_eq!(completion.decode_seconds, 148.1);
+    assert_eq!(completion.completion_tokens, 173);
+}
+
+#[test]
+fn omlx_missing_phase_timings_use_reasoning_arrival_or_total_duration() {
+    let mut completion = OpenAiCompletion::default();
+    let mut timings = OmlxUsageTimings::default();
+    update_omlx_completion_from_event(
+        &mut completion,
+        &mut timings,
+        &json!({"choices": [{"delta": {"reasoning_content": "hidden"}}]}),
+        Some(2.0),
+    );
+    finalize_omlx_completion_stats(&mut completion, &request(), 150.0, &timings);
+    assert_eq!(completion.prompt_seconds, 2.0);
+    assert_eq!(completion.decode_seconds, 148.0);
+
+    let mut completion = OpenAiCompletion::default();
+    update_omlx_completion_from_event(
+        &mut completion,
+        &mut timings,
+        &json!({"usage": {"completion_tokens": 173, "total_time": 150.0}}),
+        None,
+    );
+    let diagnostics =
+        finalize_omlx_completion_stats(&mut completion, &request(), 150.266, &timings);
+    assert_eq!(completion.first_token_seconds, 0.0);
+    assert!(completion.prompt_seconds.is_nan());
+    assert_eq!(completion.decode_seconds, 150.0);
+    assert!(diagnostics[0].contains("includes prompt processing"));
+
+    let mut completion = OpenAiCompletion::default();
+    finalize_omlx_completion_stats(
+        &mut completion,
+        &request(),
+        10.0,
+        &OmlxUsageTimings::default(),
+    );
+    assert_eq!(completion.decode_seconds, 10.0);
+    assert_eq!(completion.first_token_seconds, 0.0);
+}
+
+#[test]
+fn omlx_usage_timings_ignore_malformed_fields_without_losing_valid_values() {
+    let mut completion = OpenAiCompletion::default();
+    let mut timings = OmlxUsageTimings::default();
+    update_omlx_completion_from_event(
+        &mut completion,
+        &mut timings,
+        &json!({"usage": {"time_to_first_token": 0.0, "generation_duration": 2.0}}),
+        None,
+    );
+    update_omlx_completion_from_event(
+        &mut completion,
+        &mut timings,
+        &json!({"usage": {
+            "time_to_first_token": "NaN", "generation_duration": -1,
+            "prompt_eval_duration": null, "total_time": false
+        }}),
+        None,
+    );
+    finalize_omlx_completion_stats(&mut completion, &request(), 3.0, &timings);
+    assert_eq!(completion.first_token_seconds, 0.0);
+    assert_eq!(completion.prompt_seconds, 0.0);
+    assert_eq!(completion.decode_seconds, 2.0);
+}
+
+#[test]
+fn native_cache_diagnostics_report_only_upstream_cached_token_counts() {
+    let mut completion = OpenAiCompletion::default();
+    let mut metadata = OmlxUsageTimings::default();
+    for tokens in [0, 127] {
+        update_omlx_completion_from_event(
+            &mut completion,
+            &mut metadata,
+            &json!({"usage":{"prompt_tokens":128,"generation_duration":1.0,"prompt_tokens_details":{"cached_tokens":tokens}}}),
+            None,
+        );
+        let diagnostics =
+            finalize_omlx_completion_stats(&mut completion, &request(), 2.0, &metadata);
+        assert_eq!(
+            diagnostics,
+            vec![format!("oMLX cached prompt tokens: {tokens}")]
+        );
+    }
+    update_omlx_completion_from_event(
+        &mut completion,
+        &mut metadata,
+        &json!({"usage":{"prompt_tokens_details":{"cached_tokens":-1}}}),
+        None,
+    );
+    assert_eq!(metadata.cached_prompt_tokens, Some(127));
+    assert!(
+        finalize_omlx_completion_stats(
+            &mut completion,
+            &request(),
+            2.0,
+            &OmlxUsageTimings::default()
+        )
+        .iter()
+        .all(|line| !line.contains("cached prompt tokens"))
+    );
+}
+
 fn fixture_manifest() -> ModelManifest {
     ModelManifest {
         id: "owner/model".into(),
@@ -356,14 +622,784 @@ fn fixture_backend(fixture: &Fixture) -> OmlxBackend {
         store: fixture.store.clone(),
         invocation: Ok(fixture.invocation.clone()),
         servers: Arc::new(Mutex::new(HashMap::new())),
+        model_probes: Arc::new(Mutex::new(VecDeque::new())),
+        request_thinking: None,
+        request_reasoning_effort: None,
         test_probe: Some(ProbeReport {
             detail: "fixture".into(),
             version: "test-0.6.4".into(),
             tools: true,
             tool_calling_detail: None,
             runtime: json!({"fixture":true}),
+            cache_paths: vec![],
         }),
     }
+}
+
+#[cfg(unix)]
+fn counting_probe_backend(fixture: &Fixture, dependency_inventory: bool) -> OmlxBackend {
+    use std::os::unix::fs::PermissionsExt;
+    let mut backend = fixture_backend(fixture);
+    backend.test_probe = None;
+    let runtime_dir = fixture.root.join("probe-runtime");
+    fs::create_dir(&runtime_dir).unwrap();
+    fs::write(runtime_dir.join("runtime.py"), "runtime = 1\n").unwrap();
+    let interpreter = fixture.root.join("counting-probe-python");
+    let source = format!(
+        "#!{}\n{}",
+        fixture.invocation.python.display(),
+        r#"import json, pathlib, sys
+root = pathlib.Path(__file__).parent
+counter = root / 'probe-count.txt'
+counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))
+payload = json.load(sys.stdin)
+config = json.loads((pathlib.Path(payload['model_dir']) / 'config.json').read_text())
+result = {'ok': not config.get('reject_probe', False), 'detail': 'counted probe',
+          'runtime': {'omlx_version': '0.6.4'}, 'supports_tool_calling': True}
+if INVENTORY:
+    result['cache_paths'] = [str(root / 'probe-runtime'),
+                             str(root / 'probe-runtime' / 'runtime.py'), __file__]
+print(json.dumps(result))
+sys.exit(0 if result['ok'] else 1)
+"#
+        .replace(
+            "INVENTORY",
+            if dependency_inventory {
+                "True"
+            } else {
+                "False"
+            }
+        )
+    );
+    fs::write(&interpreter, source).unwrap();
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+    backend.invocation.as_mut().unwrap().python = interpreter;
+    backend
+}
+
+#[cfg(unix)]
+fn probe_count(fixture: &Fixture) -> usize {
+    fs::read_to_string(fixture.root.join("probe-count.txt"))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_json_larger_than_stderr_limit_preserves_dependency_inventory() {
+    let fixture = Fixture::new(json!({}));
+    let backend = counting_probe_backend(&fixture, true);
+    let interpreter = &backend.invocation().unwrap().python;
+    let source = fs::read_to_string(interpreter).unwrap().replace(
+        "print(json.dumps(result))",
+        "result['cache_paths'] *= 1000\nprint('diagnostic' * 10000, file=sys.stderr)\nprint(json.dumps(result))",
+    );
+    fs::write(interpreter, source).unwrap();
+    let manifest = fixture_model_for_backend(&fixture);
+    let directory = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let report = backend
+        .invocation()
+        .unwrap()
+        .probe(Some(&directory))
+        .unwrap();
+    assert_eq!(report.cache_paths.len(), 3000);
+    assert!(serde_json::to_vec(&report.cache_paths).unwrap().len() > MAX_PROBE_STDERR_BYTES);
+    assert_eq!(report.version, "0.6.4");
+    assert!(report.tools);
+    let payload = vec![b'x'; MAX_PROBE_STDERR_BYTES + 123];
+    assert_eq!(
+        read_bounded(payload.as_slice(), MAX_PROBE_STDERR_BYTES).len(),
+        MAX_PROBE_STDERR_BYTES
+    );
+    assert_eq!(
+        read_bounded(payload.as_slice(), MAX_PROBE_JSON_BYTES),
+        payload
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn stable_model_probes_reuse_verified_runtime_for_chat_and_tools() {
+    let fixture = Fixture::new(json!({}));
+    let backend = counting_probe_backend(&fixture, true);
+    let manifest = fixture_model_for_backend(&fixture);
+    backend.probe_model(&manifest).unwrap();
+    backend.probe_model(&manifest).unwrap();
+    assert!(backend.probe_tool_calling(&manifest).unwrap());
+    backend
+        .configured_for_chat(&chat_options(Some(false), None))
+        .unwrap()
+        .probe_model(&manifest)
+        .unwrap();
+    assert_eq!(probe_count(&fixture), 1);
+    assert_eq!(backend.model_probes.lock().unwrap().len(), 1);
+    assert!(backend.servers.lock().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_cache_invalidates_metadata_shards_runtime_and_invocation_changes() {
+    let fixture = Fixture::new(json!({}));
+    let backend = counting_probe_backend(&fixture, true);
+    let manifest = fixture_model_for_backend(&fixture);
+    let directory = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let mut expected = 0;
+    let mut assert_new_probe = |backend: &OmlxBackend, manifest: &ModelManifest| {
+        backend.probe_model(manifest).unwrap();
+        expected += 1;
+        assert_eq!(probe_count(&fixture), expected);
+        backend.probe_model(manifest).unwrap();
+        assert_eq!(probe_count(&fixture), expected);
+    };
+    assert_new_probe(&backend, &manifest);
+    fs::write(directory.join("config.json"), r#"{"changed":true}"#).unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::write(directory.join("tokenizer_config.json"), "{}").unwrap();
+    assert_new_probe(&backend, &manifest);
+    let template = directory.join("chat_template.jinja");
+    fs::write(&template, "first tool format").unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::write(&template, "changed tool format").unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::remove_file(&template).unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::create_dir(directory.join("chat_templates")).unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::remove_dir(directory.join("chat_templates")).unwrap();
+    assert_new_probe(&backend, &manifest);
+    let shard = directory.join("model.safetensors");
+    fs::write(&shard, "first fixture header").unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::write(&shard, "replacement fixture header").unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::remove_file(shard).unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::write(
+        fixture.root.join("probe-runtime/runtime.py"),
+        "runtime = 22\n",
+    )
+    .unwrap();
+    assert_new_probe(&backend, &manifest);
+    fs::write(
+        fixture.root.join("probe-runtime/new_module.py"),
+        "new_module = True\n",
+    )
+    .unwrap();
+    assert_new_probe(&backend, &manifest);
+    let mut changed_manifest = manifest.clone();
+    changed_manifest.created_unix += 1;
+    assert_new_probe(&backend, &changed_manifest);
+    let configured = backend
+        .configured_for_chat(&chat_options(None, Some(7)))
+        .unwrap();
+    assert_new_probe(&configured, &manifest);
+    let mut changed_environment = backend.clone();
+    changed_environment
+        .invocation
+        .as_mut()
+        .unwrap()
+        .environment
+        .push(("WERK_TEST_PROBE_RUNTIME".into(), "different".into()));
+    assert_new_probe(&changed_environment, &manifest);
+    fs::write(&fixture.invocation.launcher, "changed launcher").unwrap();
+    assert!(
+        backend
+            .probe_model(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("launcher changed")
+    );
+    assert_eq!(probe_count(&fixture), expected);
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_failures_and_missing_dependency_inventory_are_not_cached() {
+    for inventory in [false, true] {
+        let fixture = Fixture::new(json!({}));
+        let backend = counting_probe_backend(&fixture, inventory);
+        let manifest = fixture_model_for_backend(&fixture);
+        let directory = resolve_model_dir(&fixture.store, &manifest).unwrap();
+        if inventory {
+            fs::write(directory.join("config.json"), r#"{"reject_probe":true}"#).unwrap();
+        }
+        for _ in 0..2 {
+            assert_eq!(backend.probe_model(&manifest).is_ok(), !inventory);
+        }
+        assert_eq!(probe_count(&fixture), 2);
+        assert!(backend.model_probes.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn successful_probe_cache_has_a_bounded_lru() {
+    let fixture = Fixture::new(json!({}));
+    let backend = counting_probe_backend(&fixture, true);
+    let manifest = fixture_model_for_backend(&fixture);
+    for revision in 0..=MAX_CACHED_MODEL_PROBES {
+        let mut revision_manifest = manifest.clone();
+        revision_manifest.created_unix = revision as u64;
+        backend.probe_model(&revision_manifest).unwrap();
+    }
+    assert_eq!(
+        backend.model_probes.lock().unwrap().len(),
+        MAX_CACHED_MODEL_PROBES
+    );
+    assert_eq!(probe_count(&fixture), MAX_CACHED_MODEL_PROBES + 1);
+    backend.probe_model(&manifest).unwrap();
+    assert_eq!(probe_count(&fixture), MAX_CACHED_MODEL_PROBES + 2);
+}
+
+fn chat_options(
+    thinking: Option<bool>,
+    expert_cache_mb: Option<u64>,
+) -> crate::openai::ChatRuntimeOptions {
+    crate::openai::ChatRuntimeOptions {
+        omlx: Some(crate::openai::OmlxChatOptions {
+            reasoning_effort: None,
+            thinking,
+            expert_cache_mb,
+            ngram_cache_mb: None,
+        }),
+    }
+}
+
+fn fixture_model_for_backend(fixture: &Fixture) -> ModelManifest {
+    let manifest = fixture_manifest();
+    let actual = fixture.store.model_dir(&manifest.id).join("files");
+    if actual != fixture.model {
+        fs::create_dir_all(actual.parent().unwrap()).unwrap();
+        fs::rename(&fixture.model, &actual).unwrap();
+    }
+    manifest
+}
+
+// Exercise Rust's real HTTP/worker/configuration paths without importing MLX.
+// The embedded supervisor/helper is covered separately by its Python tests.
+#[cfg(unix)]
+fn server_cache_fixture(settings: Value) -> (Fixture, OmlxBackend, ModelManifest) {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(settings);
+    let mut backend = fixture_backend(&fixture).with_server_prefix_cache(true);
+    backend.test_probe.as_mut().unwrap().version = "0.6.4".into();
+    let interpreter = fixture.root.join("fixture-worker-python");
+    fs::write(&interpreter, format!(
+        "#!{}\nimport runpy, sys\nassert sys.argv[1] == '-c'\nsys.argv = sys.argv[4:]\nrunpy.run_path(sys.argv[0], run_name='__main__')\n",
+        fixture.invocation.python.display()
+    )).unwrap();
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+    let invocation = backend.invocation.as_mut().unwrap();
+    invocation.python = interpreter;
+    invocation.thinking = None;
+    invocation.expert_cache_bytes = None;
+    let manifest = fixture_model_for_backend(&fixture);
+    (fixture, backend, manifest)
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn server_prefix_cache_covers_prepare_sessions_stream_tools_and_request_options() {
+    use tokio_stream::StreamExt;
+    let (fixture, backend, manifest) = server_cache_fixture(json!({"version":"0.6.4"}));
+    backend.prepare(&manifest).unwrap();
+    let session = backend
+        .start_chat_session(&manifest, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.generate(request()).unwrap().text, "answer");
+    assert_eq!(
+        backend.generate(&manifest, request()).unwrap().text,
+        "answer"
+    );
+    let mut req = request();
+    req.tool_config = Some(super::super::ToolCallingConfig {
+        tools: Some(serde_json::from_value(json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}])).unwrap()),
+        tool_choice: None,
+        parallel_tool_calls: None,
+    });
+    let configured = backend
+        .with_chat_options(&manifest, &chat_options(Some(false), None))
+        .unwrap();
+    let mut stream = configured.generate_stream(manifest.clone(), req);
+    let mut done = false;
+    while let Some(event) = stream.next().await {
+        done |= matches!(event.unwrap(), GenerateStreamEvent::Done { .. });
+    }
+    assert!(done);
+    let model = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let starts = fs::read_to_string(model.join("starts.jsonl")).unwrap();
+    assert_eq!(
+        starts.lines().count(),
+        1,
+        "all paths must retain the eagerly loaded worker"
+    );
+    let start: Value = serde_json::from_str(starts.trim()).unwrap();
+    assert_eq!(start["cache"], start["env_cache"]);
+    assert_eq!(start["env_model"], model.to_str().unwrap());
+    assert_eq!(start["limit"], "4GB");
+    assert_eq!(
+        Path::new(start["cache"].as_str().unwrap()),
+        Path::new(start["base"].as_str().unwrap()).join("cache/prefix-cache")
+    );
+    let sent: Value =
+        serde_json::from_slice(&fs::read(model.join("request.json")).unwrap()).unwrap();
+    assert_eq!(sent["chat_template_kwargs"]["enable_thinking"], false);
+    assert_eq!(sent["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(backend.servers.lock().unwrap().len(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn server_prefix_cache_expert_variants_have_independent_managed_cache_directories() {
+    let (fixture, backend, manifest) = server_cache_fixture(json!({"version":"0.6.4"}));
+    backend.prepare(&manifest).unwrap();
+    let configured = backend
+        .with_chat_options(&manifest, &chat_options(None, Some(8)))
+        .unwrap();
+    configured.generate(&manifest, request()).unwrap();
+    backend.generate(&manifest, request()).unwrap();
+    let starts = fs::read_to_string(
+        resolve_model_dir(&fixture.store, &manifest)
+            .unwrap()
+            .join("starts.jsonl"),
+    )
+    .unwrap();
+    let starts: Vec<Value> = starts
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert_ne!(starts[0]["cache"], starts[1]["cache"]);
+    assert!(starts.iter().all(|start| start["limit"] == "4GB"));
+    assert_eq!(backend.servers.lock().unwrap().len(), 2);
+}
+
+#[test]
+#[cfg(unix)]
+fn server_prefix_cache_unavailable_or_disabled_keeps_one_ordinary_worker() {
+    for (version, enabled, active, expected_cache) in [
+        ("0.6.4", false, true, false),
+        ("0.6.5", true, true, false),
+        ("0.6.4", true, false, true),
+    ] {
+        let (fixture, mut backend, manifest) =
+            server_cache_fixture(json!({"version":version,"cache_active":active}));
+        backend = backend.with_server_prefix_cache(enabled);
+        backend.test_probe.as_mut().unwrap().version = version.into();
+        backend.prepare(&manifest).unwrap();
+        assert_eq!(
+            backend.generate(&manifest, request()).unwrap().text,
+            "answer"
+        );
+        let starts = fs::read_to_string(
+            resolve_model_dir(&fixture.store, &manifest)
+                .unwrap()
+                .join("starts.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(starts.lines().count(), 1);
+        let start: Value = serde_json::from_str(starts.trim()).unwrap();
+        assert_eq!(start["cache"].is_string(), expected_cache);
+        assert_eq!(backend.servers.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn ngram_budget_is_independent_and_changes_worker_and_persistence_identity() {
+    assert_eq!(ngram_cache_bytes(None).unwrap(), None);
+    assert_eq!(ngram_cache_bytes(Some("auto".into())).unwrap(), None);
+    assert_eq!(ngram_cache_bytes(Some("0".into())).unwrap(), Some(0));
+    assert_eq!(
+        ngram_cache_bytes(Some("1".into())).unwrap(),
+        Some(1024 * 1024)
+    );
+    for value in ["-1", "1.5", "", "true", "18446744073709551615"] {
+        assert!(ngram_cache_bytes(Some(value.into())).is_err());
+    }
+    let fixture = Fixture::new(json!({}));
+    let base = fixture_backend(&fixture);
+    let identity = base.cache_identity();
+    for budget in [0, 1024, 1_048_576] {
+        let mut options = chat_options(None, None);
+        options.omlx.as_mut().unwrap().ngram_cache_mb = Some(budget.into());
+        let configured = base.configured_for_chat(&options).unwrap();
+        assert_eq!(
+            configured.invocation().unwrap().ngram_cache_bytes,
+            Some(budget * 1024 * 1024)
+        );
+        assert_eq!(
+            configured.invocation().unwrap().expert_cache_bytes,
+            base.invocation().unwrap().expert_cache_bytes
+        );
+        assert_ne!(configured.cache_identity(), identity);
+    }
+    assert_eq!(base.cache_identity(), identity);
+}
+
+#[test]
+fn ngram_auto_request_overrides_fixed_server_budget_without_mutating_it() {
+    let fixture = Fixture::new(json!({}));
+    let mut base = fixture_backend(&fixture);
+    base.invocation.as_mut().unwrap().ngram_cache_bytes = Some(1024 * 1024 * 1024);
+    let options: crate::openai::ChatRuntimeOptions =
+        serde_json::from_value(json!({"omlx":{"ngram_cache_mb":"auto"}})).unwrap();
+    let configured = base.configured_for_chat(&options).unwrap();
+    assert_eq!(configured.invocation().unwrap().ngram_cache_bytes, None);
+    assert_eq!(
+        base.invocation().unwrap().ngram_cache_bytes,
+        Some(1024 * 1024 * 1024)
+    );
+    assert_ne!(configured.cache_identity(), base.cache_identity());
+    assert_eq!(
+        serde_json::to_value(options).unwrap()["omlx"]["ngram_cache_mb"],
+        "auto"
+    );
+}
+
+#[test]
+fn chat_options_inherit_defaults_without_mutation_and_bound_expert_budget() {
+    let fixture = Fixture::new(json!({}));
+    let mut base = fixture_backend(&fixture);
+    base.invocation.as_mut().unwrap().thinking = Some(true);
+    base.invocation.as_mut().unwrap().expert_cache_bytes = Some(8 * 1024 * 1024 * 1024);
+    let identity = base.cache_identity();
+    let configured = base
+        .configured_for_chat(&chat_options(Some(false), None))
+        .unwrap();
+    assert_eq!(configured.cache_identity(), identity);
+    assert_eq!(configured.request_thinking, Some(false));
+    assert_eq!(configured.invocation().unwrap().thinking, Some(true));
+    assert!(Arc::ptr_eq(&base.servers, &configured.servers));
+    let disabled = base
+        .configured_for_chat(&chat_options(None, Some(0)))
+        .unwrap();
+    assert_eq!(disabled.invocation().unwrap().expert_cache_bytes, None);
+    assert_eq!(disabled.request_thinking, None);
+    assert_ne!(disabled.cache_identity(), identity);
+    let maximum = base
+        .configured_for_chat(&chat_options(None, Some(1_048_576)))
+        .unwrap();
+    assert_eq!(
+        maximum.invocation().unwrap().expert_cache_bytes,
+        Some(1_099_511_627_776)
+    );
+    assert!(
+        base.configured_for_chat(&chat_options(None, Some(1_048_577)))
+            .is_err()
+    );
+    assert_eq!(base.cache_identity(), identity);
+    assert_eq!(base.request_thinking, None);
+}
+
+#[test]
+fn thinking_chat_options_reuse_one_worker_and_do_not_leak_into_defaults() {
+    let fixture = Fixture::new(json!({}));
+    let mut base = fixture_backend(&fixture);
+    base.invocation.as_mut().unwrap().thinking = None;
+    base.invocation.as_mut().unwrap().expert_cache_bytes = None;
+    let manifest = fixture_model_for_backend(&fixture);
+    let request_path = resolve_model_dir(&fixture.store, &manifest)
+        .unwrap()
+        .join("request.json");
+    let mut instance = None;
+    for thinking in [Some(false), Some(true), None] {
+        let configured: Arc<dyn GenerationBackend> = if let Some(thinking) = thinking {
+            base.with_chat_options(&manifest, &chat_options(Some(thinking), None))
+                .unwrap()
+        } else {
+            Arc::new(base.clone())
+        };
+        assert_eq!(
+            configured.generate(&manifest, request()).unwrap().text,
+            "answer"
+        );
+        let sent: Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+        assert_eq!(
+            sent.get("chat_template_kwargs").cloned(),
+            thinking.map(|enabled| json!({"enable_thinking": enabled}))
+        );
+        let selected = configured
+            .runtime_control_adapter_for(&manifest)
+            .unwrap()
+            .descriptor()
+            .instance_id;
+        if let Some(expected) = &instance {
+            assert_eq!(&selected, expected);
+        } else {
+            instance = Some(selected);
+        }
+        assert_eq!(base.servers.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn thinking_chat_options_are_preserved_for_streaming() {
+    use tokio_stream::StreamExt;
+    let fixture = Fixture::new(json!({}));
+    let mut base = fixture_backend(&fixture);
+    base.invocation.as_mut().unwrap().thinking = None;
+    base.invocation.as_mut().unwrap().expert_cache_bytes = None;
+    let manifest = fixture_model_for_backend(&fixture);
+    let configured = base
+        .with_chat_options(&manifest, &chat_options(Some(false), None))
+        .unwrap();
+    let mut stream = configured.generate_stream(manifest.clone(), request());
+    let mut done = false;
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), GenerateStreamEvent::Done { .. }) {
+            done = true;
+        }
+    }
+    assert!(done);
+    let path = resolve_model_dir(&fixture.store, &manifest)
+        .unwrap()
+        .join("request.json");
+    let sent: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(sent["stream"], true);
+    assert_eq!(
+        sent["chat_template_kwargs"],
+        json!({"enable_thinking":false})
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn chat_options_probe_observes_the_applied_expert_budget_before_loading() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(json!({}));
+    let mut base = fixture_backend(&fixture);
+    base.test_probe = None;
+    let manifest = fixture_model_for_backend(&fixture);
+    let interpreter = fixture.root.join("fixture-probe-python");
+    fs::write(&interpreter, format!(
+        "#!{}\nimport json, pathlib, sys\npayload=json.load(sys.stdin)\npathlib.Path(payload['model_dir'], 'probe-payload.json').write_text(json.dumps(payload))\nprint(json.dumps({{'ok':payload['expert_cache_bytes']==7340032,'detail':'configured probe','runtime':{{'omlx_version':'0.6.4'}}}}))\n",
+        fixture.invocation.python.display()
+    )).unwrap();
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+    base.invocation.as_mut().unwrap().python = interpreter;
+    base.invocation.as_mut().unwrap().expert_cache_bytes = None;
+    assert!(
+        base.with_chat_options(&manifest, &chat_options(Some(false), Some(7)))
+            .is_ok()
+    );
+    let path = resolve_model_dir(&fixture.store, &manifest)
+        .unwrap()
+        .join("probe-payload.json");
+    let payload: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(payload["expert_cache_bytes"], 7 * 1024 * 1024);
+    assert!(base.servers.lock().unwrap().is_empty());
+    assert!(!fixture.root.join("backends").exists());
+    assert!(
+        base.with_chat_options(&manifest, &chat_options(None, Some(8)))
+            .is_err()
+    );
+    assert_eq!(base.invocation().unwrap().expert_cache_bytes, None);
+}
+
+#[test]
+fn configured_expert_budget_selects_its_exact_worker_and_registry_is_bounded() {
+    let fixture = Fixture::new(json!({}));
+    let mut base = fixture_backend(&fixture);
+    base.invocation.as_mut().unwrap().thinking = None;
+    base.invocation.as_mut().unwrap().expert_cache_bytes = None;
+    let manifest = fixture_model_for_backend(&fixture);
+    let (default_worker, _) = base.cached_server(&manifest).unwrap();
+    let mut second = OmlxProcess::start(
+        &fixture.store,
+        &fixture.invocation,
+        &default_worker.model_dir,
+        base.test_probe.as_ref().unwrap().clone(),
+    )
+    .unwrap();
+    second.model_identity = default_worker.model_identity.clone();
+    second.logical_model_id = default_worker.logical_model_id.clone();
+    second.thinking = None;
+    second.expert_cache_bytes = Some(8 * 1024 * 1024);
+    let second_id = second.instance_id.clone();
+    base.servers
+        .lock()
+        .unwrap()
+        .insert("different-budget-fixture".into(), Arc::new(second));
+    let configured = base
+        .configured_for_chat(&chat_options(Some(false), Some(8)))
+        .unwrap();
+    assert_eq!(
+        configured
+            .runtime_control_adapter_for(&manifest)
+            .unwrap()
+            .descriptor()
+            .instance_id,
+        second_id
+    );
+    assert_eq!(
+        base.runtime_control_adapter_for(&manifest)
+            .unwrap()
+            .descriptor()
+            .instance_id,
+        default_worker.instance_id
+    );
+    {
+        let mut registry = base.servers.lock().unwrap();
+        while registry.len() < MAX_CACHED_WORKERS {
+            let key = format!("retained-fixture-{}", registry.len());
+            registry.insert(key, default_worker.clone());
+        }
+    }
+    assert!(
+        base.cached_server(&manifest).is_ok(),
+        "an existing worker remains reusable at capacity"
+    );
+    let error = configured.cached_server(&manifest).err().unwrap();
+    assert!(error.to_string().contains("limit of 16 retained workers"));
+    assert!(default_worker.is_running());
+    assert_eq!(base.servers.lock().unwrap().len(), MAX_CACHED_WORKERS);
+}
+
+#[test]
+fn persistent_cache_namespace_survives_restart_but_separates_model_and_runtime_settings() {
+    let fixture = Fixture::new(json!({}));
+    let cache = fixture.root.join("chat-cache");
+    fs::create_dir(&cache).unwrap();
+    let manifest = fixture_manifest();
+    let report = ProbeReport {
+        detail: "fixture".into(),
+        version: "0.6.4".into(),
+        tools: false,
+        tool_calling_detail: None,
+        runtime: json!({"omlx_version":"0.6.4","mlx_version":"0.32.2"}),
+        cache_paths: vec![],
+    };
+    let first =
+        persistent_cache_directory(&cache, &manifest, &fixture.invocation, &report).unwrap();
+    assert!(first.starts_with(cache.canonicalize().unwrap()));
+    assert_eq!(
+        first,
+        persistent_cache_directory(&cache, &manifest, &fixture.invocation, &report).unwrap()
+    );
+    let mut restarted = fixture.invocation.clone();
+    restarted
+        .environment
+        .push(("WERK_TEST_UNRELATED_SHELL_VALUE".into(), "changed".into()));
+    assert_eq!(
+        first,
+        persistent_cache_directory(&cache, &manifest, &restarted, &report).unwrap()
+    );
+    restarted.thinking = Some(!fixture.invocation.thinking.unwrap_or(true));
+    assert_ne!(
+        first,
+        persistent_cache_directory(&cache, &manifest, &restarted, &report).unwrap()
+    );
+    let mut changed_model = manifest.clone();
+    changed_model.created_unix += 1;
+    assert_ne!(
+        first,
+        persistent_cache_directory(&cache, &changed_model, &fixture.invocation, &report).unwrap()
+    );
+    let mut changed_runtime = report.clone();
+    changed_runtime.runtime["mlx_version"] = json!("0.33.0");
+    assert_ne!(
+        first,
+        persistent_cache_directory(&cache, &manifest, &fixture.invocation, &changed_runtime)
+            .unwrap()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+}
+
+#[test]
+fn persistent_cache_status_requires_verified_format_and_selected_model() {
+    let status = json!({"installed":true,"active":true,"format":"omlx-exact-prefix-v1","model_id":"physical"});
+    assert!(verified_persistent_cache_status(&status, "physical").unwrap());
+    assert!(verified_persistent_cache_status(&status, "other").is_err());
+    let mut inactive = status.clone();
+    inactive["active"] = json!(false);
+    assert!(!verified_persistent_cache_status(&inactive, "physical").unwrap());
+    for invalid in [
+        json!({}),
+        json!({"installed":false,"active":true,"format":"omlx-exact-prefix-v1","model_id":"physical"}),
+        json!({"installed":true,"active":true,"format":"unknown","model_id":"physical"}),
+        json!({"installed":true,"active":"yes","format":"omlx-exact-prefix-v1","model_id":"physical"}),
+    ] {
+        assert!(verified_persistent_cache_status(&invalid, "physical").is_err());
+    }
+}
+
+#[test]
+fn unverified_native_cache_version_returns_normal_fallback_without_starting_worker() {
+    let fixture = Fixture::new(json!({}));
+    let backend = fixture_backend(&fixture);
+    let manifest = fixture_manifest();
+    let actual = fixture.store.model_dir(&manifest.id).join("files");
+    if actual != fixture.model {
+        fs::create_dir_all(actual.parent().unwrap()).unwrap();
+        fs::rename(&fixture.model, &actual).unwrap();
+    }
+    let cache = fixture.root.join("absent-persistent-cache");
+    assert!(
+        backend
+            .start_persistent_chat_session(&manifest, None, &cache)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!cache.exists());
+    assert!(backend.servers.lock().unwrap().is_empty());
+    assert!(!fixture.root.join("backends").exists());
+}
+
+#[test]
+fn generic_native_persistence_default_does_not_load_backend_or_create_files() {
+    struct NoNativePersistence;
+    impl GenerationBackend for NoNativePersistence {
+        fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
+            panic!("native persistence default must not prepare a backend");
+        }
+        fn generate(
+            &self,
+            _manifest: &ModelManifest,
+            _request: GenerateRequest,
+        ) -> Result<GenerateResponse> {
+            panic!("native persistence default must not generate");
+        }
+        fn generate_stream(
+            &self,
+            _manifest: ModelManifest,
+            _request: GenerateRequest,
+        ) -> GenerateStream {
+            panic!("native persistence default must not generate");
+        }
+    }
+    let cache = env::temp_dir().join(format!("werk-absent-chat-cache-{}", random_id().unwrap()));
+    assert!(
+        NoNativePersistence
+            .start_persistent_chat_session(&fixture_manifest(), None, &cache)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!cache.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn persistent_cache_rejects_symlink_directory_without_touching_target() {
+    let fixture = Fixture::new(json!({}));
+    let cache = fixture.root.join("real-cache");
+    fs::create_dir(&cache).unwrap();
+    let link = fixture.root.join("linked-cache");
+    std::os::unix::fs::symlink(&cache, &link).unwrap();
+    let report = fixture_backend(&fixture).test_probe.unwrap();
+    assert!(
+        persistent_cache_directory(&link, &fixture_manifest(), &fixture.invocation, &report)
+            .is_err()
+    );
+    assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
 }
 
 #[test]
@@ -408,6 +1444,58 @@ fn cache_reuses_worker_recreates_dead_child_and_never_reuses_changed_manifest() 
         .unwrap()
         .descriptor();
     assert_eq!(descriptor.instance_id, changed_server.instance_id);
+}
+
+#[test]
+fn model_controls_require_unique_worker_when_chat_cache_namespaces_differ() {
+    let fixture = Fixture::new(json!({}));
+    let backend = fixture_backend(&fixture);
+    let manifest = fixture_manifest();
+    let actual = fixture.store.model_dir(&manifest.id).join("files");
+    if actual != fixture.model {
+        fs::create_dir_all(actual.parent().unwrap()).unwrap();
+        fs::rename(&fixture.model, &actual).unwrap();
+    }
+    let actual = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let (first, _) = backend.cached_server(&manifest).unwrap();
+    let mut second = OmlxProcess::start(
+        &fixture.store,
+        &fixture.invocation,
+        &actual,
+        backend.test_probe.as_ref().unwrap().clone(),
+    )
+    .unwrap();
+    second.model_identity = Some(ModelRuntimeIdentity::from_manifest(&manifest).unwrap());
+    second.logical_model_id = Some(manifest.id.clone());
+    let second = Arc::new(second);
+    backend
+        .servers
+        .lock()
+        .unwrap()
+        .insert("another-chat-cache".into(), second.clone());
+    let descriptor = backend
+        .runtime_control_adapter_for(&manifest)
+        .unwrap()
+        .descriptor();
+    assert_eq!(
+        descriptor
+            .capabilities
+            .iter()
+            .find(|cap| cap.id == crate::runtime_control::MODEL_RESIDENCY_CAPABILITY)
+            .unwrap()
+            .status,
+        crate::werk_protocol::CapabilityStatus::Unavailable
+    );
+    first.child.lock().unwrap().kill().unwrap();
+    first.child.lock().unwrap().wait().unwrap();
+    assert_eq!(
+        backend
+            .runtime_control_adapter_for(&manifest)
+            .unwrap()
+            .descriptor()
+            .instance_id,
+        second.instance_id
+    );
 }
 
 #[test]
@@ -564,6 +1652,122 @@ fn model_python_environment_is_rejected_before_probe_or_worker_startup() {
                 .invocation
                 .verify_import_paths(&fixture.model)
                 .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn persistent_cli_and_server_send_identical_multiturn_generation_requests() {
+    use tokio_stream::StreamExt;
+    let (fixture, mut backend, manifest) = server_cache_fixture(json!({"version":"0.6.4"}));
+    let invocation = backend.invocation.as_mut().unwrap();
+    invocation.expert_cache_bytes = Some(8 * 1024_u64.pow(3));
+    invocation.thinking = Some(false);
+    let directory = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let cache = fixture.root.join("parity-chat-cache");
+    fs::create_dir(&cache).unwrap();
+    let cli = backend
+        .start_persistent_chat_session(&manifest, Some(42), &cache)
+        .unwrap()
+        .unwrap();
+    let mut req = request();
+    req.messages = serde_json::from_value(json!([
+        {"role":"user","content":"Ein Satz über Rust."},
+        {"role":"assistant","content":"Rust bietet Speichersicherheit."},
+        {"role":"user","content":"Und über Python?"}
+    ]))
+    .unwrap();
+    req.temperature = Some(0.0);
+    req.seed = Some(42);
+    let mut stream = cli.generate_stream(req.clone());
+    let mut done = false;
+    while let Some(event) = stream.next().await {
+        done |= matches!(event.unwrap(), GenerateStreamEvent::Done { .. });
+    }
+    assert!(done);
+    drop(stream);
+    let cli_body: Value =
+        serde_json::from_slice(&fs::read(directory.join("request.json")).unwrap()).unwrap();
+    let mut stream = backend.generate_stream(manifest, req);
+    let mut done = false;
+    while let Some(event) = stream.next().await {
+        done |= matches!(event.unwrap(), GenerateStreamEvent::Done { .. });
+    }
+    assert!(done);
+    let server_body: Value =
+        serde_json::from_slice(&fs::read(directory.join("request.json")).unwrap()).unwrap();
+    assert_eq!(cli_body, server_body);
+    assert_eq!(cli_body["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(cli_body["chat_template_kwargs"]["enable_thinking"], false);
+    assert_eq!(cli_body["seed"], 42);
+}
+
+#[test]
+#[cfg(unix)]
+fn auto_expert_cache_activates_only_for_probe_verified_models() {
+    for supported in [false, true] {
+        let (fixture, mut backend, manifest) = server_cache_fixture(json!({"version":"0.6.4"}));
+        backend.invocation.as_mut().unwrap().expert_cache_bytes = Some(0);
+        if supported {
+            backend.test_probe.as_mut().unwrap().runtime["expert_offload"] =
+                json!({"cache_budget_mode":"auto"});
+        }
+        backend.prepare(&manifest).unwrap();
+        let servers = backend.servers.lock().unwrap();
+        assert_eq!(servers.len(), 1);
+        let server = servers.values().next().unwrap();
+        assert_eq!(server.expert_offload, supported);
+        assert_eq!(server.expert_cache_bytes, Some(0));
+        drop(servers);
+        drop(backend);
+        drop(fixture);
+    }
+}
+
+#[test]
+fn reasoning_effort_controls_native_payload_and_preserves_worker_reuse() {
+    assert_eq!(reasoning_effort_enabled(None).unwrap(), None);
+    for (name, effort) in [
+        ("low", OmlxReasoningEffort::Low),
+        ("high", OmlxReasoningEffort::High),
+        ("max", OmlxReasoningEffort::Max),
+    ] {
+        assert_eq!(
+            reasoning_effort_enabled(Some(name.into())).unwrap(),
+            Some(effort)
+        );
+        let options: crate::openai::ChatRuntimeOptions =
+            serde_json::from_value(json!({"omlx":{"reasoning_effort":name}})).unwrap();
+        assert!(!options.omlx.as_ref().unwrap().is_empty());
+        let fixture = Fixture::new(json!({}));
+        let mut base = fixture_backend(&fixture);
+        base.invocation.as_mut().unwrap().reasoning_effort = Some(OmlxReasoningEffort::Max);
+        let configured = base.configured_for_chat(&options).unwrap();
+        assert_eq!(configured.request_reasoning_effort, Some(effort));
+        assert_eq!(base.request_reasoning_effort, None);
+        assert_eq!(configured.cache_identity(), base.cache_identity());
+        assert!(Arc::ptr_eq(&base.servers, &configured.servers));
+        for thinking in [None, Some(false), Some(true)] {
+            for stream in [false, true] {
+                let body =
+                    omlx_chat_completion_body("model", &request(), stream, thinking, Some(effort));
+                assert_eq!(body["reasoning_effort"], name);
+                assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], name);
+                assert_eq!(
+                    body["chat_template_kwargs"].get("enable_thinking"),
+                    thinking.map(|value| json!(value)).as_ref()
+                );
+            }
+        }
+    }
+    for invalid in ["", "medium", "none", "0", " low", "LOW"] {
+        assert!(reasoning_effort_enabled(Some(invalid.into())).is_err());
+        assert!(
+            serde_json::from_value::<crate::openai::OmlxChatOptions>(
+                json!({"reasoning_effort":invalid})
+            )
+            .is_err()
         );
     }
 }

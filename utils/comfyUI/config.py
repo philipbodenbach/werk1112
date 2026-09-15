@@ -187,6 +187,43 @@ class WerkVisionConfig:
 
 
 @dataclass(frozen=True, repr=False, eq=False)
+class WerkTextConfig:
+    """Independent immutable chat fields and optional oMLX request controls."""
+
+    request_fields: Mapping[str, Any] = field(default_factory=dict)
+    omlx_options: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        fields = dict(self.request_fields)
+        if "stop" in fields:
+            fields["stop"] = tuple(fields["stop"])
+        options = dict(self.omlx_options)
+        if set(options) - {"thinking", "reasoning_effort", "expert_cache_mb", "ngram_cache_mb"}:
+            raise ValueError("text config contains unsupported oMLX options")
+        if "reasoning_effort" in options and options["reasoning_effort"] not in ("low", "high", "max"):
+            raise ValueError("oMLX reasoning effort must be low, high, or max")
+        if "thinking" in options and not isinstance(options["thinking"], bool):
+            raise ValueError("oMLX thinking must be a boolean")
+        if "expert_cache_mb" in options:
+            budget = options["expert_cache_mb"]
+            if type(budget) is not int or not 0 <= budget <= 1048576:
+                raise ValueError("oMLX expert_cache_mb must be an integer from 0 to 1048576 MiB")
+        if "ngram_cache_mb" in options:
+            budget = options["ngram_cache_mb"]
+            if budget != "auto" and (type(budget) is not int or not 0 <= budget <= 1048576):
+                raise ValueError("oMLX ngram_cache_mb must be auto or an integer from 0 to 1048576 MiB")
+        object.__setattr__(self, "request_fields", _immutable_mapping(fields))
+        object.__setattr__(self, "omlx_options", _immutable_mapping(options))
+
+    def __repr__(self) -> str:
+        return (
+            "WerkTextConfig("
+            f"request_fields={dict(self.request_fields)!r}, "
+            f"omlx_options={dict(self.omlx_options)!r})"
+        )
+
+
+@dataclass(frozen=True, repr=False, eq=False)
 class WerkImageConfig:
     """Validated image request fields and canonical Werk parameters."""
 

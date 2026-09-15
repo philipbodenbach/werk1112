@@ -1,0 +1,10 @@
+{
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "expert_cache_mb": "24576",
+  "ngram_cache_mb": "auto",
+  "tool_count": 0,
+  "tool_schema_bytes": 2,
+  "samples": [],
+  "passed": false,
+  "error": "Test server did not start"
+}

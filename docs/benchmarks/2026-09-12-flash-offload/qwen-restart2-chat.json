@@ -1,0 +1,31 @@
+{
+  "model": "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+  "expert_cache_mb": 8192,
+  "ngram_cache_mb": 1024,
+  "thinking": false,
+  "temperature": 0,
+  "max_tokens": 16,
+  "persistence": true,
+  "prompts": [
+    "Welche Zahl habe ich dich am Anfang gebeten zu merken? Antworte nur mit der Zahl."
+  ],
+  "wall_seconds": 22.38673954200931,
+  "exit_code": 0,
+  "results": [
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true
+    }
+  ],
+  "all_correct": true,
+  "durations_seconds": [
+    17.02221
+  ],
+  "cached_prompt_tokens": [
+    356
+  ],
+  "total_prompt_tokens": [
+    389
+  ]
+}

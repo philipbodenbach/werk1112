@@ -808,6 +808,7 @@ mod imp {
                     fallback_decode_seconds
                 };
             GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds: 0.0,
                 warmup_seconds,
                 first_token_seconds,

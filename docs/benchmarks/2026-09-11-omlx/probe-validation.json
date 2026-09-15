@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "json_bytes": 96519,
+  "dependency_count": 931,
+  "inventory_bytes": 95773,
+  "old_stdout_limit_bytes": 65536,
+  "new_stdout_limit_bytes": 4194304,
+  "new_stderr_limit_bytes": 65536,
+  "validation": "Actual installed oMLX Python and DeepSeek checkpoint, metadata only. Optional inventory omitted above2MiB or8192paths."
+}

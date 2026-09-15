@@ -1,0 +1,1288 @@
+{
+  "label": "after-memory-fix-24g",
+  "started_at": "2026-09-11T20:00:11.970417+00:00",
+  "worker": "7eda35226f72c6ed654653115763f3b12149435d30a7c139",
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "settings": {
+    "temperature": 0,
+    "top_p": 0.95,
+    "seed": 42,
+    "thinking": false,
+    "max_tokens": 96,
+    "turns": 6
+  },
+  "seed_messages": [
+    {
+      "role": "user",
+      "content": "Write me a sentence about the programming language rust."
+    },
+    {
+      "role": "assistant",
+      "content": "Your sentence: Rust is a powerful systems programming language that combines memory safety with a focus on performance and reliability."
+    }
+  ],
+  "notes": [
+    "Growing history replays actual answers, starting with 3, 5, 7... messages by default.",
+    "This script does not clear caches or restart workers; first does not imply cold.",
+    "Expert and native-prefix counters are worker intervals, potentially including other requests.",
+    "RSS is sampled once per second; it does not establish the exact Metal peak.",
+    "Decode estimates remain null unless usage explicitly establishes zero reasoning tokens.",
+    "English coherence and factual correctness require manual answer review."
+  ],
+  "system_before": {
+    "hw.memsize": "51539607552",
+    "machdep.cpu.brand_string": "Apple M4 Pro",
+    "vm.swapusage": "total = 2048.00M  used = 1664.19M  free = 383.81M  (encrypted)"
+  },
+  "samples": [
+    {
+      "first_text_seconds": 16.497548375002225,
+      "total_seconds": 25.403957999995328,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Sure! Here's a sentence about Rust:\n\nRust is a systems programming language that emphasizes safety, performance, and concurrency, offering memory safety without a garbage collector.",
+      "usage": {
+        "completion_tokens": 34,
+        "prompt_tokens": 50,
+        "total_tokens": 84
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 50,
+      "completion_tokens": 34,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "http_status": 200,
+      "http_error_body": null,
+      "turn": 1,
+      "messages": 3,
+      "prompt": "Write me a sentence about the programming language rust.",
+      "experts_before": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 0,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 0,
+        "prefill_samples_corrected": 0,
+        "resident_experts": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "disk_bytes_read": 4312736860,
+        "execution": "grouped",
+        "cache_evictions": 0,
+        "allocator_clears": 0,
+        "allocator_cache_bytes": 0,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 2223,
+        "disk_read_seconds": 1.0668218697828706,
+        "materialize_seconds": 0.035071744918241166,
+        "forward_calls": 0,
+        "forward_seconds": 0.0,
+        "routing_seconds": 0.0,
+        "output_evaluations": 0
+      },
+      "experts_after": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25766133760,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25768755200,
+        "prefill_samples_corrected": 1,
+        "resident_experts": 3078,
+        "cache_hits": 7794,
+        "cache_misses": 4831,
+        "disk_bytes_read": 44784100444,
+        "execution": "grouped",
+        "cache_evictions": 1753,
+        "allocator_clears": 16,
+        "allocator_cache_bytes": 39392960,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 7054,
+        "disk_read_seconds": 15.70763184587122,
+        "materialize_seconds": 2.0639932864141883,
+        "forward_calls": 1591,
+        "forward_seconds": 24.710412368091056,
+        "routing_seconds": 2.343696484938846,
+        "output_evaluations": 1981
+      },
+      "prefix_before": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 0,
+        "restores": 0,
+        "restored_tokens": 0,
+        "failures": 0,
+        "indexed_prefixes": 0,
+        "reason": null
+      },
+      "prefix_after": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 2,
+        "restores": 0,
+        "restored_tokens": 0,
+        "failures": 0,
+        "indexed_prefixes": 2,
+        "reason": null
+      },
+      "expert_interval": {
+        "cache_hits": 7794,
+        "cache_misses": 4831,
+        "cache_evictions": 1753,
+        "disk_bytes_read": 40471363584,
+        "disk_read_seconds": 14.640809976088349,
+        "forward_calls": 1591,
+        "forward_seconds": 24.710412368091056
+      },
+      "prefix_interval": {
+        "stores": 2,
+        "restores": 0,
+        "restored_tokens": 0,
+        "failures": 0
+      },
+      "swapusage_after": "total = 2048.00M  used = 1664.19M  free = 383.81M  (encrypted)"
+    },
+    {
+      "first_text_seconds": 3.673636167004588,
+      "total_seconds": 14.358759084003395,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Sure! Here's a sentence about Rust:\n\nRust is a systems programming language that prioritizes memory safety, performance, and reliability, using a strict ownership model to prevent data races and ensure thread safety.",
+      "usage": {
+        "completion_tokens": 41,
+        "prompt_tokens": 98,
+        "total_tokens": 139
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 98,
+      "completion_tokens": 41,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "http_status": 200,
+      "http_error_body": null,
+      "turn": 2,
+      "messages": 5,
+      "prompt": "Write me a sentence about the programming language rust.",
+      "experts_before": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25766133760,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25768755200,
+        "prefill_samples_corrected": 1,
+        "resident_experts": 3078,
+        "cache_hits": 7794,
+        "cache_misses": 4831,
+        "disk_bytes_read": 44784100444,
+        "execution": "grouped",
+        "cache_evictions": 1753,
+        "allocator_clears": 16,
+        "allocator_cache_bytes": 39392960,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 7054,
+        "disk_read_seconds": 15.70763184587122,
+        "materialize_seconds": 2.0639932864141883,
+        "forward_calls": 1591,
+        "forward_seconds": 24.710412368091056,
+        "routing_seconds": 2.343696484938846,
+        "output_evaluations": 1981
+      },
+      "experts_after": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25766133760,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25768755200,
+        "prefill_samples_corrected": 2,
+        "resident_experts": 3076,
+        "cache_hits": 18032,
+        "cache_misses": 7113,
+        "disk_bytes_read": 63897019484,
+        "execution": "grouped",
+        "cache_evictions": 4037,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 27662672,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 9336,
+        "disk_read_seconds": 22.73147290747147,
+        "materialize_seconds": 3.04677983673173,
+        "forward_calls": 3483,
+        "forward_seconds": 38.31993572997453,
+        "routing_seconds": 4.808004791731946,
+        "output_evaluations": 4028
+      },
+      "prefix_before": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 2,
+        "restores": 0,
+        "restored_tokens": 0,
+        "failures": 0,
+        "indexed_prefixes": 2,
+        "reason": null
+      },
+      "prefix_after": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 4,
+        "restores": 1,
+        "restored_tokens": 85,
+        "failures": 0,
+        "indexed_prefixes": 4,
+        "reason": null
+      },
+      "expert_interval": {
+        "cache_hits": 10238,
+        "cache_misses": 2282,
+        "cache_evictions": 2284,
+        "disk_bytes_read": 19112919040,
+        "disk_read_seconds": 7.023841061600251,
+        "forward_calls": 1892,
+        "forward_seconds": 13.609523361883475
+      },
+      "prefix_interval": {
+        "stores": 2,
+        "restores": 1,
+        "restored_tokens": 85,
+        "failures": 0
+      },
+      "swapusage_after": "total = 2048.00M  used = 1664.19M  free = 383.81M  (encrypted)"
+    },
+    {
+      "first_text_seconds": 4.115575874995557,
+      "total_seconds": 15.516171666997252,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Sure! Here's a sentence about Rust:\n\nRust is a systems programming language that combines memory safety, performance, and concurrency, leveraging a robust ownership model to guarantee thread safety and prevent data races.",
+      "usage": {
+        "completion_tokens": 41,
+        "prompt_tokens": 153,
+        "total_tokens": 194
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 153,
+      "completion_tokens": 41,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "http_status": 200,
+      "http_error_body": null,
+      "turn": 3,
+      "messages": 7,
+      "prompt": "Write me a sentence about the programming language rust.",
+      "experts_before": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25766133760,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25768755200,
+        "prefill_samples_corrected": 2,
+        "resident_experts": 3076,
+        "cache_hits": 18032,
+        "cache_misses": 7113,
+        "disk_bytes_read": 63897019484,
+        "execution": "grouped",
+        "cache_evictions": 4037,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 27662672,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 9336,
+        "disk_read_seconds": 22.73147290747147,
+        "materialize_seconds": 3.04677983673173,
+        "forward_calls": 3483,
+        "forward_seconds": 38.31993572997453,
+        "routing_seconds": 4.808004791731946,
+        "output_evaluations": 4028
+      },
+      "experts_after": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25765609472,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25769279488,
+        "prefill_samples_corrected": 3,
+        "resident_experts": 3076,
+        "cache_hits": 28193,
+        "cache_misses": 9540,
+        "disk_bytes_read": 84223140956,
+        "execution": "grouped",
+        "cache_evictions": 6464,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 22952600,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 11763,
+        "disk_read_seconds": 30.246616279517184,
+        "materialize_seconds": 4.065780800403445,
+        "forward_calls": 5375,
+        "forward_seconds": 53.0538613897661,
+        "routing_seconds": 7.553154949593591,
+        "output_evaluations": 6080
+      },
+      "prefix_before": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 4,
+        "restores": 1,
+        "restored_tokens": 85,
+        "failures": 0,
+        "indexed_prefixes": 4,
+        "reason": null
+      },
+      "prefix_after": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 6,
+        "restores": 2,
+        "restored_tokens": 225,
+        "failures": 0,
+        "indexed_prefixes": 6,
+        "reason": null
+      },
+      "expert_interval": {
+        "cache_hits": 10161,
+        "cache_misses": 2427,
+        "cache_evictions": 2427,
+        "disk_bytes_read": 20326121472,
+        "disk_read_seconds": 7.5151433720457135,
+        "forward_calls": 1892,
+        "forward_seconds": 14.733925659791566
+      },
+      "prefix_interval": {
+        "stores": 2,
+        "restores": 1,
+        "restored_tokens": 140,
+        "failures": 0
+      },
+      "swapusage_after": "total = 2048.00M  used = 1664.19M  free = 383.81M  (encrypted)"
+    },
+    {
+      "first_text_seconds": 4.285685000009835,
+      "total_seconds": 15.659230042001582,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Sure! Here's a sentence about Rust:\n\nRust is a systems programming language that prioritizes memory safety, performance, and reliability, utilizing a strict ownership model to ensure thread safety and prevent data races.",
+      "usage": {
+        "completion_tokens": 41,
+        "prompt_tokens": 208,
+        "total_tokens": 249
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 208,
+      "completion_tokens": 41,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "http_status": 200,
+      "http_error_body": null,
+      "turn": 4,
+      "messages": 9,
+      "prompt": "Write me a sentence about the programming language rust.",
+      "experts_before": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25765609472,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25769279488,
+        "prefill_samples_corrected": 3,
+        "resident_experts": 3076,
+        "cache_hits": 28193,
+        "cache_misses": 9540,
+        "disk_bytes_read": 84223140956,
+        "execution": "grouped",
+        "cache_evictions": 6464,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 22952600,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 11763,
+        "disk_read_seconds": 30.246616279517184,
+        "materialize_seconds": 4.065780800403445,
+        "forward_calls": 5375,
+        "forward_seconds": 53.0538613897661,
+        "routing_seconds": 7.553154949593591,
+        "output_evaluations": 6080
+      },
+      "experts_after": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25769803776,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25769279488,
+        "prefill_samples_corrected": 4,
+        "resident_experts": 3077,
+        "cache_hits": 38279,
+        "cache_misses": 12086,
+        "disk_bytes_read": 105539642460,
+        "execution": "grouped",
+        "cache_evictions": 9009,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 23759792,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 14309,
+        "disk_read_seconds": 38.123928996166796,
+        "materialize_seconds": 5.180813196930103,
+        "forward_calls": 7267,
+        "forward_seconds": 67.94231881848827,
+        "routing_seconds": 10.150784426179598,
+        "output_evaluations": 8140
+      },
+      "prefix_before": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 6,
+        "restores": 2,
+        "restored_tokens": 225,
+        "failures": 0,
+        "indexed_prefixes": 6,
+        "reason": null
+      },
+      "prefix_after": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 8,
+        "restores": 3,
+        "restored_tokens": 420,
+        "failures": 0,
+        "indexed_prefixes": 8,
+        "reason": null
+      },
+      "expert_interval": {
+        "cache_hits": 10086,
+        "cache_misses": 2546,
+        "cache_evictions": 2545,
+        "disk_bytes_read": 21316501504,
+        "disk_read_seconds": 7.877312716649612,
+        "forward_calls": 1892,
+        "forward_seconds": 14.888457428722177
+      },
+      "prefix_interval": {
+        "stores": 2,
+        "restores": 1,
+        "restored_tokens": 195,
+        "failures": 0
+      },
+      "swapusage_after": "total = 2048.00M  used = 1664.19M  free = 383.81M  (encrypted)"
+    },
+    {
+      "first_text_seconds": 4.330971666990081,
+      "total_seconds": 16.85906045799493,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Sure! Here's a sentence about Rust:\n\nRust is a systems programming language that emphasizes memory safety, performance, and concurrency, leveraging a robust ownership model to guarantee thread safety and prevent data races.",
+      "usage": {
+        "completion_tokens": 41,
+        "prompt_tokens": 263,
+        "total_tokens": 304
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 263,
+      "completion_tokens": 41,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "http_status": 200,
+      "http_error_body": null,
+      "turn": 5,
+      "messages": 11,
+      "prompt": "Write me a sentence about the programming language rust.",
+      "experts_before": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25769803776,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25769279488,
+        "prefill_samples_corrected": 4,
+        "resident_experts": 3077,
+        "cache_hits": 38279,
+        "cache_misses": 12086,
+        "disk_bytes_read": 105539642460,
+        "execution": "grouped",
+        "cache_evictions": 9009,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 23759792,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 14309,
+        "disk_read_seconds": 38.123928996166796,
+        "materialize_seconds": 5.180813196930103,
+        "forward_calls": 7267,
+        "forward_seconds": 67.94231881848827,
+        "routing_seconds": 10.150784426179598,
+        "output_evaluations": 8140
+      },
+      "experts_after": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25769803776,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25769279488,
+        "prefill_samples_corrected": 5,
+        "resident_experts": 3077,
+        "cache_hits": 48226,
+        "cache_misses": 14761,
+        "disk_bytes_read": 127937750108,
+        "execution": "grouped",
+        "cache_evictions": 11684,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 25414316,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 16984,
+        "disk_read_seconds": 46.435138122105855,
+        "materialize_seconds": 6.359770295908675,
+        "forward_calls": 9159,
+        "forward_seconds": 84.00205443844607,
+        "routing_seconds": 13.083737276421743,
+        "output_evaluations": 10196
+      },
+      "prefix_before": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 8,
+        "restores": 3,
+        "restored_tokens": 420,
+        "failures": 0,
+        "indexed_prefixes": 8,
+        "reason": null
+      },
+      "prefix_after": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 10,
+        "restores": 4,
+        "restored_tokens": 670,
+        "failures": 0,
+        "indexed_prefixes": 10,
+        "reason": null
+      },
+      "expert_interval": {
+        "cache_hits": 9947,
+        "cache_misses": 2675,
+        "cache_evictions": 2675,
+        "disk_bytes_read": 22398107648,
+        "disk_read_seconds": 8.311209125939058,
+        "forward_calls": 1892,
+        "forward_seconds": 16.05973561995779
+      },
+      "prefix_interval": {
+        "stores": 2,
+        "restores": 1,
+        "restored_tokens": 250,
+        "failures": 0
+      },
+      "swapusage_after": "total = 2048.00M  used = 1664.19M  free = 383.81M  (encrypted)"
+    },
+    {
+      "first_text_seconds": 4.5403487919975305,
+      "total_seconds": 18.115402416995494,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Sure! Here's a sentence about Rust:\n\nRust is a systems programming language that prioritizes memory safety, performance, and reliability, utilizing a strict ownership model to ensure thread safety and prevent data races.",
+      "usage": {
+        "completion_tokens": 41,
+        "prompt_tokens": 318,
+        "total_tokens": 359
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 318,
+      "completion_tokens": 41,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "http_status": 200,
+      "http_error_body": null,
+      "turn": 6,
+      "messages": 13,
+      "prompt": "Write me a sentence about the programming language rust.",
+      "experts_before": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25769803776,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25769279488,
+        "prefill_samples_corrected": 5,
+        "resident_experts": 3077,
+        "cache_hits": 48226,
+        "cache_misses": 14761,
+        "disk_bytes_read": 127937750108,
+        "execution": "grouped",
+        "cache_evictions": 11684,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 25414316,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 16984,
+        "disk_read_seconds": 46.435138122105855,
+        "materialize_seconds": 6.359770295908675,
+        "forward_calls": 9159,
+        "forward_seconds": 84.00205443844607,
+        "routing_seconds": 13.083737276421743,
+        "output_evaluations": 10196
+      },
+      "experts_after": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25763512320,
+        "effective_cache_budget_bytes": 25769803776,
+        "budget_reductions": 0,
+        "prefill_cache_growth_bytes": 25769279488,
+        "prefill_samples_corrected": 6,
+        "resident_experts": 3076,
+        "cache_hits": 57996,
+        "cache_misses": 17614,
+        "disk_bytes_read": 151825884252,
+        "execution": "grouped",
+        "cache_evictions": 14538,
+        "allocator_clears": 17,
+        "allocator_cache_bytes": 34288628,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 19837,
+        "disk_read_seconds": 55.30287451154436,
+        "materialize_seconds": 7.601346026669489,
+        "forward_calls": 11051,
+        "forward_seconds": 101.30829057040683,
+        "routing_seconds": 16.331911423490965,
+        "output_evaluations": 12255
+      },
+      "prefix_before": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 10,
+        "restores": 4,
+        "restored_tokens": 670,
+        "failures": 0,
+        "indexed_prefixes": 10,
+        "reason": null
+      },
+      "prefix_after": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 12,
+        "restores": 5,
+        "restored_tokens": 975,
+        "failures": 0,
+        "indexed_prefixes": 12,
+        "reason": null
+      },
+      "expert_interval": {
+        "cache_hits": 9770,
+        "cache_misses": 2853,
+        "cache_evictions": 2854,
+        "disk_bytes_read": 23888134144,
+        "disk_read_seconds": 8.867736389438505,
+        "forward_calls": 1892,
+        "forward_seconds": 17.30623613196076
+      },
+      "prefix_interval": {
+        "stores": 2,
+        "restores": 1,
+        "restored_tokens": 305,
+        "failures": 0
+      },
+      "swapusage_after": "total = 2048.00M  used = 1664.19M  free = 383.81M  (encrypted)"
+    }
+  ],
+  "rss_samples": [
+    {
+      "elapsed_seconds": 0.0022052499989513308,
+      "rss_bytes": 4692508672
+    },
+    {
+      "elapsed_seconds": 1.0104679169890005,
+      "rss_bytes": 6528958464
+    },
+    {
+      "elapsed_seconds": 2.018822291996912,
+      "rss_bytes": 8434876416
+    },
+    {
+      "elapsed_seconds": 3.027050666991272,
+      "rss_bytes": 10291036160
+    },
+    {
+      "elapsed_seconds": 4.03539470898977,
+      "rss_bytes": 12129632256
+    },
+    {
+      "elapsed_seconds": 5.043851499998709,
+      "rss_bytes": 14038515712
+    },
+    {
+      "elapsed_seconds": 6.052032999999938,
+      "rss_bytes": 15883354112
+    },
+    {
+      "elapsed_seconds": 7.061552749990369,
+      "rss_bytes": 17606361088
+    },
+    {
+      "elapsed_seconds": 8.067279999988386,
+      "rss_bytes": 19340476416
+    },
+    {
+      "elapsed_seconds": 9.075736792001408,
+      "rss_bytes": 21081653248
+    },
+    {
+      "elapsed_seconds": 10.08512270898791,
+      "rss_bytes": 22817832960
+    },
+    {
+      "elapsed_seconds": 11.093311459000688,
+      "rss_bytes": 24620892160
+    },
+    {
+      "elapsed_seconds": 12.101754041999811,
+      "rss_bytes": 26393640960
+    },
+    {
+      "elapsed_seconds": 13.11014633400191,
+      "rss_bytes": 28166668288
+    },
+    {
+      "elapsed_seconds": 14.117813499993645,
+      "rss_bytes": 29952294912
+    },
+    {
+      "elapsed_seconds": 15.126259583994397,
+      "rss_bytes": 30503223296
+    },
+    {
+      "elapsed_seconds": 16.13414824999927,
+      "rss_bytes": 30515363840
+    },
+    {
+      "elapsed_seconds": 17.142938042001333,
+      "rss_bytes": 30528864256
+    },
+    {
+      "elapsed_seconds": 18.152888708995306,
+      "rss_bytes": 30531125248
+    },
+    {
+      "elapsed_seconds": 19.16137791700021,
+      "rss_bytes": 30533582848
+    },
+    {
+      "elapsed_seconds": 20.170646416998352,
+      "rss_bytes": 30541463552
+    },
+    {
+      "elapsed_seconds": 21.176884166998207,
+      "rss_bytes": 30541447168
+    },
+    {
+      "elapsed_seconds": 22.184291500001564,
+      "rss_bytes": 30543282176
+    },
+    {
+      "elapsed_seconds": 23.192847166996216,
+      "rss_bytes": 30542954496
+    },
+    {
+      "elapsed_seconds": 24.199935583994375,
+      "rss_bytes": 30543822848
+    },
+    {
+      "elapsed_seconds": 25.208476083993446,
+      "rss_bytes": 30543904768
+    },
+    {
+      "elapsed_seconds": 26.218147583989776,
+      "rss_bytes": 30538268672
+    },
+    {
+      "elapsed_seconds": 27.226962791988626,
+      "rss_bytes": 30553194496
+    },
+    {
+      "elapsed_seconds": 28.237587583993445,
+      "rss_bytes": 30522392576
+    },
+    {
+      "elapsed_seconds": 29.246295334000024,
+      "rss_bytes": 30537285632
+    },
+    {
+      "elapsed_seconds": 30.25240991699684,
+      "rss_bytes": 30522753024
+    },
+    {
+      "elapsed_seconds": 31.261140958988108,
+      "rss_bytes": 30532599808
+    },
+    {
+      "elapsed_seconds": 32.26979258398933,
+      "rss_bytes": 30533943296
+    },
+    {
+      "elapsed_seconds": 33.275125000000116,
+      "rss_bytes": 30533943296
+    },
+    {
+      "elapsed_seconds": 34.28461829198932,
+      "rss_bytes": 30534369280
+    },
+    {
+      "elapsed_seconds": 35.28945383398968,
+      "rss_bytes": 30534385664
+    },
+    {
+      "elapsed_seconds": 36.29577349999454,
+      "rss_bytes": 30534828032
+    },
+    {
+      "elapsed_seconds": 37.30257499999425,
+      "rss_bytes": 30534909952
+    },
+    {
+      "elapsed_seconds": 38.31190049998986,
+      "rss_bytes": 30534369280
+    },
+    {
+      "elapsed_seconds": 39.32022629199491,
+      "rss_bytes": 30534647808
+    },
+    {
+      "elapsed_seconds": 40.32851379198837,
+      "rss_bytes": 30520721408
+    },
+    {
+      "elapsed_seconds": 41.33563633399899,
+      "rss_bytes": 30529355776
+    },
+    {
+      "elapsed_seconds": 42.3448022090015,
+      "rss_bytes": 30537826304
+    },
+    {
+      "elapsed_seconds": 43.35375562499394,
+      "rss_bytes": 30529617920
+    },
+    {
+      "elapsed_seconds": 44.36263187498844,
+      "rss_bytes": 30544527360
+    },
+    {
+      "elapsed_seconds": 45.369240833999356,
+      "rss_bytes": 30537809920
+    },
+    {
+      "elapsed_seconds": 46.378975749990786,
+      "rss_bytes": 30544838656
+    },
+    {
+      "elapsed_seconds": 47.38739229198836,
+      "rss_bytes": 30548770816
+    },
+    {
+      "elapsed_seconds": 48.39326837498811,
+      "rss_bytes": 30548770816
+    },
+    {
+      "elapsed_seconds": 49.402408458990976,
+      "rss_bytes": 30549032960
+    },
+    {
+      "elapsed_seconds": 50.41191724999226,
+      "rss_bytes": 30550343680
+    },
+    {
+      "elapsed_seconds": 51.42030604199681,
+      "rss_bytes": 30550343680
+    },
+    {
+      "elapsed_seconds": 52.42995004198747,
+      "rss_bytes": 30548918272
+    },
+    {
+      "elapsed_seconds": 53.43625883400091,
+      "rss_bytes": 30549278720
+    },
+    {
+      "elapsed_seconds": 54.44155220899847,
+      "rss_bytes": 30550867968
+    },
+    {
+      "elapsed_seconds": 55.45052324999415,
+      "rss_bytes": 30524456960
+    },
+    {
+      "elapsed_seconds": 56.4560968339938,
+      "rss_bytes": 30532222976
+    },
+    {
+      "elapsed_seconds": 57.46014962499612,
+      "rss_bytes": 30543953920
+    },
+    {
+      "elapsed_seconds": 58.470021916989936,
+      "rss_bytes": 30550343680
+    },
+    {
+      "elapsed_seconds": 59.47755329198844,
+      "rss_bytes": 30552686592
+    },
+    {
+      "elapsed_seconds": 60.48743145899789,
+      "rss_bytes": 30562418688
+    },
+    {
+      "elapsed_seconds": 61.49442699999781,
+      "rss_bytes": 30551752704
+    },
+    {
+      "elapsed_seconds": 62.50209004199132,
+      "rss_bytes": 30552686592
+    },
+    {
+      "elapsed_seconds": 63.50676162500167,
+      "rss_bytes": 30553997312
+    },
+    {
+      "elapsed_seconds": 64.51245737499266,
+      "rss_bytes": 30553997312
+    },
+    {
+      "elapsed_seconds": 65.51874795899494,
+      "rss_bytes": 30554046464
+    },
+    {
+      "elapsed_seconds": 66.52880912499677,
+      "rss_bytes": 30554669056
+    },
+    {
+      "elapsed_seconds": 67.53753470900119,
+      "rss_bytes": 30554685440
+    },
+    {
+      "elapsed_seconds": 68.54552108400094,
+      "rss_bytes": 30554931200
+    },
+    {
+      "elapsed_seconds": 69.5540112919989,
+      "rss_bytes": 30563844096
+    },
+    {
+      "elapsed_seconds": 70.5624772089941,
+      "rss_bytes": 30567514112
+    },
+    {
+      "elapsed_seconds": 71.57070858399675,
+      "rss_bytes": 30547345408
+    },
+    {
+      "elapsed_seconds": 72.577728749995,
+      "rss_bytes": 30560206848
+    },
+    {
+      "elapsed_seconds": 73.58610341699386,
+      "rss_bytes": 30570299392
+    },
+    {
+      "elapsed_seconds": 74.595098958991,
+      "rss_bytes": 30550409216
+    },
+    {
+      "elapsed_seconds": 75.60366120899562,
+      "rss_bytes": 30563614720
+    },
+    {
+      "elapsed_seconds": 76.61147908399289,
+      "rss_bytes": 30555308032
+    },
+    {
+      "elapsed_seconds": 77.62003554200055,
+      "rss_bytes": 30558765056
+    },
+    {
+      "elapsed_seconds": 78.62872458399215,
+      "rss_bytes": 30560075776
+    },
+    {
+      "elapsed_seconds": 79.63278087499202,
+      "rss_bytes": 30560337920
+    },
+    {
+      "elapsed_seconds": 80.64158204199339,
+      "rss_bytes": 30560649216
+    },
+    {
+      "elapsed_seconds": 81.65092658399954,
+      "rss_bytes": 30560731136
+    },
+    {
+      "elapsed_seconds": 82.65983516699634,
+      "rss_bytes": 30569152512
+    },
+    {
+      "elapsed_seconds": 83.66918858399731,
+      "rss_bytes": 30570086400
+    },
+    {
+      "elapsed_seconds": 84.67803108399676,
+      "rss_bytes": 30569201664
+    },
+    {
+      "elapsed_seconds": 85.68749295899761,
+      "rss_bytes": 30570774528
+    },
+    {
+      "elapsed_seconds": 86.69455975000164,
+      "rss_bytes": 30576803840
+    },
+    {
+      "elapsed_seconds": 87.70317983398854,
+      "rss_bytes": 30578900992
+    },
+    {
+      "elapsed_seconds": 88.71159875000012,
+      "rss_bytes": 30557044736
+    },
+    {
+      "elapsed_seconds": 89.71997441699205,
+      "rss_bytes": 30566547456
+    },
+    {
+      "elapsed_seconds": 90.72880466700008,
+      "rss_bytes": 30571610112
+    },
+    {
+      "elapsed_seconds": 91.73758791699947,
+      "rss_bytes": 30558994432
+    },
+    {
+      "elapsed_seconds": 92.74489175000053,
+      "rss_bytes": 30563598336
+    },
+    {
+      "elapsed_seconds": 93.75362587498967,
+      "rss_bytes": 30555209728
+    },
+    {
+      "elapsed_seconds": 94.76242420899507,
+      "rss_bytes": 30557831168
+    },
+    {
+      "elapsed_seconds": 95.76968274998944,
+      "rss_bytes": 30558339072
+    },
+    {
+      "elapsed_seconds": 96.77772908398765,
+      "rss_bytes": 30558683136
+    },
+    {
+      "elapsed_seconds": 97.78729341700091,
+      "rss_bytes": 30559469568
+    },
+    {
+      "elapsed_seconds": 98.79409645899432,
+      "rss_bytes": 30559453184
+    },
+    {
+      "elapsed_seconds": 99.80273879200104,
+      "rss_bytes": 30560239616
+    },
+    {
+      "elapsed_seconds": 100.81198208399292,
+      "rss_bytes": 30559797248
+    },
+    {
+      "elapsed_seconds": 101.8203083339904,
+      "rss_bytes": 30566711296
+    },
+    {
+      "elapsed_seconds": 102.82862233399646,
+      "rss_bytes": 30567497728
+    },
+    {
+      "elapsed_seconds": 103.83774279199133,
+      "rss_bytes": 30569922560
+    },
+    {
+      "elapsed_seconds": 104.84618233398942,
+      "rss_bytes": 30576214016
+    },
+    {
+      "elapsed_seconds": 105.85326258400164,
+      "rss_bytes": 30580408320
+    }
+  ],
+  "worker_rss_bytes_max_sampled": 30580408320,
+  "system_after": {
+    "swapusage": "total = 2048.00M  used = 1664.19M  free = 383.81M  (encrypted)",
+    "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                     4000.\nPages active:                                 480255.\nPages inactive:                               441002.\nPages speculative:                             42854.\nPages throttled:                                   0.\nPages wired down:                            2043773.\nPages purgeable:                                 695.\n\"Translation faults\":                      671215378.\nPages copy-on-write:                        15836458.\nPages zero filled:                         661941681.\nPages reactivated:                           2754930.\nPages purged:                                3100432.\nFile-backed pages:                            651670.\nAnonymous pages:                              312441.\nPages stored in compressor:                   468157.\nPages occupied by compressor:                  76372.\nDecompressions:                              8196757.\nCompressions:                               14538615.\nPageins:                                   230634564.\nPageouts:                                      97518.\nSwapins:                                        2868.\nSwapouts:                                     109068."
+  },
+  "finished_at": "2026-09-11T20:01:57.939576+00:00",
+  "needs_review": false
+}

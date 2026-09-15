@@ -137,7 +137,7 @@ export function buildAudioInputRequest(task: string, input: MediaOptions, audio:
 
 function chatOptions(value: unknown, vision: boolean): Fields {
 	const options = record(value ?? {}, 'Chat options');
-	ensureKeys(options, ['temperature', 'topP', 'maxCompletionTokens', 'seed', 'stopSequences', ...(vision ? ['imageDetail'] : ['tools', 'toolChoice', 'parallelToolCalls'])], 'Chat options');
+	ensureKeys(options, ['temperature', 'topP', 'maxCompletionTokens', 'seed', 'stopSequences', ...(vision ? ['imageDetail'] : ['tools', 'toolChoice', 'parallelToolCalls', 'omlxThinking', 'omlxReasoningEffort', 'omlxExpertOffload', 'omlxExpertCacheMb', 'omlxNgramOffload', 'omlxNgramCacheMb'])], 'Chat options');
 	const request: Fields = {};
 	if (options.temperature !== undefined) request.temperature = finite(options.temperature, 'Temperature');
 	if (options.topP !== undefined) request.top_p = finite(options.topP, 'Top P', 0, 1);
@@ -173,17 +173,34 @@ function chatOptions(value: unknown, vision: boolean): Fields {
 		}
 		const parallel = tristate(options.parallelToolCalls, 'Parallel tool calls');
 		if (parallel !== undefined) request.parallel_tool_calls = parallel;
+		const thinking = tristate(options.omlxThinking, 'oMLX Thinking');
+		const offload = tristate(options.omlxExpertOffload, 'oMLX Expert Offload');
+		const budget = options.omlxExpertCacheMb === undefined ? 8192 : integer(options.omlxExpertCacheMb, 'oMLX Expert Cache (MiB)', 1);
+		if (budget > 1048576) throw new Error('oMLX Expert Cache (MiB) must be between 1 and 1048576');
+		const omlx: Fields = {};
+		if (options.omlxReasoningEffort !== undefined) {
+			const effort = choice(options.omlxReasoningEffort, 'oMLX Reasoning Effort', ['inherit', 'low', 'high', 'max']);
+			if (effort !== 'inherit') omlx.reasoning_effort = effort;
+		}
+		if (thinking !== undefined) omlx.thinking = thinking;
+		if (offload !== undefined) omlx.expert_cache_mb = offload ? budget : 0;
+		const ngramOffload = options.omlxNgramOffload === 'auto' ? undefined : tristate(options.omlxNgramOffload, 'oMLX N-Gram Offload');
+		const ngramBudget = options.omlxNgramCacheMb === undefined ? 1024 : integer(options.omlxNgramCacheMb, 'oMLX N-Gram Cache (MiB)', 1);
+		if (ngramBudget > 1048576) throw new Error('oMLX N-Gram Cache (MiB) must be between 1 and 1048576');
+		if (ngramOffload !== undefined) omlx.ngram_cache_mb = ngramOffload ? ngramBudget : 0;
+		if (options.omlxNgramOffload === 'auto') omlx.ngram_cache_mb = 'auto';
+		if (Object.keys(omlx).length) request.werk = { omlx };
 	}
 	return request;
 }
 
-export function buildTextRequest(model: unknown, messages: unknown, options?: unknown): Fields {
+export function buildTextRequest(model: unknown, messages: unknown, options?: unknown, history?: unknown): Fields {
 	const group = record(messages, 'Messages'); ensureKeys(group, ['message'], 'Messages');
 	if (!Array.isArray(group.message) || !group.message.length) throw new Error('Provide at least one message');
 	const normalized = group.message.map((value) => {
 		const entry = record(value, 'Message'); ensureKeys(entry, ['role', 'content', 'name', 'toolCallId', 'toolCalls'], 'Message');
-		const role = choice(entry.role, 'Message role', ['system', 'user', 'assistant', 'tool']);
-		const result: Fields = { role, content: textValue(entry.content ?? '', 'Message content', true) };
+		const role = choice(entry.role, 'Message role', ['system', 'developer', 'user', 'assistant', 'tool']);
+		const result: Fields = { role, content: entry.content === null && role === 'assistant' ? null : textValue(entry.content ?? '', 'Message content', true) };
 		if (entry.name !== undefined && textValue(entry.name, 'Message name', true).trim()) result.name = entry.name;
 		if (entry.toolCallId !== undefined && textValue(entry.toolCallId, 'Tool call ID', true).trim()) result.tool_call_id = entry.toolCallId;
 		if (role === 'tool' && !result.tool_call_id) throw new Error('Tool messages require a tool call ID');
@@ -201,7 +218,20 @@ export function buildTextRequest(model: unknown, messages: unknown, options?: un
 		}
 		return result;
 	});
-	return { model: textValue(model, 'Model').trim(), messages: normalized, stream: false, ...chatOptions(options, false) };
+	if (typeof history === 'string' && Buffer.byteLength(history) > 16 * 1024 * 1024) throw new Error('Chat history exceeds 16 MiB');
+	const prior = history === undefined ? [] : jsonValue(history, 'Conversation history');
+	if (!Array.isArray(prior)) throw new Error('Conversation history must be an array of OpenAI messages');
+	if (prior.length + normalized.length > 4096) throw new Error('Chat history exceeds 4096 messages');
+	const priorMessages = prior.length ? buildTextRequest(model, { message: prior.map((value) => {
+		const entry = record(value, 'History message');
+		ensureKeys(entry, ['role', 'content', 'name', 'tool_call_id', 'tool_calls'], 'History message');
+		return { role: entry.role, content: entry.content, ...(entry.name !== undefined ? { name: entry.name } : {}),
+			...(entry.tool_call_id !== undefined ? { toolCallId: entry.tool_call_id } : {}),
+			...(entry.tool_calls !== undefined ? { toolCalls: entry.tool_calls } : {}) };
+	}) }).messages as Fields[] : [];
+	const conversation = [...priorMessages, ...normalized];
+	if (conversation.length > 4096 || Buffer.byteLength(JSON.stringify(conversation)) > 16 * 1024 * 1024) throw new Error('Chat history exceeds 4096 messages or 16 MiB');
+	return { model: textValue(model, 'Model').trim(), messages: conversation, stream: false, ...chatOptions(options, false) };
 }
 
 export function buildVisionRequest(model: unknown, prompt: unknown, systemPrompt: unknown, images: MediaBytes[], options?: unknown): Fields {

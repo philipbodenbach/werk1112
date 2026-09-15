@@ -23,6 +23,7 @@ test('private Beta package registers all eight version-one nodes and one credent
     names.push(node.description.name);
     assert.match(node.description.displayName, /^WERK \w+ \(Beta\)$/);
     assert.equal(node.description.version, 1);
+    assert.equal(node.description.properties.find(property => property.name === 'httpTimeoutSeconds').default, 600);
     assert.deepEqual(node.description.inputs, ['main']);
     assert.deepEqual(node.description.outputs, ['main']);
     assert.equal(node.description.credentials[0].name, 'werkApi');

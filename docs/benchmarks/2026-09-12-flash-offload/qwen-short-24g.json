@@ -1,0 +1,56 @@
+{
+  "model": "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+  "expert_cache_mb": "24576",
+  "ngram_cache_mb": "auto",
+  "tool_count": 0,
+  "tool_schema_bytes": 2,
+  "samples": [
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust is a systems programming language that guarantees memory safety and thread safety without a garbage collector, enabling developers to write high-performance, reliable code with zero-cost abstractions."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 23.454923500001314,
+      "usage": {
+        "completion_tokens": 34,
+        "prompt_tokens": 23,
+        "total_tokens": 57
+      },
+      "first_text_seconds": 10.6485227499943,
+      "backend_phases": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 12.8,
+        "evaluated_prompt_tokens": 23,
+        "first_token_seconds": 10.62,
+        "prompt_seconds": 10.62
+      }
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust ownership is a compile-time system where each value has a single owner, and the value is automatically deallocated when that owner goes out of scope."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 9.81487412500428,
+      "usage": {
+        "completion_tokens": 31,
+        "prompt_tokens": 21,
+        "total_tokens": 52
+      },
+      "first_text_seconds": 2.9931569160107756,
+      "backend_phases": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 6.82,
+        "evaluated_prompt_tokens": 21,
+        "first_token_seconds": 2.98,
+        "prompt_seconds": 2.98
+      }
+    }
+  ],
+  "passed": true
+}

@@ -1,0 +1,11 @@
+{
+  "passed": false,
+  "tool_count": 34,
+  "tool_schema_bytes": 28425,
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": "auto",
+  "error": "prefill_memory_aborted",
+  "observed_usage_gib": 36.0,
+  "hard_watermark_gib": 35.6,
+  "note": "First request aborted by native memory enforcer before output; endpoint-only transient accounting was insufficient. No second request issued."
+}

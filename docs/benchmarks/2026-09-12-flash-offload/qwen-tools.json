@@ -1,0 +1,78 @@
+{
+  "model": "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": 1024,
+  "samples": [
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust is a systems programming language that delivers performance and memory safety without a garbage collector, thanks to its innovative ownership and borrowing system."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 66.10509441699833
+    },
+    {
+      "stream": false,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_ab5aa7e1",
+            "type": "function",
+            "function": {
+              "name": "add",
+              "arguments": "{\"a\": 17, \"b\": 25}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "received_done": null,
+      "seconds": 64.60545616700256
+    },
+    {
+      "stream": false,
+      "message": {
+        "role": "assistant",
+        "content": "17 plus 25 equals **42**."
+      },
+      "finish_reason": "stop",
+      "received_done": null,
+      "seconds": 8.321026500008884
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "id": "call_78663e90",
+            "function": {
+              "name": "add",
+              "arguments": "{\"a\": 17, \"b\": 25}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "received_done": true,
+      "seconds": 13.499137000006158
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "17 plus 25 equals **42**."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 2.01332574999833
+    }
+  ],
+  "passed": true
+}

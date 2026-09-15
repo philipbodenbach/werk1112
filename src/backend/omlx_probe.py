@@ -48,7 +48,8 @@ def launcher_module(path):
                 if len(assignment.targets) != 1 or ast.unparse(assignment.targets[0]) != "sys.argv[0]":
                     raise ValueError("cannot verify custom oMLX launcher assignments")
                 expected = ast.parse(r"re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])", mode="eval").body
-                if ast.dump(assignment.value) != ast.dump(expected):
+                homebrew = ast.parse("sys.argv[0].removesuffix('.exe')", mode="eval").body
+                if ast.dump(assignment.value) not in (ast.dump(expected), ast.dump(homebrew)):
                     raise ValueError("cannot verify custom oMLX launcher argv handling")
                 body = body[1:]
             if not node.orelse and len(body) == 1 and ast.unparse(body[0]) == "sys.exit(main())":
@@ -283,6 +284,12 @@ CONTRACTS = {
     "deepseek_tokenizer_patch": {"a9cef3a580b1bc3d75764cb2bf15e11fcae9cfe001680464eafa6a607ccb60ed"},
     "deepseek_tokenizer": {"0d5b1b4229d30a1e279258be649e6671f4f1e61cded088301bad2a78685edfab"},
     "deepseek_parser": {"fe3ad579842a87f816d6def9992f900112ecadc9d7d50005eab3db32171b475f"},
+    "native_tokenizer": {"81805beafb00c4a23b60252397f3dbfdd16fb3312b409bcc02d6d5ccaa215d3b"},
+    "native_tokenizer_loader": {"5a54ff0969ea3e2766be98887f244b7f0cfa7f889dfed70df620700317c2eab2"},
+    "native_tool_inference": {"ce5386192baf92f6f8590e868ea81e748102ba5e773cfcc05134e16a4e54741c"},
+    # Entire module: parser, schema-based argument conversion and delimiters.
+    "glm47_parser_module": {"9dce4324772d04cb3fbf67474816785944c3c24cca38976dcdedcd078da2cef8"},
+    "qwen_coder_parser_module": {"f89e1b330159dc991c04595362c62eeec26f92de4dcea9a429da28031af41088"},
 }
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
@@ -320,7 +327,7 @@ def verify_contract(function, contract):
         raise ValueError(f"unverified oMLX loader contract: {contract}")
 
 
-def read_json(path, required=True):
+def read_json(path, required=True, installed_text_port=False):
     try:
         with path.open("rb") as stream:
             data = stream.read(MAX_JSON_BYTES + 1)
@@ -336,11 +343,11 @@ def read_json(path, required=True):
         raise ValueError(f"damaged model metadata: {path.name}: {error}") from error
     if not isinstance(result, dict):
         raise ValueError(f"damaged model metadata: {path.name} must be an object")
-    validate_metadata(result)
+    validate_metadata(result, installed_text_port=installed_text_port)
     return result
 
 
-def validate_metadata(config):
+def validate_metadata(config, installed_text_port=False):
     pending = [(config, 0)]
     count = 0
     while pending:
@@ -349,7 +356,10 @@ def validate_metadata(config):
         if depth > 32 or count > 250000:
             raise ValueError("model metadata exceeds bounded probe structure limit")
         if isinstance(item, dict):
-            if item.get("model_file") is not None:
+            installed_override = (installed_text_port and item is config
+                                  and item.get("model_type") == "qwen4_exp"
+                                  and item.get("model_file") == "qwen4_exp.py")
+            if item.get("model_file") is not None and not installed_override:
                 raise ValueError("model_file requires executing model repository code; oMLX preflight cannot verify it")
             for key, value in item.items():
                 # ModelArgs may expand these counts into Python lists.
@@ -535,6 +545,51 @@ def check_quantization(config, loader, root, mx):
 
 
 def supports_tools(config, tokenizer_config, root, utils):
+    if config["model_type"] in ("qwen4_exp", "glm5_next"):
+        expected_parser, parser_contract = {
+            "qwen4_exp": ("qwen3_coder", "qwen_coder_parser_module"),
+            "glm5_next": ("glm47", "glm47_parser_module"),
+        }[config["model_type"]]
+        if tokenizer_config.get("chat_template_type") is not None:
+            return False
+        tokenizer = installed_module("mlx_lm.tokenizer_utils", root)
+        verify_contract(utils.load_tokenizer, "native_tokenizer_loader")
+        native_load = tokenizer.load
+        if ast_digest(function_tree(native_load)) in CONTRACTS["deepseek_tokenizer"]:
+            # A previously imported native DeepSeek patch delegates other
+            # architectures to its original tokenizer loader.
+            native_load = inspect.getclosurevars(native_load).nonlocals.get("orig_load")
+            check_function_origin(native_load, root)
+        verify_contract(native_load, "native_tokenizer")
+        verify_contract(tokenizer._infer_tool_parser, "native_tool_inference")
+        if getattr(utils, "_load_tokenizer", None) is not tokenizer.load:
+            return False
+        # Match the local Transformers template precedence without constructing
+        # a tokenizer. Multiple named templates need a separate verified path.
+        if (root / "chat_templates").exists():
+            return False
+        template = tokenizer_config.get("chat_template")
+        template_file = root / "chat_template.jinja"
+        if template_file.exists():
+            with template_file.open(encoding="utf-8") as source:
+                template = source.read(MAX_JSON_BYTES + 1)
+            if len(template) > MAX_JSON_BYTES:
+                return False
+        inferred = tokenizer._infer_tool_parser(template)
+        selected = tokenizer_config.get("tool_parser_type", inferred)
+        if inferred != expected_parser or selected != inferred:
+            return False
+        parser = installed_module(f"mlx_lm.tool_parsers.{expected_parser}", root)
+        verify_contract(parser, parser_contract)
+        for node in function_tree(parser).body:
+            if isinstance(node, ast.FunctionDef):
+                function = getattr(parser, node.name, None)
+                expected = ast.Module(body=[node], type_ignores=[])
+                if (getattr(function, "__globals__", None) is not parser.__dict__
+                        or ast_digest(function_tree(function)) != ast_digest(expected)):
+                    return False
+        return (parser.tool_call_start == "<tool_call>"
+                and parser.tool_call_end == "</tool_call>")
     if config["model_type"].startswith("deepseek_v4"):
         if (tokenizer_config.get("tool_parser_type") not in (None, "deepseek_v4")
                 or tokenizer_config.get("chat_template_type") not in (None, "deepseek_v4")):
@@ -546,9 +601,71 @@ def supports_tools(config, tokenizer_config, root, utils):
         parser = installed_module("mlx_lm.tool_parsers.deepseek_v4", root)
         verify_contract(parser.parse_tool_call, "deepseek_parser")
         return bool(getattr(parser, "tool_call_start", None) and getattr(parser, "tool_call_end", None))
-    # Other architectures remain conservatively text-only in this first
-    # integration. Importing a parser alone would not prove tokenizer wiring.
+    # Other architectures remain text-only until tokenizer wiring is verified.
     return False
+
+
+def probe_cache_paths():
+    """Files and import directories whose changes invalidate this preflight.
+
+    Only paths are returned. Werk compares filesystem metadata without reading
+    weights or importing Python again for each request. Search directories and
+    .pth files cover new shadowing modules and installation changes as well as
+    edits to the modules actually imported by this successful probe.
+    """
+    paths = {Path(sys.executable).absolute()}
+    for module in tuple(sys.modules.values()):
+        namespace = getattr(module, "__dict__", {})
+        filename = namespace.get("__file__")
+        if isinstance(filename, str) and Path(filename).exists():
+            path = Path(filename).absolute()
+            paths.add(path)
+            paths.add(path.parent)
+        for directory in namespace.get("__path__", ()) or ():
+            if isinstance(directory, str) and Path(directory).is_dir():
+                paths.add(Path(directory).absolute())
+    for directory in sys.path:
+        if not isinstance(directory, str):
+            continue
+        root = Path(directory).absolute()
+        if root.exists():
+            paths.add(root)
+        if root.is_dir():
+            paths.update(root.glob("*.pth"))
+        elif root.parent.is_dir():
+            # Python also searches zip archives, including paths which do not
+            # yet exist. Their parent detects a newly installed archive.
+            paths.add(root.parent)
+    for name in ("omlx", "mlx", "mlx-lm"):
+        distribution = importlib.metadata.distribution(name)
+        found_metadata = False
+        for entry in distribution.files or ():
+            if entry.name == "METADATA" and str(entry.parent).endswith(".dist-info"):
+                paths.add(Path(distribution.locate_file(entry)).absolute())
+                found_metadata = True
+        if not found_metadata:
+            # Homebrew omits RECORD, making Distribution.files return None.
+            # Its standard PathDistribution still exposes the metadata folder.
+            metadata_root = getattr(distribution, "_path", None)
+            if metadata_root is None:
+                raise ValueError("runtime package metadata path is unavailable")
+            metadata_root = Path(metadata_root)
+            metadata_files = [metadata_root / filename for filename in ("METADATA", "PKG-INFO")]
+            metadata_files = [path.absolute() for path in metadata_files if path.is_file()]
+            if not metadata_files:
+                raise ValueError("runtime package metadata file is unavailable")
+            paths.update(metadata_files)
+    return sorted(map(str, paths))
+
+
+def add_probe_cache_paths(result):
+    """Optional optimization metadata must fit the bounded JSON transport."""
+    try:
+        paths = probe_cache_paths()
+        if len(paths) <= 8192 and len(json.dumps(paths).encode("utf-8")) <= 2 * 1024 * 1024:
+            result["cache_paths"] = paths
+    except Exception:
+        pass
 
 
 def probe(payload):
@@ -563,7 +680,7 @@ def probe(payload):
         root = Path(payload["model_dir"]).resolve(strict=True)
         if not root.is_dir():
             raise ValueError("oMLX model path must be a local directory")
-        config = read_json(root / "config.json")
+        config = read_json(root / "config.json", installed_text_port=True)
         if not config.get("model_type"):
             raise ValueError("damaged model metadata: config.json requires model_type")
         tokenizer_config = read_json(root / "tokenizer_config.json", required=False)
@@ -594,6 +711,27 @@ def probe(payload):
         raise ValueError(f"MLX Metal device is unavailable ({detail})")
     result = {"ok": True, "detail": detail, "runtime": runtime, "supports_tool_calling": False}
     if root is not None:
+        text_offload_requested = (payload.get("expert_cache_bytes") is not None or payload.get("ngram_cache_bytes") is not None)
+        # Qwen's default/explicit N-gram Auto also works with native experts.
+        # Other architectures and unverified runtime versions keep their route.
+        text_offload_requested |= config.get("model_type") == "qwen4_exp" and payload.get("ngram_cache_bytes") is None
+        text_offload_explicit = bool(payload.get("expert_cache_bytes") or payload.get("ngram_cache_bytes"))
+        if (config.get("model_type") in ("qwen4_exp", "glm5_next") and text_offload_requested
+                and (runtime["omlx_version"] == "0.6.4" or text_offload_explicit)):
+            from _werk_omlx_text_offload import inspect_model
+            result["runtime"]["expert_offload"] = inspect_model(root, payload.get("expert_cache_bytes"), payload.get("ngram_cache_bytes"))
+            result["model_type"] = config["model_type"]
+            try:
+                utils = installed_module("mlx_lm.utils", root)
+                result["supports_tool_calling"] = supports_tools(config, tokenizer_config, root, utils)
+                if not result["supports_tool_calling"]:
+                    result["tool_calling_detail"] = "native text offload tokenizer/tool parser wiring is unverified for this model"
+            except Exception as error:
+                result["tool_calling_detail"] = f"native text offload tool parser is unverified: {error}"
+            add_probe_cache_paths(result)
+            return result
+        if payload.get("ngram_cache_bytes"):
+            raise ValueError("this architecture has no verified N-gram offload adapter")
         try:
             config, utils, loader = prepare_runtime(root, config)
             check_quantization(config, loader, root, mx)
@@ -606,6 +744,22 @@ def probe(payload):
         except Exception as error:
             result["tool_calling_detail"] = f"oMLX tool parser is unverified: {error}"
         result["model_type"] = config["model_type"]
+        expert_budget = payload.get("expert_cache_bytes")
+        # Auto applies only to the verified adapter. Preserve native loading
+        # for other architectures, runtime versions and quantization layouts.
+        auto_eligible = (runtime["omlx_version"] == "0.6.4"
+                         and config.get("model_type") == "deepseek_v4"
+                         and not config.get("model_file")
+                         and isinstance(config.get("quantization"), dict)
+                         and config["quantization"].get("mode", "affine") == "affine")
+        if expert_budget is not None and (expert_budget > 0 or auto_eligible):
+            if runtime["omlx_version"] != "0.6.4":
+                raise ValueError("experimental expert streaming currently requires oMLX 0.6.4")
+            from _werk_omlx_experts import inspect_model
+            result["runtime"]["expert_offload"] = inspect_model(root, payload["expert_cache_bytes"])
+    # A missing dependency inventory disables the Rust-side optimization; it
+    # must never make an otherwise valid runtime incompatible.
+    add_probe_cache_paths(result)
     return result
 
 

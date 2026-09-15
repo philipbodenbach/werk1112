@@ -628,10 +628,22 @@ class WerkRuntimeExpertsNode:
             "required": {
                 "connection": ("WERK_CONNECTION",),
                 "model_id": ("STRING", {"default": ""}),
-                "tier": (["all", *EXPERT_TIERS], {"default": "all"}),
+                "tier": (
+                    ["all", *EXPERT_TIERS],
+                    {
+                        "default": "all",
+                        "tooltip": "oMLX expert offload reports SSD-backed experts as external and its unified-memory cache as ram.",
+                    },
+                ),
                 "limit": ("INT", {"default": 50, "min": 1, "max": 4096}),
                 "cursor": ("STRING", {"default": ""}),
-                "allow_experimental": ("BOOLEAN", {"default": False}),
+                "allow_experimental": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Required for experimental expert adapters. Enable offload in WERK Text Config, generate once, then connect Text Generate.model_id here. Server defaults also apply.",
+                    },
+                ),
                 "refresh_token": ("INT", {"default": 0, "min": 0}),
             }
         }
@@ -710,10 +722,19 @@ class WerkExpertControlNode:
                 "action": (list(EXPERT_ACTIONS), {"default": "pin"}),
                 "target_tier": (
                     ["unchanged", *EXPERT_TIERS],
-                    {"default": "unchanged"},
+                    {
+                        "default": "unchanged",
+                        "tooltip": "Prefetch requires ram or vram when supported by the backend. oMLX uses ram for unified memory; other actions use unchanged.",
+                    },
                 ),
                 "dry_run": ("BOOLEAN", {"default": True}),
-                "allow_experimental": ("BOOLEAN", {"default": False}),
+                "allow_experimental": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Opts this expert operation in. First generate with offload enabled in WERK Text Config or the server defaults; connect Text Generate.model_id to order execution.",
+                    },
+                ),
             }
         }
 

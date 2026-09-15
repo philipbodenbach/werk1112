@@ -23,7 +23,7 @@ installation can require workflow migration.
 
 | File | Prerequisites and result |
 | --- | --- |
-| [01-discovery-text.json](01-discovery-text.json) | Installed text model; discovery followed by a short normal chat completion. |
+| [01-discovery-text.json](01-discovery-text.json) | Installed text model; discovery followed by two chat turns; the second uses `{{ $json.conversation }}` and inherits server sampling/cache defaults. |
 | [02-image.json](02-image.json) | Available image-generation model; inspect generated binary `data` in n8n. No GPU/model is bundled. |
 | [03-vision.json](03-vision.json) | Suitable vision model and readable `/data/werk-examples/input.png`; ordered binary input, text analysis. Change the read node to your own local file path. |
 | [04-image-to-video-jobs.json](04-image-to-video-jobs.json) | Image-to-video model and the same image; submit once, native Wait, Get, completed/terminal branching and output-ID download. The example downloads the first output (`count: 1`). Failed/cancelled jobs stop on an inspectable branch. Stop the workflow to end polling of a job that never becomes terminal. |

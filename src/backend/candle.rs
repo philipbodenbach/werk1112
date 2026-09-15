@@ -448,6 +448,7 @@ fn generate_with_loaded_model(
         completion_tokens: generated.len(),
         finish_reason,
         timings: GenerationTimings {
+            cached_prompt_tokens: None,
             load_seconds: 0.0,
             warmup_seconds: 0.0,
             first_token_seconds: 0.0,

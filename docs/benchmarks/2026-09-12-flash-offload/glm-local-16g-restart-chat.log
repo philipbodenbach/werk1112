@@ -1,0 +1,31 @@
+[werk chat] persistence enabled: 22 saved messages restored
+[werk chat] conversation: /Users/philipbodenbach/.local/share/werk1112/chat-sessions/b71e634f0812a01d29aa6345d3d23b7834578a1292bfbd6a42a51e27609ee679.json
+oMLX expert cache: 16384 MiB (explicit) upper budget; SSD offload active, native memory guard may reduce residency
+[werk chat] native KV cache enabled; reuse depends on the prompt and backend
+Chatting with Vontra/GLM-5.3-Flash-MLX-oQ2-MTP. Type /exit or /quit to stop.
+you> assistant> 37
+
+backend:              oMLX
+total duration:       43.437234s
+load duration:        0us
+prompt total count:   239 token(s)
+prompt cached count:  0 token(s)
+prompt eval count:    239 token(s)
+prompt eval duration: 29.64s
+prompt eval rate:     8.06 tokens/s
+eval count:           22 token(s)
+eval duration:        13.77s
+first token:          29.64s
+eval rate:            1.60 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 23
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 0
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":256,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":58077833,"allocator_clears":619,"budget_reductions":0,"cache_budget_bytes":17179869184,"cache_budget_mode":"explicit","cache_evictions":8802,"cache_hits":4784,"cache_misses":10986,"disk_bytes_read":86397419520,"disk_read_seconds":26.228058,"effective_cache_budget_bytes":17179869184,"execution":"grouped","forward_calls":1050,"forward_seconds":42.906993,"materialize_seconds":0.364253,"ngram_cache_budget_bytes":0,"ngram_cache_budget_mode":"disabled","ngram_cache_evictions":0,"ngram_cache_hits":0,"ngram_cache_misses":0,"ngram_effective_cache_budget_bytes":0,"ngram_requested_rows":0,"ngram_resident_cache_bytes":0,"ngram_unique_rows":0,"output_evaluations":2056,"prefill_cache_growth_bytes":17175674880,"prefill_samples_corrected":1,"resident_cache_bytes":17175674880,"routing_seconds":4.107569,"tensor_materializations":10986}
+you> 

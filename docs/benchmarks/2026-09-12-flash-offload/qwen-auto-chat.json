@@ -1,0 +1,125 @@
+{
+  "model": "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": 1024,
+  "thinking": false,
+  "temperature": 0,
+  "max_tokens": 16,
+  "persistence": true,
+  "prompts": [
+    "Merke dir die Zahl 37. Antworte nur mit OK.",
+    "Welche Zahl sollst du dir merken? Antworte nur mit der Zahl.",
+    "Was ist 2 plus 3? Nur die Zahl.",
+    "What is 6 times 7? Answer with the number only.",
+    "Welche Zahl sollte gespeichert bleiben? Nur die Zahl.",
+    "Ist Berlin die Hauptstadt von Deutschland? Antworte nur mit Ja oder Nein.",
+    "Was ist 20 minus 8? Nur die Zahl.",
+    "Translate cat into German. One word only.",
+    "Nenne erneut unsere gespeicherte Zahl. Nur die Zahl.",
+    "What is 9 plus 4? Answer with the number only.",
+    "Wie lautet die anfangs gemerkte Zahl? Nur die Zahl."
+  ],
+  "wall_seconds": 63.46660820800753,
+  "exit_code": 0,
+  "results": [
+    {
+      "answer": "OK",
+      "expected": "OK",
+      "correct": true
+    },
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true
+    },
+    {
+      "answer": "5",
+      "expected": "5",
+      "correct": true
+    },
+    {
+      "answer": "42",
+      "expected": "42",
+      "correct": true
+    },
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true
+    },
+    {
+      "answer": "Ja",
+      "expected": "Ja",
+      "correct": true
+    },
+    {
+      "answer": "12",
+      "expected": "12",
+      "correct": true
+    },
+    {
+      "answer": "Katze",
+      "expected": "Katze",
+      "correct": true
+    },
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true
+    },
+    {
+      "answer": "13",
+      "expected": "13",
+      "correct": true
+    },
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true
+    }
+  ],
+  "durations_seconds": [
+    14.062314,
+    6.137536,
+    4.234012,
+    4.666658,
+    3.169455,
+    4.917552,
+    3.655149,
+    3.997007,
+    4.282269,
+    4.043955,
+    4.112484
+  ],
+  "warm_median_seconds": 4.173248,
+  "cached_prompt_tokens": [
+    0,
+    29,
+    61,
+    88,
+    118,
+    145,
+    176,
+    205,
+    230,
+    259,
+    289
+  ],
+  "total_prompt_tokens": [
+    27,
+    58,
+    86,
+    115,
+    142,
+    174,
+    202,
+    227,
+    256,
+    286,
+    317
+  ],
+  "all_correct": true,
+  "expert_cache_effective_bytes": [
+    22399793128
+  ]
+}

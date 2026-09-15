@@ -1,0 +1,32 @@
+{
+  "cases": [
+    {
+      "id": "rust",
+      "max_tokens": 64,
+      "turns": [
+        {
+          "prompt": "Write me a sentence about the programming language rust."
+        }
+      ]
+    },
+    {
+      "id": "german",
+      "max_tokens": 64,
+      "turns": [
+        {
+          "prompt": "Erkläre in einem deutschen Satz, warum Rust Speichersicherheit bietet."
+        }
+      ]
+    },
+    {
+      "id": "json",
+      "max_tokens": 64,
+      "turns": [
+        {
+          "prompt": "Return only JSON with the keys language and safe. Set language to Rust and safe to true."
+        }
+      ]
+    }
+  ],
+  "note": "Exact inputs for the private-worker differential measurements. The German answer intentionally hits the fixed64-token comparison limit; not a passing quality fixture."
+}

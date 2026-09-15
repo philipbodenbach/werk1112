@@ -86,6 +86,10 @@ def test_connection_discovery_returns_safe_status_and_model_lists():
         "declared": ["image-ready", "image-unavailable"],
         "available": ["image-ready"],
     }
+    assert result["text_models"] == {
+        "declared": ["vision-ready", "text"],
+        "available": ["vision-ready", "text"],
+    }
     assert result["video_models"] == {
         "declared": ["video-ready", "video-i2v"],
         "available": ["video-ready", "video-i2v"],

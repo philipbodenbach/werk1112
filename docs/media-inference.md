@@ -488,7 +488,9 @@ candidate.
 
 This residency is active independently of `werk serve --persistence`. That
 flag supplies defaults for missing fields on Werk Protocol Prefill and,
-separately, the native APC default when Werk starts a local vLLM process. It
+separately, the native APC default when Werk starts a local vLLM process. With
+`auto`/`disk` mode and reuse enabled, it also enables verified short exact-prefix
+caching in local oMLX 0.6.4 workers. It
 does not turn media caches on, off or into named runtime state; remote vLLM is
 not configured by that flag.
 

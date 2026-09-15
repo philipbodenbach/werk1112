@@ -1,0 +1,56 @@
+{
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "expert_cache_mb": "24576",
+  "ngram_cache_mb": "auto",
+  "tool_count": 0,
+  "tool_schema_bytes": 2,
+  "samples": [
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "A systems-level programming language with a focus on safety, performance, and concurrency, Rust offers memory safety without garbage collection through its ownership model and borrow checker."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 20.885974290999002,
+      "usage": {
+        "completion_tokens": 32,
+        "prompt_tokens": 15,
+        "total_tokens": 47
+      },
+      "first_text_seconds": 9.959944166010246,
+      "backend_phases": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 10.93,
+        "evaluated_prompt_tokens": 15,
+        "first_token_seconds": 9.94,
+        "prompt_seconds": 9.94
+      }
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "**Ownership in Rust means each value has exactly one owner, and the owner is responsible for freeing that value when it goes out of scope.**"
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 14.40550350000558,
+      "usage": {
+        "completion_tokens": 29,
+        "prompt_tokens": 12,
+        "total_tokens": 41
+      },
+      "first_text_seconds": 4.750784332994954,
+      "backend_phases": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 9.65,
+        "evaluated_prompt_tokens": 12,
+        "first_token_seconds": 4.74,
+        "prompt_seconds": 4.74
+      }
+    }
+  ],
+  "passed": true
+}

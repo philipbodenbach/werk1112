@@ -1,0 +1,129 @@
+{
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "session": "offload-validation-glm-local-1789333082570692000-auto",
+  "execution": "grouped",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": null,
+  "thinking": false,
+  "temperature": 0,
+  "max_tokens": 256,
+  "persistence": true,
+  "prompts": [
+    "Merke dir die Zahl 37. Antworte nur mit OK.",
+    "Welche Zahl sollst du dir merken? Antworte nur mit der Zahl.",
+    "Was ist 2 plus 3? Nur die Zahl.",
+    "What is 6 times 7? Answer with the number only.",
+    "Welche Zahl sollte gespeichert bleiben? Nur die Zahl.",
+    "Ist Berlin die Hauptstadt von Deutschland? Antworte nur mit Ja oder Nein.",
+    "Was ist 20 minus 8? Nur die Zahl.",
+    "Translate cat into German. One word only.",
+    "Nenne erneut unsere gespeicherte Zahl. Nur die Zahl.",
+    "What is 9 plus 4? Answer with the number only.",
+    "Wie lautet die anfangs gemerkte Zahl? Nur die Zahl."
+  ],
+  "wall_seconds": 455.2394297909923,
+  "exit_code": 0,
+  "results": [
+    {
+      "answer": "OK",
+      "expected": "OK",
+      "correct": true,
+      "total_seconds": 67.405941,
+      "cached_tokens": 0,
+      "decode_tokens_per_second": 1.6,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true,
+      "total_seconds": 80.628313,
+      "cached_tokens": 25,
+      "decode_tokens_per_second": 1.44,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "5",
+      "expected": "5",
+      "correct": true,
+      "total_seconds": 28.811888,
+      "cached_tokens": 47,
+      "decode_tokens_per_second": 1.52,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "42",
+      "expected": "42",
+      "correct": true,
+      "total_seconds": 64.817166,
+      "cached_tokens": 64,
+      "decode_tokens_per_second": 1.45,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true,
+      "total_seconds": 31.704919,
+      "cached_tokens": 83,
+      "decode_tokens_per_second": 1.42,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "Ja",
+      "expected": "Ja",
+      "correct": true,
+      "total_seconds": 42.349022,
+      "cached_tokens": 100,
+      "decode_tokens_per_second": 1.36,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "12",
+      "expected": "12",
+      "correct": true,
+      "total_seconds": 30.833799,
+      "cached_tokens": 122,
+      "decode_tokens_per_second": 1.45,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "Katze",
+      "expected": "Katze",
+      "correct": true,
+      "total_seconds": 21.052322,
+      "cached_tokens": 139,
+      "decode_tokens_per_second": 1.51,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true,
+      "total_seconds": 24.170663,
+      "cached_tokens": 153,
+      "decode_tokens_per_second": 1.52,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "13",
+      "expected": "13",
+      "correct": true,
+      "total_seconds": 32.32736,
+      "cached_tokens": 172,
+      "decode_tokens_per_second": 1.43,
+      "finish_reason": "stop"
+    },
+    {
+      "answer": "37",
+      "expected": "37",
+      "correct": true,
+      "total_seconds": 25.594648,
+      "cached_tokens": 191,
+      "decode_tokens_per_second": 1.4,
+      "finish_reason": "stop"
+    }
+  ],
+  "all_correct": true,
+  "warm_median_seconds": 31.269359
+}

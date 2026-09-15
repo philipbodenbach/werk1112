@@ -1,0 +1,25 @@
+{
+  "process_exit_code": 0,
+  "completed_turns": 1,
+  "generation_errors": [],
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "session": "glm-auto-low-validation-20260914",
+  "execution": "grouped",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": null,
+  "thinking": false,
+  "reasoning_effort": "low",
+  "temperature": 0,
+  "max_tokens": 256,
+  "persistence": true,
+  "prompts": [
+    "Welche Zahl habe ich dich am Anfang gebeten zu merken? Antworte nur mit der Zahl."
+  ],
+  "wall_seconds": 19.863357125010225,
+  "exit_code": 0,
+  "answer": "37",
+  "correct": true,
+  "total_seconds": 13.328245,
+  "cached_prompt_tokens": 216,
+  "prompt_total_tokens": 239
+}

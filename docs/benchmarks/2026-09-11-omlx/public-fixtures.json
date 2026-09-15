@@ -1,0 +1,214 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-09-11T16:06:57.650111+00:00",
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "base_url": "http://127.0.0.1:11434/v1",
+  "settings": {
+    "temperature": 0,
+    "top_p": 0.95,
+    "seed": 42,
+    "repeats": 1
+  },
+  "notes": [
+    "First sample does not imply a cold worker or cold prefix cache.",
+    "Repeat samples start the fixture conversation again; multi-turn samples replay actual assistant answers.",
+    "First text latency includes network, queue, loading, prefill, and any preceding reasoning.",
+    "Client decode rate is only an estimate: SSE chunks can contain multiple tokens and final events add overhead.",
+    "Missing usage/cache metrics remain null. Temperature zero does not guarantee identical results on every backend.",
+    "Language and answer usefulness require manual review; automated checks cover only the declared constraints."
+  ],
+  "samples": [
+    {
+      "first_text_seconds": 9.342596750007942,
+      "total_seconds": 20.92812587499793,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "A sentence about Rust: Rust is a systems-level programming language that emphasizes memory safety, concurrency, and performance, ensuring that programs run reliably without data races or undefined behavior.",
+      "usage": {
+        "completion_tokens": 35,
+        "prompt_tokens": 19,
+        "total_tokens": 54
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 19,
+      "completion_tokens": 35,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 2.934695483753262,
+      "case": "rust-english",
+      "repetition": 1,
+      "turn": 1,
+      "sample_kind": "first",
+      "prompt": "Write me a sentence about the programming language Rust. Use one English sentence.",
+      "max_tokens": 128,
+      "checks": [
+        {
+          "type": "manual",
+          "passed": null,
+          "criterion": "One coherent, factually correct English sentence about Rust; no repetition or unrelated text."
+        }
+      ]
+    },
+    {
+      "first_text_seconds": 9.560474333993625,
+      "total_seconds": 24.357512749993475,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "Rust bietet Speichersicherheit, weil es durch ein striktes Ownership-Modell mit festen Regeln für Besitz, Ausleihen und Lebenszeiten sicherstellt, dass Speicherfehler wie Use-After-Free, Doppel-Frees oder Datenrace zur Compile-Zeit verhindert werden.",
+      "usage": {
+        "completion_tokens": 68,
+        "prompt_tokens": 24,
+        "total_tokens": 92
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 24,
+      "completion_tokens": 68,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 4.527933098257942,
+      "case": "rust-german",
+      "repetition": 1,
+      "turn": 1,
+      "sample_kind": "first",
+      "prompt": "Erkläre in genau einem deutschen Satz, warum Rust Speichersicherheit bietet.",
+      "max_tokens": 128,
+      "checks": [
+        {
+          "type": "manual",
+          "passed": null,
+          "criterion": "One coherent German sentence correctly explaining ownership/borrowing or compiler checks; no repetition."
+        }
+      ]
+    },
+    {
+      "first_text_seconds": 11.06359262499609,
+      "total_seconds": 15.42969487499795,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\n  \"language\": \"Rust\",\n  \"safe\": true\n}",
+      "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 29,
+        "total_tokens": 45
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 29,
+      "completion_tokens": 16,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 3.4355585694296584,
+      "case": "structured-json",
+      "repetition": 1,
+      "turn": 1,
+      "sample_kind": "first",
+      "prompt": "Return only JSON with the keys language and safe. Set language to Rust and safe to true. Do not use Markdown.",
+      "max_tokens": 64,
+      "checks": [
+        {
+          "type": "json_equals",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "first_text_seconds": 11.908031042010407,
+      "total_seconds": 11.909728250000626,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "104",
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 25,
+        "total_tokens": 26
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 25,
+      "completion_tokens": 1,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "case": "arithmetic",
+      "repetition": 1,
+      "turn": 1,
+      "sample_kind": "first",
+      "prompt": "There are three boxes with four pencils each. How many pencils are there? Reply with the number only.",
+      "max_tokens": 32,
+      "checks": [
+        {
+          "type": "exact_text",
+          "passed": false
+        }
+      ]
+    },
+    {
+      "first_text_seconds": 9.190088707997347,
+      "total_seconds": 16.057506416997057,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "During the project, I will acknowledge the name \"Cedar\" and its Rust implementation in one short English sentence.",
+      "usage": {
+        "completion_tokens": 23,
+        "prompt_tokens": 25,
+        "total_tokens": 48
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 25,
+      "completion_tokens": 23,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 3.2035331084010124,
+      "case": "conversation",
+      "repetition": 1,
+      "turn": 1,
+      "sample_kind": "first",
+      "prompt": "My project is named Cedar and is written in Rust. Acknowledge this in one short English sentence.",
+      "max_tokens": 128,
+      "checks": [
+        {
+          "type": "manual",
+          "passed": null,
+          "criterion": "Acknowledges Cedar and Rust in coherent English."
+        }
+      ]
+    },
+    {
+      "first_text_seconds": 8.405070250009885,
+      "total_seconds": 11.47150587500073,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "{\"project\":\"Cedar\",\"language\":\"Rust\"}",
+      "usage": {
+        "completion_tokens": 11,
+        "prompt_tokens": 75,
+        "total_tokens": 86
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 75,
+      "completion_tokens": 11,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": 3.261115256587151,
+      "case": "conversation",
+      "repetition": 1,
+      "turn": 2,
+      "sample_kind": "first",
+      "prompt": "What are the name and language of my project? Reply only with JSON containing project and language, without Markdown.",
+      "max_tokens": 128,
+      "checks": [
+        {
+          "type": "json_equals",
+          "passed": true
+        }
+      ]
+    }
+  ],
+  "finished_at": "2026-09-11T16:08:37.809967+00:00",
+  "needs_review": true,
+  "measurement_note": "Run with Thinking=0. These historical client estimates assume visible-only usage. Current harness defaults to null unless upstream reasoning details establish this or the user opts in."
+}

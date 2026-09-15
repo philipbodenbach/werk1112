@@ -1,0 +1,79 @@
+{
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": "auto",
+  "reasoning_effort": "low",
+  "samples": [
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust is a systems programming language that emphasizes memory safety, concurrency, and performance through its innovative ownership model, enabling developers to write fast, reliable software without needing a garbage collector."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 53.27359600001364
+    },
+    {
+      "stream": false,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_7bdb4163",
+            "type": "function",
+            "function": {
+              "name": "add",
+              "arguments": "{\"a\": 17, \"b\": 25}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "received_done": null,
+      "seconds": 42.67885795899201
+    },
+    {
+      "stream": false,
+      "message": {
+        "role": "assistant",
+        "content": "17 + 25 = 42"
+      },
+      "finish_reason": "stop",
+      "received_done": null,
+      "seconds": 6.318324166000821
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "id": "call_7b27ea75",
+            "function": {
+              "name": "add",
+              "arguments": "{\"a\": 17, \"b\": 25}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "received_done": true,
+      "seconds": 8.762157707998995
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "17 + 25 = 42"
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 4.360659583006054
+    }
+  ],
+  "passed": true
+}

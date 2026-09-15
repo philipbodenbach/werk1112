@@ -1,6 +1,8 @@
 //! Werk-owned oMLX workers. Discovery and compatibility checks never load weights.
+use crate::openai::OmlxReasoningEffort;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     env,
@@ -23,10 +25,10 @@ use super::{
     GenerationBackend, GenerationTimings,
     openai_transport::{
         HttpDeadline, OpenAiCompletion, SseAccumulator, append_assistant_content,
-        chat_completion_body, delta_content, delta_tool_calls, ensure_visible_completion,
-        finalize_completion_stats, request_with_bearer, send_stream_result, send_text_chunk,
-        send_tool_call_delta, stream_body, update_completion_from_event,
-        update_completion_from_message,
+        chat_completion_body, delta_content, delta_has_reasoning_content, delta_tool_calls,
+        ensure_visible_completion, finalize_completion_stats, request_with_bearer,
+        send_stream_result, send_text_chunk, send_tool_call_delta, stream_body,
+        update_completion_from_event, update_completion_from_message,
     },
 };
 use crate::{
@@ -38,10 +40,23 @@ use crate::{
 
 const PROBE: &str = include_str!("omlx_probe.py");
 const SUPERVISOR: &str = include_str!("omlx_supervisor.py");
+const EXPERTS: &str = include_str!("omlx_experts.py");
+const PERSISTENCE: &str = include_str!("omlx_persistence.py");
+const OFFLOAD: &str = include_str!("omlx_offload.py");
+const OFFLOAD_RUNTIME: &str = include_str!("omlx_offload_runtime.py");
+const TEXT_OFFLOAD: &str = include_str!("omlx_text_offload.py");
+mod experts;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(900);
 const POLL: Duration = Duration::from_millis(100);
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
+// Request-specific controls may select another worker, but cannot grow an
+// unbounded collection or evict a worker still owned by runtime operations.
+const MAX_CACHED_WORKERS: usize = 16;
+const MAX_CACHED_MODEL_PROBES: usize = 32;
+const MAX_PROBE_DEPENDENCIES: usize = 8192;
+const MAX_PROBE_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROBE_STDERR_BYTES: usize = 64 * 1024;
 
 fn console_script_source(source: &str) -> String {
     // `python -c` otherwise imports from the caller's current directory before
@@ -52,12 +67,33 @@ fn console_script_source(source: &str) -> String {
     )
 }
 
+fn worker_script_source(source: &str) -> String {
+    // Embed Werk's helper in a private module, never import code from model paths.
+    let mut script = String::from("import types\n");
+    for (name, helper) in [
+        ("_werk_omlx_experts", EXPERTS),
+        ("_werk_omlx_offload", OFFLOAD),
+        ("_werk_omlx_offload_runtime", OFFLOAD_RUNTIME),
+        ("_werk_omlx_text_offload", TEXT_OFFLOAD),
+        ("_werk_omlx_persistence", PERSISTENCE),
+    ] {
+        let literal = serde_json::to_string(helper).expect("Python source is serializable");
+        script.push_str(&format!("_werk_helper = types.ModuleType('{name}')\nsys.modules['{name}'] = _werk_helper\nexec({literal}, _werk_helper.__dict__)\n"));
+    }
+    script.push_str(source);
+    console_script_source(&script)
+}
+
 #[derive(Clone)]
 pub struct OmlxBackend {
     store: ModelStore,
     // Snapshot once. The same invocation is used for model preflight and startup.
     invocation: std::result::Result<OmlxInvocation, String>,
     servers: Arc<Mutex<HashMap<String, Arc<OmlxProcess>>>>,
+    model_probes: Arc<Mutex<VecDeque<CachedModelProbe>>>,
+    // Native template control is request-local; toggling it reuses weights.
+    request_thinking: Option<bool>,
+    request_reasoning_effort: Option<OmlxReasoningEffort>,
     #[cfg(test)]
     test_probe: Option<ProbeReport>,
 }
@@ -71,6 +107,13 @@ struct OmlxInvocation {
     environment: Vec<(OsString, OsString)>,
     launcher_fingerprint: u64,
     working_directory: PathBuf,
+    expert_cache_bytes: Option<u64>,
+    ngram_cache_bytes: Option<u64>,
+    expert_execution: &'static str,
+    thinking: Option<bool>,
+    reasoning_effort: Option<OmlxReasoningEffort>,
+    persistence_dir: Option<PathBuf>,
+    server_prefix_cache: bool,
 }
 
 impl std::fmt::Debug for OmlxInvocation {
@@ -88,6 +131,13 @@ impl std::fmt::Debug for OmlxInvocation {
             .field("environment", &hasher.finish())
             .field("working_directory", &self.working_directory)
             .field("launcher_fingerprint", &self.launcher_fingerprint)
+            .field("expert_cache_bytes", &self.expert_cache_bytes)
+            .field("ngram_cache_bytes", &self.ngram_cache_bytes)
+            .field("expert_execution", &self.expert_execution)
+            .field("thinking", &self.thinking)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("persistence_dir", &self.persistence_dir)
+            .field("server_prefix_cache", &self.server_prefix_cache)
             .finish()
     }
 }
@@ -99,26 +149,130 @@ struct ProbeReport {
     tools: bool,
     tool_calling_detail: Option<String>,
     runtime: Value,
+    cache_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProbeFileStamp {
+    path: PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    unix_identity: (u64, u64, i64, i64, u32),
+}
+
+impl ProbeFileStamp {
+    fn read(path: PathBuf) -> Result<Self> {
+        let metadata = fs::metadata(&path)?;
+        #[cfg(unix)]
+        let unix_identity = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.mode(),
+            )
+        };
+        Ok(Self {
+            path,
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            unix_identity,
+        })
+    }
+
+    fn unchanged(&self) -> bool {
+        Self::read(self.path.clone()).is_ok_and(|current| current == *self)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct ModelProbeKey {
+    invocation: String,
+    manifest: ModelRuntimeIdentity,
+    directory: PathBuf,
+    files: Vec<ProbeFileStamp>,
+}
+
+impl ModelProbeKey {
+    fn read(
+        invocation: &OmlxInvocation,
+        manifest: &ModelManifest,
+        directory: &Path,
+    ) -> Result<Self> {
+        let mut paths = fs::read_dir(directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        // These are the files consumed by omlx_probe.py and its header-only
+        // expert preflight. Additions/removals are represented by the list.
+        paths.retain(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    matches!(
+                        name,
+                        "config.json"
+                            | "tokenizer_config.json"
+                            | "generation_config.json"
+                            | "chat_template.jinja"
+                            | "chat_templates"
+                    ) || (name.starts_with("model") && name.ends_with(".safetensors"))
+                })
+        });
+        paths.sort();
+        let files = paths
+            .into_iter()
+            .map(ProbeFileStamp::read)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            invocation: format!("{invocation:?}"),
+            manifest: ModelRuntimeIdentity::from_manifest(manifest)?,
+            directory: directory.to_path_buf(),
+            files,
+        })
+    }
+}
+
+struct CachedModelProbe {
+    key: ModelProbeKey,
+    dependencies: Vec<ProbeFileStamp>,
+    report: ProbeReport,
 }
 
 struct OmlxProcess {
     child: Mutex<Child>,
     // EOF stops the owned worker even if Werk exits via a signal without Drop.
     parent_pipe: Option<ChildStdin>,
+    // These flock descriptions also belong to the child. Closing the parent's
+    // copies cannot make its cache purgeable until the worker actually exits.
+    _lifetime_locks: Vec<fs::File>,
     url: String,
     api_key: String,
     model_name: String,
     model_dir: PathBuf,
     model_identity: Option<ModelRuntimeIdentity>,
+    logical_model_id: Option<String>,
     base_path: PathBuf,
     version: String,
     instance_id: String,
     tools: bool,
     log_tail: Arc<Mutex<VecDeque<String>>>,
+    expert_offload: bool,
+    expert_cache_bytes: Option<u64>,
+    ngram_cache_bytes: Option<u64>,
+    expert_execution: &'static str,
+    thinking: Option<bool>,
+    reasoning_effort: Option<OmlxReasoningEffort>,
+    server_prefix_cache: bool,
 }
 
 struct OmlxChatSession {
     server: Arc<OmlxProcess>,
+    request_thinking: Option<bool>,
+    request_reasoning_effort: Option<OmlxReasoningEffort>,
 }
 
 impl OmlxBackend {
@@ -127,6 +281,9 @@ impl OmlxBackend {
             store,
             invocation: OmlxInvocation::discover().map_err(|error| format!("{error:#}")),
             servers: Arc::new(Mutex::new(HashMap::new())),
+            model_probes: Arc::new(Mutex::new(VecDeque::new())),
+            request_thinking: None,
+            request_reasoning_effort: None,
             #[cfg(test)]
             test_probe: None,
         }
@@ -134,6 +291,16 @@ impl OmlxBackend {
 
     pub(crate) fn cache_identity(&self) -> String {
         format!("{:?}", self.invocation)
+    }
+
+    /// Retain short exact token prefixes across requests in the owned worker.
+    /// Configure before `prepare`; this applies to sessions, tools and direct
+    /// generation alike. It stores no chat history and ends with the worker.
+    pub fn with_server_prefix_cache(mut self, enabled: bool) -> Self {
+        if let Ok(invocation) = &mut self.invocation {
+            invocation.server_prefix_cache = enabled;
+        }
+        self
     }
 
     pub fn probe() -> Result<String> {
@@ -165,16 +332,103 @@ impl OmlxBackend {
             .map_err(|detail| anyhow!(detail.clone()))
     }
 
+    fn configured_for_chat(&self, options: &crate::openai::ChatRuntimeOptions) -> Result<Self> {
+        options.validate()?;
+        let mut configured = self.clone();
+        let invocation = configured
+            .invocation
+            .as_mut()
+            .map_err(|detail| anyhow!(detail.clone()))?;
+        if let Some(omlx) = &options.omlx {
+            if let Some(thinking) = omlx.thinking {
+                configured.request_thinking = Some(thinking);
+            }
+            if let Some(effort) = omlx.reasoning_effort {
+                configured.request_reasoning_effort = Some(effort);
+            }
+            if let Some(megabytes) = omlx.expert_cache_mb {
+                invocation.expert_cache_bytes =
+                    expert_cache_bytes(Some(megabytes.to_string().into()))?;
+            }
+            if let Some(budget) = omlx.ngram_cache_mb {
+                invocation.ngram_cache_bytes = match budget {
+                    crate::openai::NgramCacheBudget::Megabytes(mb) => Some(mb * 1024 * 1024),
+                    crate::openai::NgramCacheBudget::Mode(_) => None,
+                };
+            }
+        }
+        Ok(configured)
+    }
+
+    fn matches_chat_configuration(&self, server: &OmlxProcess) -> bool {
+        self.invocation().is_ok_and(|invocation| {
+            server.thinking == invocation.thinking
+                && server.reasoning_effort == invocation.reasoning_effort
+                && server.expert_cache_bytes == invocation.expert_cache_bytes
+                && server.ngram_cache_bytes == invocation.ngram_cache_bytes
+                && server.expert_execution == invocation.expert_execution
+                && server.server_prefix_cache == invocation.server_prefix_cache
+        })
+    }
+
     fn model_probe(&self, manifest: &ModelManifest) -> Result<(PathBuf, ProbeReport)> {
         let directory = resolve_model_dir(&self.store, manifest)?;
         #[cfg(test)]
         if let Some(report) = &self.test_probe {
             return Ok((directory, report.clone()));
         }
-        let report = self
-            .invocation()?
+        let invocation = self.invocation()?;
+        // Always recheck the launcher and import boundary, including cache hits.
+        invocation.verify_launcher()?;
+        invocation.verify_import_paths(&directory)?;
+        let key = ModelProbeKey::read(invocation, manifest, &directory)?;
+        let mut probes = self
+            .model_probes
+            .lock()
+            .map_err(|_| anyhow!("oMLX model probe cache mutex poisoned"))?;
+        // Keep only the latest on-disk snapshot for a given model invocation.
+        // A later removal must not revive an older inventory for that model.
+        probes.retain(|entry| {
+            entry.key.manifest != key.manifest
+                || entry.key.invocation != key.invocation
+                || entry.key.directory != key.directory
+                || entry.key.files == key.files
+        });
+        if let Some(index) = probes.iter().position(|entry| entry.key == key) {
+            let cached = probes
+                .remove(index)
+                .expect("located probe cache entry exists");
+            if cached.dependencies.iter().all(ProbeFileStamp::unchanged) {
+                let report = cached.report.clone();
+                probes.push_back(cached);
+                return Ok((directory, report));
+            }
+        }
+        // Serialize misses so concurrent first requests do not all import the
+        // same Python runtime. Failures and incomplete inventories are uncached.
+        let report = invocation
             .probe(Some(&directory))
             .with_context(|| format!("oMLX model '{}' is not verified compatible", manifest.id))?;
+        if !report.cache_paths.is_empty()
+            && report.cache_paths.len() <= MAX_PROBE_DEPENDENCIES
+            && report.cache_paths.iter().all(|path| path.is_absolute())
+            && ModelProbeKey::read(invocation, manifest, &directory)? == key
+            && let Ok(dependencies) = report
+                .cache_paths
+                .iter()
+                .cloned()
+                .map(ProbeFileStamp::read)
+                .collect::<Result<Vec<_>>>()
+        {
+            probes.push_back(CachedModelProbe {
+                key,
+                dependencies,
+                report: report.clone(),
+            });
+            while probes.len() > MAX_CACHED_MODEL_PROBES {
+                probes.pop_front();
+            }
+        }
         Ok((directory, report))
     }
 
@@ -182,10 +436,19 @@ impl OmlxBackend {
         let invocation = self.invocation()?;
         // Recheck metadata against this exact invocation before startup/reuse.
         let (directory, report) = self.model_probe(manifest)?;
+        self.cached_server_with(manifest, invocation, directory, report)
+    }
+
+    fn cached_server_with(
+        &self,
+        manifest: &ModelManifest,
+        invocation: &OmlxInvocation,
+        directory: PathBuf,
+        report: ProbeReport,
+    ) -> Result<(Arc<OmlxProcess>, f64)> {
         let identity = ModelRuntimeIdentity::from_manifest(manifest)?;
         let key = format!(
-            "{}|{}|{identity}|{}",
-            self.cache_identity(),
+            "{invocation:?}|{}|{identity}|{}",
             directory.display(),
             report.runtime
         );
@@ -201,9 +464,15 @@ impl OmlxBackend {
             return Ok((server.clone(), 0.0));
         }
         servers.retain(|_, server| server.is_running());
+        if servers.len() >= MAX_CACHED_WORKERS {
+            bail!(
+                "oMLX has reached its limit of {MAX_CACHED_WORKERS} retained workers; restart the Werk server before selecting additional model or cache configurations"
+            );
+        }
         let started = Instant::now();
         let mut server = OmlxProcess::start(&self.store, invocation, &directory, report)?;
         server.model_identity = Some(identity);
+        server.logical_model_id = Some(manifest.id.clone());
         let server = Arc::new(server);
         servers.insert(key, server.clone());
         Ok((server, started.elapsed().as_secs_f64()))
@@ -225,7 +494,12 @@ impl OmlxBackend {
         }
         let started = Instant::now();
         let (server, load_seconds) = self.cached_server(manifest)?;
-        let mut response = server.generate(&request, tx)?;
+        let mut response = server.generate_with_controls(
+            &request,
+            tx,
+            self.request_thinking,
+            self.request_reasoning_effort,
+        )?;
         response.timings.load_seconds = load_seconds;
         response.timings.total_seconds = started.elapsed().as_secs_f64();
         Ok(response)
@@ -233,17 +507,31 @@ impl OmlxBackend {
 }
 
 impl GenerationBackend for OmlxBackend {
+    fn with_chat_options(
+        &self,
+        manifest: &ModelManifest,
+        options: &crate::openai::ChatRuntimeOptions,
+    ) -> Result<Arc<dyn GenerationBackend>> {
+        let configured = self.configured_for_chat(options)?;
+        // Inspect the exact configured runtime and offload loader, without
+        // loading weights or mutating the base backend's captured settings.
+        configured.probe_model(manifest)?;
+        Ok(Arc::new(configured))
+    }
+
     fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
         !has_images && self.probe_tool_calling(manifest).unwrap_or(false)
     }
 
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         let server = self.servers.lock().ok().and_then(|servers| {
-            let mut active = servers.values().filter(|server| server.is_running());
+            let mut active = servers
+                .values()
+                .filter(|server| server.is_running() && self.matches_chat_configuration(server));
             let first = active.next().cloned();
             if active.next().is_some() { None } else { first }
         });
-        Arc::new(residency_adapter(server.as_deref()))
+        Arc::new(experts::OmlxRuntimeAdapter::new(server, self.store.clone()))
     }
 
     fn runtime_control_adapter_for(
@@ -256,12 +544,22 @@ impl GenerationBackend for OmlxBackend {
             .servers
             .lock()
             .map_err(|_| anyhow!("oMLX worker registry is poisoned"))?;
-        let server = servers.values().find(|server| {
+        let mut matching = servers.values().filter(|server| {
             server.model_dir == directory
                 && server.model_identity.as_ref() == Some(&identity)
+                && self.matches_chat_configuration(server)
                 && server.is_running()
         });
-        Ok(Arc::new(residency_adapter(server.map(Arc::as_ref))))
+        let first = matching.next().cloned();
+        let server = if matching.next().is_some() {
+            None
+        } else {
+            first
+        };
+        Ok(Arc::new(experts::OmlxRuntimeAdapter::new(
+            server,
+            self.store.clone(),
+        )))
     }
 
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
@@ -274,7 +572,58 @@ impl GenerationBackend for OmlxBackend {
         _seed: Option<u64>,
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         let (server, _) = self.cached_server(manifest)?;
-        Ok(Some(Box::new(OmlxChatSession { server })))
+        Ok(Some(Box::new(OmlxChatSession {
+            server,
+            request_thinking: self.request_thinking,
+            request_reasoning_effort: self.request_reasoning_effort,
+        })))
+    }
+
+    fn start_persistent_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        _seed: Option<u64>,
+        cache_directory: &Path,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        let (directory, report) = self.model_probe(manifest)?;
+        // The ordinary path remains available on all previously supported
+        // runtimes. Only the verified native-cache extension is version gated.
+        if report.version != "0.6.4" {
+            return Ok(None);
+        }
+        let mut invocation = self.invocation()?.clone();
+        invocation.persistence_dir = Some(persistent_cache_directory(
+            cache_directory,
+            manifest,
+            &invocation,
+            &report,
+        )?);
+        let (server, _) = self.cached_server_with(manifest, &invocation, directory, report)?;
+        let status = server.json_request(
+            "GET",
+            "/werk/persistence/status",
+            None,
+            Duration::from_secs(5),
+        );
+        let active =
+            status.and_then(|value| verified_persistent_cache_status(&value, &server.model_name));
+        match active {
+            Ok(true) => Ok(Some(Box::new(OmlxChatSession {
+                server,
+                request_thinking: self.request_thinking,
+                request_reasoning_effort: self.request_reasoning_effort,
+            }))),
+            inactive => {
+                // An unsupported model cache must not leave a second large
+                // model alive when the caller resumes its ordinary chat path.
+                self.servers
+                    .lock()
+                    .map_err(|_| anyhow!("oMLX worker registry is poisoned"))?
+                    .retain(|_, candidate| !Arc::ptr_eq(candidate, &server));
+                drop(server);
+                inactive.map(|_| None)
+            }
+        }
     }
 
     fn task_readiness(
@@ -327,14 +676,26 @@ impl GenerationBackend for OmlxBackend {
 
 impl ChatGenerationSession for OmlxChatSession {
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
-        self.server.generate(&request, None)
+        self.server.generate_with_controls(
+            &request,
+            None,
+            self.request_thinking,
+            self.request_reasoning_effort,
+        )
     }
 
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream {
         let server = self.server.clone();
+        let thinking = self.request_thinking;
+        let reasoning_effort = self.request_reasoning_effort;
         let (tx, rx) = mpsc::channel(16);
         tokio::task::spawn_blocking(move || {
-            let result = server.generate(&request, Some(tx.clone()));
+            let result = server.generate_with_controls(
+                &request,
+                Some(tx.clone()),
+                thinking,
+                reasoning_effort,
+            );
             send_stream_result(tx, result);
         });
         Box::pin(ReceiverStream::new(rx))
@@ -445,10 +806,25 @@ impl OmlxInvocation {
     }
 
     fn from_launcher(launcher: PathBuf, health_timeout: Duration) -> Result<Self> {
+        let expert_cache_bytes = expert_cache_bytes(env::var_os("WERK_OMLX_EXPERT_CACHE_MB"))?;
+        let ngram_cache_bytes = ngram_cache_bytes(env::var_os("WERK_OMLX_NGRAM_CACHE_MB"))?;
+        let expert_execution = expert_execution(env::var_os("WERK_OMLX_EXPERT_EXECUTION"))?;
         let mut environment: Vec<_> = env::vars_os()
             .filter(|(name, _)| !name.to_string_lossy().starts_with("OMLX_"))
             .collect();
         environment.sort();
+        let thinking = thinking_enabled(
+            environment
+                .iter()
+                .find(|(name, _)| name == "WERK_OMLX_THINKING")
+                .map(|(_, value)| value.clone()),
+        )?;
+        let reasoning_effort = reasoning_effort_enabled(
+            environment
+                .iter()
+                .find(|(name, _)| name == "WERK_OMLX_REASONING_EFFORT")
+                .map(|(_, value)| value.clone()),
+        )?;
         let launcher = launcher
             .canonicalize()
             .context("oMLX launcher does not exist")?;
@@ -533,6 +909,13 @@ impl OmlxInvocation {
             environment,
             launcher_fingerprint,
             working_directory: env::current_dir()?,
+            expert_cache_bytes,
+            ngram_cache_bytes,
+            expert_execution,
+            thinking,
+            reasoning_effort,
+            persistence_dir: None,
+            server_prefix_cache: false,
         })
     }
 
@@ -555,7 +938,7 @@ impl OmlxInvocation {
         }
         let mut command = self.python_command();
         command
-            .args(["-c", &console_script_source(PROBE)])
+            .args(["-c", &worker_script_source(PROBE)])
             .arg(
                 self.launcher
                     .parent()
@@ -564,7 +947,9 @@ impl OmlxInvocation {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let payload = json!({"model_dir": model_dir, "launcher": self.launcher});
+        let payload = json!({"model_dir": model_dir, "launcher": self.launcher,
+            "expert_cache_bytes": self.expert_cache_bytes,
+            "ngram_cache_bytes": self.ngram_cache_bytes});
         let mut child = command
             .spawn()
             .context("failed to start selected oMLX metadata probe")?;
@@ -579,8 +964,8 @@ impl OmlxInvocation {
             .stderr
             .take()
             .context("oMLX probe stderr unavailable")?;
-        let out = thread::spawn(move || read_bounded(stdout));
-        let err = thread::spawn(move || read_bounded(stderr));
+        let out = thread::spawn(move || read_bounded(stdout, MAX_PROBE_JSON_BYTES));
+        let err = thread::spawn(move || read_bounded(stderr, MAX_PROBE_STDERR_BYTES));
         let started = Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -635,6 +1020,17 @@ impl OmlxInvocation {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             runtime,
+            cache_paths: value
+                .get("cache_paths")
+                .and_then(Value::as_array)
+                .filter(|paths| paths.len() <= MAX_PROBE_DEPENDENCIES)
+                .and_then(|paths| {
+                    paths
+                        .iter()
+                        .map(|path| path.as_str().map(PathBuf::from))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -681,6 +1077,326 @@ impl OmlxInvocation {
     }
 }
 
+fn expert_cache_bytes(value: Option<OsString>) -> Result<Option<u64>> {
+    // Internally Some(0) selects auto; the public numeric 0 still disables offload.
+    let Some(value) = value else {
+        return Ok(Some(0));
+    };
+    if value == "auto" {
+        return Ok(Some(0));
+    }
+    let mb = value.to_str().and_then(|value| value.parse::<u64>().ok())
+        .filter(|mb| *mb <= u64::MAX / (1024 * 1024))
+        .context("WERK_OMLX_EXPERT_CACHE_MB must be auto or a nonnegative MiB integer that fits in u64 bytes (0 disables expert offload)")?;
+    Ok((mb > 0).then_some(mb * 1024 * 1024))
+}
+
+fn reasoning_effort_enabled(value: Option<OsString>) -> Result<Option<OmlxReasoningEffort>> {
+    value.map(|value| {
+        let text = value.to_str().context("WERK_OMLX_REASONING_EFFORT is not valid UTF-8")?;
+        match text {
+            "low" => Ok(OmlxReasoningEffort::Low),
+            "high" => Ok(OmlxReasoningEffort::High),
+            "max" => Ok(OmlxReasoningEffort::Max),
+            _ => bail!("WERK_OMLX_REASONING_EFFORT must be low, high or max; unset it to inherit the model default"),
+        }
+    }).transpose()
+}
+
+fn thinking_enabled(value: Option<OsString>) -> Result<Option<bool>> {
+    match value.as_deref().and_then(|value| value.to_str()) {
+        None if value.is_none() => Ok(None),
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        _ => bail!(
+            "WERK_OMLX_THINKING must be 0 (disabled) or 1 (enabled); unset it to preserve the model's default"
+        ),
+    }
+}
+
+fn ngram_cache_bytes(value: Option<OsString>) -> Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value == "auto" {
+        return Ok(None);
+    }
+    let mb = value.to_str().and_then(|value| value.parse::<u64>().ok())
+        .filter(|mb| *mb <= u64::MAX / (1024 * 1024))
+        .context("WERK_OMLX_NGRAM_CACHE_MB must be auto or a nonnegative MiB integer (0 selects resident tables)")?;
+    Ok(Some(mb * 1024 * 1024))
+}
+
+fn expert_execution(value: Option<OsString>) -> Result<&'static str> {
+    match value.as_deref().and_then(|value| value.to_str()) {
+        None if value.is_none() => Ok("grouped"),
+        Some("grouped") => Ok("grouped"),
+        Some("serial") => Ok("serial"),
+        _ => bail!("WERK_OMLX_EXPERT_EXECUTION must be grouped or serial"),
+    }
+}
+
+fn expert_interval_diagnostics(before: &Value, after: &Value) -> Option<String> {
+    // These counters belong to the entire worker. Concurrent requests may
+    // contribute; never label their differences as request-exclusive timings.
+    let mut interval = serde_json::Map::new();
+    for name in [
+        "cache_hits",
+        "cache_misses",
+        "disk_bytes_read",
+        "cache_evictions",
+        "allocator_clears",
+        "tensor_materializations",
+        "output_evaluations",
+        "forward_calls",
+        "budget_reductions",
+        "prefill_cache_growth_bytes",
+        "prefill_samples_corrected",
+        "ngram_requested_rows",
+        "ngram_unique_rows",
+        "ngram_cache_hits",
+        "ngram_cache_misses",
+        "ngram_cache_evictions",
+    ] {
+        if let (Some(a), Some(b)) = (
+            before.get(name).and_then(Value::as_u64),
+            after.get(name).and_then(Value::as_u64),
+        ) {
+            interval.insert(name.into(), json!(b.checked_sub(a)?));
+        }
+    }
+    for name in [
+        "disk_read_seconds",
+        "materialize_seconds",
+        "forward_seconds",
+        "routing_seconds",
+    ] {
+        if let (Some(a), Some(b)) = (
+            before.get(name).and_then(Value::as_f64),
+            after.get(name).and_then(Value::as_f64),
+        ) {
+            if !a.is_finite() || !b.is_finite() || a < 0.0 || b < a {
+                return None;
+            }
+            interval.insert(
+                name.into(),
+                json!(((b - a) * 1_000_000.0).round() / 1_000_000.0),
+            );
+        }
+    }
+    if !interval.contains_key("cache_hits") || !interval.contains_key("cache_misses") {
+        return None;
+    }
+    for name in [
+        "resident_cache_bytes",
+        "cache_budget_bytes",
+        "effective_cache_budget_bytes",
+        "allocator_cache_bytes",
+        "ngram_resident_cache_bytes",
+        "ngram_cache_budget_bytes",
+        "ngram_effective_cache_budget_bytes",
+    ] {
+        if let Some(value) = after.get(name).and_then(Value::as_u64) {
+            interval.insert(name.into(), json!(value));
+        }
+    }
+    if let Some(mode @ ("auto" | "explicit")) =
+        after.get("cache_budget_mode").and_then(Value::as_str)
+    {
+        interval.insert("cache_budget_mode".into(), json!(mode));
+    }
+    if let Some(mode @ ("serial" | "grouped")) = after.get("execution").and_then(Value::as_str) {
+        interval.insert("execution".into(), json!(mode));
+    }
+    if let Some(mode @ ("auto" | "explicit" | "disabled")) =
+        after.get("ngram_cache_budget_mode").and_then(Value::as_str)
+    {
+        interval.insert("ngram_cache_budget_mode".into(), json!(mode));
+    }
+    Some(format!(
+        "oMLX experts (worker interval; reads include OS file cache): {}",
+        Value::Object(interval)
+    ))
+}
+
+fn omlx_chat_completion_body(
+    model_name: &str,
+    request: &GenerateRequest,
+    stream: bool,
+    thinking: Option<bool>,
+    reasoning_effort: Option<OmlxReasoningEffort>,
+) -> Value {
+    let mut body = chat_completion_body(model_name, request, stream);
+    if let Some(enabled) = thinking {
+        body["chat_template_kwargs"] = json!({"enable_thinking": enabled});
+    }
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+        body["chat_template_kwargs"]["reasoning_effort"] = json!(effort);
+    }
+    body
+}
+
+fn persistent_cache_directory(
+    root: &Path,
+    manifest: &ModelManifest,
+    invocation: &OmlxInvocation,
+    report: &ProbeReport,
+) -> Result<PathBuf> {
+    let metadata =
+        fs::symlink_metadata(root).context("persistent chat cache directory is missing")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("persistent chat cache path must be a regular directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("persistent chat cache directory is not owned by the current user");
+        }
+    }
+    // Runtime and model changes select another namespace. Unrelated captured
+    // shell environment changes do not invalidate the cache on every restart.
+    let import_environment = invocation
+        .environment
+        .iter()
+        .filter(|(name, _)| name == "PYTHONPATH" || name == "PYTHONHOME")
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let namespace = json!({
+        "format": "werk-omlx-native-chat-cache-v1",
+        "adapter": env!("CARGO_PKG_VERSION"),
+        "model": ModelRuntimeIdentity::from_manifest(manifest)?.to_string(),
+        "runtime": report.runtime,
+        "launcher": invocation.launcher,
+        "launcher_fingerprint": invocation.launcher_fingerprint,
+        "python": invocation.python,
+        "python_args": invocation.python_args,
+        "import_environment": import_environment,
+        "import_working_directory": (!import_environment.is_empty()).then_some(&invocation.working_directory),
+        "thinking": invocation.thinking,
+        "reasoning_effort": invocation.reasoning_effort,
+        "expert_cache_bytes": invocation.expert_cache_bytes,
+        "ngram_cache_bytes": invocation.ngram_cache_bytes,
+        "expert_execution": invocation.expert_execution,
+    });
+    let namespace = format!("omlx-{:x}", Sha256::digest(serde_json::to_vec(&namespace)?));
+    let directory = root.canonicalize()?.join(namespace);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("persistent oMLX cache namespace is not a regular directory");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&directory).context("cannot create persistent oMLX cache namespace")?;
+        }
+        Err(error) => return Err(error).context("cannot inspect persistent oMLX cache namespace"),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if fs::metadata(&directory)?.uid() != unsafe { libc::geteuid() } {
+            bail!("persistent oMLX cache namespace is not owned by the current user");
+        }
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(directory)
+}
+
+fn verified_persistent_cache_status(value: &Value, physical_model: &str) -> Result<bool> {
+    if value.get("installed").and_then(Value::as_bool) != Some(true)
+        || value.get("format").and_then(Value::as_str) != Some("omlx-exact-prefix-v1")
+    {
+        bail!("oMLX did not confirm the requested native persistent chat cache adapter");
+    }
+    match value.get("active").and_then(Value::as_bool) {
+        Some(false) => Ok(false),
+        Some(true) if value.get("model_id").and_then(Value::as_str) == Some(physical_model) => {
+            Ok(true)
+        }
+        _ => bail!("oMLX persistent chat cache does not identify the selected loaded model"),
+    }
+}
+
+#[derive(Default)]
+struct OmlxUsageTimings {
+    first_token: Option<f64>,
+    prompt: Option<f64>,
+    decode: Option<f64>,
+    total: Option<f64>,
+    cached_prompt_tokens: Option<u64>,
+}
+
+fn update_omlx_completion_from_event(
+    completion: &mut OpenAiCompletion,
+    timings: &mut OmlxUsageTimings,
+    value: &Value,
+    observed_seconds: Option<f64>,
+) {
+    update_completion_from_event(completion, value);
+    // oMLX's Usage extension reports durations in seconds, including reasoning
+    // generation. Ignore malformed fields without discarding earlier metadata.
+    if let Some(usage) = value.get("usage") {
+        let seconds = |key: &str| {
+            usage
+                .get(key)
+                .and_then(Value::as_f64)
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        };
+        timings.first_token = seconds("time_to_first_token").or(timings.first_token);
+        timings.prompt = seconds("prompt_eval_duration").or(timings.prompt);
+        timings.decode = seconds("generation_duration").or(timings.decode);
+        timings.total = seconds("total_time").or(timings.total);
+        timings.cached_prompt_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .or(timings.cached_prompt_tokens);
+    }
+    // Hidden reasoning is already token generation, not prompt evaluation.
+    if completion.first_token_seconds <= 0.0
+        && delta_has_reasoning_content(value)
+        && let Some(seconds) = observed_seconds
+    {
+        completion.first_token_seconds = seconds;
+    }
+}
+
+fn finalize_omlx_completion_stats(
+    completion: &mut OpenAiCompletion,
+    request: &GenerateRequest,
+    elapsed_seconds: f64,
+    timings: &OmlxUsageTimings,
+) -> Vec<String> {
+    let first_token = timings.first_token.or_else(|| {
+        (completion.first_token_seconds > 0.0).then_some(completion.first_token_seconds)
+    });
+    let total = timings.total.unwrap_or(elapsed_seconds);
+    let decode = timings.decode.unwrap_or_else(|| match first_token {
+        Some(first) if total > first => total - first,
+        _ => total,
+    });
+    // Keep the shared token-count fallback, then replace its timing estimates.
+    finalize_completion_stats(completion, request, elapsed_seconds);
+    completion.first_token_seconds = first_token.unwrap_or(0.0);
+    completion.prompt_seconds = timings.prompt.or(first_token).unwrap_or(f64::NAN);
+    completion.decode_seconds = decode;
+    let mut diagnostics = if timings.decode.is_none() && first_token.is_none() {
+        vec!["oMLX timing: separate phase durations unavailable; eval duration includes prompt processing".into()]
+    } else {
+        Vec::new()
+    };
+    if let Some(tokens) = timings.cached_prompt_tokens {
+        diagnostics.push(format!("oMLX cached prompt tokens: {tokens}"));
+    }
+    diagnostics
+}
+
 fn absolute_program(path: PathBuf) -> Result<PathBuf> {
     // Preserve venv Python symlink paths: canonicalizing to the system Python
     // would select a different site-packages environment.
@@ -706,14 +1422,14 @@ fn find_program(name: &str) -> Option<PathBuf> {
     })
 }
 
-fn read_bounded(mut reader: impl Read) -> Vec<u8> {
+fn read_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
     let mut captured = Vec::new();
     let mut bytes = [0; 4096];
     while let Ok(count) = reader.read(&mut bytes) {
         if count == 0 {
             break;
         }
-        let keep = count.min(65536_usize.saturating_sub(captured.len()));
+        let keep = count.min(limit.saturating_sub(captured.len()));
         captured.extend_from_slice(&bytes[..keep]);
     }
     captured
@@ -731,21 +1447,46 @@ impl OmlxProcess {
         let instance_id = random_id()?;
         let port = TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
         let api_key = random_id()?;
-        let base_path = store
-            .home()
-            .join("backends")
-            .join("omlx")
-            .join("workers")
-            .join(&instance_id);
-        fs::create_dir_all(&base_path).context("cannot create isolated oMLX base path")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&base_path, fs::Permissions::from_mode(0o700))?;
+        // Auto is architecture/version gated by the metadata probe; unrelated
+        // models keep the native loader. Explicit budgets remain strict.
+        let expert_cache = invocation
+            .expert_cache_bytes
+            .filter(|bytes| *bytes > 0 || report.runtime.get("expert_offload").is_some());
+        let native_weight_adapter = report
+            .runtime
+            .get("expert_offload")
+            .and_then(|entry| entry.get("loader"))
+            .and_then(Value::as_str)
+            == Some("installed_native_text_port");
+        let mut lifetime_locks = Vec::new();
+        if let Some(directory) = &invocation.persistence_dir {
+            // persistent_cache_directory creates exactly one runtime namespace
+            // under the chat's native-cache root, whose archive lock is held by
+            // the caller for the entire session.
+            let cache_root = directory
+                .parent()
+                .context("persistent oMLX cache has no root")?;
+            if let Some(lock) = crate::cache::workers::lock_persistent_worker_cache(cache_root)? {
+                lifetime_locks.push(lock);
+            }
         }
+        let (base_path, lifetime_lock) =
+            crate::cache::workers::prepare_worker(store.home(), &instance_id)?;
+        lifetime_locks.extend(lifetime_lock);
+        // Server requests share a worker, not a conversation archive. Keeping
+        // this cache inside its private base also gives each model/configuration
+        // its own writer and the existing inherited cache-purge lifetime lock.
+        let server_cache_directory = (invocation.server_prefix_cache
+            && report.version == "0.6.4"
+            && invocation.persistence_dir.is_none())
+        .then(|| base_path.join("cache").join("prefix-cache"));
+        let persistence_directory = invocation
+            .persistence_dir
+            .as_ref()
+            .or(server_cache_directory.as_ref());
         let mut command = invocation.python_command();
         command
-            .args(["-c", &console_script_source(SUPERVISOR)])
+            .args(["-c", &worker_script_source(SUPERVISOR)])
             .arg(
                 invocation
                     .launcher
@@ -769,11 +1510,40 @@ impl OmlxProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command
+            .env_remove("WERK_OMLX_EXPERT_MODEL_DIR")
+            .env_remove("WERK_OMLX_EXPERT_CACHE_BYTES")
+            .env_remove("WERK_OMLX_NGRAM_CACHE_BYTES")
+            .env_remove("WERK_OMLX_EXPERT_EXECUTION")
+            .env_remove("WERK_OMLX_PERSISTENCE_DIR")
+            .env_remove("WERK_OMLX_PERSISTENCE_MODEL_DIR");
+        if let Some(bytes) = expert_cache {
+            command
+                .env("WERK_OMLX_EXPERT_MODEL_DIR", model_dir)
+                .env("WERK_OMLX_EXPERT_EXECUTION", invocation.expert_execution)
+                .env("WERK_OMLX_EXPERT_CACHE_BYTES", bytes.to_string());
+        } else if native_weight_adapter {
+            command
+                .env("WERK_OMLX_EXPERT_MODEL_DIR", model_dir)
+                .env("WERK_OMLX_EXPERT_CACHE_BYTES", "native");
+        }
+        if let Some(bytes) = invocation.ngram_cache_bytes {
+            command.env("WERK_OMLX_NGRAM_CACHE_BYTES", bytes.to_string());
+        }
+        if let Some(directory) = persistence_directory {
+            command
+                .args(["--paged-ssd-cache-dir"])
+                .arg(directory)
+                .args(["--paged-ssd-cache-max-size", "4GB"])
+                .env("WERK_OMLX_PERSISTENCE_DIR", directory)
+                .env("WERK_OMLX_PERSISTENCE_MODEL_DIR", model_dir);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        crate::cache::workers::inherit_lifetime_locks(&mut command, &lifetime_locks)?;
         let deadline = HttpDeadline::new(invocation.health_timeout);
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -795,20 +1565,129 @@ impl OmlxProcess {
         let mut process = Self {
             child: Mutex::new(child),
             parent_pipe,
+            _lifetime_locks: lifetime_locks,
             url: format!("http://127.0.0.1:{port}"),
             api_key,
             model_name: String::new(),
             model_dir: model_dir.to_path_buf(),
             model_identity: None,
+            logical_model_id: None,
             base_path,
             version: report.version,
             instance_id,
             tools: report.tools,
             log_tail,
+            expert_offload: false,
+            expert_cache_bytes: invocation.expert_cache_bytes,
+            ngram_cache_bytes: invocation.ngram_cache_bytes,
+            expert_execution: invocation.expert_execution,
+            thinking: invocation.thinking,
+            reasoning_effort: invocation.reasoning_effort,
+            server_prefix_cache: invocation.server_prefix_cache,
         };
         process
             .wait_and_load(deadline)
             .with_context(|| format!("oMLX startup failed{}", process.formatted_log_tail()))?;
+        if let Some(requested_bytes) = expert_cache {
+            let status =
+                process.json_request("GET", "/werk/experts/status", None, deadline.remaining()?)?;
+            let actual = status.get("cache_budget_bytes").and_then(Value::as_u64);
+            let confirmed = if requested_bytes == 0 {
+                actual.is_some_and(|bytes| bytes > 0)
+                    && status.get("cache_budget_mode").and_then(Value::as_str) == Some("auto")
+            } else {
+                actual == Some(requested_bytes)
+            };
+            if status.get("active").and_then(Value::as_bool) != Some(true) || !confirmed {
+                bail!("oMLX did not confirm activating the requested bounded expert cache");
+            }
+            process.expert_offload = true;
+            eprintln!(
+                "oMLX expert cache: {} MiB ({}) upper budget; SSD offload active, native memory guard may reduce residency",
+                actual.unwrap_or_default() / (1024 * 1024),
+                if requested_bytes == 0 {
+                    "auto"
+                } else {
+                    "explicit"
+                }
+            );
+        }
+        if native_weight_adapter {
+            let status =
+                process.json_request("GET", "/werk/experts/status", None, deadline.remaining()?)?;
+            if status.get("active").and_then(Value::as_bool) != Some(true) {
+                bail!("native text offload worker did not confirm the loaded model");
+            }
+            if let Some(requested) = invocation.ngram_cache_bytes {
+                let mode = status.get("ngram_offload").and_then(Value::as_str);
+                let actual = status
+                    .get("ngram_cache_budget_bytes")
+                    .and_then(Value::as_u64);
+                let capacity = status
+                    .get("ngram_maximum_cache_bytes")
+                    .and_then(Value::as_u64);
+                let confirmed = if requested == 0 {
+                    actual == Some(0) && matches!(mode, Some("disabled" | "not_applicable"))
+                } else {
+                    mode == Some("supported")
+                        && capacity.is_some_and(|bytes| actual == Some(bytes.min(requested)))
+                };
+                if !confirmed {
+                    bail!("oMLX worker did not confirm the requested N-gram cache setting");
+                }
+            }
+            if status.get("ngram_offload").and_then(Value::as_str) == Some("supported") {
+                eprintln!(
+                    "oMLX N-gram cache: {} MiB initial, {} MiB upper budget ({}); shares memory with the expert cache",
+                    status
+                        .get("ngram_initial_cache_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                        / (1024 * 1024),
+                    status
+                        .get("ngram_cache_budget_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                        / (1024 * 1024),
+                    status
+                        .get("ngram_cache_budget_mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                );
+            }
+            process.expert_offload =
+                status.get("experts_offloaded").and_then(Value::as_bool) == Some(true);
+        }
+        if invocation.server_prefix_cache {
+            let active = if server_cache_directory.is_some() {
+                process
+                    .json_request(
+                        "GET",
+                        "/werk/persistence/status",
+                        None,
+                        Duration::from_secs(5),
+                    )
+                    .and_then(|status| {
+                        verified_persistent_cache_status(&status, &process.model_name)
+                    })
+            } else {
+                Ok(false)
+            };
+            // Unsupported model cache trees keep this already loaded worker;
+            // starting a fallback worker would duplicate its model weights.
+            match active {
+                Ok(true) => eprintln!(
+                    "oMLX native short-prefix cache active for {}; worker lifetime, SSD limit 4GB",
+                    model_dir.display()
+                ),
+                Ok(false) => eprintln!(
+                    "oMLX native short-prefix cache unavailable for this runtime/model; ordinary prefix caching remains active"
+                ),
+                Err(error) => eprintln!(
+                    "oMLX native short-prefix cache could not be verified ({error:#}); continuing with the loaded worker"
+                ),
+            }
+        }
         Ok(process)
     }
 
@@ -915,10 +1794,21 @@ impl OmlxProcess {
         Ok(value)
     }
 
+    #[cfg(test)]
     fn generate(
         &self,
         request: &GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+    ) -> Result<GenerateResponse> {
+        self.generate_with_controls(request, tx, None, None)
+    }
+
+    fn generate_with_controls(
+        &self,
+        request: &GenerateRequest,
+        tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+        thinking: Option<bool>,
+        reasoning_effort: Option<OmlxReasoningEffort>,
     ) -> Result<GenerateResponse> {
         reject_images(request)?;
         validate_tool_options(request)?;
@@ -929,7 +1819,21 @@ impl OmlxProcess {
             bail!("oMLX model worker has exited{}", self.formatted_log_tail());
         }
         let started = Instant::now();
-        let body = chat_completion_body(&self.model_name, request, tx.is_some());
+        let body = omlx_chat_completion_body(
+            &self.model_name,
+            request,
+            tx.is_some(),
+            thinking.or(self.thinking),
+            reasoning_effort.or(self.reasoning_effort),
+        );
+        let expert_before = ((self.expert_offload
+            || self.ngram_cache_bytes.is_some_and(|bytes| bytes > 0))
+            && (request.verbose || request.debug))
+            .then(|| {
+                self.json_request("GET", "/werk/experts/status", None, Duration::from_secs(2))
+                    .ok()
+            })
+            .flatten();
         let mut response = super::openai_transport::request_with_bearer_cancellable(
             &self.url,
             "/v1/chat/completions",
@@ -947,6 +1851,7 @@ impl OmlxProcess {
             finish_reason: "length".to_string(),
             ..Default::default()
         };
+        let mut usage_timings = OmlxUsageTimings::default();
         if tx.is_some() {
             let mut sse = SseAccumulator::default();
             let mut done = false;
@@ -962,7 +1867,12 @@ impl OmlxProcess {
                     let value: Value =
                         serde_json::from_str(event).context("oMLX returned invalid SSE JSON")?;
                     reject_upstream_error(&value)?;
-                    update_completion_from_event(&mut completion, &value);
+                    update_omlx_completion_from_event(
+                        &mut completion,
+                        &mut usage_timings,
+                        &value,
+                        Some(started.elapsed().as_secs_f64()),
+                    );
                     if let Some(chunk) = delta_content(&value) {
                         if !chunk.is_empty() && completion.first_token_seconds <= 0.0 {
                             completion.first_token_seconds = started.elapsed().as_secs_f64();
@@ -1000,12 +1910,43 @@ impl OmlxProcess {
             let value: Value = serde_json::from_slice(&bytes)
                 .context("oMLX returned invalid chat completion JSON")?;
             reject_upstream_error(&value)?;
-            update_completion_from_event(&mut completion, &value);
+            update_omlx_completion_from_event(&mut completion, &mut usage_timings, &value, None);
             update_completion_from_message(&mut completion, &value)?;
-            completion.first_token_seconds = started.elapsed().as_secs_f64();
         }
         ensure_visible_completion(&completion).context("oMLX completion has no visible answer")?;
-        finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
+        let generation_seconds = started.elapsed().as_secs_f64();
+        let mut backend_diagnostics = finalize_omlx_completion_stats(
+            &mut completion,
+            request,
+            generation_seconds,
+            &usage_timings,
+        );
+        if request.verbose || request.debug {
+            // Only explicitly sent values are known here; omitted sampling
+            // controls continue to inherit the selected runtime's defaults.
+            let controls = [
+                "temperature",
+                "top_p",
+                "seed",
+                "max_tokens",
+                "chat_template_kwargs",
+                "reasoning_effort",
+            ]
+            .into_iter()
+            .filter_map(|key| body.get(key).map(|v| (key.to_owned(), v.clone())))
+            .collect::<serde_json::Map<_, _>>();
+            backend_diagnostics.push(format!(
+                "oMLX request controls (omitted values inherit runtime defaults): {}",
+                Value::Object(controls)
+            ));
+        }
+        if let Some(before) = expert_before
+            && let Ok(after) =
+                self.json_request("GET", "/werk/experts/status", None, Duration::from_secs(2))
+            && let Some(diagnostic) = expert_interval_diagnostics(&before, &after)
+        {
+            backend_diagnostics.push(diagnostic);
+        }
         let assistant_message = completion.assistant_message();
         Ok(GenerateResponse {
             text: completion.text,
@@ -1014,13 +1955,17 @@ impl OmlxProcess {
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
             timings: GenerationTimings {
+                cached_prompt_tokens: usage_timings
+                    .cached_prompt_tokens
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|n| *n <= completion.prompt_tokens),
                 first_token_seconds: completion.first_token_seconds,
                 prompt_seconds: completion.prompt_seconds,
                 decode_seconds: completion.decode_seconds,
-                total_seconds: started.elapsed().as_secs_f64(),
+                total_seconds: generation_seconds,
                 ..Default::default()
             },
-            backend_diagnostics: Vec::new(),
+            backend_diagnostics,
         })
     }
 
@@ -1050,6 +1995,7 @@ impl OmlxProcess {
 impl Drop for OmlxProcess {
     fn drop(&mut self) {
         drop(self.parent_pipe.take());
+        let mut stopped = false;
         if let Ok(child) = self.child.get_mut() {
             #[cfg(unix)]
             {
@@ -1062,9 +2008,13 @@ impl Drop for OmlxProcess {
                 }
             }
             let _ = child.kill();
-            let _ = child.wait();
+            stopped = child.wait().is_ok();
         }
-        let _ = fs::remove_dir_all(&self.base_path);
+        // If reaping failed, leave the private cache for later inspection. Its
+        // inherited lifetime lock still protects it while the child is alive.
+        if stopped {
+            let _ = fs::remove_dir_all(&self.base_path);
+        }
     }
 }
 

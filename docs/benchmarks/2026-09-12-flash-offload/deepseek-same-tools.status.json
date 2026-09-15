@@ -1,0 +1,83 @@
+[
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 21,
+    "disk_bytes_read": 42833224796,
+    "resident_cache_bytes": 14990442496,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 0
+  },
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 43,
+    "disk_bytes_read": 81329595484,
+    "resident_cache_bytes": 14991491072,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 0
+  },
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 67,
+    "disk_bytes_read": 117450941532,
+    "resident_cache_bytes": 14990442496,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 1
+  },
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 92,
+    "disk_bytes_read": 153194275932,
+    "resident_cache_bytes": 14989918208,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 2
+  },
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 116,
+    "disk_bytes_read": 187235247196,
+    "resident_cache_bytes": 14990442496,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 2
+  },
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 144,
+    "disk_bytes_read": 227064357980,
+    "resident_cache_bytes": 14990442496,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 3
+  },
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 575,
+    "disk_bytes_read": 270652613724,
+    "resident_cache_bytes": 14991491072,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 4
+  },
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 1697,
+    "disk_bytes_read": 310702449756,
+    "resident_cache_bytes": 14990442496,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 4
+  },
+  {
+    "last_prefill_admission": null,
+    "forward_calls": 2446,
+    "disk_bytes_read": 352739861596,
+    "resident_cache_bytes": 14986772480,
+    "ngram_resident_cache_bytes": null,
+    "ngram_effective_cache_budget_bytes": null,
+    "prefill_samples_corrected": 5
+  }
+]

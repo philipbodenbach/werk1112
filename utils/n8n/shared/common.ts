@@ -1,14 +1,14 @@
 import { NodeOperationError } from 'n8n-workflow';
 import type { IDataObject, IExecuteFunctions, ILoadOptionsFunctions, INodeExecutionData, INodeProperties, INodeTypeDescription } from 'n8n-workflow';
-import { WerkClient } from './client';
+import { DEFAULT_HTTP_TIMEOUT_SECONDS, WerkClient } from './client';
 import { discoverModels } from './discovery';
 import { safeMessage, sanitize } from './validation';
 import { werkApiTest } from './credential-test';
 import { WerkProtocolError } from './protocol';
 
 export const transportProperties: INodeProperties[] = [{
-  displayName: 'HTTP Timeout (Seconds)', name: 'httpTimeoutSeconds', type: 'number', default: 120,
-  typeOptions: { minValue: 1, maxValue: 3600 }, description: 'Finite timeout for each HTTP request. Separate from inference timeout and total job wait time.',
+  displayName: 'HTTP Timeout (Seconds)', name: 'httpTimeoutSeconds', type: 'number', default: DEFAULT_HTTP_TIMEOUT_SECONDS,
+  typeOptions: { minValue: 1, maxValue: 3600 }, description: 'Finite timeout for each HTTP request; the 600-second default accommodates large offloaded models. Explicit workflow values are preserved. Separate from inference timeout and total job wait time.',
 }];
 
 export function nodeDescription(name: string, title: string, properties: INodeProperties[]): INodeTypeDescription {

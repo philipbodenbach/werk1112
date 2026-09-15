@@ -298,6 +298,7 @@ impl LlamaServerBackend {
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds,
                 warmup_seconds: 0.0,
                 first_token_seconds: completion.first_token_seconds,
@@ -405,6 +406,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
             timings: GenerationTimings {
+                cached_prompt_tokens: None,
                 load_seconds: 0.0,
                 warmup_seconds: 0.0,
                 first_token_seconds: completion.first_token_seconds,
@@ -431,6 +433,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                     completion_tokens: completion.completion_tokens,
                     finish_reason: completion.finish_reason,
                     timings: GenerationTimings {
+                        cached_prompt_tokens: None,
                         load_seconds: 0.0,
                         warmup_seconds: 0.0,
                         first_token_seconds: completion.first_token_seconds,

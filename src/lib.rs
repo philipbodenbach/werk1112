@@ -38,6 +38,7 @@ pub mod api;
 pub mod api_keys;
 pub mod backend;
 pub mod banner;
+pub(crate) mod cache;
 pub mod capabilities;
 pub mod cli;
 pub mod inference;

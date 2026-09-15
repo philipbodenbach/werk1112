@@ -1,0 +1,30 @@
+{
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "execution": "grouped",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": null,
+  "thinking": false,
+  "temperature": 0,
+  "samples": [
+    {
+      "first_text_seconds": null,
+      "total_seconds": 12.048211874993285,
+      "finish_reason": null,
+      "truncated": false,
+      "answer": "",
+      "usage": null,
+      "received_done": false,
+      "has_reasoning": false,
+      "error": "server returned a streaming error: {\"code\": null, \"message\": \"oMLX upstream error: {\\\"code\\\":\\\"prefill_memory_aborted\\\",\\\"limit_bytes\\\":38190851686,\\\"message\\\":\\\"oMLX memory guard aborted this request mid-prefill: Request aborted: process memory limit exceeded (usage 36.4 GB, abort threshold (hard watermark) 35.6 GB, metal_cap ceiling 37.4 GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.\\\",\\\"omlx_code\\\":\\\"prefill_memory_aborted\\\",\\\"param\\\":null,\\\"type\\\":\\\"invalid_request_error\\\"}\", \"param\": null, \"type\": \"invalid_request_error\"}",
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "turn": 1,
+      "prompt": "Merke dir die Zahl 37. Antworte nur mit OK.",
+      "expected": "OK",
+      "correct": false
+    }
+  ],
+  "max_tokens": 256
+}

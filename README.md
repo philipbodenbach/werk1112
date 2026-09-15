@@ -23,9 +23,55 @@ architecture-specific companion runtimes.
 - optional ComfyUI nodes with native IMAGE, VIDEO and AUDIO values
 - optional [native n8n nodes (Beta)](utils/n8n/README.md),
   with manual installation, binary media and runtime operations
+- experimental [SSD expert offload for oMLX](docs/backends.md#experimental-omlx-expert-offload)
+  with a bounded cache and existing ComfyUI/n8n expert controls
 
 Werk is an inference runtime and router, not an agent framework, workflow
 engine or GUI.
+
+Save and resume a terminal conversation with any chat backend:
+
+~~~bash
+werk chat MODEL --persistence --session project
+~~~
+
+Run the same command again to continue. Completed turns are saved locally,
+including when runtime routing changes. Without `--session`, the name is
+`default` for that model. Native KV reuse is separate and backend-dependent;
+conversation persistence works even when the backend must recompute the prompt.
+See the [CLI reference](docs/reference/cli.md#persistent-terminal-chat).
+
+Inspect and clean up persisted caches:
+
+~~~bash
+werk cache list
+werk cache purge <CACHE-ID>
+werk cache purge --all --dry-run
+werk cache purge --all
+~~~
+
+The list distinguishes chat KV caches, saved chat histories, oMLX worker
+caches and runtime states. `--all` preserves saved histories and skips active
+or protected entries. Use `--include-history` to explicitly remove histories
+too. See [cache management](docs/reference/cli.md#local-persistence-caches).
+
+For experimental DeepSeek V4 chat with an 8 GiB expert cache and thinking
+explicitly disabled:
+
+~~~bash
+WERK_OMLX_EXPERT_CACHE_MB=8192 WERK_OMLX_THINKING=0 \
+  werk --backend omlx chat mlx-community/DeepSeek-V4-Flash-2bit-DQ --persistence --verbose
+~~~
+
+oMLX enables thinking by default for this model; its hidden reasoning can delay
+the first visible answer. Omit `WERK_OMLX_THINKING` to preserve that default.
+SSD expert offload saves memory but can substantially reduce generation speed.
+For ComfyUI or n8n, start `werk --backend omlx serve` and select the options
+directly in **WERK Text Config** (ComfyUI) or **WERK Text → Chat Options**
+(n8n): thinking `disabled`, expert offload `enabled`, and an expert cache
+budget of `8192` MiB. The default `inherit` keeps the server's
+settings. See the [chat API options](docs/api.md#omlx-chat-options) for the
+request contract and server compatibility check.
 
 ## Status
 
@@ -35,7 +81,7 @@ runtime can execute its architecture. Use the following before a large run:
 
 ~~~bash
 werk inspect MODEL
-werk doctor --model MODEL --task TASK --debug
+werk doctor --model MODEL --task TASK
 ~~~
 
 The detailed support levels and known gaps are documented rather than hidden

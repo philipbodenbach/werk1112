@@ -1,0 +1,176 @@
+{
+  "label": "before-memory-fix",
+  "started_at": "2026-09-11T19:42:33.286994+00:00",
+  "worker": "5d55a7def1cff1b5356b5e6cf1cc1bf9db271c93c6f808e8",
+  "model": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+  "settings": {
+    "temperature": 0,
+    "top_p": 0.95,
+    "seed": 42,
+    "thinking": false,
+    "max_tokens": 96,
+    "turns": 1
+  },
+  "seed_messages": [
+    {
+      "role": "user",
+      "content": "Write me a sentence about the programming language rust."
+    },
+    {
+      "role": "assistant",
+      "content": "Your sentence: Rust is a powerful systems programming language that combines memory safety with a focus on performance and reliability."
+    }
+  ],
+  "notes": [
+    "Growing history replays actual answers, starting with 3, 5, 7... messages by default.",
+    "This script does not clear caches or restart workers; first does not imply cold.",
+    "Expert and native-prefix counters are worker intervals, potentially including other requests.",
+    "RSS is sampled once per second; it does not establish the exact Metal peak.",
+    "Decode estimates remain null unless usage explicitly establishes zero reasoning tokens.",
+    "English coherence and factual correctness require manual answer review."
+  ],
+  "system_before": {
+    "hw.memsize": "51539607552",
+    "machdep.cpu.brand_string": "Apple M4 Pro",
+    "vm.swapusage": "total = 1024.00M  used = 20.94M  free = 1003.06M  (encrypted)"
+  },
+  "samples": [
+    {
+      "first_text_seconds": null,
+      "total_seconds": 0.04818270901159849,
+      "finish_reason": null,
+      "truncated": false,
+      "answer": "",
+      "usage": null,
+      "received_done": false,
+      "has_reasoning": false,
+      "error": "server returned a streaming error: {\"code\": null, \"message\": \"oMLX chat completion request failed: OpenAI backend HTTP 400: {\\\"error\\\":{\\\"message\\\":\\\"oMLX prefill memory guard rejected this prompt: Prefill would require ~49.06 GB peak (current 28.41 GB + KV+SDPA 20.65 GB) but metal_cap ceiling is 35.57 GB. Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length. To continue, set Memory Guard to aggressive, raise the custom memory guard ceiling, free system memory, or compact/reduce context.\\\",\\\"type\\\":\\\"invalid_request_error\\\",\\\"param\\\":null,\\\"code\\\":\\\"prefill_memory_exceeded\\\",\\\"omlx_code\\\":\\\"prefill_memory_exceeded\\\",\\\"estimated_bytes\\\":52677430003,\\\"limit_bytes\\\":38190851686},\\\"type\\\":\\\"error\\\"}\", \"param\": null, \"type\": \"invalid_request_error\"}",
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "http_status": 200,
+      "http_error_body": null,
+      "turn": 1,
+      "messages": 3,
+      "prompt": "Write me a sentence about the programming language rust.",
+      "experts_before": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25765609472,
+        "resident_experts": 3078,
+        "cache_hits": 8272,
+        "cache_misses": 4869,
+        "disk_bytes_read": 45102343260,
+        "execution": "grouped",
+        "cache_evictions": 1791,
+        "allocator_clears": 16,
+        "allocator_cache_bytes": 46124372,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 7092,
+        "disk_read_seconds": 15.667808309561224,
+        "materialize_seconds": 2.225377346680034,
+        "forward_calls": 1677,
+        "forward_seconds": 24.643992964105564,
+        "routing_seconds": 2.4335858888662187,
+        "output_evaluations": 2067
+      },
+      "experts_after": {
+        "architecture": "deepseek_v4",
+        "fingerprint": "51e0c49f3e9b8b4122a2d8f9b80ace44e534f002b8e7800f6bd4e58ace46a49d",
+        "base_bytes": 4312736860,
+        "expert_bytes": 92207579136,
+        "checkpoint_bytes": 96520315996,
+        "cache_budget_bytes": 25769803776,
+        "workspace_bytes": 1073741824,
+        "resident_estimate_bytes": 31156282460,
+        "expert_count": 11008,
+        "largest_expert_bytes": 8388608,
+        "active": true,
+        "model_id": "files",
+        "resident_cache_bytes": 25765609472,
+        "resident_experts": 3078,
+        "cache_hits": 8272,
+        "cache_misses": 4869,
+        "disk_bytes_read": 45102343260,
+        "execution": "grouped",
+        "cache_evictions": 1791,
+        "allocator_clears": 16,
+        "allocator_cache_bytes": 46124372,
+        "allocator_cache_limit_bytes": 67108864,
+        "tensor_materializations": 7092,
+        "disk_read_seconds": 15.667808309561224,
+        "materialize_seconds": 2.225377346680034,
+        "forward_calls": 1677,
+        "forward_seconds": 24.643992964105564,
+        "routing_seconds": 2.4335858888662187,
+        "output_evaluations": 2067
+      },
+      "prefix_before": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 2,
+        "restores": 0,
+        "restored_tokens": 0,
+        "failures": 0,
+        "indexed_prefixes": 2,
+        "reason": null
+      },
+      "prefix_after": {
+        "installed": true,
+        "active": true,
+        "format": "omlx-exact-prefix-v1",
+        "model_id": "files",
+        "max_prefix_tokens": 2048,
+        "stores": 2,
+        "restores": 0,
+        "restored_tokens": 0,
+        "failures": 0,
+        "indexed_prefixes": 2,
+        "reason": null
+      },
+      "expert_interval": {
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_evictions": 0,
+        "disk_bytes_read": 0,
+        "disk_read_seconds": 0.0,
+        "forward_calls": 0,
+        "forward_seconds": 0.0
+      },
+      "prefix_interval": {
+        "stores": 0,
+        "restores": 0,
+        "restored_tokens": 0,
+        "failures": 0
+      },
+      "swapusage_after": "total = 1024.00M  used = 20.94M  free = 1003.06M  (encrypted)"
+    }
+  ],
+  "rss_samples": [
+    {
+      "elapsed_seconds": 0.003994124999735504,
+      "rss_bytes": 7747354624
+    }
+  ],
+  "worker_rss_bytes_max_sampled": 7747354624,
+  "system_after": {
+    "swapusage": "total = 1024.00M  used = 20.94M  free = 1003.06M  (encrypted)",
+    "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                     3540.\nPages active:                                 664379.\nPages inactive:                               661640.\nPages speculative:                              3584.\nPages throttled:                                   0.\nPages wired down:                             194538.\nPages purgeable:                                   2.\n\"Translation faults\":                      665391384.\nPages copy-on-write:                        15654928.\nPages zero filled:                         657057041.\nPages reactivated:                           2688741.\nPages purged:                                3014230.\nFile-backed pages:                            500697.\nAnonymous pages:                              828906.\nPages stored in compressor:                  1831855.\nPages occupied by compressor:                1560213.\nDecompressions:                              8170470.\nCompressions:                               14227321.\nPageins:                                   223708906.\nPageouts:                                      96567.\nSwapins:                                         516.\nSwapouts:                                       1852."
+  },
+  "finished_at": "2026-09-11T19:42:33.359291+00:00",
+  "needs_review": true
+}

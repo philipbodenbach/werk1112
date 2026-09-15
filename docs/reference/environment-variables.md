@@ -46,9 +46,11 @@ There is deliberately no environment variable for:
 defaults for missing top-level `policy` and `allow_experimental` members on
 `POST /werk/v1/prefill`. In addition, the effective reuse default controls the
 native prefix-cache flag generated for a local Werk-started vLLM process;
-explicit vLLM arguments win. Werk sends no generated flag to remote vLLM: its
-model lifetime is externally managed and its APC configuration remains opaque
-metadata. The options do not redirect ordinary `/v1` or media requests through
+explicit vLLM arguments win. For local oMLX 0.6.4, `auto` or `disk` mode with
+reuse enabled also opts into verified short exact-prefix caching for the
+worker. This cache has no cross-restart guarantee. Werk sends no generated
+flag to remote vLLM: its model lifetime is externally managed and its APC
+configuration remains opaque metadata. The options do not redirect ordinary `/v1` or media requests through
 Prefill.
 
 Independent same-process model/pipeline residency is automatic where supported
@@ -139,6 +141,11 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_MLX_VLM_PYTHON`, `WERK_MLX_VLM_MODULE`, `WERK_MLX_VLM_GENERATE` | MLX-VLM equivalents; the default module is `mlx_vlm`. |
 | `WERK_OMLX_BIN` | Installed local oMLX Python CLI launcher on macOS Apple Silicon. Takes precedence over `omlx` on `PATH`; an empty or invalid override fails discovery. Werk uses the launcher's own interpreter for compatibility checks and execution. |
 | `WERK_OMLX_HEALTH_TIMEOUT_SECONDS` | Positive integer timeout shared by oMLX startup, health checks and model loading. Default: `900` seconds; invalid values fail discovery. It does not change the fixed 20-second metadata-probe limit or generation timeouts. |
+| `WERK_OMLX_EXPERT_CACHE_MB` | Experimental oMLX SSD expert offload. Unset or `auto` selects a device- and model-dependent cache ceiling for supported DeepSeek V4, Qwen `qwen4_exp` and GLM `glm5_next` affine checkpoints on oMLX 0.6.4; other architectures/runtimes keep native loading. A positive integer sets an explicit ceiling in MiB; `0` retains ordinary oMLX loading. Auto accounts for current available memory, the effective Metal cap, base weights and workspace; it has no fixed 24-GiB or 1-TiB cache cap. Before prompt admission and at prefill chunk boundaries, the worker can shrink the working set to leave room for real KV/attention costs, retaining native memory guards. Small budgets remain supported: the full model need not fit in RAM. Set on the Werk server or CLI process before starting it. Chat API and ComfyUI/n8n text options can override this default per request. Dense weights, attention, KV cache and temporary buffers require additional memory. See [oMLX expert offload](../backends.md#experimental-omlx-expert-offload). |
+| `WERK_OMLX_EXPERT_EXECUTION` | Expert-offload execution strategy: `grouped` (default) batches tensor materialization and expert output evaluation while preserving the cache budget and active-weight lifetimes. `serial` keeps the previous execution order for comparison and rollback. Both use the same checkpoint quantization. Captured at backend selection; restart Werk after changing it. |
+| `WERK_OMLX_NGRAM_CACHE_MB` | Separate N-gram cache cap in MiB for verified text offload adapters. Unset or `auto` starts with at most 64 MiB for Qwen `qwen4_exp` PLE rows and grows at prefill/request boundaries only after demand eviction. The hardware ceiling uses at most one eighth of shared weight-cache room when experts are streamed; native expert weights are otherwise charged as base memory. Pressure can shrink the row cache. There is no fixed 1-GiB Auto ceiling; `0` keeps tables resident. A positive integer requires actual supported tables. Both caches share native memory admission, so their effective limits may shrink. API `werk.omlx.ngram_cache_mb` and ComfyUI/n8n text controls can override it. |
+| `WERK_OMLX_THINKING` | Optional oMLX thinking override: `0` disables thinking and `1` enables it through `chat_template_kwargs.enable_thinking` for model templates that support the setting. Unset preserves the runtime/model default; empty or other values fail discovery. Captured when Werk selects the backend, so set it before starting the CLI or server. Applies to streaming and nonstreaming text/chat requests. Chat API and ComfyUI/n8n text options can override this default per request without changing the process environment. |
+| `WERK_OMLX_REASONING_EFFORT` | Optional `low`, `high`, or `max` native reasoning effort for oMLX chat/run/serve; unset preserves the model default. Sent both as native `reasoning_effort` and template kwargs. GLM honors this separately from thinking; `low` does not turn reasoning off. |
 | `WERK_TRANSFORMERS_PYTHON` | Python interpreter containing PyTorch and Transformers for the compatibility backend. |
 | `WERK_TRANSFORMERS_DEVICE` | Device override; `auto` chooses CUDA, then MPS, then CPU. |
 | `WERK_TRANSFORMERS_DTYPE` | `auto`, `float32`/`fp32`/`f32`, `bfloat16`/`bf16`, or `float16`/`fp16`/`f16`/`half`. |
@@ -152,6 +159,35 @@ It sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` and
 `PYTHONDONTWRITEBYTECODE=1` for the probe and worker. There is no oMLX remote
 endpoint or extra-launch-arguments override; install the CLI separately and
 select it with `--backend omlx` or compatible automatic routing.
+
+Automatic selection, an explicit `WERK_OMLX_EXPERT_CACHE_MB` budget, or a
+positive `werk.omlx.expert_cache_mb` chat option enables the backend's
+experimental loading path; none supplies
+`allow_experimental` to protocol requests. Expert list and
+control requests must still opt in explicitly. ComfyUI and n8n use their
+existing **Allow Experimental** controls; media `allow_disk_offload` options
+do not configure this text-model cache.
+
+ComfyUI **Werk Text Config** and n8n **WERK Text → Chat Options** expose
+thinking and expert offload as **Inherit / Enabled / Disabled**. Inherit omits
+the option and keeps the server default. Explicit settings require the
+server's `api.chat.omlx_options` capability; update and restart Werk if it is
+missing. See the [chat options contract](../api.md#omlx-chat-options).
+
+oMLX's DeepSeek V4 template enables thinking by default. Werk displays the
+visible answer; reasoning deltas do not clear the terminal's waiting indicator.
+With SSD expert offload, generating hidden reasoning can therefore look like
+a stalled chat. For templates honoring the switch, set `WERK_OMLX_THINKING=0`
+for direct answers. GLM ignores this switch; use `WERK_OMLX_REASONING_EFFORT=low`
+to reduce its reasoning effort. Leave these settings unset
+to keep the runtime's default. This option changes generation behavior; the
+expert cache budget remains controlled separately.
+
+oMLX timing statistics include reasoning tokens in generation time. Werk uses
+the runtime's phase durations when supplied, or the first streamed token
+(including reasoning) as a fallback. Without phase timings or streamed tokens,
+prompt timing is unavailable and the reported eval duration includes prompt
+processing.
 
 `WERK_VLLM_ARGS` is a list of arguments, not a shell command. Quoting and
 backslash escaping follow POSIX shell-word rules, including quoted empty

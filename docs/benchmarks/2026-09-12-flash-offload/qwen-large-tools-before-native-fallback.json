@@ -1,0 +1,10 @@
+{
+  "model": "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": "auto",
+  "tool_count": 34,
+  "tool_schema_bytes": 28425,
+  "samples": [],
+  "passed": false,
+  "error": "{'error': {'code': None, 'message': 'oMLX upstream error: {\"message\":\"insufficient memory for one N-gram row and the protected expert working set\",\"type\":\"server_error\"}', 'param': None, 'type': 'invalid_request_error'}}"
+}

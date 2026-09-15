@@ -57,6 +57,38 @@
       },
       "notes": "Select your WERK API credential and replace REPLACE_* values before running.",
       "notesInFlow": true
+    },
+    {
+      "id": "text-followup",
+      "name": "Text Followup",
+      "type": "CUSTOM.werkText",
+      "typeVersion": 1,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "operation": "complete",
+        "model": {
+          "__rl": true,
+          "value": "={{ $json.werk.request.model }}",
+          "mode": "id"
+        },
+        "messages": {
+          "message": [
+            {
+              "role": "user",
+              "content": "Give one practical example of that."
+            }
+          ]
+        },
+        "options": {
+          "maxCompletionTokens": 128
+        },
+        "conversationHistory": "={{ $json.conversation }}"
+      },
+      "notes": "Select the same WERK API credential. Conversation History carries the previous turn. Server Default preserves automatic expert sizing; start Werk with --persistence for supported native prompt-cache reuse.",
+      "notesInFlow": true
     }
   ],
   "connections": {
@@ -76,6 +108,17 @@
         [
           {
             "node": "Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Text": {
+      "main": [
+        [
+          {
+            "node": "Text Followup",
             "type": "main",
             "index": 0
           }

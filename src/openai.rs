@@ -10,6 +10,8 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<ChatStreamOptions>,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -28,6 +30,94 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<ToolChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub werk: Option<ChatRuntimeOptions>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ChatStreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+/// Explicit per-request runtime controls. Empty objects inherit server defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatRuntimeOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omlx: Option<OmlxChatOptions>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OmlxChatOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<OmlxReasoningEffort>,
+    /// MiB; zero explicitly disables SSD expert offload, omitted inherits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_cache_mb: Option<u64>,
+    /// MiB or "auto" for N-gram rows; zero keeps tables resident, omitted inherits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ngram_cache_mb: Option<NgramCacheBudget>,
+}
+
+/// Native reasoning levels exposed by the GLM template; omission inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OmlxReasoningEffort {
+    Low,
+    High,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum NgramCacheBudget {
+    Megabytes(u64),
+    Mode(AutomaticCacheBudget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutomaticCacheBudget {
+    Auto,
+}
+
+impl From<u64> for NgramCacheBudget {
+    fn from(value: u64) -> Self {
+        Self::Megabytes(value)
+    }
+}
+
+impl ChatRuntimeOptions {
+    pub fn is_empty(&self) -> bool {
+        self.omlx.as_ref().is_none_or(OmlxChatOptions::is_empty)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(options) = &self.omlx {
+            anyhow::ensure!(
+                options.expert_cache_mb.is_none_or(|mb| mb <= 1_048_576),
+                "werk.omlx.expert_cache_mb must be an integer from 0 to 1048576 MiB (0 disables expert offload)"
+            );
+            anyhow::ensure!(
+                !matches!(options.ngram_cache_mb, Some(NgramCacheBudget::Megabytes(mb)) if mb > 1_048_576),
+                "werk.omlx.ngram_cache_mb must be auto or an integer from 0 to 1048576 MiB (0 selects resident tables)"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl OmlxChatOptions {
+    pub fn is_empty(&self) -> bool {
+        self.thinking.is_none()
+            && self.reasoning_effort.is_none()
+            && self.expert_cache_mb.is_none()
+            && self.ngram_cache_mb.is_none()
+    }
 }
 
 impl ChatCompletionRequest {
