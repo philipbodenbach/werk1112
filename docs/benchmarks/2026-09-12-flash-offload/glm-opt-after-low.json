@@ -1,0 +1,749 @@
+{
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "expert_budget": "auto",
+  "reasoning_effort": "low",
+  "samples": [
+    {
+      "first_text_seconds": 14.869034332994488,
+      "total_seconds": 15.401014500006568,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "OK",
+      "usage": {
+        "completion_tokens": 2,
+        "prompt_tokens": 26,
+        "total_tokens": 28
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 26,
+      "completion_tokens": 2,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "correct": true
+    },
+    {
+      "first_text_seconds": 10.191067250008928,
+      "total_seconds": 10.192764250008622,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "37",
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 48,
+        "total_tokens": 51
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 48,
+      "completion_tokens": 3,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "correct": true
+    },
+    {
+      "first_text_seconds": 14.237172416003887,
+      "total_seconds": 14.242755333005334,
+      "finish_reason": "stop",
+      "truncated": false,
+      "answer": "5",
+      "usage": {
+        "completion_tokens": 13,
+        "prompt_tokens": 65,
+        "total_tokens": 78
+      },
+      "received_done": true,
+      "has_reasoning": false,
+      "error": null,
+      "prompt_tokens": 65,
+      "completion_tokens": 13,
+      "cached_tokens": null,
+      "client_decode_tokens_per_second_estimate": null,
+      "correct": true
+    }
+  ],
+  "status": [
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 2,
+      "disk_bytes_read": 11722217084,
+      "disk_read_seconds": 2.594140883622458,
+      "resident_cache_bytes": 2154823680,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 4,
+      "disk_bytes_read": 14191613564,
+      "disk_read_seconds": 3.3363435644714627,
+      "resident_cache_bytes": 4624220160,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 7,
+      "disk_bytes_read": 16417216124,
+      "disk_read_seconds": 4.040001308196224,
+      "resident_cache_bytes": 6849822720,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 10,
+      "disk_bytes_read": 18642818684,
+      "disk_read_seconds": 4.7476085460948525,
+      "resident_cache_bytes": 9075425280,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 13,
+      "disk_bytes_read": 20829099644,
+      "disk_read_seconds": 5.479964963218663,
+      "resident_cache_bytes": 11261706240,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 17,
+      "disk_bytes_read": 22944601724,
+      "disk_read_seconds": 6.189757240674226,
+      "resident_cache_bytes": 13377208320,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 22,
+      "disk_bytes_read": 25123018364,
+      "disk_read_seconds": 6.878541385594872,
+      "resident_cache_bytes": 15555624960,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 25,
+      "disk_bytes_read": 27246384764,
+      "disk_read_seconds": 7.58602120053547,
+      "resident_cache_bytes": 17678991360,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 29,
+      "disk_bytes_read": 29550630524,
+      "disk_read_seconds": 8.297336796691525,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 32,
+      "disk_bytes_read": 31673996924,
+      "disk_read_seconds": 8.988176857033977,
+      "resident_cache_bytes": 21210071040,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 36,
+      "disk_bytes_read": 33726584444,
+      "disk_read_seconds": 9.675596402288647,
+      "resident_cache_bytes": 21210071040,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 39,
+      "disk_bytes_read": 35747714684,
+      "disk_read_seconds": 10.346081296011107,
+      "resident_cache_bytes": 21210071040,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 42,
+      "disk_bytes_read": 37383493244,
+      "disk_read_seconds": 10.923837577473023,
+      "resident_cache_bytes": 21210071040,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 124,
+      "disk_bytes_read": 38563141244,
+      "disk_read_seconds": 11.39344018851989,
+      "resident_cache_bytes": 21210071040,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 32,
+        "cached_tokens": 0,
+        "current_bytes": 13852237912,
+        "non_weight_bytes": 13852237912,
+        "predicted_peak_bytes": 39649280,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 21215177844
+      },
+      "forward_calls": 203,
+      "disk_bytes_read": 39679874684,
+      "disk_read_seconds": 11.838445289671654,
+      "resident_cache_bytes": 21210071040,
+      "effective_cache_budget_bytes": 21215177844
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 212,
+      "disk_bytes_read": 41166231164,
+      "disk_read_seconds": 12.402055485348683,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 216,
+      "disk_bytes_read": 43187361404,
+      "disk_read_seconds": 13.136443427414633,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 221,
+      "disk_bytes_read": 45098391164,
+      "disk_read_seconds": 13.83392087413813,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 228,
+      "disk_bytes_read": 46899320444,
+      "disk_read_seconds": 14.510359586420236,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 235,
+      "disk_bytes_read": 48778892924,
+      "disk_read_seconds": 15.179377328167902,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 242,
+      "disk_bytes_read": 50674194044,
+      "disk_read_seconds": 15.832896038569743,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 247,
+      "disk_bytes_read": 52545902204,
+      "disk_read_seconds": 16.520104228475248,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 272,
+      "disk_bytes_read": 54008665724,
+      "disk_read_seconds": 17.103035414023907,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 336,
+      "disk_bytes_read": 55298414204,
+      "disk_read_seconds": 17.607018188587972,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 18,
+        "cached_tokens": 29,
+        "current_bytes": 34016315536,
+        "non_weight_bytes": 14292600976,
+        "predicted_peak_bytes": 827216078,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19987247982
+      },
+      "forward_calls": 443,
+      "disk_bytes_read": 56336504444,
+      "disk_read_seconds": 18.01909840996086,
+      "resident_cache_bytes": 19983237120,
+      "effective_cache_budget_bytes": 19987247982
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 464,
+      "disk_bytes_read": 57877911164,
+      "disk_read_seconds": 18.559082106454298,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 470,
+      "disk_bytes_read": 59851855484,
+      "disk_read_seconds": 19.255720782559365,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 478,
+      "disk_bytes_read": 61471905404,
+      "disk_read_seconds": 19.867782552959397,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 492,
+      "disk_bytes_read": 63036905084,
+      "disk_read_seconds": 20.443599237973103,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 503,
+      "disk_bytes_read": 64546854524,
+      "disk_read_seconds": 21.022659216847387,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 570,
+      "disk_bytes_read": 65537758844,
+      "disk_read_seconds": 21.483317893827916,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 617,
+      "disk_bytes_read": 67055572604,
+      "disk_read_seconds": 22.075550670560915,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 690,
+      "disk_bytes_read": 68384642684,
+      "disk_read_seconds": 22.606663131417008,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 758,
+      "disk_bytes_read": 69863134844,
+      "disk_read_seconds": 23.167869709490333,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 830,
+      "disk_bytes_read": 71341627004,
+      "disk_read_seconds": 23.71805930683331,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 889,
+      "disk_bytes_read": 72914491004,
+      "disk_read_seconds": 24.310703882656526,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 960,
+      "disk_bytes_read": 74345797244,
+      "disk_read_seconds": 24.847513445449295,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 1027,
+      "disk_bytes_read": 75832153724,
+      "disk_read_seconds": 25.40457242768025,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 1110,
+      "disk_bytes_read": 77169088124,
+      "disk_read_seconds": 25.906685353897046,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    },
+    {
+      "attention_fusion_bytes": 3683811328,
+      "last_prefill_admission": {
+        "chunk_tokens": 17,
+        "cached_tokens": 47,
+        "current_bytes": 34089096528,
+        "non_weight_bytes": 14373246288,
+        "predicted_peak_bytes": 781259630,
+        "ceiling_bytes": 36180806860,
+        "effective_expert_bytes": 19952559118
+      },
+      "forward_calls": 1134,
+      "disk_bytes_read": 77365696124,
+      "disk_read_seconds": 25.979714595931,
+      "resident_cache_bytes": 19951779840,
+      "effective_cache_budget_bytes": 19952559118
+    }
+  ]
+}

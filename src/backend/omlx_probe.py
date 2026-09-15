@@ -288,6 +288,7 @@ CONTRACTS = {
     "native_tokenizer_loader": {"5a54ff0969ea3e2766be98887f244b7f0cfa7f889dfed70df620700317c2eab2"},
     "native_tool_inference": {"ce5386192baf92f6f8590e868ea81e748102ba5e773cfcc05134e16a4e54741c"},
     # Entire module: parser, schema-based argument conversion and delimiters.
+    "glm47_parser_module": {"9dce4324772d04cb3fbf67474816785944c3c24cca38976dcdedcd078da2cef8"},
     "qwen_coder_parser_module": {"f89e1b330159dc991c04595362c62eeec26f92de4dcea9a429da28031af41088"},
 }
 MAX_JSON_BYTES = 16 * 1024 * 1024
@@ -544,7 +545,11 @@ def check_quantization(config, loader, root, mx):
 
 
 def supports_tools(config, tokenizer_config, root, utils):
-    if config["model_type"] == "qwen4_exp":
+    if config["model_type"] in ("qwen4_exp", "glm5_next"):
+        expected_parser, parser_contract = {
+            "qwen4_exp": ("qwen3_coder", "qwen_coder_parser_module"),
+            "glm5_next": ("glm47", "glm47_parser_module"),
+        }[config["model_type"]]
         if tokenizer_config.get("chat_template_type") is not None:
             return False
         tokenizer = installed_module("mlx_lm.tokenizer_utils", root)
@@ -572,10 +577,10 @@ def supports_tools(config, tokenizer_config, root, utils):
                 return False
         inferred = tokenizer._infer_tool_parser(template)
         selected = tokenizer_config.get("tool_parser_type", inferred)
-        if inferred != "qwen3_coder" or selected != inferred:
+        if inferred != expected_parser or selected != inferred:
             return False
-        parser = installed_module("mlx_lm.tool_parsers.qwen3_coder", root)
-        verify_contract(parser, "qwen_coder_parser_module")
+        parser = installed_module(f"mlx_lm.tool_parsers.{expected_parser}", root)
+        verify_contract(parser, parser_contract)
         for node in function_tree(parser).body:
             if isinstance(node, ast.FunctionDef):
                 function = getattr(parser, node.name, None)

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -16,6 +17,7 @@ import weakref
 from unittest.mock import patch
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 SPEC = importlib.util.spec_from_file_location("omlx_experts", Path(__file__).with_name("omlx_experts.py"))
 experts = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(experts)
@@ -184,6 +186,12 @@ def memory_guard_fixture(cache_bytes=24 * 1024**3):
             self.record_calls = []
             self.check_calls = []
             self.chunk_limit = 1024
+            self.running = {}
+            self.waiting = []
+            self.prefilling = []
+
+        def _process_batch_responses(self, responses):
+            return responses, set()
 
         def _current_usage_bytes(self, *, refresh_mlx_active=True):
             self.current_calls.append(refresh_mlx_active)
@@ -311,6 +319,60 @@ class ExpertMemoryGuardTests(unittest.TestCase):
             2048, request_id="large-tools", loop_label="external"), 2048)
         self.assertEqual(self.manager.effective_cache_bytes, 19 * self.gib - 2 * self.mib)
         self.assertTrue(self.scheduler._prefill_memory_guard)
+
+    def test_decode_recovers_prefill_budget_after_workspace_is_released(self):
+        self.scheduler.workspace = 10 * self.gib
+        self.guard_chunk()
+        prefill = self.manager.last_prefill_admission.copy()
+        self.assertLess(self.manager.effective_cache_bytes, 24 * self.gib)
+        self.scheduler.running = {"chat": SimpleNamespace(num_prompt_tokens=100, num_output_tokens=1)}
+        self.scheduler.workspace = 64 * self.mib
+        responses = [object()]
+        self.assertEqual(self.scheduler._process_batch_responses(responses), (responses, set()))
+        self.assertEqual(self.manager.effective_cache_bytes, 24 * self.gib)
+        self.assertEqual(self.manager.last_prefill_admission, prefill)
+        self.assertEqual(self.manager.last_decode_admission["chunk_tokens"], 1)
+        self.assertEqual(self.manager.last_decode_admission["cached_tokens"], 101)
+
+    def test_decode_retains_actual_memory_pressure_and_explicit_upper_limit(self):
+        manager, scheduler, guard, _ = memory_guard_fixture(cache_bytes=8 * self.gib)
+        scheduler.running = {"chat": SimpleNamespace(num_prompt_tokens=100, num_output_tokens=1)}
+        scheduler.base_bytes = 25 * self.gib
+        scheduler._process_batch_responses([])
+        self.assertLess(manager.effective_cache_bytes, 6 * self.gib)
+        scheduler.base_bytes = 4 * self.gib
+        scheduler._process_batch_responses([])
+        self.assertEqual(manager.effective_cache_bytes, 8 * self.gib)
+        self.assertTrue(scheduler._prefill_memory_guard)
+
+    def test_decode_does_not_rebudget_interleaved_or_unrelated_work(self):
+        request = SimpleNamespace(num_prompt_tokens=100, num_output_tokens=1)
+        for running, waiting, prefilling, matching in (
+            ({}, [], [], True),
+            ({"a": request, "b": request}, [], [], True),
+            ({"a": request}, [request], [], True),
+            ({"a": request}, [], [request], True),
+            ({"a": request}, [], [], False),
+            ({"a": SimpleNamespace(num_prompt_tokens=100, num_output_tokens=0)}, [], [], True),
+        ):
+            with self.subTest(running=running, waiting=waiting, prefilling=prefilling, matching=matching):
+                self.scheduler.running, self.scheduler.waiting, self.scheduler.prefilling = running, waiting, prefilling
+                with patch.object(self.guard, "matches", return_value=matching), patch.object(self.guard, "prepare") as prepare:
+                    self.scheduler._process_batch_responses([])
+                prepare.assert_not_called()
+
+    def test_decode_waits_for_native_response_processing_and_preserves_signature(self):
+        import inspect
+        self.assertEqual(tuple(inspect.signature(type(self.scheduler)._process_batch_responses).parameters),
+                         ("self", "responses"))
+        self.scheduler.running = {"a": SimpleNamespace(num_prompt_tokens=100, num_output_tokens=1)}
+        def finish(scheduler, responses):
+            scheduler.running.clear()
+            return responses, {"a"}
+        self.guard.original_responses = finish
+        with patch.object(self.guard, "prepare") as prepare:
+            self.assertEqual(self.scheduler._process_batch_responses([]), ([], {"a"}))
+        prepare.assert_not_called()
 
     def test_unknown_native_caps_preserve_current_budget_without_eviction(self):
         self.manager.effective_cache_bytes = 8 * self.gib
@@ -477,6 +539,15 @@ class ExpertCacheResizeTests(unittest.TestCase):
         self.assertEqual(self.manager.effective_cache_bytes, 2 * self.size)
 
 
+class RetainedExpertCacheResizeTests(ExpertCacheResizeTests):
+    def setUp(self):
+        super().setUp()
+        from omlx_offload import ExpertRetention
+        self.manager._retention = ExpertRetention(self.manager.effective_cache_bytes)
+        for key in self.manager._cache:
+            self.manager._retention.touch(key, self.size)
+
+
 @unittest.skipUnless(os.environ.get("WERK_TEST_MLX_EXPERTS") == "1", "native oMLX tests are opt-in")
 class NativePrefillMemoryAccountingTests(unittest.TestCase):
     def setUp(self):
@@ -621,6 +692,7 @@ class MlxStreamingTests(unittest.TestCase):
         self.assertFalse(tree_flatten(self.streamed.parameters()))
 
     def test_decode_matches_resident_quantized_experts(self):
+        self.assertEqual(self.manager.status()["cache_policy"], "segmented_lru")
         self.compare(1)
 
     def test_grouped_matches_serial_with_weighted_duplicate_routes(self):
@@ -672,6 +744,39 @@ class MlxStreamingTests(unittest.TestCase):
         self.assertFalse(self.manager._leased)
         mx.eval(self.streamed(x, routes))
         self.assertFalse(self.manager._leased)
+
+    def test_parallel_reads_preserve_results_and_reader_lifetime(self):
+        import threading
+        reader = self.manager._range_reader()
+        read = reader._isolated_read
+        threads = []
+
+        def tracked(tensor):
+            threads.append(threading.current_thread().name)
+            return read(tensor)
+
+        with patch.object(reader, "_isolated_read", side_effect=tracked):
+            self.compare(2)
+        self.assertTrue(threads)
+        self.assertTrue(all(name.startswith("werk-expert-read") for name in threads))
+        self.assertIsNone(reader._prefetched)
+        before = self.manager.disk_bytes_read
+        self.manager.deactivate()
+        self.assertTrue(reader._closed)
+        self.assertIsNone(reader._read_pool)
+        self.compare(2)
+        self.assertIsNot(self.manager._range_reader(), reader)
+        self.assertGreater(self.manager.disk_bytes_read, before)
+
+    def test_parallel_read_failure_discards_staging_and_releases_leases(self):
+        reader = self.manager._range_reader()
+        with patch.object(reader, "_isolated_read", side_effect=OSError("prefetch read failed")):
+            with self.assertRaisesRegex(OSError, "prefetch read failed"):
+                self.compare(2)
+        self.assertIsNone(reader._prefetched)
+        self.assertFalse(self.manager._leased)
+        self.assertFalse(self.manager._cache)
+        self.compare(2)
 
     def test_partial_group_acquisition_failure_releases_leases_and_recovers(self):
         mx = self.mx

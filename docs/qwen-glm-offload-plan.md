@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash, Qwen3.8-Flash-Next und GLM-5.3-Flash: Auslagerung und Performance
 
-Stand: 2026-09-13. **Umsetzung und laufende Abnahme auf dem vorhandenen Mac
+Stand: 2026-09-14. **Umsetzung und laufende Abnahme auf dem vorhandenen Mac
 mit 48 GB Unified Memory.**
 
 ## Aktueller Implementierungsstand
@@ -28,7 +28,7 @@ mit 48 GB Unified Memory.**
   Qwen mit jeder unabhängigen Kombination von Experten-/N-Gramm-Auslagerung;
   erzwungene Cacheverdrängung; nach SSD-Neuöffnung exakt gleiche Fortsetzung.
   Echte private oMLX-Worker liefern vollständige HTTP-Streams und speichern Präfixe.
-- ComfyUI: 239 Tests bestanden. n8n: 99 Tests, Build und Lint bestanden.
+- ComfyUI: 240 Tests bestanden. n8n: 100 Tests, Build, Lint und Host-Loader bestanden.
   MLX-Suite: 171 Tests, 4 optionale Tests ausgelassen; bestanden nach Isolation
   der synthetischen Probe-Runtime von zuvor importierten nativen Architekturen.
 - Qwen: elf echte CLI-Chatturns mit 8 GiB Experten-/1 GiB N-Gramm-Cache
@@ -51,9 +51,23 @@ mit 48 GB Unified Memory.**
   Mit festem 16-GiB-Expertenbudget bestehen außerdem Gesprächswiederherstellung
   und drei vollständige HTTP-Textstreams. Bei einem weiteren Prozessneustart
   wurden 238 von 265 Prompttokens aus dem nativen SSD-Präfix wiederverwendet.
-  Höhere Auto-Budgets führten bei
-  Neustart/Serve zu nativen Speicherabbrüchen und sind noch nicht zuverlässig.
-  GLM-Tool-Calling wird abgewiesen; das GLM-Template ignoriert `enable_thinking`.
+  Höhere Auto-Budgets führten zunächst bei Neustart/Serve zu nativen
+  Speicherabbrüchen. Seit 14. September werden 3,43 GiB zusätzliche native
+  Attention-Kopien bereits beim Laden berücksichtigt. Neue kurze Auto-Läufe
+  bestehen; eine Freigabe beliebiger Kontextlängen folgt daraus nicht.
+  Die neue native Reasoning-Stufe `low` reduziert den ersten Serve-Turn von
+  67,01 auf 15,40 s, bei weiterhin korrekter Antwort. CLI/API und beide Nodes
+  bieten diese optionale Einstellung; Weglassen erhält den bisherigen Standard.
+  Die zusätzliche `glm47`-Parserprüfung behebt die bisherige GLM-Tool-Ablehnung
+  in der Kompatibilitätsprobe; native Parser- und Regressionstests bestehen,
+  fünf echte Tool-/Textanfragen sowie zwei Textstreams mit 34 angebotenen
+  Tools bestehen. Beim großen Tool-Katalog sinkt die Gesamtzeit innerhalb
+  derselben Version von 231,33 auf 31,30 s; 6.144 von 6.169 Prompttokens
+  werden wiederverwendet. Zusätzliche gemeinsame
+  Attention-Allokationen sparen jetzt 3,43 GiB und ermöglichen mehr
+  Expertenresidenz: drei wortgleiche Rust-Antworten benötigen 3,4–6,9 %
+  weniger Gesamtzeit. Zehn native Textadapter-Tests bestehen. Das GLM-Template ignoriert
+  `enable_thinking`.
   Diese Textprüfung ist keine Freigabe für Vision/MTP oder die vollständige
   geplante Abnahmematrix. [Messbericht und reproduzierbare Aufrufe](benchmarks/2026-09-12-flash-offload/README.md).
 

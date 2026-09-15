@@ -35,6 +35,6 @@ process_exit_code=code
 completed_turns=sum(line.startswith('finish reason:') for line in log_text.splitlines())
 generation_errors=[line for line in log_text.splitlines() if line.startswith('error: ')]
 if code == 0 and (generation_errors or completed_turns != len(prompts)): code=1
-report={'process_exit_code':process_exit_code,'completed_turns':completed_turns,'generation_errors':generation_errors,'model':model,'session':command[command.index('--session')+1],'execution':environment['WERK_OMLX_EXPERT_EXECUTION'],'expert_cache_mb':environment['WERK_OMLX_EXPERT_CACHE_MB'],'ngram_cache_mb':1024 if label=='qwen' else None,'thinking':False,'temperature':0,'max_tokens':max_tokens,'persistence':True,'prompts':prompts,'wall_seconds':time.monotonic()-started,'exit_code':code}
+report={'process_exit_code':process_exit_code,'completed_turns':completed_turns,'generation_errors':generation_errors,'model':model,'session':command[command.index('--session')+1],'execution':environment['WERK_OMLX_EXPERT_EXECUTION'],'expert_cache_mb':environment['WERK_OMLX_EXPERT_CACHE_MB'],'ngram_cache_mb':1024 if label=='qwen' else None,'thinking':False,'reasoning_effort':os.environ.get('WERK_OMLX_REASONING_EFFORT'),'temperature':0,'max_tokens':max_tokens,'persistence':True,'prompts':prompts,'wall_seconds':time.monotonic()-started,'exit_code':code}
 (output/(report_label+'-chat.json')).write_text(json.dumps(report,indent=2))
 print(json.dumps(report,indent=2));print((output/(report_label+'-chat.log')).read_text()[-3500:]);sys.exit(code)

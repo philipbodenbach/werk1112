@@ -429,3 +429,13 @@ the loader smoke. It has read-only repository permissions and no publishing.
 The Werk 1.6.0 release keeps these nodes in Beta with manual installation.
 The package remains private; the release does not publish it to npm or change
 the saved node, operation or parameter IDs.
+
+### Native reasoning effort
+
+**oMLX Reasoning Effort** in WERK Text → Chat Options offers `inherit`, `low`, `high`, and `max`.
+Inheritance preserves existing workflows. An explicit value sends
+`werk.omlx.reasoning_effort` for this request, independently of thinking and
+expert/N-gram cache budgets. It reuses loaded weights. GLM’s template honors
+reasoning effort while ignoring the thinking switch; `low` still allows reasoning.
+Update the Werk server to a version advertising `reasoning_effort` in
+`api.chat.omlx_options` before using this option.

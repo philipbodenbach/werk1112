@@ -1,0 +1,25 @@
+oMLX expert cache: 20480 MiB (explicit) upper budget; SSD offload active, native memory guard may reduce residency
+oMLX native short-prefix cache active for /Users/philipbodenbach/.local/share/werk1112/models/mlx-community-DeepSeek-V4-Flash-2bit-DQ/files; worker lifetime, SSD limit 4GB
+Default model available: mlx-community/DeepSeek-V4-Flash-2bit-DQ
+Werk persistence enabled: prefill defaults mode=auto reuse=prefer ttl_seconds=none pin=false; automatic model/pipeline residency remains active on supported Werk-managed runtimes; oMLX native short-prefix caching requested for compatible models during the worker lifetime; local vLLM automatic prefix caching defaults to enabled unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM remains externally managed.
+Server running at http://127.0.0.1:50408
+API key auth enabled; use Authorization: Bearer <key> or X-API-Key: <key> (A1111 clients may use Basic werk:<key>)
+[werk serve] GET /v1/models -> 3 model(s)
+[werk serve] POST /v1/chat/completions model=mlx-community/DeepSeek-V4-Flash-2bit-DQ stream=yes messages=1 images=0 max_tokens=256 tools=0 tool_schema_bytes=0
+[werk serve] stream model=mlx-community/DeepSeek-V4-Flash-2bit-DQ finish=stop prompt_tokens=16 completion_tokens=105 total=48.472165s load=0us eval_rate=2.76 tok/s
+[werk serve] phases {"cached_prompt_tokens":0,"decode_seconds":38.11,"evaluated_prompt_tokens":16,"first_token_seconds":10.36,"prompt_seconds":10.36}
+[werk serve]   oMLX cached prompt tokens: 0
+[werk serve]   oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":256,"temperature":0.0}
+[werk serve]   oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":51368382,"allocator_clears":0,"budget_reductions":0,"cache_budget_bytes":21474836480,"cache_budget_mode":"explicit","cache_evictions":5134,"cache_hits":21823,"cache_misses":7697,"disk_bytes_read":64473792512,"disk_read_seconds":24.109244,"effective_cache_budget_bytes":21474836480,"execution":"grouped","forward_calls":4644,"forward_seconds":46.789698,"materialize_seconds":3.278738,"output_evaluations":4860,"prefill_cache_growth_bytes":16026435584,"prefill_samples_corrected":1,"resident_cache_bytes":21466972160,"routing_seconds":8.443334,"tensor_materializations":7697}
+[werk serve] POST /v1/chat/completions model=mlx-community/DeepSeek-V4-Flash-2bit-DQ stream=yes messages=3 images=0 max_tokens=256 tools=0 tool_schema_bytes=0
+[werk serve] stream model=mlx-community/DeepSeek-V4-Flash-2bit-DQ finish=stop prompt_tokens=137 completion_tokens=103 total=45.961915s load=0us eval_rate=2.53 tok/s
+[werk serve] phases {"cached_prompt_tokens":122,"decode_seconds":40.67,"evaluated_prompt_tokens":15,"first_token_seconds":5.29,"prompt_seconds":5.29}
+[werk serve]   oMLX cached prompt tokens: 122
+[werk serve]   oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":256,"temperature":0.0}
+[werk serve]   oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":46070516,"allocator_clears":1,"budget_reductions":0,"cache_budget_bytes":21474836480,"cache_budget_mode":"explicit","cache_evictions":7288,"cache_hits":21342,"cache_misses":7288,"disk_bytes_read":61041803264,"disk_read_seconds":22.892665,"effective_cache_budget_bytes":21474836480,"execution":"grouped","forward_calls":4558,"forward_seconds":44.306057,"materialize_seconds":3.101134,"output_evaluations":4725,"prefill_cache_growth_bytes":0,"prefill_samples_corrected":1,"resident_cache_bytes":21467496448,"routing_seconds":8.603064,"tensor_materializations":7288}
+[werk serve] POST /v1/chat/completions model=mlx-community/DeepSeek-V4-Flash-2bit-DQ stream=yes messages=5 images=0 max_tokens=256 tools=0 tool_schema_bytes=0
+[werk serve] stream model=mlx-community/DeepSeek-V4-Flash-2bit-DQ finish=stop prompt_tokens=256 completion_tokens=103 total=49.821909s load=0us eval_rate=2.33 tok/s
+[werk serve] phases {"cached_prompt_tokens":241,"decode_seconds":44.24,"evaluated_prompt_tokens":15,"first_token_seconds":5.58,"prompt_seconds":5.58}
+[werk serve]   oMLX cached prompt tokens: 241
+[werk serve]   oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":256,"temperature":0.0}
+[werk serve]   oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":33567976,"allocator_clears":0,"budget_reductions":0,"cache_budget_bytes":21474836480,"cache_budget_mode":"explicit","cache_evictions":8247,"cache_hits":20534,"cache_misses":8248,"disk_bytes_read":69067603968,"disk_read_seconds":25.948021,"effective_cache_budget_bytes":21474836480,"execution":"grouped","forward_calls":4558,"forward_seconds":48.141988,"materialize_seconds":3.440445,"output_evaluations":4741,"prefill_cache_growth_bytes":2097152,"prefill_samples_corrected":1,"resident_cache_bytes":21472739328,"routing_seconds":8.792423,"tensor_materializations":8248}

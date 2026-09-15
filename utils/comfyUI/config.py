@@ -198,8 +198,10 @@ class WerkTextConfig:
         if "stop" in fields:
             fields["stop"] = tuple(fields["stop"])
         options = dict(self.omlx_options)
-        if set(options) - {"thinking", "expert_cache_mb", "ngram_cache_mb"}:
+        if set(options) - {"thinking", "reasoning_effort", "expert_cache_mb", "ngram_cache_mb"}:
             raise ValueError("text config contains unsupported oMLX options")
+        if "reasoning_effort" in options and options["reasoning_effort"] not in ("low", "high", "max"):
+            raise ValueError("oMLX reasoning effort must be low, high, or max")
         if "thinking" in options and not isinstance(options["thinking"], bool):
             raise ValueError("oMLX thinking must be a boolean")
         if "expert_cache_mb" in options:

@@ -1,0 +1,22 @@
+{
+  "builds": {
+    "baseline": {
+      "path": "/private/tmp/werk-perf-before-20260915",
+      "sha256": "34d1b4337ab8970448c75a39e3508648ba57dcb430b9c6ecb354385929e1aeb2"
+    },
+    "retention": {
+      "path": "/private/tmp/werk-perf-retention-20260915",
+      "sha256": "3b63db42470acdf5e476a91385b2f7208ce49f7b637bdac34b5b9f8241204142"
+    },
+    "parallel": {
+      "path": "target/release/werk",
+      "sha256": "18978a6c2e1ada7e3f507468ac84b4e23b8045f4a73687eab267dcdb62a87107"
+    }
+  },
+  "parallel_sources": {
+    "src/backend/omlx_experts.py": "02ed3bcf7a660e5e69c84c088b3508b839b0bbc04c645e70769487ff589f814d",
+    "src/backend/omlx_offload.py": "b45946873607eddc196b683a04317cad0d5c00433a3ab2fb1cddbb8e1c3d2f1f",
+    "src/backend/omlx_text_offload.py": "b15d60bbdf11e36eee92d544c4f7523f6d571e925a30885200631eec03883a92",
+    "src/backend/omlx_offload_runtime.py": "ecf71cc9bdce5aa4489376fb0756de83761c0dd89e8e7495f0ce6701e9186d32"
+  }
+}

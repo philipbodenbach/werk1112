@@ -6,6 +6,7 @@ expert byte ranges and keeps a bounded cache; no full expert tensor is loaded.
 """
 
 from collections import OrderedDict
+from contextlib import contextmanager
 import hashlib
 import importlib.metadata
 import inspect
@@ -237,13 +238,23 @@ class ExpertManager:
             raise ValueError("expert execution must be serial or grouped")
         self.model_id = checkpoint.path.name
         self._cache = OrderedDict()
+        self._retention = None
         self._pinned = set()
         self._leased = set()
         self._usage = {}
         self._lock = threading.RLock()
-        self._fds = {}
+        self._reader = None
+        self._tensor_specs = {}
         self._resident = 0
         self.effective_cache_bytes = min(checkpoint.cache_bytes, checkpoint.total_expert_bytes)
+        if getattr(checkpoint, "config", {}).get("model_type") == "deepseek_v4":
+            # Imported lazily: the embedded worker registers the shared helper
+            # after this module, before any manager is constructed.
+            try:
+                from _werk_omlx_offload import ExpertRetention
+            except ImportError:
+                from omlx_offload import ExpertRetention
+            self._retention = ExpertRetention(self.effective_cache_bytes)
         self.budget_reductions = 0
         self.prefill_cache_growth_bytes = 0
         self.prefill_samples_corrected = 0
@@ -264,9 +275,11 @@ class ExpertManager:
                            "budget_reductions": self.budget_reductions,
                            "prefill_cache_growth_bytes": self.prefill_cache_growth_bytes,
                            "prefill_samples_corrected": self.prefill_samples_corrected,
+                           "last_decode_admission": getattr(self, "last_decode_admission", None),
                            "resident_experts": len(self._cache), "cache_hits": self.hits,
                            "cache_misses": self.misses, "disk_bytes_read": self.disk_bytes_read,
                            "execution": self.execution, "cache_evictions": self.cache_evictions,
+                           "cache_policy": "segmented_lru" if self._retention else "lru",
                            "allocator_clears": self.allocator_clears,
                            "allocator_cache_bytes": self.allocator_cache_bytes,
                            "allocator_cache_limit_bytes": _ALLOCATOR_CACHE_BYTES,
@@ -281,13 +294,15 @@ class ExpertManager:
     def deactivate(self):
         with self._lock:
             self._cache.clear()
+            if self._retention:
+                self._retention.clear()
             self._pinned.clear()
             self._leased.clear()
             self._resident = 0
             self._model_ref = None
-            for fd in self._fds.values():
-                os.close(fd)
-            self._fds.clear()
+            if self._reader is not None:
+                self._reader.close()
+                self._reader = None
 
     def _materialize(self, pending):
         import mlx.core as mx
@@ -320,12 +335,16 @@ class ExpertManager:
             if budget < self.effective_cache_bytes:
                 self.budget_reductions += 1
             self.effective_cache_bytes = budget
+            if self._retention:
+                self._retention.resize(budget)
             evicted = False
             while self._resident > budget:
-                victim = next((key for key in self._cache if key not in protected), None)
+                victim = self._cache_victim(protected)
                 if victim is None:
                     break
                 self._cache.pop(victim)
+                if self._retention:
+                    self._retention.discard(victim)
                 self._resident -= self.checkpoint.expert_bytes[victim[0]]
                 self.cache_evictions += 1
                 evicted = True
@@ -341,40 +360,72 @@ class ExpertManager:
             self.allocator_clears += 1
             self.allocator_cache_bytes = mx.get_cache_memory()
 
+    def _range_reader(self):
+        if self._reader is None:
+            try:
+                from _werk_omlx_offload import RangeReader
+            except ImportError:
+                from omlx_offload import RangeReader
+            self._reader = RangeReader(prefetch_workers=4 if self.execution == "grouped" else 0)
+        return self._reader
+
+    def _tensor(self, name, expert=None):
+        tensor = self._tensor_specs.get(name)
+        if tensor is None:
+            try:
+                from _werk_omlx_offload import Tensor
+            except ImportError:
+                from omlx_offload import Tensor
+            info = self.checkpoint.tensors[name]
+            tensor = Tensor(Path(info["path"]), info["offset"], info["bytes"],
+                            info["shape"], info["dtype"], self.checkpoint.files[info["path"]])
+            self._tensor_specs[name] = tensor
+        if expert is not None:
+            if type(expert) is not int or not 0 <= expert < tensor.shape[0]:
+                raise ValueError("expert index out of bounds")
+            tensor = tensor.rows(expert)
+        return tensor
+
+    @contextmanager
+    def prefetch_experts(self, layer, indices):
+        # The caller leases this entire group before any read or acquisition.
+        # Only demanded, missing rows are staged; CPU workers never call MLX.
+        if self.execution != "grouped":
+            yield
+            return
+        tensors = [self._tensor(self._projection_prefix(layer, projection) + "." + suffix, int(expert))
+                   for expert in indices if (layer, int(expert)) not in self._cache
+                   for projection in ("gate_proj", "up_proj", "down_proj")
+                   for suffix in ("weight", "scales", "biases")]
+        reader = self._range_reader()
+        before_bytes, before_seconds = reader.logical_bytes, reader.read_seconds
+        try:
+            with reader.prefetch(tensors, max_bytes=_WORKSPACE_BYTES // 8):
+                # Account only prefetch here. Acquisitions in the context count
+                # their own reads (including the oversized-group fallback).
+                self.disk_bytes_read += reader.logical_bytes - before_bytes
+                self.disk_read_seconds += reader.read_seconds - before_seconds
+                before_bytes = before_seconds = None
+                yield
+        finally:
+            if before_bytes is not None:
+                self.disk_bytes_read += reader.logical_bytes - before_bytes
+                self.disk_read_seconds += reader.read_seconds - before_seconds
+
     def _read(self, name, expert=None, pending=None):
         import mlx.core as mx
         import numpy as np
 
         info = self.checkpoint.tensors[name]
-        path = info["path"]
-        fd = self._fds.get(path)
-        if fd is None:
-            fd = os.open(path, os.O_RDONLY)
-            if _signature(os.fstat(fd)) != self.checkpoint.files[path]:
-                os.close(fd)
-                raise ValueError("checkpoint changed after expert streaming preflight")
-            self._fds[path] = fd
-        if _signature(os.fstat(fd)) != self.checkpoint.files[path]:
-            raise ValueError("checkpoint changed after expert streaming preflight")
-        shape, count, offset = info["shape"], info["bytes"], info["offset"]
-        if expert is not None:
-            if type(expert) is not int or not 0 <= expert < shape[0]:
-                raise ValueError("expert index out of bounds")
-            count //= shape[0]
-            offset += expert * count
-            shape = shape[1:]
-        started = time.perf_counter()
-        raw = bytearray(count)
-        view = memoryview(raw)
-        consumed = 0
-        while consumed < count:
-            chunk = os.pread(fd, min(count - consumed, 8 * 1024 * 1024), offset + consumed)
-            if not chunk:
-                raise ValueError(f"truncated checkpoint tensor: {name}")
-            view[consumed:consumed + len(chunk)] = chunk
-            consumed += len(chunk)
-        self.disk_bytes_read += count
-        self.disk_read_seconds += time.perf_counter() - started
+        tensor = self._tensor(name, expert)
+        shape = tensor.shape[1:] if expert is not None else tensor.shape
+        reader = self._range_reader()
+        before_bytes, before_seconds = reader.logical_bytes, reader.read_seconds
+        try:
+            raw = reader.read(tensor)
+        finally:
+            self.disk_bytes_read += reader.logical_bytes - before_bytes
+            self.disk_read_seconds += reader.read_seconds - before_seconds
         dtypes = {"U32": "<u4", "I32": "<i4", "F32": "<f4", "F16": "<f2", "BF16": "<u2",
                   "I64": "<i8", "U64": "<u8", "I16": "<i2", "U16": "<u2", "I8": "i1", "U8": "u1", "BOOL": "?"}
         value = mx.array(np.frombuffer(raw, dtype=dtypes[info["dtype"]]).reshape(shape))
@@ -389,6 +440,11 @@ class ExpertManager:
             pending.append((value, raw))
         return value
 
+    def _cache_victim(self, excluded):
+        if self._retention:
+            return self._retention.victim(excluded)
+        return next((key for key in self._cache if key not in excluded), None)
+
     def _acquire(self, key, record=True):
         import mlx.core as mx
 
@@ -399,11 +455,12 @@ class ExpertManager:
         else:
             size = self.checkpoint.expert_bytes[layer]
             while self._resident + size > self.effective_cache_bytes:
-                victim = next((item for item in self._cache
-                               if item not in self._pinned and item not in self._leased), None)
+                victim = self._cache_victim(self._pinned | self._leased)
                 if victim is None:
                     raise ValueError("expert cache is full of pinned experts; unpin experts or raise its budget")
                 self._cache.pop(victim)
+                if self._retention:
+                    self._retention.discard(victim)
                 self._resident -= self.checkpoint.expert_bytes[victim[0]]
                 self.cache_evictions += 1
                 # Small recyclable allocations serve the next expert load.
@@ -419,6 +476,8 @@ class ExpertManager:
             self._cache[key] = values
             self._resident += size
             self.misses += 1
+        if self._retention:
+            self._retention.touch(key, self.checkpoint.expert_bytes[layer])
         if record:
             previous = self._usage.get(key, (0, None))
             self._usage[key] = (previous[0] + 1, int(time.time() * 1000))
@@ -563,6 +622,8 @@ class ExpertManager:
                     for key in keys:
                         if key in self._cache:
                             self._cache.pop(key)
+                            if self._retention:
+                                self._retention.discard(key)
                             self._resident -= self.checkpoint.expert_bytes[key[0]]
                     import mlx.core as mx
                     mx.clear_cache()
@@ -609,9 +670,10 @@ def _streamed_module(manager, layer, activation):
                     manager._leased.update(group)
                     acquired = []
                     try:
-                        for key in group:
-                            rows, slots = np.nonzero(routes == key[1])
-                            acquired.append((manager._acquire(key), rows, slots))
+                        with manager.prefetch_experts(layer, [key[1] for key in group]):
+                            for key in group:
+                                rows, slots = np.nonzero(routes == key[1])
+                                acquired.append((manager._acquire(key), rows, slots))
                         # Output storage uses at most half the workspace; this
                         # separate allowance bounds the grouped activation DAG.
                         bytes_per_row = len(group) * max(x.shape[-1], manager.checkpoint.intermediate) * 4 * 4
@@ -744,6 +806,7 @@ class _ExpertMemoryGuard:
         self.original_adaptive = scheduler_class._adaptive_chunk_size
         self.original_record = scheduler_class._record_chunk_transient
         self.original_check = scheduler_class._preflight_memory_check
+        self.original_responses = scheduler_class._process_batch_responses
         self.original_preflight = engine_class._preflight_or_raise_with_eviction
         contracts = (
             (self.original_current, ("self", "refresh_mlx_active")),
@@ -751,6 +814,7 @@ class _ExpertMemoryGuard:
             (self.original_adaptive, ("self", "requested", "request_id", "loop_label", "kv_len")),
             (self.original_record, ("self", "n_tokens", "pre_bytes", "post_bytes", "request_id", "loop_label", "kv_len", "requested_step")),
             (self.original_check, ("self", "request")),
+            (self.original_responses, ("self", "responses")),
             (self.original_preflight, ("self", "scheduler", "num_prompt_tokens", "request_id")),
         )
         if any(tuple(inspect.signature(method).parameters) != signature
@@ -777,7 +841,8 @@ class _ExpertMemoryGuard:
                 current += _WORKSPACE_BYTES
         return current
 
-    def prepare(self, scheduler, *, num_prompt_tokens, cached_tokens=0, chunk=None):
+    def prepare(self, scheduler, *, num_prompt_tokens, cached_tokens=0, chunk=None,
+                phase="prefill"):
         """Reclaim only on the MLX executor, before native guards see usage."""
         if not self.matches(scheduler):
             return
@@ -813,7 +878,7 @@ class _ExpertMemoryGuard:
             if resize_auxiliary is not None:
                 available -= resize_auxiliary(available)
             self.manager._resize_cache(available)
-            self.manager.last_prefill_admission = {
+            admission = {
                 "chunk_tokens": chunk[0] if chunk else None,
                 "cached_tokens": cached_tokens,
                 "current_bytes": current,
@@ -822,12 +887,29 @@ class _ExpertMemoryGuard:
                 "ceiling_bytes": min(caps),
                 "effective_expert_bytes": self.manager.effective_cache_bytes,
             }
+            setattr(self.manager, "last_" + phase + "_admission", admission)
             # Refresh executor telemetry after actual eviction. Early HTTP
             # preflight subsequently reads this sample without touching MLX.
             refreshed = self.original_current(scheduler)
             resident_after = self.cache_totals()[0]
             deferred = max(0, resident_before - resident_after - max(0, current - refreshed))
             self.deferred_reclaims[scheduler] = (credit + deferred, refreshed, resident_after)
+
+    def responses(self, scheduler, responses):
+        result = self.original_responses(scheduler, responses)
+        # This callback runs on the owning MLX executor, after prefill locals
+        # have been released and the first token has been evaluated. Revisit
+        # the budget throughout decode: a prefill-sized reserve must not keep
+        # evicting experts for the rest of a single-request generation.
+        # Interleaved prefills/batches retain their existing native accounting.
+        if (self.matches(scheduler) and not scheduler.prefilling
+                and not scheduler.waiting and len(scheduler.running) == 1):
+            request = next(iter(scheduler.running.values()))
+            if request.num_output_tokens > 0:
+                kv_len = request.num_prompt_tokens + request.num_output_tokens
+                self.prepare(scheduler, num_prompt_tokens=kv_len + 1,
+                             cached_tokens=kv_len, chunk=(1, kv_len), phase="decode")
+        return result
 
     def adaptive(self, scheduler, requested, *, request_id, loop_label, kv_len=0):
         # Native adaptive sizing runs BEFORE the final chunk guard. Reclaim
@@ -913,6 +995,9 @@ class _ExpertMemoryGuard:
             return owner.record(scheduler, n_tokens, pre_bytes, post_bytes, **kwargs)
         def check(scheduler, request):
             return owner.check(scheduler, request)
+        def responses(self, responses):
+            # Preserve the native signature for the persistence wrapper.
+            return owner.responses(self, responses)
         async def preflight(engine, scheduler, **kwargs):
             return await owner.preflight(engine, scheduler, **kwargs)
         scheduler_class._current_usage_bytes = current
@@ -920,6 +1005,7 @@ class _ExpertMemoryGuard:
         scheduler_class._adaptive_chunk_size = adaptive
         scheduler_class._record_chunk_transient = record
         scheduler_class._preflight_memory_check = check
+        scheduler_class._process_batch_responses = responses
         engine_class._preflight_or_raise_with_eviction = preflight
 
 

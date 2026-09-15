@@ -1,0 +1,13 @@
+oMLX expert cache: 18566 MiB (auto) upper budget; SSD offload active, native memory guard may reduce residency
+oMLX native short-prefix cache active for /Users/philipbodenbach/.local/share/werk1112/models/Vontra-GLM-5.3-Flash-MLX-oQ2-MTP/files; worker lifetime, SSD limit 4GB
+Default model available: Vontra/GLM-5.3-Flash-MLX-oQ2-MTP
+Werk persistence enabled: prefill defaults mode=auto reuse=prefer ttl_seconds=none pin=false; automatic model/pipeline residency remains active on supported Werk-managed runtimes; oMLX native short-prefix caching requested for compatible models during the worker lifetime; local vLLM automatic prefix caching defaults to enabled unless WERK_VLLM_ARGS explicitly overrides it; remote vLLM remains externally managed.
+Server running at http://127.0.0.1:62090
+API key auth enabled; use Authorization: Bearer <key> or X-API-Key: <key> (A1111 clients may use Basic werk:<key>)
+[werk serve] GET /v1/models -> 3 model(s)
+[werk serve] POST /v1/chat/completions model=Vontra/GLM-5.3-Flash-MLX-oQ2-MTP stream=yes messages=1 images=0 max_tokens=256 tools=0 tool_schema_bytes=0
+[werk serve] stream model=Vontra/GLM-5.3-Flash-MLX-oQ2-MTP finish=stop prompt_tokens=26 completion_tokens=82 total=67.001027s load=0us eval_rate=1.58 tok/s
+[werk serve] phases {"cached_prompt_tokens":0,"decode_seconds":51.74,"evaluated_prompt_tokens":26,"first_token_seconds":15.23,"prompt_seconds":15.23}
+[werk serve]   oMLX cached prompt tokens: 0
+[werk serve]   oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":256,"temperature":0.0}
+[werk serve]   oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":57691427,"allocator_clears":253,"budget_reductions":0,"cache_budget_bytes":19468282244,"cache_budget_mode":"auto","cache_evictions":11063,"cache_hits":18264,"cache_misses":13538,"disk_bytes_read":106467164160,"disk_read_seconds":39.124314,"effective_cache_budget_bytes":19468282244,"execution":"grouped","forward_calls":3570,"forward_seconds":65.960575,"materialize_seconds":0.470619,"ngram_cache_budget_bytes":0,"ngram_cache_budget_mode":"disabled","ngram_cache_evictions":0,"ngram_cache_hits":0,"ngram_cache_misses":0,"ngram_effective_cache_budget_bytes":0,"ngram_requested_rows":0,"ngram_resident_cache_bytes":0,"ngram_unique_rows":0,"output_evaluations":3996,"prefill_cache_growth_bytes":19464192000,"prefill_samples_corrected":1,"resident_cache_bytes":19464192000,"routing_seconds":9.477416,"tensor_materializations":13538}

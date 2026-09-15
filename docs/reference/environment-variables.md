@@ -145,6 +145,7 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_OMLX_EXPERT_EXECUTION` | Expert-offload execution strategy: `grouped` (default) batches tensor materialization and expert output evaluation while preserving the cache budget and active-weight lifetimes. `serial` keeps the previous execution order for comparison and rollback. Both use the same checkpoint quantization. Captured at backend selection; restart Werk after changing it. |
 | `WERK_OMLX_NGRAM_CACHE_MB` | Separate N-gram cache cap in MiB for verified text offload adapters. Unset or `auto` starts with at most 64 MiB for Qwen `qwen4_exp` PLE rows and grows at prefill/request boundaries only after demand eviction. The hardware ceiling uses at most one eighth of shared weight-cache room when experts are streamed; native expert weights are otherwise charged as base memory. Pressure can shrink the row cache. There is no fixed 1-GiB Auto ceiling; `0` keeps tables resident. A positive integer requires actual supported tables. Both caches share native memory admission, so their effective limits may shrink. API `werk.omlx.ngram_cache_mb` and ComfyUI/n8n text controls can override it. |
 | `WERK_OMLX_THINKING` | Optional oMLX thinking override: `0` disables thinking and `1` enables it through `chat_template_kwargs.enable_thinking` for model templates that support the setting. Unset preserves the runtime/model default; empty or other values fail discovery. Captured when Werk selects the backend, so set it before starting the CLI or server. Applies to streaming and nonstreaming text/chat requests. Chat API and ComfyUI/n8n text options can override this default per request without changing the process environment. |
+| `WERK_OMLX_REASONING_EFFORT` | Optional `low`, `high`, or `max` native reasoning effort for oMLX chat/run/serve; unset preserves the model default. Sent both as native `reasoning_effort` and template kwargs. GLM honors this separately from thinking; `low` does not turn reasoning off. |
 | `WERK_TRANSFORMERS_PYTHON` | Python interpreter containing PyTorch and Transformers for the compatibility backend. |
 | `WERK_TRANSFORMERS_DEVICE` | Device override; `auto` chooses CUDA, then MPS, then CPU. |
 | `WERK_TRANSFORMERS_DTYPE` | `auto`, `float32`/`fp32`/`f32`, `bfloat16`/`bf16`, or `float16`/`fp16`/`f16`/`half`. |
@@ -176,7 +177,9 @@ missing. See the [chat options contract](../api.md#omlx-chat-options).
 oMLX's DeepSeek V4 template enables thinking by default. Werk displays the
 visible answer; reasoning deltas do not clear the terminal's waiting indicator.
 With SSD expert offload, generating hidden reasoning can therefore look like
-a stalled chat. Set `WERK_OMLX_THINKING=0` for direct answers, or leave it unset
+a stalled chat. For templates honoring the switch, set `WERK_OMLX_THINKING=0`
+for direct answers. GLM ignores this switch; use `WERK_OMLX_REASONING_EFFORT=low`
+to reduce its reasoning effort. Leave these settings unset
 to keep the runtime's default. This option changes generation behavior; the
 expert cache budget remains controlled separately.
 

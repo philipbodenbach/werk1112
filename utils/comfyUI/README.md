@@ -1024,3 +1024,13 @@ These nodes are part of Werk1112 and use the repository-wide
 [Elastic License 2.0](LICENSE). The adjacent `LICENSE` is the same authoritative
 license text as the repository root and is included in standalone Comfy
 Registry packages; it is not a separate license for the nodes.
+
+### Native reasoning effort
+
+`omlx_reasoning_effort` in WERK Text Config offers `inherit`, `low`, `high`, and `max`.
+Inheritance preserves existing workflows. An explicit value sends
+`werk.omlx.reasoning_effort` for this request, independently of thinking and
+expert/N-gram cache budgets. It reuses loaded weights. GLM’s template honors
+reasoning effort while ignoring the thinking switch; `low` still allows reasoning.
+Update the Werk server to a version advertising `reasoning_effort` in
+`api.chat.omlx_options` before using this option.

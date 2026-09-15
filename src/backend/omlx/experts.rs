@@ -382,6 +382,7 @@ mod tests {
                 ngram_cache_bytes: None,
                 expert_execution: "grouped",
                 thinking: None,
+                reasoning_effort: None,
                 server_prefix_cache: false,
             };
             Self {

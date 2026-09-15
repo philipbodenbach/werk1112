@@ -4,7 +4,7 @@ import subprocess,os,time,json,sys,socket,urllib.request,urllib.error,statistics
 from pathlib import Path
 root=Path(__file__).resolve().parents[3];sys.path.insert(0,str(root/'utils/benchmarks'));import chat
 model,label,execution,budget=sys.argv[1:5];output=Path(os.environ.get('WERK_FLASH_REPORT_DIR','/tmp/werk-flash-reproduction'));output.mkdir(parents=True,exist_ok=True)
-fixture=json.loads((Path(__file__).parent/'qwen-chat.json').read_text()); report={'model':model,'execution':execution,'expert_cache_mb':budget,'ngram_cache_mb':1024 if label.startswith('qwen') else None,'thinking':False,'temperature':0,'samples':[]}
+fixture=json.loads((Path(__file__).parent/'qwen-chat.json').read_text()); report={'model':model,'execution':execution,'expert_cache_mb':budget,'ngram_cache_mb':1024 if label.startswith('qwen') else None,'thinking':False,'reasoning_effort':os.environ.get('WERK_OMLX_REASONING_EFFORT'),'temperature':0,'samples':[]}
 with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
 key=secrets.token_hex(32)
 max_tokens=int(os.environ.get('WERK_FLASH_MAX_TOKENS','16'));report['max_tokens']=max_tokens

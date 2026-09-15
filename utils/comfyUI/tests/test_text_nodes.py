@@ -285,3 +285,16 @@ def test_text_nodes_are_exported_and_api_example_is_executable():
     assert not {"temperature", "top_p", "seed"}.intersection(payload)
     discovery_inputs = next(node["inputs"] for node in prompt.values() if node["class_type"] == "WerkTextModels")
     assert discovery_inputs["require_available"] is False
+
+
+def test_reasoning_effort_is_optional_and_independent_of_thinking():
+    assert 'omlx_reasoning_effort' in WerkTextConfigNode.INPUT_TYPES()['optional']
+    assert 'werk' not in text_config_payload(build_text_config())
+    for effort in ('low', 'high', 'max'):
+        config = build_text_config(omlx_reasoning_effort=effort, omlx_thinking='disabled')
+        assert text_config_payload(config)['werk']['omlx'] == {'reasoning_effort': effort, 'thinking': False}
+    for invalid in ('medium', 'none', '', 0, False, []):
+        with pytest.raises(ValueError):
+            build_text_config(omlx_reasoning_effort=invalid)
+        with pytest.raises(ValueError):
+            WerkTextConfig(omlx_options={'reasoning_effort': invalid})

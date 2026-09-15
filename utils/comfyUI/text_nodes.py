@@ -89,6 +89,7 @@ def build_text_config(
     inherit_sampling: bool = False,
     omlx_ngram_offload: str = "inherit",
     omlx_ngram_cache_mb: int = 1024,
+    omlx_reasoning_effort: str = "inherit",
 ) -> WerkTextConfig:
     # Reuse validation for the common /v1/chat/completions sampling fields.
     common = build_vision_config(
@@ -105,6 +106,10 @@ def build_text_config(
         for key in ("temperature", "top_p", "seed"):
             fields.pop(key, None)
     options: dict[str, Any] = {}
+    if omlx_reasoning_effort not in ("inherit", "low", "high", "max"):
+        raise ValueError("omlx_reasoning_effort must be inherit, low, high, or max")
+    if omlx_reasoning_effort != "inherit":
+        options["reasoning_effort"] = omlx_reasoning_effort
     thinking = _tristate(omlx_thinking, "omlx_thinking")
     offload = _tristate(omlx_expert_offload, "omlx_expert_offload")
     if thinking is not None:
@@ -296,6 +301,7 @@ class WerkTextConfigNode:
                 "tooltip": "Manual expert cache ceiling, used only when offload is enabled. Inherit ignores this field and keeps server Auto sizing. Native memory guards may shrink residency; other weights, KV and workspace need additional memory.",
             }),
         }, "optional": {
+            "omlx_reasoning_effort": (["inherit", "low", "high", "max"], {"default": "inherit", "tooltip": "Native reasoning effort for compatible templates, including GLM. Low reduces reasoning effort; it does not disable reasoning."}),
             "inherit_sampling": ("BOOLEAN", {"default": False, "tooltip": "Use server temperature, top-p and seed. Completion limit and explicit stop sequences still apply."}),
             "omlx_ngram_offload": (["inherit", "enabled", "disabled", "auto"], {"default": "inherit", "tooltip": "N-gram table storage, independent of MoE experts. Auto adapts to memory and row demand; enabled uses the manual MiB limit; disabled keeps tables resident."}),
             "omlx_ngram_cache_mb": ("INT", {"default": 1024, "min": 1, "max": 1048576, "tooltip": "N-gram row cache in MiB when enabled. Shares the available system memory with experts, dense weights and KV."}),

@@ -401,8 +401,8 @@ fn capabilities_for_descriptor(
         Capability {
             id: "api.chat.omlx_options".into(),
             status: CapabilityStatus::Supported,
-            detail: "Chat requests accept werk.omlx.thinking, expert_cache_mb and ngram_cache_mb; the selected runtime, architecture and checkpoint must support the requested controls. This does not declare native state persistence.".into(),
-            operations: vec!["thinking".into(), "expert_cache_mb".into(), "ngram_cache_mb".into()],
+            detail: "Chat requests accept werk.omlx.thinking, reasoning_effort, expert_cache_mb and ngram_cache_mb; the selected runtime, architecture and checkpoint must support the requested controls. This does not declare native state persistence.".into(),
+            operations: vec!["thinking".into(), "reasoning_effort".into(), "expert_cache_mb".into(), "ngram_cache_mb".into()],
         },
     );
     let memory = memory_status_for(inner);

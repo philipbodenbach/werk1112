@@ -76,11 +76,12 @@ fn thinking_override_changes_only_explicit_omlx_template_kwargs() {
     for stream in [false, true] {
         let baseline = chat_completion_body("model", &request, stream);
         assert_eq!(
-            omlx_chat_completion_body("model", &request, stream, None),
+            omlx_chat_completion_body("model", &request, stream, None, None),
             baseline
         );
         for thinking in [false, true] {
-            let mut body = omlx_chat_completion_body("model", &request, stream, Some(thinking));
+            let mut body =
+                omlx_chat_completion_body("model", &request, stream, Some(thinking), None);
             assert_eq!(
                 body.as_object_mut().unwrap().remove("chat_template_kwargs"),
                 Some(json!({"enable_thinking": thinking}))
@@ -623,6 +624,7 @@ fn fixture_backend(fixture: &Fixture) -> OmlxBackend {
         servers: Arc::new(Mutex::new(HashMap::new())),
         model_probes: Arc::new(Mutex::new(VecDeque::new())),
         request_thinking: None,
+        request_reasoning_effort: None,
         test_probe: Some(ProbeReport {
             detail: "fixture".into(),
             version: "test-0.6.4".into(),
@@ -856,6 +858,7 @@ fn chat_options(
 ) -> crate::openai::ChatRuntimeOptions {
     crate::openai::ChatRuntimeOptions {
         omlx: Some(crate::openai::OmlxChatOptions {
+            reasoning_effort: None,
             thinking,
             expert_cache_mb,
             ngram_cache_mb: None,
@@ -1719,5 +1722,52 @@ fn auto_expert_cache_activates_only_for_probe_verified_models() {
         drop(servers);
         drop(backend);
         drop(fixture);
+    }
+}
+
+#[test]
+fn reasoning_effort_controls_native_payload_and_preserves_worker_reuse() {
+    assert_eq!(reasoning_effort_enabled(None).unwrap(), None);
+    for (name, effort) in [
+        ("low", OmlxReasoningEffort::Low),
+        ("high", OmlxReasoningEffort::High),
+        ("max", OmlxReasoningEffort::Max),
+    ] {
+        assert_eq!(
+            reasoning_effort_enabled(Some(name.into())).unwrap(),
+            Some(effort)
+        );
+        let options: crate::openai::ChatRuntimeOptions =
+            serde_json::from_value(json!({"omlx":{"reasoning_effort":name}})).unwrap();
+        assert!(!options.omlx.as_ref().unwrap().is_empty());
+        let fixture = Fixture::new(json!({}));
+        let mut base = fixture_backend(&fixture);
+        base.invocation.as_mut().unwrap().reasoning_effort = Some(OmlxReasoningEffort::Max);
+        let configured = base.configured_for_chat(&options).unwrap();
+        assert_eq!(configured.request_reasoning_effort, Some(effort));
+        assert_eq!(base.request_reasoning_effort, None);
+        assert_eq!(configured.cache_identity(), base.cache_identity());
+        assert!(Arc::ptr_eq(&base.servers, &configured.servers));
+        for thinking in [None, Some(false), Some(true)] {
+            for stream in [false, true] {
+                let body =
+                    omlx_chat_completion_body("model", &request(), stream, thinking, Some(effort));
+                assert_eq!(body["reasoning_effort"], name);
+                assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], name);
+                assert_eq!(
+                    body["chat_template_kwargs"].get("enable_thinking"),
+                    thinking.map(|value| json!(value)).as_ref()
+                );
+            }
+        }
+    }
+    for invalid in ["", "medium", "none", "0", " low", "LOW"] {
+        assert!(reasoning_effort_enabled(Some(invalid.into())).is_err());
+        assert!(
+            serde_json::from_value::<crate::openai::OmlxChatOptions>(
+                json!({"reasoning_effort":invalid})
+            )
+            .is_err()
+        );
     }
 }

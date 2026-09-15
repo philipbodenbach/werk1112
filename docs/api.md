@@ -393,7 +393,7 @@ Accepted top-level fields:
 | <code>tools</code> | No | array | OpenAI function-tool definitions; supported by the vLLM adapter |
 | <code>tool_choice</code> | No | string or object | <code>none</code>, <code>auto</code>, <code>required</code>, or a named function selection |
 | <code>parallel_tool_calls</code> | No | boolean | Forwarded unchanged to vLLM |
-| <code>werk</code> | No | object | Validated Werk chat runtime options; currently <code>omlx.thinking</code>, <code>omlx.expert_cache_mb</code> and <code>omlx.ngram_cache_mb</code> |
+| <code>werk</code> | No | object | Validated Werk chat runtime options; currently <code>omlx.thinking</code>, <code>omlx.reasoning_effort</code>, <code>omlx.expert_cache_mb</code> and <code>omlx.ngram_cache_mb</code> |
 
 #### oMLX chat options
 
@@ -412,6 +412,13 @@ environment:
 ```
 
 `thinking` is a JSON boolean: `false` corresponds to `WERK_OMLX_THINKING=0`.
+`reasoning_effort` accepts `"low"`, `"high"`, or `"max"`, overriding
+`WERK_OMLX_REASONING_EFFORT` for this request. It is sent to native oMLX and
+the chat template. GLM honors this control even though it ignores the thinking
+switch; low effort still permits reasoning. Omission preserves the server/model
+default. Like thinking, this override reuses the worker and does not reload
+weights. Other models must support the corresponding native template argument.
+
 `expert_cache_mb` is an integer from 0 to 1048576 MiB; `8192` enables the
 experimental SSD expert loader with an 8 GiB RAM cache, and `0` explicitly
 disables expert offload. `ngram_cache_mb` independently accepts `"auto"` or the same integer range:

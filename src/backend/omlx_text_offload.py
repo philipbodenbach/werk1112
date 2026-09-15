@@ -14,11 +14,11 @@ from pathlib import Path
 import weakref
 
 try:
-    from _werk_omlx_offload import Inventory, RangeReader, SharedCache, GiB, MiB, integer
+    from _werk_omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer
     from _werk_omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
     from _werk_omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
 except ImportError:  # Direct repository tests.
-    from omlx_offload import Inventory, RangeReader, SharedCache, GiB, MiB, integer
+    from omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer
     from omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
     from omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
 
@@ -71,6 +71,91 @@ def native_classes(config, model_path):
     return module.Model, args
 
 
+def attention_fusion_bytes(inventory):
+    """Packed copies retained by the installed GLM linear-attention fusion."""
+    if inventory.architecture != "glm5_next":
+        return 0
+    tensors = {_canonical_name(name, inventory.architecture): (name, tensor)
+               for name, tensor in inventory.categories["base"].items()}
+    total = 0
+    for name in tensors:
+        if not name.endswith(".self_attn.forget_gate.f_a_proj.weight"):
+            continue
+        prefix = name.removesuffix("forget_gate.f_a_proj.weight")
+        modules = [prefix + suffix for suffix in
+                   ("q_proj", "k_proj", "v_proj", "forget_gate.f_a_proj", "g_a_proj", "b_proj")]
+        if any(module + ".weight" not in tensors for module in modules):
+            continue
+        quantized = [module + ".scales" in tensors for module in modules]
+        if any(quantized) and not all(quantized):
+            continue
+        if all(quantized):
+            specs = [inventory.quantization(tensors[module + ".weight"][0].removesuffix(".weight"))
+                     for module in modules]
+            if any(spec != specs[0] for spec in specs):
+                continue
+        suffixes = ("weight", "scales", "biases") if all(quantized) else ("weight",)
+        total += sum(tensors[module + "." + suffix][1].size
+                     for module in modules for suffix in suffixes)
+    return total
+
+
+def share_attention_fusion(attention):
+    """Keep native projection modules as row views of their fused allocation.
+
+    The installed GLM fusion concatenates only the output axis. Views preserve
+    packed values, quantization metadata and the unfused fallback, without a
+    second persistent copy of every input projection.
+    """
+    import mlx.core as mx
+    modules = [attention.q_proj, attention.k_proj, attention.v_proj,
+               attention.forget_gate.f_a_proj, attention.g_a_proj, attention.b_proj]
+    fields = [("weight", attention._fw)]
+    if attention._fq:
+        fields.extend((("scales", attention._fs), ("biases", attention._fb)))
+    boundaries = [0, *attention._split_pts, attention._fw.shape[0]]
+    if len(boundaries) != len(modules) + 1:
+        raise ValueError("unsupported native GLM fusion boundaries")
+    views = []
+    for index, module in enumerate(modules):
+        start, end = boundaries[index:index + 2]
+        for name, fused in fields:
+            view = fused[start:end]
+            original = getattr(module, name)
+            if view.shape != original.shape or view.dtype != original.dtype:
+                raise ValueError("unsupported native GLM fused projection layout")
+            views.append((module, name, view))
+    mx.eval([view for _, _, view in views])
+    for module, name, view in views:
+        setattr(module, name, view)
+
+
+def prepare_attention_fusion(root, checkpoint):
+    """Prepare shared native projections before the first memory admission.
+
+    The projection output stays lazy: no attention, KV state or expert forward
+    is run here. Mixed quantization retains the native unfused fallback.
+    """
+    if checkpoint.inventory.architecture != "glm5_next":
+        return
+    import mlx.core as mx
+    actual = 0
+    for layer in root.language_model.model.layers:
+        attention = layer.self_attn
+        if not getattr(attention, "fuse_in", False):
+            continue
+        attention._fused_in_proj(mx.zeros((1, 1, checkpoint.hidden), dtype=mx.bfloat16))
+        if getattr(attention, "_fused_ready", False):
+            arrays = [attention._fw]
+            if attention._fq:
+                arrays.extend((attention._fs, attention._fb))
+            mx.eval(arrays)
+            actual += sum(array.nbytes for array in arrays)
+            share_attention_fusion(attention)
+    if actual != checkpoint.attention_fusion_bytes:
+        raise ValueError("native GLM attention fusion memory differs from checkpoint preflight")
+
+
 class TextCheckpoint:
     def __init__(self, path, expert_bytes, ngram_bytes=None):
         self.inventory = Inventory(path)
@@ -110,6 +195,7 @@ class TextCheckpoint:
         self.ngram_initial_cache_bytes = (min(self.ngram_budget_bytes, max(64 * MiB, self.largest_ngram_row_bytes))
                                           if self.ngram_budget_mode == "auto" else self.ngram_budget_bytes)
         self.dense_bytes = sum(t.size for t in inv.categories["base"].values())
+        self.attention_fusion_bytes = attention_fusion_bytes(inv)
         self.base_bytes = (self.dense_bytes + self.ngram_initial_cache_bytes
                            + (0 if self.ngrams_enabled else self.ngram_storage_bytes)
                            + (0 if self.experts_enabled else self.total_expert_bytes))
@@ -120,6 +206,8 @@ class TextCheckpoint:
         return {
             "architecture": self.inventory.architecture, "fingerprint": self.fingerprint,
             "base_bytes": self.dense_bytes, "expert_bytes": self.total_expert_bytes,
+            "attention_fusion_bytes": self.attention_fusion_bytes,
+            "attention_shared_bytes": self.attention_fusion_bytes,
             "checkpoint_bytes": self.inventory.summary()["checkpoint_bytes"],
             "cache_budget_bytes": self.cache_bytes, "cache_budget_mode": self.cache_budget_mode,
             "workspace_bytes": _WORKSPACE_BYTES, "resident_estimate_bytes": self.resident_estimate_bytes,
@@ -160,7 +248,9 @@ class TextCheckpoint:
 class TextExpertManager(ExpertManager):
     def __init__(self, checkpoint, execution=None):
         super().__init__(checkpoint, execution=execution)
-        self.reader = RangeReader()
+        if checkpoint.experts_enabled and checkpoint.inventory.architecture in ARCHITECTURES:
+            self._retention = ExpertRetention(self.effective_cache_bytes)
+        self.reader = RangeReader(prefetch_workers=4 if checkpoint.inventory.architecture in ARCHITECTURES else 0)
         self.ngram_cache = SharedCache(max(1, checkpoint.ngram_initial_cache_bytes))
         self._ngram_auto_target = checkpoint.ngram_initial_cache_bytes
         self._ngram_last_evictions = 0
@@ -383,6 +473,7 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
         nn.Module.load_weights(root, list(weights.items()), strict=True)
         mx.eval(root.parameters())
         del weights
+        prepare_attention_fusion(root, cp)
         mx.clear_cache()
 
         class TextModel(nn.Module):

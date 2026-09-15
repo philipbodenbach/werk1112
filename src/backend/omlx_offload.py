@@ -1,8 +1,8 @@
 """Architecture-specific offload inventory and bounded shared residency.
 
 No MLX import, model construction or model-repository code execution is allowed
-in this module. DeepSeek keeps its existing adapter until integration parity is
-verified. Byte counts include quantization metadata, not parameter estimates.
+in this module. DeepSeek keeps its native adapter and shares the bounded reader
+and retention helpers. Byte counts include quantization metadata, not parameter estimates.
 """
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -274,6 +274,58 @@ def automatic_budget(*, metal_limit, available_memory, base_bytes, state_bytes,
     return cache
 
 
+class ExpertRetention:
+    """Byte-bounded segmented LRU metadata, never an extra weight allocation.
+
+    A first reference enters probation. Reuse promotes to the protected LRU;
+    its oldest entries return to probation above 80% of the total budget.
+    Streaming a large prefill therefore cannot flush every reused expert.
+    Hard pins and active leases override both segments at eviction time.
+    """
+    def __init__(self, budget):
+        self.probation = OrderedDict()
+        self.protected = OrderedDict()
+        self.protected_bytes = 0
+        self.resize(budget)
+
+    def resize(self, budget):
+        self.limit = max(0, int(budget)) * 4 // 5
+        self._balance()
+
+    def _balance(self):
+        while self.protected_bytes > self.limit and self.protected:
+            key, size = self.protected.popitem(last=False)
+            self.protected_bytes -= size
+            self.probation[key] = size
+
+    def touch(self, key, size):
+        if key in self.protected:
+            self.protected.move_to_end(key)
+        elif key in self.probation:
+            self.probation.pop(key)
+            self.protected[key] = size
+            self.protected_bytes += size
+            self._balance()
+        else:
+            self.probation[key] = size
+
+    def victim(self, excluded):
+        for segment in (self.probation, self.protected):
+            key = next((key for key in segment if key not in excluded), None)
+            if key is not None:
+                return key
+        return None
+
+    def discard(self, key):
+        self.probation.pop(key, None)
+        self.protected_bytes -= self.protected.pop(key, 0)
+
+    def clear(self):
+        self.probation.clear()
+        self.protected.clear()
+        self.protected_bytes = 0
+
+
 class SharedCache:
     """Bounded synchronous cache with namespace caps and reference-counted leases.
 
@@ -358,8 +410,12 @@ class SharedCache:
 
 
 class RangeReader:
-    def __init__(self, max_open_files=16):
+    def __init__(self, max_open_files=16, prefetch_workers=0):
         self.max_open_files = integer(max_open_files, 'open file limit', 1)
+        self.prefetch_workers = integer(prefetch_workers, 'prefetch workers')
+        if self.prefetch_workers > 4:
+            raise ValueError('checkpoint prefetch supports at most four readers')
+        self._read_pool = None
         self._fds = OrderedDict()
         self._lock = threading.RLock()
         self._closed = False
@@ -378,6 +434,9 @@ class RangeReader:
     def close(self):
         with self._lock:
             self._closed = True
+            if self._read_pool is not None:
+                self._read_pool.shutdown(wait=True)
+                self._read_pool = None
             self._finalizer()
 
     def _file(self, path):
@@ -440,10 +499,16 @@ class RangeReader:
             yield
             return
         with self._lock:
+            if self._closed:
+                raise ValueError('checkpoint reader is closed')
             if self._prefetched is not None:
                 raise ValueError('nested checkpoint prefetch is unsupported')
             self._prefetched = {}
             try:
+                if self.prefetch_workers and len(tensors) > 1:
+                    self._parallel_prefetch(tensors)
+                    yield
+                    return
                 runs = []
                 for tensor in tensors:
                     if (runs and runs[-1][-1].path == tensor.path
@@ -467,3 +532,44 @@ class RangeReader:
                 yield
             finally:
                 self._prefetched = None
+
+    @staticmethod
+    def _isolated_read(tensor):
+        # Worker threads perform file I/O only, never MLX operations. Each
+        # task owns its descriptor, preserving replacement/truncation checks
+        # without sharing the descriptor LRU or its lock across threads.
+        reader = RangeReader(max_open_files=1)
+        try:
+            raw = reader.read(tensor)
+            return raw, reader.logical_bytes, reader.calls
+        finally:
+            reader.close()
+
+    def _parallel_prefetch(self, tensors):
+        from concurrent.futures import ThreadPoolExecutor, wait
+        if self._read_pool is None:
+            self._read_pool = ThreadPoolExecutor(
+                max_workers=self.prefetch_workers, thread_name_prefix='werk-expert-read')
+        started = time.perf_counter()
+        futures = []
+        try:
+            for tensor in tensors:
+                futures.append(self._read_pool.submit(self._isolated_read, tensor))
+        finally:
+            # Drain all readers even if scheduling or a read fails. At most
+            # the caller's bounded group is in flight; no work escapes its
+            # workspace lifetime and no worker retains raw bytes for later.
+            wait(futures)
+            self.read_seconds += time.perf_counter() - started
+        failure = None
+        for tensor, future in zip(tensors, futures):
+            try:
+                raw, count, calls = future.result()
+            except Exception as error:
+                failure = failure or error
+            else:
+                self._prefetched[tensor] = raw
+                self.logical_bytes += count
+                self.calls += calls
+        if failure is not None:
+            raise failure

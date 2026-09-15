@@ -1,0 +1,57 @@
+{
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "expert_cache_mb": "auto",
+  "ngram_cache_mb": "auto",
+  "tool_count": 34,
+  "tool_schema_bytes": 28425,
+  "samples": [
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust is a systems programming language that emphasizes memory safety, concurrency, and performance through its ownership model, enabling developers to write fast, reliable software without needing a garbage collector."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 231.32980450001196,
+      "usage": {
+        "completion_tokens": 36,
+        "prompt_tokens": 6171,
+        "total_tokens": 6207
+      },
+      "first_text_seconds": 210.29064720799215,
+      "backend_phases": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 21.04,
+        "evaluated_prompt_tokens": 6171,
+        "first_token_seconds": 210.24,
+        "prompt_seconds": 210.24
+      }
+    },
+    {
+      "stream": true,
+      "message": {
+        "role": "assistant",
+        "content": "Rust ownership means each value has exactly one owner responsible for cleanup, and the value is automatically dropped when that owner goes out of scope."
+      },
+      "finish_reason": "stop",
+      "received_done": true,
+      "seconds": 31.304846166982315,
+      "usage": {
+        "completion_tokens": 29,
+        "prompt_tokens": 6169,
+        "total_tokens": 6198
+      },
+      "first_text_seconds": 14.033462291990872,
+      "backend_phases": {
+        "cached_prompt_tokens": 6144,
+        "decode_seconds": 17.27,
+        "evaluated_prompt_tokens": 25,
+        "first_token_seconds": 14.0,
+        "prompt_seconds": 14.0
+      }
+    }
+  ],
+  "passed": true,
+  "reasoning_effort": "low"
+}

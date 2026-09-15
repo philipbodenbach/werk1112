@@ -1,4 +1,5 @@
 //! Werk-owned oMLX workers. Discovery and compatibility checks never load weights.
+use crate::openai::OmlxReasoningEffort;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -92,6 +93,7 @@ pub struct OmlxBackend {
     model_probes: Arc<Mutex<VecDeque<CachedModelProbe>>>,
     // Native template control is request-local; toggling it reuses weights.
     request_thinking: Option<bool>,
+    request_reasoning_effort: Option<OmlxReasoningEffort>,
     #[cfg(test)]
     test_probe: Option<ProbeReport>,
 }
@@ -109,6 +111,7 @@ struct OmlxInvocation {
     ngram_cache_bytes: Option<u64>,
     expert_execution: &'static str,
     thinking: Option<bool>,
+    reasoning_effort: Option<OmlxReasoningEffort>,
     persistence_dir: Option<PathBuf>,
     server_prefix_cache: bool,
 }
@@ -132,6 +135,7 @@ impl std::fmt::Debug for OmlxInvocation {
             .field("ngram_cache_bytes", &self.ngram_cache_bytes)
             .field("expert_execution", &self.expert_execution)
             .field("thinking", &self.thinking)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("persistence_dir", &self.persistence_dir)
             .field("server_prefix_cache", &self.server_prefix_cache)
             .finish()
@@ -261,12 +265,14 @@ struct OmlxProcess {
     ngram_cache_bytes: Option<u64>,
     expert_execution: &'static str,
     thinking: Option<bool>,
+    reasoning_effort: Option<OmlxReasoningEffort>,
     server_prefix_cache: bool,
 }
 
 struct OmlxChatSession {
     server: Arc<OmlxProcess>,
     request_thinking: Option<bool>,
+    request_reasoning_effort: Option<OmlxReasoningEffort>,
 }
 
 impl OmlxBackend {
@@ -277,6 +283,7 @@ impl OmlxBackend {
             servers: Arc::new(Mutex::new(HashMap::new())),
             model_probes: Arc::new(Mutex::new(VecDeque::new())),
             request_thinking: None,
+            request_reasoning_effort: None,
             #[cfg(test)]
             test_probe: None,
         }
@@ -336,6 +343,9 @@ impl OmlxBackend {
             if let Some(thinking) = omlx.thinking {
                 configured.request_thinking = Some(thinking);
             }
+            if let Some(effort) = omlx.reasoning_effort {
+                configured.request_reasoning_effort = Some(effort);
+            }
             if let Some(megabytes) = omlx.expert_cache_mb {
                 invocation.expert_cache_bytes =
                     expert_cache_bytes(Some(megabytes.to_string().into()))?;
@@ -353,6 +363,7 @@ impl OmlxBackend {
     fn matches_chat_configuration(&self, server: &OmlxProcess) -> bool {
         self.invocation().is_ok_and(|invocation| {
             server.thinking == invocation.thinking
+                && server.reasoning_effort == invocation.reasoning_effort
                 && server.expert_cache_bytes == invocation.expert_cache_bytes
                 && server.ngram_cache_bytes == invocation.ngram_cache_bytes
                 && server.expert_execution == invocation.expert_execution
@@ -483,7 +494,12 @@ impl OmlxBackend {
         }
         let started = Instant::now();
         let (server, load_seconds) = self.cached_server(manifest)?;
-        let mut response = server.generate_with_thinking(&request, tx, self.request_thinking)?;
+        let mut response = server.generate_with_controls(
+            &request,
+            tx,
+            self.request_thinking,
+            self.request_reasoning_effort,
+        )?;
         response.timings.load_seconds = load_seconds;
         response.timings.total_seconds = started.elapsed().as_secs_f64();
         Ok(response)
@@ -559,6 +575,7 @@ impl GenerationBackend for OmlxBackend {
         Ok(Some(Box::new(OmlxChatSession {
             server,
             request_thinking: self.request_thinking,
+            request_reasoning_effort: self.request_reasoning_effort,
         })))
     }
 
@@ -594,6 +611,7 @@ impl GenerationBackend for OmlxBackend {
             Ok(true) => Ok(Some(Box::new(OmlxChatSession {
                 server,
                 request_thinking: self.request_thinking,
+                request_reasoning_effort: self.request_reasoning_effort,
             }))),
             inactive => {
                 // An unsupported model cache must not leave a second large
@@ -658,16 +676,26 @@ impl GenerationBackend for OmlxBackend {
 
 impl ChatGenerationSession for OmlxChatSession {
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
-        self.server
-            .generate_with_thinking(&request, None, self.request_thinking)
+        self.server.generate_with_controls(
+            &request,
+            None,
+            self.request_thinking,
+            self.request_reasoning_effort,
+        )
     }
 
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream {
         let server = self.server.clone();
         let thinking = self.request_thinking;
+        let reasoning_effort = self.request_reasoning_effort;
         let (tx, rx) = mpsc::channel(16);
         tokio::task::spawn_blocking(move || {
-            let result = server.generate_with_thinking(&request, Some(tx.clone()), thinking);
+            let result = server.generate_with_controls(
+                &request,
+                Some(tx.clone()),
+                thinking,
+                reasoning_effort,
+            );
             send_stream_result(tx, result);
         });
         Box::pin(ReceiverStream::new(rx))
@@ -791,6 +819,12 @@ impl OmlxInvocation {
                 .find(|(name, _)| name == "WERK_OMLX_THINKING")
                 .map(|(_, value)| value.clone()),
         )?;
+        let reasoning_effort = reasoning_effort_enabled(
+            environment
+                .iter()
+                .find(|(name, _)| name == "WERK_OMLX_REASONING_EFFORT")
+                .map(|(_, value)| value.clone()),
+        )?;
         let launcher = launcher
             .canonicalize()
             .context("oMLX launcher does not exist")?;
@@ -879,6 +913,7 @@ impl OmlxInvocation {
             ngram_cache_bytes,
             expert_execution,
             thinking,
+            reasoning_effort,
             persistence_dir: None,
             server_prefix_cache: false,
         })
@@ -1056,6 +1091,18 @@ fn expert_cache_bytes(value: Option<OsString>) -> Result<Option<u64>> {
     Ok((mb > 0).then_some(mb * 1024 * 1024))
 }
 
+fn reasoning_effort_enabled(value: Option<OsString>) -> Result<Option<OmlxReasoningEffort>> {
+    value.map(|value| {
+        let text = value.to_str().context("WERK_OMLX_REASONING_EFFORT is not valid UTF-8")?;
+        match text {
+            "low" => Ok(OmlxReasoningEffort::Low),
+            "high" => Ok(OmlxReasoningEffort::High),
+            "max" => Ok(OmlxReasoningEffort::Max),
+            _ => bail!("WERK_OMLX_REASONING_EFFORT must be low, high or max; unset it to inherit the model default"),
+        }
+    }).transpose()
+}
+
 fn thinking_enabled(value: Option<OsString>) -> Result<Option<bool>> {
     match value.as_deref().and_then(|value| value.to_str()) {
         None if value.is_none() => Ok(None),
@@ -1177,10 +1224,15 @@ fn omlx_chat_completion_body(
     request: &GenerateRequest,
     stream: bool,
     thinking: Option<bool>,
+    reasoning_effort: Option<OmlxReasoningEffort>,
 ) -> Value {
     let mut body = chat_completion_body(model_name, request, stream);
     if let Some(enabled) = thinking {
         body["chat_template_kwargs"] = json!({"enable_thinking": enabled});
+    }
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+        body["chat_template_kwargs"]["reasoning_effort"] = json!(effort);
     }
     body
 }
@@ -1228,6 +1280,7 @@ fn persistent_cache_directory(
         "import_environment": import_environment,
         "import_working_directory": (!import_environment.is_empty()).then_some(&invocation.working_directory),
         "thinking": invocation.thinking,
+        "reasoning_effort": invocation.reasoning_effort,
         "expert_cache_bytes": invocation.expert_cache_bytes,
         "ngram_cache_bytes": invocation.ngram_cache_bytes,
         "expert_execution": invocation.expert_execution,
@@ -1529,6 +1582,7 @@ impl OmlxProcess {
             ngram_cache_bytes: invocation.ngram_cache_bytes,
             expert_execution: invocation.expert_execution,
             thinking: invocation.thinking,
+            reasoning_effort: invocation.reasoning_effort,
             server_prefix_cache: invocation.server_prefix_cache,
         };
         process
@@ -1746,14 +1800,15 @@ impl OmlxProcess {
         request: &GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<GenerateResponse> {
-        self.generate_with_thinking(request, tx, None)
+        self.generate_with_controls(request, tx, None, None)
     }
 
-    fn generate_with_thinking(
+    fn generate_with_controls(
         &self,
         request: &GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
         thinking: Option<bool>,
+        reasoning_effort: Option<OmlxReasoningEffort>,
     ) -> Result<GenerateResponse> {
         reject_images(request)?;
         validate_tool_options(request)?;
@@ -1769,6 +1824,7 @@ impl OmlxProcess {
             request,
             tx.is_some(),
             thinking.or(self.thinking),
+            reasoning_effort.or(self.reasoning_effort),
         );
         let expert_before = ((self.expert_offload
             || self.ngram_cache_bytes.is_some_and(|bytes| bytes > 0))
@@ -1874,6 +1930,7 @@ impl OmlxProcess {
                 "seed",
                 "max_tokens",
                 "chat_template_kwargs",
+                "reasoning_effort",
             ]
             .into_iter()
             .filter_map(|key| body.get(key).map(|v| (key.to_owned(), v.clone())))

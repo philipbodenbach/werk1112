@@ -13708,6 +13708,7 @@ mod tests {
         let model = test_manifest(ModelFormat::Mlx, Some("deepseek_v4"));
         let controls = crate::openai::ChatRuntimeOptions {
             omlx: Some(crate::openai::OmlxChatOptions {
+                reasoning_effort: None,
                 thinking: Some(false),
                 expert_cache_mb: Some(8),
                 ngram_cache_mb: None,
@@ -13749,6 +13750,7 @@ mod tests {
         );
         let controls = crate::openai::ChatRuntimeOptions {
             omlx: Some(crate::openai::OmlxChatOptions {
+                reasoning_effort: None,
                 thinking: Some(false),
                 expert_cache_mb: None,
                 ngram_cache_mb: None,

@@ -162,7 +162,7 @@ async fn omlx_chat_options_are_request_scoped_on_json_and_streaming_paths() {
             &app,
             "/v1/chat/completions",
             request(
-                Some(json!({"omlx":{"thinking":thinking,"expert_cache_mb":budget,"ngram_cache_mb":ngram}})),
+                Some(json!({"omlx":{"thinking":thinking,"expert_cache_mb":budget,"ngram_cache_mb":ngram,"reasoning_effort":"low"}})),
                 *stream,
             ),
             None,
@@ -185,6 +185,7 @@ async fn omlx_chat_options_are_request_scoped_on_json_and_streaming_paths() {
             selected,
             &Some(ChatRuntimeOptions {
                 omlx: Some(OmlxChatOptions {
+                    reasoning_effort: Some(crate::openai::OmlxReasoningEffort::Low),
                     thinking: Some(thinking),
                     expert_cache_mb: Some(budget),
                     ngram_cache_mb: Some(serde_json::from_value(ngram).unwrap()),
@@ -253,6 +254,8 @@ async fn chat_runtime_options_reject_invalid_values_and_unsupported_backends_bef
         json!({"omlx":{"ngram_cache_mb":"1024"}}),
         json!({"omlx":{"thinking":0}}),
         json!({"omlx":{"thinking":"false"}}),
+        json!({"omlx":{"reasoning_effort":"medium"}}),
+        json!({"omlx":{"reasoning_effort":false}}),
         json!({"omlx":{"unknown":1}}),
         json!({"unknown":{}}),
     ] {
@@ -304,6 +307,11 @@ async fn discovery_advertises_chat_options_without_claiming_model_compatibility(
     assert_eq!(capability["status"], "supported");
     assert_eq!(
         capability["operations"],
-        json!(["thinking", "expert_cache_mb", "ngram_cache_mb"])
+        json!([
+            "thinking",
+            "reasoning_effort",
+            "expert_cache_mb",
+            "ngram_cache_mb"
+        ])
     );
 }

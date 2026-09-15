@@ -53,12 +53,23 @@ pub struct ChatRuntimeOptions {
 pub struct OmlxChatOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<OmlxReasoningEffort>,
     /// MiB; zero explicitly disables SSD expert offload, omitted inherits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_cache_mb: Option<u64>,
     /// MiB or "auto" for N-gram rows; zero keeps tables resident, omitted inherits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ngram_cache_mb: Option<NgramCacheBudget>,
+}
+
+/// Native reasoning levels exposed by the GLM template; omission inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OmlxReasoningEffort {
+    Low,
+    High,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -102,7 +113,10 @@ impl ChatRuntimeOptions {
 
 impl OmlxChatOptions {
     pub fn is_empty(&self) -> bool {
-        self.thinking.is_none() && self.expert_cache_mb.is_none() && self.ngram_cache_mb.is_none()
+        self.thinking.is_none()
+            && self.reasoning_effort.is_none()
+            && self.expert_cache_mb.is_none()
+            && self.ngram_cache_mb.is_none()
     }
 }
 

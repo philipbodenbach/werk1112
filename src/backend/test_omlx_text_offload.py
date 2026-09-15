@@ -205,6 +205,91 @@ class NativeTextLoaderTests(unittest.TestCase):
                 self.assertFalse(probe.supports_tools(config, metadata, path, utils))
             self.assertFalse(probe.supports_tools({"model_type": "glm5_next"}, metadata, path, utils))
 
+    def test_glm_tool_probe_matches_native_tokenizer_and_typed_parser(self):
+        import omlx_probe as probe
+        from mlx_lm import utils
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+        from mlx_lm.tool_parsers import glm47 as parser
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            adapter.native_classes(tiny_config("glm5_next"), path)
+            template = "{{ '<tool_call>lookup<arg_key>query</arg_key><arg_value>x</arg_value></tool_call>' }}{{ tools | tojson }}"
+            tokenizer = PreTrainedTokenizerFast(
+                tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+                unk_token="[UNK]", chat_template=template)
+            tokenizer.save_pretrained(path)
+            metadata = json.loads((path / "tokenizer_config.json").read_text())
+            config = {"model_type": "glm5_next"}
+            self.assertTrue(probe.supports_tools(config, metadata, path, utils))
+            loaded = utils.load_tokenizer(path, {"local_files_only": True})
+            self.assertIs(loaded.tool_parser, parser.parse_tool_call)
+            self.assertEqual((loaded.tool_call_start, loaded.tool_call_end), ("<tool_call>", "</tool_call>"))
+            tools = [{"type": "function", "function": {"name": "lookup", "parameters": {
+                "type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"},
+                "enabled": {"type": "boolean"}, "filters": {"type": "object"}}}}}]
+            parsed = loaded.tool_parser('lookup<arg_key>query</arg_key><arg_value>001</arg_value>'
+                '<arg_key>limit</arg_key><arg_value>2</arg_value>'
+                '<arg_key>enabled</arg_key><arg_value>false</arg_value>'
+                '<arg_key>filters</arg_key><arg_value>{"label":"Grün"}</arg_value>', tools)
+            self.assertEqual(parsed, {"name": "lookup", "arguments": {
+                "query": "001", "limit": 2, "enabled": False, "filters": {"label": "Grün"}}})
+            self.assertEqual(loaded.tool_parser("ping", []), {"name": "ping", "arguments": {}})
+            for override in ({"tool_parser_type": None}, {"tool_parser_type": "qwen3_coder"},
+                             {"chat_template_type": "deepseek_v4"}):
+                self.assertFalse(probe.supports_tools(config, {**metadata, **override}, path, utils))
+            (path / "chat_template.jinja").write_text("{{ messages }}")
+            self.assertFalse(probe.supports_tools(config, metadata, path, utils))
+            (path / "chat_template.jinja").write_text(template)
+            with patch.object(parser, "parse_tool_call", lambda *_: {}):
+                self.assertFalse(probe.supports_tools(config, metadata, path, utils))
+            with patch.object(parser, "_deserialize", lambda value: value):
+                self.assertFalse(probe.supports_tools(config, metadata, path, utils))
+            with patch.object(utils, "_load_tokenizer", lambda *_: None):
+                self.assertFalse(probe.supports_tools(config, metadata, path, utils))
+            (path / "chat_templates").mkdir()
+            self.assertFalse(probe.supports_tools(config, metadata, path, utils))
+
+    def test_glm_fused_projections_release_duplicate_storage_and_preserve_fallback(self):
+        import mlx.core as mx
+        import mlx.nn as nn
+        import numpy as np
+
+        for quantized in (False, True):
+            with self.subTest(quantized=quantized), tempfile.TemporaryDirectory() as directory:
+                _, args = adapter.native_classes(tiny_config("glm5_next"), Path(directory))
+                from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention, linear_forward
+                attention = Glm5NextLinearAttention(args.text_config)
+                attention.set_dtype(mx.bfloat16)
+                if quantized:
+                    nn.quantize(attention, group_size=32, bits=4)
+                attention.eval()
+                x = mx.ones((1, 2, args.text_config.hidden_size), dtype=mx.bfloat16)
+                expected = attention._fused_in_proj(x)
+                mx.eval(expected)
+                expected = [np.array(value.astype(mx.float32)) for value in expected]
+                fields = [attention._fw]
+                if quantized:
+                    fields.extend((attention._fs, attention._fb))
+                fused_bytes = sum(array.nbytes for array in fields)
+                before = mx.get_active_memory()
+                adapter.share_attention_fusion(attention)
+                after = mx.get_active_memory()
+                # Assert actual MLX allocation savings, not summed view sizes.
+                self.assertGreaterEqual(before - after, fused_bytes)
+                actual = attention._fused_in_proj(x)
+                mx.eval(actual)
+                for left, right in zip(expected, actual):
+                    np.testing.assert_array_equal(left, np.array(right.astype(mx.float32)))
+                modules = [attention.q_proj, attention.k_proj, attention.v_proj,
+                           attention.forget_gate.f_a_proj, attention.g_a_proj, attention.b_proj]
+                fallback = [linear_forward(module, x) for module in modules]
+                mx.eval(fallback)
+                for left, right in zip(expected, fallback):
+                    np.testing.assert_allclose(left, np.array(right.astype(mx.float32)), atol=0.02, rtol=0.02)
+
     def test_installed_models_match_offloaded_prefill_and_decode(self):
         import mlx.core as mx
         import mlx.nn as nn
@@ -264,6 +349,15 @@ class NativeTextLoaderTests(unittest.TestCase):
                         manager = adapter.TextExpertManager(cp)
                         with patch("mlx_lm.utils.load_tokenizer", return_value=object()):
                             model, _ = adapter.load_text_model(manager)
+                        if architecture == "glm5_next":
+                            attention = model.core.language_model.model.layers[0].self_attn
+                            # Uniform quantization fuses; mixed Q8/Q4 retains
+                            # the native fallback. Both must be ready before
+                            # prefill admission and remain numerically equal.
+                            self.assertEqual(attention._fused_ready, not with_vision)
+                            self.assertEqual(cp.attention_fusion_bytes > 0, not with_vision)
+                        else:
+                            self.assertEqual(cp.attention_fusion_bytes, 0)
                         left_cache = reference.language_model.make_cache()
                         right_cache = model.make_cache()
                         all_tokens = []
@@ -279,6 +373,7 @@ class NativeTextLoaderTests(unittest.TestCase):
                                                        np.array(left.astype(mx.float32)), atol=0.02, rtol=0.02)
                         self.assertTrue(manager.status()["active"])
                         if cp.experts_enabled:
+                            self.assertEqual(manager.status()["cache_policy"], "segmented_lru")
                             rows = manager.list_experts({"allow_experimental":True})["experts"]
                             self.assertEqual(len(rows), len(cp.expert_bytes) * cp.experts)
                         self.assertLessEqual(manager.ngram_cache.used, max(1, cp.ngram_budget_bytes))

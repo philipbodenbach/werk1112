@@ -181,3 +181,15 @@ test('text oMLX options reject invalid budgets and choices; vision never accepts
 	assert.throws(() => buildVisionRequest('vision', 'test', '', [png], { omlxExpertCacheMb: 8192 }), /unsupported fields/);
 	assert.throws(() => buildTextRequest('text', messages, { werk: { omlx: { thinking: false } } }), /unsupported fields/);
 });
+
+test('native reasoning effort inherits by default and remains independent of thinking', () => {
+	const messages = { message: [{ role: 'user', content: 'Hi' }] };
+	assert.equal(buildTextRequest('model', messages, { omlxReasoningEffort: 'inherit' }).werk, undefined);
+	for (const effort of ['low', 'high', 'max']) {
+		assert.deepEqual(buildTextRequest('model', messages, { omlxReasoningEffort: effort, omlxThinking: 'disabled' }).werk,
+			{ omlx: { reasoning_effort: effort, thinking: false } });
+	}
+	for (const value of ['medium', 'none', '', 0, false, null]) {
+		assert.throws(() => buildTextRequest('model', messages, { omlxReasoningEffort: value }));
+	}
+});

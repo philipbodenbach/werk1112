@@ -232,9 +232,10 @@ without normal cleanup. Failed startup and load attempts retain their diagnostic
 Text, chat, streaming and native tool calls use `/v1/chat/completions`. Tool
 requests require a verified model parser. Verified paths include DeepSeek V4's
 native DSML parser/template and Qwen `qwen4_exp` text offload with the installed
-`qwen3_coder` XML parser. Qwen checks the actual local template, tokenizer-loader
-wiring and typed argument parser without loading model weights. GLM tool wiring
-remains unverified. The verified oMLX API supports
+`qwen3_coder` XML parser, plus GLM `glm5_next` with the installed `glm47`
+`<arg_key>`/`<arg_value>` parser. Both text adapters check the actual local
+template, tokenizer-loader wiring and typed argument parser without loading
+model weights. Explicit incompatible parser/template overrides remain rejected. The verified oMLX API supports
 omitted, `auto` and `none` tool choice; required/named choices, explicit
 `parallel_tool_calls` (either value) and function definitions with `strict: true`
 are rejected because their constraints are not enforced by that upstream API.
@@ -374,12 +375,48 @@ Its supplied GLM chat template always starts a reasoning block and does not
 consume `enable_thinking`. Consequently, `WERK_OMLX_THINKING=0` is a request
 that this template does not honor; allow enough generation tokens for reasoning
 and the final answer. This limitation also applies to the equivalent node/API
-thinking setting. The text adapter does not enable GLM tool calling, vision or MTP.
+thinking setting. Use `WERK_OMLX_REASONING_EFFORT=low` (also `high` or `max`)
+or API `werk.omlx.reasoning_effort` to request less reasoning. Omission preserves
+the native default; low effort does not guarantee zero reasoning. Both Text
+Config nodes expose this independently as **oMLX Reasoning Effort**.
+
+GLM linear attention fuses input projections at load time. The original
+projection modules now reference row views of those same native allocations,
+so packed weights and quantization metadata occupy RAM once. On the installed
+Vontra checkpoint this removes 3.43 GiB of duplicate weights and leaves more
+room for Auto expert residency. The unfused fallback still sees identical
+projection values. Mixed quantization that cannot fuse keeps its native path.
+The status field `attention_fusion_bytes` measures fused storage and
+`attention_shared_bytes` records how much is shared with original modules;
+shared bytes are included once in base memory. Memory guards remain active;
+explicit expert budgets remain supported.
+
+For a single decoding request with no waiting requests or interleaved prefills,
+Werk revisits the shared cache budget after native decode responses. This lets
+expert capacity recover after temporary prefill allocations are released,
+within the measured native memory limits and configured upper budget.
+The expert status endpoint reports this as `last_decode_admission`.
+
+GLM, Qwen and DeepSeek expert offload use a segmented LRU: repeated accesses protect hot experts
+within at most 80% of the existing expert budget, leaving a recency-adaptive
+region for new demand. Up to four file readers fetch missing tensors of each
+bounded expert group in parallel. Pins, leases and native memory limits remain
+authoritative; all MLX operations stay on the owning executor. These are
+automatic adapter choices, including when the expert budget is `auto`.
+DeepSeek retains its native BF16/FP16 expert metadata conversion and uses the
+shared bounded reader in grouped execution; owned read buffers also avoid its
+previous intermediate bytearray copy. No new CLI, ComfyUI or n8n option is
+required. See the [Qwen/DeepSeek comparison](benchmarks/2026-09-12-flash-offload/README.md#qwen--deepseek-geschützter-experten-cache-2026-09-15)
+for measurements at an unchanged 20-GiB expert budget.
+They do not enable MTP. See the [GLM decode measurements and design](glm-decode-optimization.md).
+
+GLM tool calls require the verified native `glm47` parser described above.
+The text adapter does not enable vision or MTP.
 
 Qwen PLE N-gram tables have a separate row cache, controlled through
 `WERK_OMLX_NGRAM_CACHE_MB` or API `werk.omlx.ngram_cache_mb`:
 
-- Unset/`auto`: demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
+- Unset/`auto`: demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries and isolated decode budget checks up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
 - API `ngram_cache_mb: "auto"`: explicitly override a fixed server setting with Auto. Omission inherits.
 - Positive integer: manual upper bound in MiB; the API accepts 1–1048576.
 - `0`: resident tables. It does not disable expert offload.
@@ -410,8 +447,8 @@ independent offload, ten decode steps, exact continuation after SSD-index restar
 and real private workers producing complete HTTP streams. Full checkpoint
 acceptance and measured limitations are tracked in the
 [implementation report](qwen-glm-offload-plan.md); tiny tests alone are not a
-large-model quality or speed claim. Tool parsing and vision are not enabled by
-these text adapters.
+large-model quality or speed claim. Native tool parsing requires the separate
+verified tokenizer/parser path; vision is not enabled by these text adapters.
 
 For ComfyUI, n8n or another HTTP client, the same variable supplies a default
 for the persistent Werk service:

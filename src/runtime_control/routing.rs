@@ -1888,6 +1888,7 @@ mod tests {
         );
         let controls = crate::openai::ChatRuntimeOptions {
             omlx: Some(crate::openai::OmlxChatOptions {
+                reasoning_effort: None,
                 thinking: Some(false),
                 expert_cache_mb: None,
                 ngram_cache_mb: None,

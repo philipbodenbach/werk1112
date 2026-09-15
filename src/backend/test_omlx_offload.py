@@ -19,6 +19,56 @@ offload=module('omlx_offload')
 runtime=module('omlx_offload_runtime')
 
 
+class ExpertRetentionTests(unittest.TestCase):
+    def test_reused_experts_survive_a_scan_of_one_use_experts(self):
+        policy = offload.ExpertRetention(100)
+        resident = {}
+        def access(key):
+            hit = key in resident
+            if not hit:
+                while sum(resident.values()) + 20 > 100:
+                    victim = policy.victim(set())
+                    resident.pop(victim); policy.discard(victim)
+                resident[key] = 20
+            policy.touch(key, 20)
+            return hit
+        for key in range(4):
+            access(key); access(key)
+        for key in range(4, 100):
+            access(key)
+        self.assertTrue(all(access(key) for key in range(4)))
+        self.assertEqual(policy.protected_bytes, 80)
+        self.assertEqual(len(policy.probation), 1)
+        # A new repeatedly used working set can displace old protection.
+        for key in range(100, 104):
+            access(key); access(key)
+        self.assertEqual(set(policy.protected), set(range(100, 104)))
+
+    def test_byte_budget_resize_and_pins_override_retention(self):
+        policy = offload.ExpertRetention(100)
+        for key, size in [('a', 45), ('b', 25), ('c', 10)]:
+            policy.touch(key, size); policy.touch(key, size)
+        self.assertEqual(policy.protected_bytes, 80)
+        policy.resize(50)
+        self.assertEqual(policy.protected_bytes, 35)
+        self.assertEqual(policy.victim(set()), 'a')
+        self.assertEqual(policy.victim({'a', 'b'}), 'c')
+        self.assertIsNone(policy.victim({'a', 'b', 'c'}))
+        policy.discard('a'); policy.discard('b')
+        self.assertEqual(policy.protected_bytes, 10)
+        policy.clear()
+        self.assertEqual(policy.protected_bytes, 0)
+        self.assertIsNone(policy.victim(set()))
+
+    def test_tiny_budget_and_rounding_never_expand_protected_allowance(self):
+        policy = offload.ExpertRetention(7)
+        for _ in range(100):
+            policy.touch('a', 6)
+        self.assertEqual(policy.limit, 5)
+        self.assertEqual(policy.protected_bytes, 0)
+        self.assertEqual(list(policy.probation), ['a'])
+
+
 def config(arch='qwen4_exp'):
     text={'num_hidden_layers':2,'num_experts':4,'n_routed_experts':4,'hidden_size':64,
           'moe_intermediate_size':64,'num_experts_per_tok':2,'first_k_dense_replace':1,
@@ -133,6 +183,63 @@ class RangeReaderTests(unittest.TestCase):
         path = self.path / name
         path.write_bytes(b'header-padding' + data)
         return offload.Tensor(path, 14, len(data), (len(data),), 'U8', offload.signature(path.stat()))
+
+    def test_parallel_prefetch_reads_concurrently_and_preserves_owned_bytes(self):
+        import threading
+        expected = [bytes([i]) * 1024 for i in range(4)]
+        tensors = [self.tensor(str(i), data) for i, data in enumerate(expected)]
+        reader = offload.RangeReader(prefetch_workers=4)
+        self.addCleanup(reader.close)
+        barrier = threading.Barrier(4)
+        original = reader._isolated_read
+        def concurrent(tensor):
+            barrier.wait(timeout=5)
+            return original(tensor)
+        with patch.object(reader, '_isolated_read', side_effect=concurrent):
+            with reader.prefetch(tensors, max_bytes=4096):
+                result = [reader.read(t) for t in tensors]
+        self.assertEqual(result, expected)
+        self.assertEqual(reader.logical_bytes, 4096)
+        self.assertEqual(reader.calls, 4)
+        self.assertIsNone(reader._prefetched)
+        reader.close()
+        self.assertIsNone(reader._read_pool)
+        self.assertEqual(result, expected)
+
+    def test_parallel_failure_drains_readers_and_supports_retry(self):
+        tensors = [self.tensor(str(i), bytes([i]) * 256) for i in range(4)]
+        reader = offload.RangeReader(prefetch_workers=4)
+        self.addCleanup(reader.close)
+        completed = []
+        original = reader._isolated_read
+        def fail(tensor):
+            try:
+                if tensor == tensors[0]:
+                    raise OSError('injected parallel failure')
+                return original(tensor)
+            finally:
+                completed.append(tensor)
+        with patch.object(reader, '_isolated_read', side_effect=fail):
+            with self.assertRaisesRegex(OSError, 'injected parallel'):
+                with reader.prefetch(tensors): pass
+        self.assertCountEqual(completed, tensors)
+        self.assertIsNone(reader._prefetched)
+        with reader.prefetch(tensors):
+            self.assertEqual([reader.read(t) for t in tensors], [bytes([i]) * 256 for i in range(4)])
+
+    def test_parallel_budget_fallback_and_replaced_checkpoint(self):
+        tensors = [self.tensor(str(i), bytes([i]) * 256) for i in range(2)]
+        reader = offload.RangeReader(prefetch_workers=4)
+        self.addCleanup(reader.close)
+        with reader.prefetch(tensors, max_bytes=511):
+            self.assertIsNone(reader._read_pool)
+            self.assertEqual(reader.read(tensors[0]), bytes(256))
+        replacement = self.path / 'replacement'
+        replacement.write_bytes(tensors[0].path.read_bytes())
+        replacement.replace(tensors[0].path)
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            with reader.prefetch(tensors): pass
+        self.assertIsNone(reader._prefetched)
 
     def test_owned_reads_reuse_handles_and_survive_lru_close(self):
         first = self.tensor('one', bytes(range(256)) * 4)
