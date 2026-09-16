@@ -2,6 +2,9 @@ use crate::capabilities::{
     InferenceTask, InputModality, ModelComponent, ModelComponentKind, OutputModality,
     RepositoryLayout,
 };
+mod import_collection;
+pub use import_collection::ModelImportCandidate;
+
 use anyhow::{Context, Result, anyhow, bail};
 use candle_core::quantized::gguf_file::{self, Value as GgufValue};
 use crc32fast::Hasher;
@@ -15,7 +18,7 @@ use std::{
     env,
     ffi::OsStr,
     fmt, fs,
-    io::{Read, Write},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::mpsc,
@@ -217,10 +220,30 @@ impl Default for ModelMetadata {
     }
 }
 
+/// Where model weights live. Registration metadata and generated artifacts
+/// always belong to the active Werk store, including for external models.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelStorage {
+    #[default]
+    Managed,
+    External {
+        path: PathBuf,
+    },
+}
+
+impl ModelStorage {
+    fn is_managed(&self) -> bool {
+        matches!(self, Self::Managed)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelManifest {
     pub id: String,
     pub source: ModelSource,
+    #[serde(default, skip_serializing_if = "ModelStorage::is_managed")]
+    pub storage: ModelStorage,
     pub format: ModelFormat,
     pub architecture: Option<String>,
     pub tokenizer_path: Option<String>,
@@ -519,6 +542,22 @@ impl ModelStore {
         self.models_dir().join(sanitize_id(id))
     }
 
+    /// Physical repository directory, independently of the local registration.
+    pub fn model_files_dir(&self, manifest: &ModelManifest) -> PathBuf {
+        match &manifest.storage {
+            ModelStorage::Managed => self.model_dir(&manifest.id).join("files"),
+            ModelStorage::External { path } => path.clone(),
+        }
+    }
+
+    /// Location shown to users for managed models and external bindings.
+    pub fn model_location(&self, manifest: &ModelManifest) -> PathBuf {
+        match &manifest.storage {
+            ModelStorage::Managed => self.model_dir(&manifest.id),
+            ModelStorage::External { path } => path.clone(),
+        }
+    }
+
     pub fn artifacts_dir(&self, id: &str) -> PathBuf {
         self.shared_artifacts_dir().join(sanitize_id(id))
     }
@@ -541,6 +580,225 @@ impl ModelStore {
         )
     }
 
+    /// Import the distinct models directly beneath a collection directory.
+    /// Discovery checks all names and destination collisions before any model
+    /// is copied or registered. Completed imports remain usable if a later
+    /// source cannot be read.
+    pub fn import_collection(&self, source: &Path, link: bool) -> Result<Vec<ModelManifest>> {
+        let candidates = self.discover_import_collection(source)?;
+        let mut imported = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let result = if link {
+                self.link_path(&candidate.path, &candidate.id)
+            } else if candidate.is_werk_model {
+                self.copy_registered_model(&candidate.path, &candidate.id)
+            } else {
+                self.import_path(&candidate.path, &candidate.id)
+            };
+            let manifest = result.with_context(|| {
+                format!(
+                    "could not import '{}' from {}; {} earlier model(s) remain installed",
+                    candidate.id,
+                    candidate.path.display(),
+                    imported.len()
+                )
+            })?;
+            imported.push(manifest);
+        }
+        Ok(imported)
+    }
+
+    fn copy_registered_model(&self, source: &Path, id: &str) -> Result<ModelManifest> {
+        let mut manifest = read_manifest(&source.join(MANIFEST_FILE))?;
+        validate_external_inventory(&manifest)?;
+        validate_id(id)?;
+        self.ensure()?;
+        let dest = self.model_dir(id);
+        fs::create_dir(&dest)
+            .with_context(|| format!("cannot create model registration {}", dest.display()))?;
+
+        let result = (|| {
+            // Copy the recorded inventory only. An external single-file
+            // registration may share its physical directory with other models.
+            for file in &manifest.files {
+                let origin = resolve_model_file(source, &manifest.storage, &file.path);
+                let target = dest.join(&file.path);
+                fs::create_dir_all(target.parent().context("model file has no parent")?)?;
+                fs::copy(&origin, &target)
+                    .with_context(|| format!("cannot copy model file {}", origin.display()))?;
+            }
+            let copied = self.build_manifest(id, manifest.source.clone(), &dest)?;
+            manifest.id = id.to_string();
+            manifest.storage = ModelStorage::Managed;
+            manifest.files = copied.files;
+            manifest.artifacts.clear();
+            manifest.metadata.optimized_artifacts.clear();
+            write_json_pretty(&dest.join(MANIFEST_FILE), &manifest)?;
+            Ok(manifest)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&dest);
+        }
+        result
+    }
+
+    /// Register existing weights without copying or modifying the source.
+    pub fn link_path(&self, source: &Path, id: &str) -> Result<ModelManifest> {
+        self.ensure()?;
+        validate_id(id)?;
+        let dest = self.model_dir(id);
+        match fs::symlink_metadata(&dest) {
+            Ok(_) => bail!("model '{id}' already exists at {}", dest.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect model registration"),
+        }
+        // Canonicalize a file's parent rather than its leaf: Hugging Face
+        // snapshots commonly use named symlinks to extensionless blob files.
+        // The selected filename remains part of the model's logical identity.
+        let source = if source.is_file() {
+            let parent = source
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            parent.canonicalize()?.join(
+                source
+                    .file_name()
+                    .context("external model file has no name")?,
+            )
+        } else {
+            source.canonicalize().with_context(|| {
+                format!("cannot resolve external model path {}", source.display())
+            })?
+        };
+        let existing = if source.is_dir() && source.join(MANIFEST_FILE).is_file() {
+            Some(read_manifest(&source.join(MANIFEST_FILE))?)
+        } else {
+            None
+        };
+        let files_root = if let Some(manifest) = &existing {
+            match &manifest.storage {
+                ModelStorage::Managed => source.join("files"),
+                ModelStorage::External { path } => path.clone(),
+            }
+        } else if source.is_dir() {
+            source.clone()
+        } else if source.is_file() {
+            source
+                .parent()
+                .context("external model file has no parent")?
+                .to_path_buf()
+        } else {
+            bail!(
+                "external model path is not a file or directory: {}",
+                source.display()
+            );
+        };
+        let files_root = files_root.canonicalize().with_context(|| {
+            format!(
+                "cannot resolve external model files {}",
+                files_root.display()
+            )
+        })?;
+        if !files_root.is_dir() {
+            bail!(
+                "external model files are not a directory: {}",
+                files_root.display()
+            );
+        }
+        self.validate_external_location(id, &files_root)?;
+        if existing.is_none() && source.is_dir() {
+            for owned_root in [self.models_dir(), self.shared_artifacts_dir()] {
+                if owned_root
+                    .canonicalize()?
+                    .join(sanitize_id(id))
+                    .starts_with(&files_root)
+                {
+                    bail!(
+                        "external model directory must not contain its local registration or artifacts"
+                    );
+                }
+            }
+        }
+        let storage = ModelStorage::External {
+            path: files_root.clone(),
+        };
+        let manifest = if let Some(mut manifest) = existing {
+            validate_external_inventory(&manifest)?;
+            for file in &manifest.files {
+                let path = resolve_model_file(&dest, &storage, &file.path);
+                if !path.is_file() {
+                    bail!("external model file does not exist: {}", path.display());
+                }
+            }
+            manifest.id = id.to_string();
+            manifest.storage = storage;
+            manifest.artifacts.clear();
+            manifest.metadata.optimized_artifacts.clear();
+            manifest
+        } else {
+            let mut files = Vec::new();
+            if source.is_file() {
+                files.push(source.clone());
+            } else {
+                collect_files(&files_root, &mut files)?;
+            }
+            if files.is_empty() {
+                bail!(
+                    "external model directory contains no files: {}",
+                    files_root.display()
+                );
+            }
+            self.build_manifest_from_files(
+                id,
+                ModelSource::LocalPath {
+                    path: source.display().to_string(),
+                },
+                storage,
+                &dest,
+                &files_root,
+                files,
+            )?
+        };
+
+        for file in &manifest.files {
+            let path = self
+                .absolute_model_file(&manifest, &file.path)
+                .canonicalize()?;
+            self.validate_external_location(id, &path)?;
+        }
+
+        // Create only after validation and inventorying succeed. An existing
+        // directory is never reused, and failed writes leave no registration.
+        fs::create_dir(&dest)
+            .with_context(|| format!("cannot create model registration {}", dest.display()))?;
+        if let Err(error) = write_json_pretty(&dest.join(MANIFEST_FILE), &manifest) {
+            let _ = fs::remove_dir_all(&dest);
+            return Err(error);
+        }
+        Ok(manifest)
+    }
+
+    fn validate_external_location(&self, id: &str, external: &Path) -> Result<()> {
+        for owned in [self.model_dir(id), self.artifacts_dir(id)] {
+            let physical_owned = if owned.exists() {
+                owned.canonicalize()?
+            } else {
+                owned
+                    .parent()
+                    .context("model storage path has no parent")?
+                    .canonicalize()?
+                    .join(sanitize_id(id))
+            };
+            if external.starts_with(&physical_owned) {
+                bail!(
+                    "external model files must be outside their local registration and artifacts: {}",
+                    external.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn import_path_with_source(
         &self,
         source: &Path,
@@ -554,22 +812,30 @@ impl ModelStore {
             bail!("model '{id}' already exists at {}", dest.display());
         }
 
-        let files_dir = dest.join("files");
-        fs::create_dir_all(&files_dir)?;
-        if source.is_dir() {
-            copy_dir_contents(source, &files_dir)?;
-        } else if source.is_file() {
-            let name = source
-                .file_name()
-                .ok_or_else(|| anyhow!("cannot determine file name for {}", source.display()))?;
-            fs::copy(source, files_dir.join(name))?;
-        } else {
-            bail!("import path does not exist: {}", source.display());
-        }
+        fs::create_dir(&dest)
+            .with_context(|| format!("cannot create model registration {}", dest.display()))?;
+        let result = (|| {
+            let files_dir = dest.join("files");
+            fs::create_dir(&files_dir)?;
+            if source.is_dir() {
+                copy_dir_contents(source, &files_dir)?;
+            } else if source.is_file() {
+                let name = source.file_name().ok_or_else(|| {
+                    anyhow!("cannot determine file name for {}", source.display())
+                })?;
+                fs::copy(source, files_dir.join(name))?;
+            } else {
+                bail!("import path does not exist: {}", source.display());
+            }
 
-        let manifest = self.build_manifest(id, model_source, &dest)?;
-        write_json_pretty(&dest.join(MANIFEST_FILE), &manifest)?;
-        Ok(manifest)
+            let manifest = self.build_manifest(id, model_source, &dest)?;
+            write_json_pretty(&dest.join(MANIFEST_FILE), &manifest)?;
+            Ok(manifest)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&dest);
+        }
+        result
     }
 
     pub fn pull_from_huggingface(&self, repo: &str, name: Option<&str>) -> Result<ModelManifest> {
@@ -809,6 +1075,15 @@ impl ModelStore {
         self.ensure()?;
         validate_id(id)?;
         let manifest = self.get(id)?;
+        if let ModelStorage::External { path } = &manifest.storage {
+            let physical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            self.validate_external_location(&manifest.id, &physical_path)?;
+            for file in &manifest.files {
+                let path = self.absolute_model_file(&manifest, &file.path);
+                let physical_path = path.canonicalize().unwrap_or(path);
+                self.validate_external_location(&manifest.id, &physical_path)?;
+            }
+        }
         let dir = self.model_dir(&manifest.id);
         if !dir.is_dir() {
             bail!(
@@ -897,7 +1172,7 @@ impl ModelStore {
         let exporter = find_onnx_exporter().ok_or_else(|| {
             anyhow!("no ONNX exporter found; install optimum-cli or set WERK_ONNX_EXPORTER")
         })?;
-        let source_dir = self.model_dir(&manifest.id).join("files");
+        let source_dir = self.model_files_dir(&manifest);
         let result = run_onnx_exporter(&exporter, &source_dir, &artifact_dir);
         match result {
             Ok(()) if onnx_files_exist(&artifact_dir)? => {
@@ -933,7 +1208,11 @@ impl ModelStore {
     }
 
     pub fn absolute_model_file(&self, manifest: &ModelManifest, relative_path: &str) -> PathBuf {
-        self.model_dir(&manifest.id).join(relative_path)
+        resolve_model_file(
+            &self.model_dir(&manifest.id),
+            &manifest.storage,
+            relative_path,
+        )
     }
 
     pub fn absolute_artifact_path(
@@ -970,7 +1249,7 @@ impl ModelStore {
             );
         }
 
-        let absolute_path = model_dir.join(&selected_path);
+        let absolute_path = self.absolute_model_file(&manifest, &selected_path);
         if !absolute_path.is_file() {
             bail!("model file does not exist: {}", absolute_path.display());
         }
@@ -981,6 +1260,7 @@ impl ModelStore {
         manifest.model_path = Some(selected_path);
         manifest.architecture = detect_architecture(
             &model_dir,
+            &manifest.storage,
             &manifest.format,
             manifest.model_path.as_deref(),
             manifest.config_path.as_deref(),
@@ -1004,29 +1284,52 @@ impl ModelStore {
         let files_root = model_dir.join("files");
         let mut file_paths = Vec::new();
         collect_files(&files_root, &mut file_paths)?;
+        self.build_manifest_from_files(
+            id,
+            source,
+            ModelStorage::Managed,
+            model_dir,
+            &files_root,
+            file_paths,
+        )
+    }
+
+    fn build_manifest_from_files(
+        &self,
+        id: &str,
+        source: ModelSource,
+        storage: ModelStorage,
+        model_dir: &Path,
+        files_root: &Path,
+        mut file_paths: Vec<PathBuf>,
+    ) -> Result<ModelManifest> {
         file_paths.sort();
 
         let mut files = Vec::with_capacity(file_paths.len());
         for path in &file_paths {
             let rel = path
-                .strip_prefix(model_dir)
-                .context("model file is not inside model directory")?
+                .strip_prefix(files_root)
+                .context("model file is not inside model files directory")?
                 .to_string_lossy()
                 .replace('\\', "/");
             let metadata = fs::metadata(path)?;
             files.push(ModelFile {
-                path: rel,
+                path: format!("files/{rel}"),
                 size: metadata.len(),
                 checksum: format!("crc32:{:08x}", crc32(path)?),
             });
         }
 
         let format = detect_format(&file_paths);
-        let model_path = first_model_path(model_dir, &file_paths, &format);
-        let tokenizer_path = first_relative_by_name(model_dir, &file_paths, "tokenizer.json");
-        let config_path = first_relative_by_name(model_dir, &file_paths, "config.json");
+        let model_path =
+            first_model_path(files_root, &file_paths, &format).map(|path| format!("files/{path}"));
+        let tokenizer_path = first_relative_by_name(files_root, &file_paths, "tokenizer.json")
+            .map(|path| format!("files/{path}"));
+        let config_path = first_relative_by_name(files_root, &file_paths, "config.json")
+            .map(|path| format!("files/{path}"));
         let architecture = detect_architecture(
             model_dir,
+            &storage,
             &format,
             model_path.as_deref(),
             config_path.as_deref(),
@@ -1036,6 +1339,7 @@ impl ModelStore {
         let mut manifest = ModelManifest {
             id: id.to_string(),
             source,
+            storage,
             format,
             architecture,
             tokenizer_path,
@@ -1050,6 +1354,61 @@ impl ModelStore {
         enrich_manifest_metadata(model_dir, &mut manifest);
         Ok(manifest)
     }
+}
+
+fn resolve_model_file(model_dir: &Path, storage: &ModelStorage, relative_path: &str) -> PathBuf {
+    match storage {
+        ModelStorage::Managed => model_dir.join(relative_path),
+        ModelStorage::External { path } => {
+            // All manifests retain the same virtual files/ namespace, even
+            // when that directory exists on another disk under another name.
+            let relative = Path::new(relative_path);
+            path.join(relative.strip_prefix("files").unwrap_or(relative))
+        }
+    }
+}
+
+fn validate_external_inventory(manifest: &ModelManifest) -> Result<()> {
+    let valid_path = |path: &str| {
+        let path = Path::new(path);
+        path.strip_prefix("files").is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+        })
+    };
+    if manifest.files.is_empty() || manifest.files.iter().any(|file| !valid_path(&file.path)) {
+        bail!("external Werk model manifest must track relative files within files/");
+    }
+    for path in [
+        manifest.model_path.as_deref(),
+        manifest.config_path.as_deref(),
+        manifest.tokenizer_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !valid_path(path) || !manifest.files.iter().any(|file| file.path == path) {
+            bail!("external Werk model manifest references an untracked or invalid file: {path}");
+        }
+    }
+    for component in &manifest.metadata.components {
+        if component.path != "files" && !valid_path(&component.path) {
+            bail!(
+                "external Werk model manifest has an invalid component path: {}",
+                component.path
+            );
+        }
+        if component
+            .files
+            .iter()
+            .any(|path| !valid_path(path) || !manifest.files.iter().any(|file| file.path == *path))
+        {
+            bail!("external Werk model manifest has untracked or invalid component files");
+        }
+    }
+    Ok(())
 }
 
 pub fn default_home() -> Result<PathBuf> {
@@ -2391,18 +2750,19 @@ fn detect_format_for_model_path(path: &str) -> ModelFormat {
 
 fn detect_architecture(
     model_dir: &Path,
+    storage: &ModelStorage,
     format: &ModelFormat,
     model_path: Option<&str>,
     config_path: Option<&str>,
 ) -> Option<String> {
     match format {
         ModelFormat::Gguf => model_path.and_then(|path| {
-            detect_gguf_architecture(&model_dir.join(path))
+            detect_gguf_architecture(&resolve_model_file(model_dir, storage, path))
                 .ok()
                 .flatten()
         }),
         ModelFormat::SafeTensors => config_path.and_then(|path| {
-            detect_config_architecture(&model_dir.join(path))
+            detect_config_architecture(&resolve_model_file(model_dir, storage, path))
                 .ok()
                 .flatten()
         }),
@@ -2413,7 +2773,7 @@ fn detect_architecture(
         | ModelFormat::OpenVino
         | ModelFormat::TensorFlow
         | ModelFormat::CoreMl => config_path.and_then(|path| {
-            detect_config_architecture(&model_dir.join(path))
+            detect_config_architecture(&resolve_model_file(model_dir, storage, path))
                 .ok()
                 .flatten()
         }),
@@ -2422,7 +2782,7 @@ fn detect_architecture(
 }
 
 fn detect_gguf_architecture(path: &Path) -> Result<Option<String>> {
-    let mut file = fs::File::open(path)?;
+    let mut file = BufReader::new(fs::File::open(path)?);
     let content = gguf_file::Content::read(&mut file)?;
     Ok(content
         .metadata
@@ -2546,9 +2906,9 @@ fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
     manifest.metadata.schema_version = CURRENT_MANIFEST_SCHEMA_VERSION;
 
     let model_index = find_root_repository_file(manifest, "model_index.json")
-        .and_then(|path| read_repository_json(model_dir, &path));
+        .and_then(|path| read_repository_json(model_dir, manifest, &path));
     let root_config = find_root_repository_file(manifest, "config.json")
-        .and_then(|path| read_repository_json(model_dir, &path));
+        .and_then(|path| read_repository_json(model_dir, manifest, &path));
     let layout = detect_repository_layout(manifest);
 
     if manifest.metadata.repository_layout == RepositoryLayout::Custom {
@@ -2695,10 +3055,9 @@ fn resolve_chat_template(
         return None;
     }
 
-    let gguf = manifest
-        .model_path
-        .as_deref()
-        .and_then(|path| read_gguf_chat_metadata(&model_dir.join(path)));
+    let gguf = manifest.model_path.as_deref().and_then(|path| {
+        read_gguf_chat_metadata(&resolve_model_file(model_dir, &manifest.storage, path))
+    });
     if gguf.as_ref().is_some_and(|metadata| metadata.has_template) {
         return Some(ResolvedChatTemplate {
             name: "model".to_string(),
@@ -2757,7 +3116,7 @@ struct GgufChatMetadata {
 }
 
 fn read_gguf_chat_metadata(path: &Path) -> Option<GgufChatMetadata> {
-    let mut file = fs::File::open(path).ok()?;
+    let mut file = BufReader::new(fs::File::open(path).ok()?);
     let content = gguf_file::Content::read(&mut file).ok()?;
     let has_template = content.metadata.iter().any(|(key, value)| {
         key.starts_with("tokenizer.chat_template")
@@ -2783,13 +3142,14 @@ fn repository_special_tokens(model_dir: &Path, manifest: &ModelManifest) -> Vec<
     let mut tokens = Vec::new();
     for name in ["tokenizer_config.json", "special_tokens_map.json"] {
         if let Some(path) = find_repository_file(manifest, name)
-            && let Some(value) = read_repository_json(model_dir, &path)
+            && let Some(value) = read_repository_json(model_dir, manifest, &path)
         {
             collect_known_chat_tokens(&value, &mut tokens);
         }
     }
     if let Some(path) = find_repository_file(manifest, "chat_template.jinja")
-        && let Ok(template) = fs::read_to_string(model_dir.join(path))
+        && let Ok(template) =
+            fs::read_to_string(resolve_model_file(model_dir, &manifest.storage, &path))
     {
         collect_known_chat_tokens_from_text(&template, &mut tokens);
     }
@@ -3023,7 +3383,7 @@ fn detect_model_components(model_dir: &Path, manifest: &ModelManifest) -> Vec<Mo
             let component_config = files
                 .iter()
                 .find(|path| path.ends_with("/config.json"))
-                .and_then(|path| read_repository_json(model_dir, path));
+                .and_then(|path| read_repository_json(model_dir, manifest, path));
             component.precision =
                 infer_precision_from_paths_and_json(&files, component_config.as_ref());
             component.quantization =
@@ -3140,7 +3500,7 @@ fn infer_diffusers_architecture(
         if !manifest.files.iter().any(|file| file.path == path) {
             continue;
         }
-        if let Some(value) = read_repository_json(model_dir, &path)
+        if let Some(value) = read_repository_json(model_dir, manifest, &path)
             && let Some(architecture) = json_model_identifier(&value)
         {
             return Some(normalize_model_identifier(&architecture));
@@ -4017,7 +4377,7 @@ fn infer_generation_defaults(
 ) -> BTreeMap<String, Value> {
     let mut defaults = BTreeMap::new();
     if let Some(path) = find_repository_file(manifest, "generation_config.json")
-        && let Some(Value::Object(values)) = read_repository_json(model_dir, &path)
+        && let Some(Value::Object(values)) = read_repository_json(model_dir, manifest, &path)
     {
         defaults.extend(values);
     }
@@ -4041,7 +4401,7 @@ fn infer_generation_defaults(
         ],
     );
     if let Some(path) = find_component_file(manifest, "scheduler", "scheduler_config.json")
-        && let Some(config) = read_repository_json(model_dir, &path)
+        && let Some(config) = read_repository_json(model_dir, manifest, &path)
     {
         copy_known_json_fields(
             &mut defaults,
@@ -4074,7 +4434,7 @@ fn infer_parameter_constraints(
         ],
     );
     if let Some(path) = find_repository_file(manifest, "tokenizer_config.json")
-        && let Some(config) = read_repository_json(model_dir, &path)
+        && let Some(config) = read_repository_json(model_dir, manifest, &path)
     {
         copy_known_json_fields(&mut constraints, Some(&config), &["model_max_length"]);
     }
@@ -4283,8 +4643,17 @@ fn has_repository_file(manifest: &ModelManifest, name: &str) -> bool {
     find_repository_file(manifest, name).is_some()
 }
 
-fn read_repository_json(model_dir: &Path, relative_path: &str) -> Option<Value> {
-    let data = fs::read_to_string(model_dir.join(relative_path)).ok()?;
+fn read_repository_json(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    relative_path: &str,
+) -> Option<Value> {
+    let data = fs::read_to_string(resolve_model_file(
+        model_dir,
+        &manifest.storage,
+        relative_path,
+    ))
+    .ok()?;
     serde_json::from_str(&data).ok()
 }
 
@@ -4342,6 +4711,20 @@ fn read_manifest(path: &Path) -> Result<ModelManifest> {
     let data = fs::read_to_string(path)?;
     let mut manifest = serde_json::from_str::<ModelManifest>(&data)
         .with_context(|| format!("invalid manifest {}", path.display()))?;
+    if let ModelStorage::External { path: external } = &manifest.storage {
+        if !external.is_absolute() {
+            bail!(
+                "external model path must be absolute: {}",
+                external.display()
+            );
+        }
+        validate_external_inventory(&manifest)?;
+        // Registration remains usable for list/inspect/remove while a disk is
+        // unmounted. Do not replace its cached metadata with missing-file guesses.
+        if !external.is_dir() {
+            return Ok(manifest);
+        }
+    }
     reconcile_mlx_safetensors_manifest(path, &mut manifest);
     if let Some(model_dir) = path.parent() {
         enrich_manifest_metadata(model_dir, &mut manifest);
@@ -4360,7 +4743,13 @@ fn reconcile_mlx_safetensors_manifest(manifest_path: &Path, manifest: &mut Model
         return;
     };
 
-    if safetensors_declares_mlx(&model_dir.join(model_path)).unwrap_or(false) {
+    if safetensors_declares_mlx(&resolve_model_file(
+        model_dir,
+        &manifest.storage,
+        model_path,
+    ))
+    .unwrap_or(false)
+    {
         manifest.format = ModelFormat::Mlx;
         manifest.backend = manifest.format.backend_hint().to_string();
     }
@@ -4547,6 +4936,7 @@ mod tests {
 
     fn runtime_identity_manifest() -> ModelManifest {
         ModelManifest {
+            storage: ModelStorage::Managed,
             id: "identity-model".to_string(),
             source: ModelSource::LocalPath {
                 path: "/private/source/model".to_string(),
@@ -4925,6 +5315,7 @@ mod tests {
         )
         .unwrap();
         let manifest = ModelManifest {
+            storage: ModelStorage::Managed,
             id: "renamed-model".to_string(),
             source: ModelSource::LocalPath {
                 path: "model".to_string(),
@@ -4971,6 +5362,7 @@ mod tests {
         )
         .unwrap();
         let manifest = ModelManifest {
+            storage: ModelStorage::Managed,
             id: "ambiguous".to_string(),
             source: ModelSource::LocalPath {
                 path: "model".to_string(),
@@ -6004,6 +6396,537 @@ mod tests {
         assert!(store.get("test-model").is_err());
         assert!(source.join("model.gguf").is_file());
 
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn failed_local_import_does_not_reserve_model_name() {
+        let tmp = test_dir("failed-import-retry");
+        let source = tmp.join("not-yet-downloaded.gguf");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        assert!(store.import_path(&source, "retry").is_err());
+        assert!(!store.model_dir("retry").exists());
+        fs::write(&source, b"weights").unwrap();
+        assert!(store.import_path(&source, "retry").is_ok());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn collection_import_links_each_model_and_keeps_existing_werk_ids() {
+        let tmp = test_dir("collection-link-models");
+        let raw = tmp.join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("model.gguf"), b"weights").unwrap();
+        let original = ModelStore::resolve(Some(tmp.join("raid"))).unwrap();
+        original.import_path(&raw, "owner/model").unwrap();
+        let source_manifest = original.model_dir("owner/model").join(MANIFEST_FILE);
+        let source_bytes = fs::read(&source_manifest).unwrap();
+        fs::write(original.models_dir().join("standalone.gguf"), b"single").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("local"))).unwrap();
+
+        let imported = store
+            .import_collection(&original.models_dir(), true)
+            .unwrap();
+        assert_eq!(
+            imported
+                .iter()
+                .map(|manifest| manifest.id.as_str())
+                .collect::<Vec<_>>(),
+            ["owner/model", "standalone"]
+        );
+        assert!(
+            imported
+                .iter()
+                .all(|manifest| matches!(manifest.storage, ModelStorage::External { .. }))
+        );
+        assert_eq!(store.list().unwrap().len(), 2);
+        for manifest in imported {
+            assert!(!store.model_dir(&manifest.id).join("files").exists());
+            store.remove(&manifest.id).unwrap();
+        }
+        assert_eq!(fs::read(source_manifest).unwrap(), source_bytes);
+        assert_eq!(
+            fs::read(original.models_dir().join("standalone.gguf")).unwrap(),
+            b"single"
+        );
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn collection_copy_preserves_metadata_without_nesting_werk_directories() {
+        let tmp = test_dir("collection-copy-models");
+        let raw = tmp.join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("first.gguf"), b"first").unwrap();
+        fs::write(raw.join("second.gguf"), b"second").unwrap();
+        let original = ModelStore::resolve(Some(tmp.join("raid"))).unwrap();
+        original.import_path(&raw, "owner/model").unwrap();
+        let mut curated = original
+            .set_model_file("owner/model", "second.gguf")
+            .unwrap();
+        curated.metadata.family = Some("custom-family".to_string());
+        curated.source = ModelSource::HuggingFace {
+            repo: "owner/model".to_string(),
+        };
+        original.write_manifest(&curated).unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("local"))).unwrap();
+
+        let copied = store
+            .import_collection(&original.models_dir(), false)
+            .unwrap();
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].storage, ModelStorage::Managed);
+        assert_eq!(copied[0].source, curated.source);
+        assert_eq!(copied[0].model_path, curated.model_path);
+        assert_eq!(copied[0].metadata.family, curated.metadata.family);
+        assert_eq!(
+            fs::read(store.model_dir("owner/model").join("files/second.gguf")).unwrap(),
+            b"second"
+        );
+        assert!(!store.model_dir("owner/model").join("files/files").exists());
+        assert!(
+            !store
+                .model_dir("owner/model")
+                .join("files/manifest.json")
+                .exists()
+        );
+        store.remove("owner/model").unwrap();
+        assert!(
+            original
+                .model_dir("owner/model")
+                .join("files/second.gguf")
+                .is_file()
+        );
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn collection_copy_of_external_registration_copies_only_tracked_files() {
+        let tmp = test_dir("collection-copy-external-inventory");
+        let raw = tmp.join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("chosen.gguf"), b"chosen").unwrap();
+        fs::write(raw.join("untracked.gguf"), b"untracked").unwrap();
+        let original = ModelStore::resolve(Some(tmp.join("registrations"))).unwrap();
+        original
+            .link_path(&raw.join("chosen.gguf"), "chosen")
+            .unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("local"))).unwrap();
+        let copied = store
+            .import_collection(&original.models_dir(), false)
+            .unwrap();
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].storage, ModelStorage::Managed);
+        assert_eq!(copied[0].files.len(), 1);
+        assert_eq!(
+            fs::read(store.model_dir("chosen").join("files/chosen.gguf")).unwrap(),
+            b"chosen"
+        );
+        assert!(
+            !store
+                .model_dir("chosen")
+                .join("files/untracked.gguf")
+                .exists()
+        );
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn collection_collisions_fail_before_any_import() {
+        let tmp = test_dir("collection-conflict-preflight");
+        let sources = tmp.join("sources");
+        fs::create_dir_all(&sources).unwrap();
+        fs::write(sources.join("a-new.gguf"), b"new").unwrap();
+        fs::write(sources.join("z-existing.gguf"), b"existing").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("local"))).unwrap();
+        store
+            .import_path(&sources.join("z-existing.gguf"), "z-existing")
+            .unwrap();
+        assert!(store.import_collection(&sources, true).is_err());
+        assert!(!store.model_dir("a-new").exists());
+        assert_eq!(store.list().unwrap().len(), 1);
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn collection_failed_copy_cleans_incomplete_registration() {
+        let tmp = test_dir("collection-copy-missing-file");
+        let raw = tmp.join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("model.gguf"), b"weights").unwrap();
+        let original = ModelStore::resolve(Some(tmp.join("raid"))).unwrap();
+        original.import_path(&raw, "model").unwrap();
+        fs::remove_file(original.model_dir("model").join("files/model.gguf")).unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("local"))).unwrap();
+        assert!(
+            store
+                .import_collection(&original.models_dir(), false)
+                .is_err()
+        );
+        assert!(!store.model_dir("model").exists());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn external_models_mix_with_copied_models_without_copying_weights() {
+        let tmp = test_dir("external-mixed-store");
+        let source = tmp.join("raid-model");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
+        fs::write(source.join("model.safetensors"), b"external-weights").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let copied = store.import_path(&source, "small-local").unwrap();
+        let linked = store.link_path(&source, "large-external").unwrap();
+
+        assert_eq!(copied.storage, ModelStorage::Managed);
+        assert!(
+            serde_json::to_value(&copied)
+                .unwrap()
+                .get("storage")
+                .is_none()
+        );
+        assert_eq!(
+            linked.storage,
+            ModelStorage::External {
+                path: source.canonicalize().unwrap()
+            }
+        );
+        assert_eq!(linked.architecture.as_deref(), Some("qwen3"));
+        assert_eq!(
+            linked.model_path.as_deref(),
+            Some("files/model.safetensors")
+        );
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(
+            store.model_location(&copied),
+            store.model_dir("small-local")
+        );
+        assert_eq!(
+            store.model_files_dir(&linked),
+            source.canonicalize().unwrap()
+        );
+        assert_eq!(
+            store.model_location(&linked),
+            source.canonicalize().unwrap()
+        );
+        assert!(
+            store
+                .model_dir("small-local")
+                .join("files/model.safetensors")
+                .is_file()
+        );
+        assert!(!store.model_dir("large-external").join("files").exists());
+        assert_eq!(
+            fs::read_dir(store.model_dir("large-external"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read(store.absolute_model_file(&linked, "files/model.safetensors")).unwrap(),
+            b"external-weights"
+        );
+
+        let reloaded = ModelStore::resolve(Some(tmp.join("store")))
+            .unwrap()
+            .get("large-external")
+            .unwrap();
+        assert_eq!(reloaded.storage, linked.storage);
+        assert_eq!(reloaded.architecture, linked.architecture);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn external_model_selection_updates_only_local_registration() {
+        let tmp = test_dir("external-selection");
+        let source = tmp.join("raid-model");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("model.Q4_K_M.gguf"), b"q4 weights").unwrap();
+        fs::write(source.join("model.Q8_0.gguf"), b"q8 weights").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        store.link_path(&source, "external").unwrap();
+        let selected = store.set_model_file("external", "model.Q8_0.gguf").unwrap();
+        assert_eq!(
+            selected.model_path.as_deref(),
+            Some("files/model.Q8_0.gguf")
+        );
+        assert_eq!(
+            store.get("external").unwrap().model_path,
+            selected.model_path
+        );
+        assert!(!source.join(MANIFEST_FILE).exists());
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 2);
+        assert_eq!(
+            fs::read(source.join("model.Q8_0.gguf")).unwrap(),
+            b"q8 weights"
+        );
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn external_removal_preserves_source_and_removes_local_artifacts() {
+        let tmp = test_dir("external-remove");
+        let source = tmp.join("raid-model");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("model.gguf"), b"preserved").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        store.link_path(&source, "external").unwrap();
+        fs::create_dir_all(store.artifacts_dir("external")).unwrap();
+        fs::write(
+            store.artifacts_dir("external").join("generated"),
+            b"artifact",
+        )
+        .unwrap();
+        store.remove("external").unwrap();
+        assert_eq!(fs::read(source.join("model.gguf")).unwrap(), b"preserved");
+        assert!(!store.model_dir("external").exists());
+        assert!(!store.artifacts_dir("external").exists());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn unavailable_external_models_remain_listable_and_removable() {
+        let tmp = test_dir("external-missing-disk");
+        let source = tmp.join("mounted-model");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
+        fs::write(source.join("model.safetensors"), b"weights").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let linked = store.link_path(&source, "external").unwrap();
+        fs::rename(&source, tmp.join("unmounted-model")).unwrap();
+        let cached = store.get("external").unwrap();
+        assert_eq!(cached.metadata, linked.metadata);
+        assert_eq!(cached.architecture, linked.architecture);
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert!(
+            !store
+                .absolute_model_file(&cached, "files/model.safetensors")
+                .exists()
+        );
+        store.remove("external").unwrap();
+        assert_eq!(
+            fs::read(tmp.join("unmounted-model/model.safetensors")).unwrap(),
+            b"weights"
+        );
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn external_single_file_does_not_register_siblings() {
+        let tmp = test_dir("external-single-file");
+        let source = tmp.join("raid");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("chosen.gguf"), b"chosen").unwrap();
+        fs::write(source.join("other.gguf"), b"other").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let linked = store
+            .link_path(&source.join("chosen.gguf"), "external")
+            .unwrap();
+        assert_eq!(linked.files.len(), 1);
+        assert_eq!(linked.files[0].path, "files/chosen.gguf");
+        assert_eq!(
+            store.absolute_model_file(&linked, "files/chosen.gguf"),
+            source.canonicalize().unwrap().join("chosen.gguf")
+        );
+        assert!(store.set_model_file("external", "other.gguf").is_err());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn external_single_file_may_share_a_parent_with_the_store() {
+        let tmp = test_dir("external-file-above-store");
+        fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("large.gguf");
+        fs::write(&source, b"large weights").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("local-store"))).unwrap();
+        let linked = store.link_path(&source, "large").unwrap();
+        assert_eq!(
+            store.absolute_model_file(&linked, "files/large.gguf"),
+            source.canonicalize().unwrap()
+        );
+        store.remove("large").unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"large weights");
+        assert!(store.link_path(&tmp, "whole-parent").is_err());
+        assert!(!store.model_dir("whole-parent").exists());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_single_file_keeps_snapshot_symlink_name() {
+        let tmp = test_dir("external-snapshot-symlink");
+        let snapshot = tmp.join("snapshot");
+        let blobs = tmp.join("blobs");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(&blobs).unwrap();
+        fs::write(blobs.join("abcdef123"), b"weights").unwrap();
+        std::os::unix::fs::symlink("../blobs/abcdef123", snapshot.join("model.gguf")).unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let linked = store
+            .link_path(&snapshot.join("model.gguf"), "external")
+            .unwrap();
+        assert_eq!(linked.format, ModelFormat::Gguf);
+        assert_eq!(linked.model_path.as_deref(), Some("files/model.gguf"));
+        assert_eq!(
+            store.model_files_dir(&linked),
+            snapshot.canonicalize().unwrap()
+        );
+        assert_eq!(
+            fs::read(store.absolute_model_file(&linked, "files/model.gguf")).unwrap(),
+            b"weights"
+        );
+        store.remove("external").unwrap();
+        assert!(snapshot.join("model.gguf").is_symlink());
+        assert_eq!(fs::read(blobs.join("abcdef123")).unwrap(), b"weights");
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn external_diffusers_metadata_reads_from_bound_directory() {
+        let tmp = test_dir("external-diffusers-metadata");
+        let source = tmp.join("raid-pipeline");
+        fs::create_dir_all(source.join("transformer")).unwrap();
+        fs::write(
+            source.join("model_index.json"),
+            br#"{"_class_name":"FluxPipeline"}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("transformer/config.json"),
+            br#"{"_class_name":"FluxTransformer2DModel"}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("transformer/diffusion_pytorch_model.safetensors"),
+            b"weights",
+        )
+        .unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let linked = store.link_path(&source, "external").unwrap();
+        assert_eq!(
+            linked.metadata.repository_layout,
+            RepositoryLayout::Diffusers
+        );
+        assert_eq!(linked.metadata.family.as_deref(), Some("flux"));
+        assert_eq!(
+            linked.architecture.as_deref(),
+            Some("flux_transformer2_d_model")
+        );
+        assert!(linked.supports_task(InferenceTask::ImageGeneration));
+        assert!(linked.model_path.is_none());
+        assert_eq!(store.get("external").unwrap().metadata, linked.metadata);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn external_werk_import_preserves_curated_metadata_and_original_source() {
+        let tmp = test_dir("external-existing-werk-model");
+        let raw = tmp.join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("first.gguf"), b"first").unwrap();
+        fs::write(raw.join("second.gguf"), b"second").unwrap();
+        let original = ModelStore::resolve(Some(tmp.join("raid-store"))).unwrap();
+        original.import_path(&raw, "owner/model").unwrap();
+        let mut source_manifest = original
+            .set_model_file("owner/model", "second.gguf")
+            .unwrap();
+        source_manifest.source = ModelSource::HuggingFace {
+            repo: "owner/model".to_string(),
+        };
+        source_manifest.metadata.family = Some("curated-family".to_string());
+        source_manifest
+            .metadata
+            .generation_defaults
+            .insert("temperature".to_string(), serde_json::json!(0.25));
+        source_manifest.artifacts.push(ModelArtifact {
+            kind: ArtifactKind::Onnx,
+            path: "onnx".to_string(),
+            status: ArtifactStatus::Ready,
+            created_unix: 1,
+            detail: None,
+        });
+        original.write_manifest(&source_manifest).unwrap();
+        let original_bytes =
+            fs::read(original.model_dir("owner/model").join(MANIFEST_FILE)).unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("local-store"))).unwrap();
+        let linked = store
+            .link_path(&original.model_dir("owner/model"), "renamed")
+            .unwrap();
+        assert_eq!(linked.source, source_manifest.source);
+        assert_eq!(linked.model_path, source_manifest.model_path);
+        assert_eq!(linked.metadata.family, source_manifest.metadata.family);
+        assert_eq!(
+            linked.metadata.generation_defaults,
+            source_manifest.metadata.generation_defaults
+        );
+        assert!(linked.artifacts.is_empty());
+        assert!(linked.metadata.optimized_artifacts.is_empty());
+        assert_eq!(
+            store.model_files_dir(&linked),
+            original
+                .model_dir("owner/model")
+                .canonicalize()
+                .unwrap()
+                .join("files")
+        );
+        store.set_model_file("renamed", "first.gguf").unwrap();
+        store.remove("renamed").unwrap();
+        assert_eq!(
+            fs::read(original.model_dir("owner/model").join(MANIFEST_FILE)).unwrap(),
+            original_bytes
+        );
+        assert!(
+            original
+                .model_dir("owner/model")
+                .join("files/second.gguf")
+                .is_file()
+        );
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn external_binding_rejects_collisions_and_owned_artifact_sources() {
+        let tmp = test_dir("external-binding-collisions");
+        let source = tmp.join("raid-model");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("model.gguf"), b"weights").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        store.link_path(&source, "owner/model").unwrap();
+        assert!(store.link_path(&source, "owner/model").is_err());
+        assert!(store.link_path(&source, "owner-model").is_err());
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        let artifact_source = store.artifacts_dir("owned").join("onnx");
+        fs::create_dir_all(&artifact_source).unwrap();
+        fs::write(artifact_source.join("model.onnx"), b"artifact-weights").unwrap();
+        assert!(store.link_path(&artifact_source, "owned").is_err());
+        assert!(!store.model_dir("owned").exists());
+        assert_eq!(
+            fs::read(artifact_source.join("model.onnx")).unwrap(),
+            b"artifact-weights"
+        );
+        assert!(store.link_path(&source.join("missing"), "missing").is_err());
+        assert!(!store.model_dir("missing").exists());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn external_binding_rejects_invalid_managed_inventory_without_registration() {
+        let tmp = test_dir("external-invalid-inventory");
+        let raw = tmp.join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("model.gguf"), b"weights").unwrap();
+        let original = ModelStore::resolve(Some(tmp.join("raid-store"))).unwrap();
+        let mut manifest = original.import_path(&raw, "original").unwrap();
+        manifest.files[0].path = "files/../../outside.gguf".to_string();
+        original.write_manifest(&manifest).unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("local-store"))).unwrap();
+        assert!(
+            store
+                .link_path(&original.model_dir("original"), "external")
+                .is_err()
+        );
+        assert!(!store.model_dir("external").exists());
         let _ = fs::remove_dir_all(tmp);
     }
 

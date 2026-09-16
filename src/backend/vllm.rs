@@ -1257,7 +1257,7 @@ fn has_reasoning_parser_arg(args: &[String]) -> bool {
 }
 
 fn resolve_vllm_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Result<PathBuf> {
-    let root = store.model_dir(&manifest.id);
+    let root = store.model_location(manifest);
     if !root.is_dir() {
         bail!(
             "model directory for '{}' does not exist: {}",
@@ -1279,7 +1279,7 @@ fn resolve_vllm_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Resul
         }
     }
 
-    let files_dir = root.join("files");
+    let files_dir = store.model_files_dir(manifest);
     if files_dir.join("config.json").is_file() {
         return Ok(files_dir);
     }
@@ -3241,6 +3241,32 @@ mod tests {
     }
 
     #[test]
+    fn vllm_model_dir_resolves_external_config_and_files_fallback() {
+        let store = test_store("vllm-external-directory");
+        let external = store.home().join("external/qwen");
+        fs::create_dir_all(external.join("snapshot")).unwrap();
+        fs::write(external.join("config.json"), b"{}").unwrap();
+        fs::write(external.join("snapshot/config.json"), b"{}").unwrap();
+        let mut manifest = test_manifest(
+            "Qwen/Qwen3-4B",
+            Some("files/snapshot/config.json"),
+            Some("files/model.safetensors"),
+        );
+        manifest.storage = crate::model_store::ModelStorage::External {
+            path: external.clone(),
+        };
+
+        assert_eq!(
+            resolve_vllm_model_dir(&store, &manifest).unwrap(),
+            external.join("snapshot")
+        );
+        manifest.config_path = None;
+        assert_eq!(resolve_vllm_model_dir(&store, &manifest).unwrap(), external);
+        assert!(!store.model_dir(&manifest.id).join("files").exists());
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
     fn vllm_model_dir_prefers_manifest_config_parent() {
         let store = test_store("vllm-config-parent");
         let manifest = test_manifest(
@@ -4594,6 +4620,7 @@ exit 9
         model_path: Option<&str>,
     ) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: id.to_string(),
             source: ModelSource::LocalPath {
                 path: "test".to_string(),

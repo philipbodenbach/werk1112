@@ -3007,6 +3007,7 @@ mod tests {
             projector_path: None,
             model_id: "test-model".to_string(),
             model_identity: ModelRuntimeIdentity::from_manifest(&ModelManifest {
+                storage: Default::default(),
                 id: "test-model".to_string(),
                 source: ModelSource::LocalPath {
                     path: "test".to_string(),

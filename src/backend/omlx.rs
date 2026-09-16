@@ -752,7 +752,7 @@ fn resolve_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Result<Pat
     if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
         bail!("oMLX supports MLX or Hugging Face safetensors text model directories");
     }
-    let root = store.model_dir(&manifest.id);
+    let root = store.model_location(manifest);
     let mut candidates = Vec::new();
     if let Some(config) = &manifest.config_path {
         let relative = Path::new(config);
@@ -762,11 +762,11 @@ fn resolve_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Result<Pat
         {
             bail!("oMLX manifest config_path must stay within the model directory");
         }
-        if let Some(parent) = root.join(relative).parent() {
+        if let Some(parent) = store.absolute_model_file(manifest, config).parent() {
             candidates.push(parent.to_path_buf());
         }
     }
-    candidates.push(root.join("files"));
+    candidates.push(store.model_files_dir(manifest));
     candidates.push(root);
     for candidate in candidates {
         if candidate.join("config.json").is_file() {

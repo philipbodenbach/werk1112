@@ -154,6 +154,23 @@ werk list
 werk inspect model-name
 ~~~
 
+Keep large models on a RAID alongside small models in the normal local store:
+
+~~~bash
+werk import /mnt/f/Werk1112/models/wan22-ti2v-5b --name wan22-ti2v-5b --link
+# Register all models in an existing collection:
+werk import /mnt/f/Werk1112/models --all --link
+~~~
+
+`--link` registers existing files without copying them, including an existing
+Werk model directory with its metadata. Removing the registration leaves the
+external files intact. `--all` discovers separate models directly inside a
+collection directory, retaining existing Werk model IDs or using directory
+names and file stems. Omit `--link` to copy the collection into the active store.
+Ordinary imports still copy files; `--model-home` and
+`WERK_HOME` still select the complete store. See
+[Models, manifests and the store](docs/concepts/models-manifests-and-store.md).
+
 Run text and media inference:
 
 ~~~bash

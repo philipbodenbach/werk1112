@@ -10,6 +10,16 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Added
 
+- `werk import DIRECTORY --all` imports a collection of model directories and
+  supported model files, retaining existing Werk model IDs and metadata. Combine
+  it with `--link` to register a RAID collection without copying weights.
+  Collection imports check model ID and destination conflicts before writing;
+  individual repositories remain intact, including components and shards.
+- `werk import --link` registers existing external model files without copying
+  weights, including existing Werk model directories and their metadata. Mix
+  local and RAID models in one store; `werk list` identifies external storage,
+  and removal preserves external files. Whole-store `--model-home` and
+  `WERK_HOME` selection remains available.
 - Grouped oMLX expert execution with batched tensor materialization, protected
   active groups and reduced allocator flushing; `WERK_OMLX_EXPERT_EXECUTION=serial`
   retains the prior path for comparison. Verbose diagnostics expose worker
@@ -42,6 +52,10 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Fixed
 
+- Buffer GGUF architecture and chat metadata reads to avoid excessive small
+  reads and long delays on mounted storage, including Windows drives in WSL.
+- Show each model's absolute local storage path in `werk list`, align columns
+  to their contents and use labeled blocks when the table exceeds the terminal width.
 - Reuse successful oMLX compatibility probes across chat requests and sessions,
   with bounded caching and model/runtime dependency invalidation, avoiding
   repeated Python imports before each HTTP response.

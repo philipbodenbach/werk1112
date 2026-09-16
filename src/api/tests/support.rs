@@ -303,6 +303,7 @@ pub(super) fn install_media_model(store: &ModelStore) {
         ..ModelMetadata::default()
     };
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "media".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),

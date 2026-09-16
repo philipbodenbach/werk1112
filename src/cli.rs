@@ -1,5 +1,6 @@
 mod chat_persistence;
 mod media_diagnostics;
+mod model_list;
 mod terminal_activity;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -961,13 +962,30 @@ pub enum Commands {
         command: RuntimeCommands,
     },
 
-    #[command(about = "Copy a local model file or directory into the managed model store")]
+    #[command(about = "Import local models, copying their files or binding external paths")]
     Import {
-        #[arg(help = "Model file or directory to copy")]
+        #[arg(help = "Model file or directory, or a collection directory with --all")]
         path: PathBuf,
 
-        #[arg(long, help = "Installed model id")]
-        name: String,
+        #[arg(
+            long,
+            required_unless_present = "all",
+            conflicts_with = "all",
+            help = "Installed model id; required unless --all is used"
+        )]
+        name: Option<String>,
+
+        #[arg(
+            long,
+            help = "Import each model directly inside a collection directory, preserving existing Werk model ids"
+        )]
+        all: bool,
+
+        #[arg(
+            long,
+            help = "Register the existing model in place without copying its files"
+        )]
+        link: bool,
     },
 
     #[command(about = "Pull a Hugging Face repository into the managed model store")]
@@ -995,7 +1013,7 @@ pub enum Commands {
         id: String,
     },
 
-    #[command(about = "List installed models")]
+    #[command(about = "List installed models and their local storage paths")]
     List {
         #[arg(long, value_parser = parse_inference_task, help = "Filter by supported task")]
         task: Option<InferenceTask>,
@@ -2081,10 +2099,36 @@ pub async fn run(cli: Cli) -> Result<()> {
         })
         .await
         .context("runtime-control client task failed")?,
-        Commands::Import { path, name } => {
+        Commands::Import {
+            path,
+            name,
+            all,
+            link,
+        } => {
             let store = ModelStore::resolve(model_home)?;
-            let manifest = store.import_path(&path, &name)?;
-            print_manifest_summary("Imported", &manifest);
+            let manifests = if all {
+                store.import_collection(&path, link)?
+            } else {
+                let name = name.context("a single model import requires --name")?;
+                vec![if link {
+                    store.link_path(&path, &name)?
+                } else {
+                    store.import_path(&path, &name)?
+                }]
+            };
+            let action = if link { "Linked" } else { "Imported" };
+            for manifest in &manifests {
+                print_manifest_summary(action, manifest);
+                if link {
+                    println!(
+                        "External path: {}",
+                        store.model_location(manifest).display()
+                    );
+                }
+            }
+            if all {
+                println!("{action} {} models.", manifests.len());
+            }
             Ok(())
         }
         Commands::Pull { repo, name, file } => {
@@ -2143,25 +2187,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&manifests)?);
                 return Ok(());
             }
-            if manifests.is_empty() {
-                println!("No matching models installed in {}", store.home().display());
-            } else {
-                println!(
-                    "{:<26} {:<14} {:<14} {:<18} TASKS",
-                    "MODEL", "LAYOUT", "FAMILY", "ARCHITECTURE"
-                );
-                for manifest in manifests {
-                    println!(
-                        "{:<26} {:<14} {:<14} {:<18} {}",
-                        manifest.id,
-                        manifest.metadata.repository_layout,
-                        manifest.metadata.family.as_deref().unwrap_or("-"),
-                        manifest.architecture.unwrap_or_else(|| "-".to_string()),
-                        join_display(&manifest.metadata.tasks)
-                    );
-                }
-            }
-            Ok(())
+            model_list::print(&store, &manifests)
         }
         Commands::Parameters {
             model,
@@ -5098,6 +5124,7 @@ fn remote_hf_manifest(remote: &RemoteHfModel, include_file: Option<&str>) -> Res
     let architecture = remote_architecture_from_config(remote.config.as_ref());
 
     Ok(ModelManifest {
+        storage: Default::default(),
         id: remote.repo.clone(),
         source: ModelSource::HuggingFace {
             repo: remote.repo.clone(),
@@ -5559,7 +5586,7 @@ fn safetensors_index_weight_accounting(
     manifest: &ModelManifest,
 ) -> Option<WeightAccounting> {
     let index_path = find_safetensors_index_path(manifest)?;
-    let index_abs = store.model_dir(&manifest.id).join(&index_path);
+    let index_abs = store.absolute_model_file(manifest, &index_path);
     let data = fs::read_to_string(index_abs).ok()?;
     let value: Value = serde_json::from_str(&data).ok()?;
     safetensors_index_weight_accounting_from_value(manifest, &index_path, &value)
@@ -5843,7 +5870,7 @@ fn scale_bytes(bytes: u64, factor: f64) -> u64 {
 
 fn read_estimate_config(store: &ModelStore, manifest: &ModelManifest) -> Option<EstimateConfig> {
     let config_path = manifest.config_path.as_deref()?;
-    let path = store.model_dir(&manifest.id).join(config_path);
+    let path = store.absolute_model_file(manifest, config_path);
     let data = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&data).ok()?;
     Some(parse_estimate_config(&value))
@@ -11037,6 +11064,88 @@ mod tests {
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn external_import_preserves_global_model_home_option() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "--model-home",
+            "/tmp/local-werk",
+            "import",
+            "/mnt/raid/large-model",
+            "--name",
+            "large-model",
+            "--link",
+        ])
+        .unwrap();
+        assert_eq!(cli.model_home, Some(PathBuf::from("/tmp/local-werk")));
+        match cli.command.unwrap() {
+            Commands::Import {
+                path,
+                name,
+                all,
+                link,
+            } => {
+                assert_eq!(path, PathBuf::from("/mnt/raid/large-model"));
+                assert_eq!(name.as_deref(), Some("large-model"));
+                assert!(!all);
+                assert!(link);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn collection_import_supports_copy_and_link_with_global_model_home() {
+        for link in [false, true] {
+            let mut args = vec![
+                "werk",
+                "--model-home",
+                "/tmp/local-werk",
+                "import",
+                "/mnt/f/Werk1112/models",
+                "--all",
+            ];
+            if link {
+                args.push("--link");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.model_home, Some(PathBuf::from("/tmp/local-werk")));
+            match cli.command.unwrap() {
+                Commands::Import {
+                    path,
+                    name,
+                    all,
+                    link: parsed_link,
+                } => {
+                    assert_eq!(path, PathBuf::from("/mnt/f/Werk1112/models"));
+                    assert!(name.is_none());
+                    assert!(all);
+                    assert_eq!(parsed_link, link);
+                }
+                command => panic!("unexpected command: {command:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn import_requires_either_a_single_model_name_or_all() {
+        for suffix in [vec![], vec!["--link"]] {
+            let mut args = vec!["werk", "import", "/tmp/model"];
+            args.extend(suffix);
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+        for suffix in [vec![], vec!["--link"]] {
+            let mut args = vec!["werk", "import", "/tmp/models", "--all", "--name", "model"];
+            args.extend(suffix);
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn editable_line_inserts_at_cursor() {
@@ -11252,9 +11361,16 @@ mod tests {
 
         let cli = Cli::try_parse_from(["werk", "import", "/tmp/model", "--name", "local"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Import { path, name } => {
+            Commands::Import {
+                path,
+                name,
+                all,
+                link,
+            } => {
                 assert_eq!(path, PathBuf::from("/tmp/model"));
-                assert_eq!(name, "local");
+                assert_eq!(name.as_deref(), Some("local"));
+                assert!(!all);
+                assert!(!link);
             }
             command => panic!("unexpected command: {command:?}"),
         }
@@ -15430,6 +15546,38 @@ mod tests {
     }
 
     #[test]
+    fn estimate_reads_external_config_and_shard_index() {
+        let store = test_store("estimate-external");
+        let external = store.home().join("raid");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("config.json"), r#"{"hidden_size":2048}"#).unwrap();
+        fs::write(
+            external.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001.safetensors","b":"model-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("llama"));
+        manifest.storage = crate::model_store::ModelStorage::External { path: external };
+        manifest.config_path = Some("files/config.json".to_string());
+        manifest.files = vec![
+            model_file("files/model.safetensors.index.json", 128),
+            model_file("files/model-00001.safetensors", 2 * GIB),
+            model_file("files/model-00002.safetensors", 2 * GIB),
+            model_file("files/unreferenced.safetensors", 10 * GIB),
+        ];
+        assert_eq!(
+            read_estimate_config(&store, &manifest).unwrap().hidden_size,
+            Some(2048)
+        );
+        assert_eq!(
+            estimate_weight_accounting(&store, &manifest).total_bytes(),
+            4 * GIB
+        );
+        assert!(!store.model_dir(&manifest.id).join("files").exists());
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
     fn estimate_kv_cache_formula_computes_expected_bytes() {
         let config = EstimateConfig {
             hidden_size: Some(2048),
@@ -15815,6 +15963,7 @@ mod tests {
 
     fn test_manifest(format: ModelFormat, architecture: Option<&str>) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: "test-model".to_string(),
             source: ModelSource::LocalPath {
                 path: "test".to_string(),

@@ -1104,12 +1104,15 @@ fn discover_multimodal_projector(
     manifest: &ModelManifest,
     model_path: &Path,
 ) -> Result<Option<PathBuf>> {
-    let model_root = store.absolute_model_file(manifest, "");
-    discover_multimodal_projector_from_files(&model_root, &manifest.files, model_path)
+    discover_multimodal_projector_from_files(
+        |path| store.absolute_model_file(manifest, path),
+        &manifest.files,
+        model_path,
+    )
 }
 
 fn discover_multimodal_projector_from_files(
-    model_root: &Path,
+    resolve_path: impl Fn(&str) -> PathBuf,
     files: &[ModelFile],
     model_path: &Path,
 ) -> Result<Option<PathBuf>> {
@@ -1129,7 +1132,7 @@ fn discover_multimodal_projector_from_files(
             if !filename.contains("mmproj") && !filename.contains("projector") {
                 return None;
             }
-            let candidate = model_root.join(relative);
+            let candidate = resolve_path(&file.path);
             (candidate != model_path && candidate.is_file()).then_some(candidate)
         })
         .collect::<Vec<_>>();
@@ -3257,6 +3260,42 @@ Agent 3
     }
 
     #[test]
+    fn projector_discovery_resolves_external_manifest_files() {
+        let root = temp_root("external-mmproj-discovery");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        let external = root.join("raid/qwen-vl");
+        let model = touch(external.join("model.gguf"));
+        let projector = touch(external.join("vision/mmproj.gguf"));
+        let manifest = ModelManifest {
+            id: "qwen-vl".to_string(),
+            source: crate::model_store::ModelSource::LocalPath {
+                path: external.display().to_string(),
+            },
+            storage: crate::model_store::ModelStorage::External { path: external },
+            format: ModelFormat::Gguf,
+            architecture: Some("qwen2vl".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: Some("files/model.gguf".to_string()),
+            backend: "llama.cpp".to_string(),
+            created_unix: 0,
+            files: vec![
+                model_file("files/model.gguf"),
+                model_file("files/vision/mmproj.gguf"),
+            ],
+            artifacts: Vec::new(),
+            metadata: Default::default(),
+        };
+
+        assert_eq!(
+            discover_multimodal_projector(&store, &manifest, &model).unwrap(),
+            Some(projector)
+        );
+        assert!(!store.model_dir(&manifest.id).join("files").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn projector_discovery_requires_one_safe_local_manifest_file() {
         let root = temp_root("mmproj-discovery");
         let model = touch(root.join("model-q4.gguf"));
@@ -3270,7 +3309,9 @@ Agent 3
             model_file("notes-projector.txt"),
         ];
 
-        let found = discover_multimodal_projector_from_files(&root, &files, &model).unwrap();
+        let found =
+            discover_multimodal_projector_from_files(|path| root.join(path), &files, &model)
+                .unwrap();
 
         assert_eq!(found.as_deref(), Some(projector.as_path()));
     }
@@ -3281,7 +3322,9 @@ Agent 3
         let model = touch(root.join("projector-model.gguf"));
         let files = vec![model_file("projector-model.gguf")];
 
-        let found = discover_multimodal_projector_from_files(&root, &files, &model).unwrap();
+        let found =
+            discover_multimodal_projector_from_files(|path| root.join(path), &files, &model)
+                .unwrap();
 
         assert_eq!(found, None);
     }
@@ -3298,9 +3341,10 @@ Agent 3
             model_file("vision-projector-q8.gguf"),
         ];
 
-        let error = discover_multimodal_projector_from_files(&root, &files, &model)
-            .unwrap_err()
-            .to_string();
+        let error =
+            discover_multimodal_projector_from_files(|path| root.join(path), &files, &model)
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("multiple local multimodal projector GGUF files"));
         assert!(error.contains("mmproj-f16.gguf"));

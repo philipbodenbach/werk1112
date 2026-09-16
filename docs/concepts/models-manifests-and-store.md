@@ -1,8 +1,9 @@
 # Models, manifests and the managed store
 
-Werk copies models into a managed store and records a local manifest for every
-installed model. Importing or classifying a repository does not imply that a
-runtime can execute it. Use `werk doctor --model MODEL --task TASK --debug`
+Werk records a local manifest for every installed model. By default, imports
+copy model files into the managed store; `import --link` registers files at
+their existing location. Importing or classifying a repository does not imply
+that a runtime can execute it. Use `werk doctor --model MODEL --task TASK --debug`
 before a large first load.
 
 See [Tasks and formats](../reference/tasks-and-formats.md) for the canonical
@@ -44,6 +45,10 @@ outputs and jobs are separate siblings. See
 [Managed backend locations](../backends.md#managed-locations) before removing
 anything manually.
 
+`--model-home` and `WERK_HOME` select the complete store. External model bindings
+are an additional option: keep the normal store, backends and small models
+locally, while individual large models remain on a RAID or another mounted disk.
+
 Model IDs remain as entered in `manifest.json`. Directory names retain ASCII
 letters, digits, `.`, `_` and `-`; other characters are replaced with `-`.
 Empty IDs, IDs beginning with `-`, and IDs containing `..` are rejected.
@@ -60,6 +65,61 @@ Werk copies a file, or the contents of a directory, into
 `models/LOCAL-MODEL/files/`. It does not leave the model pointing at the
 original path. A source directory's `.git` directory is not copied. Import
 fails if the target model directory already exists.
+
+### Register external model files
+
+~~~bash
+werk import /path/to/small-model --name small-local
+werk import /mnt/f/Werk1112/models/wan22-ti2v-5b --name wan22-ti2v-5b --link
+werk list
+~~~
+
+`--link` registers an existing file or directory without copying weights or
+creating an operating-system symlink. A local `manifest.json` records the
+external files' absolute, canonical location. Both models then use the same
+normal CLI and server commands under the active Werk home.
+
+An existing Werk model directory containing `manifest.json` and `files/` is
+also accepted. Its model metadata is retained, and the binding points to its
+`files/` directory. The local registration owns subsequent manifest updates
+and optimized artifacts; the external source remains in place.
+
+The source must be accessible when registering or loading the model. If its
+disk is later unmounted, `werk list` still shows the registration from the
+local manifest. Mount the disk at the recorded path before inference.
+
+### Import a collection of models
+
+Use `--all` when a directory contains several separate models:
+
+~~~bash
+# Keep all the collection's weights on the RAID:
+werk import /mnt/f/Werk1112/models --all --link
+
+# Copy a collection into the active Werk home:
+werk import /path/to/model-collection --all
+~~~
+
+Werk examines the directory's immediate children for model directories and
+supported model files and ignores unrelated entries. It does not recursively
+search the directory tree or split a repository's components and weight shards
+into separate models. The collection directory must not itself be a model
+repository.
+
+Existing Werk model directories retain their original model IDs and metadata
+in both copy and link mode. Other models receive the directory name or file
+stem as their ID. `--all` cannot be combined with `--name`; single-model imports
+continue to require `--name`.
+
+Werk validates the collection's IDs and destinations before registering or
+copying any model. Duplicate IDs, destination name collisions, or an existing
+model in the active store abort the import without overwriting it. With
+`--link`, all models remain at their existing paths while registrations live
+alongside local models in the active store. Whole-store `--model-home` and
+`WERK_HOME` overrides continue to work with both modes.
+
+If a later source fails during copying or registration, completed models remain
+installed and the error reports their count. Incomplete copies are cleaned up.
 
 ### Hugging Face pull
 
@@ -93,6 +153,8 @@ werk remove model-name
 
 Removal deletes the model directory and its sibling `artifacts/MODEL_DIRECTORY`
 tree. It does not remove outputs, jobs, other models or managed backends.
+For an external binding, it deletes only the local registration and local
+artifacts; external model files are never deleted.
 
 ## Manifest identity and inventory
 
@@ -102,6 +164,7 @@ Each `manifest.json` contains these stable identity and inventory fields:
 | --- | --- |
 | `id` | Installed model ID. |
 | `source` | Tagged `local_path` or `hugging_face` source record. |
+| `storage` | External bindings use `{"kind":"external","path":"/absolute/model/files"}`. Absent for ordinary managed models; `source` continues to describe model provenance. |
 | `format` | Detected model format. |
 | `architecture` | GGUF `general.architecture` or Transformers-style configuration identity when detectable. |
 | `tokenizer_path` | Tracked relative `tokenizer.json` path, if present. |
@@ -109,7 +172,7 @@ Each `manifest.json` contains these stable identity and inventory fields:
 | `model_path` | Selected primary weight path; Diffusers repositories normally use the repository root and therefore have no component `model_path`. |
 | `backend` | Human-facing backend hint, not a runtime guarantee. |
 | `created_unix` | Creation timestamp in Unix seconds. |
-| `files` | Relative path, byte size and `crc32:` checksum for each copied file. |
+| `files` | Logical relative path, byte size and `crc32:` checksum for each tracked file. Paths retain the `files/` prefix for both managed and external storage. |
 | `artifacts` | Persisted optimized-artifact records. Currently the concrete artifact kind is ONNX. |
 
 The CRC32 inventory detects accidental file changes; it is not a cryptographic
@@ -157,7 +220,9 @@ werk inspect model-name
 
 `werk list` reads installed manifests, enriches them from local files and sorts
 them by model ID. Filters cover task, input modality, output modality, family,
-layout and an explicitly selected global backend.
+layout and an explicitly selected global backend. Human-readable output labels
+storage as `managed` or `external` and shows the physical source path for
+external bindings. JSON output includes their `storage` record.
 
 `werk inspect` prints the enriched manifest as JSON and adds a dynamic
 `host_resources` object to that command's output. `host_resources` is not part
@@ -173,8 +238,8 @@ werk select-file model-name model.Q5_K_M.gguf
 ~~~
 
 The selected file must already appear in the manifest inventory and must stay
-inside the installed model tree. Werk updates `format`, `model_path`,
-`architecture` and the backend hint, then re-runs capability enrichment.
+inside the model's managed or external files directory. Werk updates `format`,
+`model_path`, `architecture` and the backend hint, then re-runs capability enrichment.
 Metadata that differs from inference-derived values is preserved as a curated
 override.
 
@@ -195,8 +260,9 @@ detail.
 
 ## Offline execution boundary
 
-Import and pull are the workflows that place weights in the store. The media
-companion itself forces Hugging Face, Transformers, Diffusers and datasets
+Import and pull place weights in the store; `import --link` registers existing
+external weights. The media companion itself forces Hugging Face,
+Transformers, Diffusers and datasets
 offline modes and passes local-only loading options. It does not install
 packages or download missing weights during inference.
 

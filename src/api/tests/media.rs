@@ -839,6 +839,7 @@ impl MediaInferenceBackend for VisionBlindMediaBackend {
 async fn capabilities_include_chat_generation_vision_readiness() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "vision".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),

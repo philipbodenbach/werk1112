@@ -457,6 +457,7 @@ mod tests {
 
     fn manifest(id: impl Into<String>) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: id.into(),
             source: ModelSource::LocalPath {
                 path: "test".to_string(),

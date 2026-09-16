@@ -125,6 +125,7 @@ fn write_response(stream: &mut TcpStream, response: MockHttpResponse) {
 fn vllm_app(server_url: String) -> Router {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "qwen-test".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),

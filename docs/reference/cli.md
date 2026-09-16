@@ -48,6 +48,44 @@ werk import /absolute/path/to/model --name local-model
 The original path is not used as mutable runtime state after a successful
 copy. Removing the managed model does not remove the original source.
 
+Add `--link` to register existing files without copying them or creating an
+operating-system symlink:
+
+```bash
+werk import /mnt/f/Werk1112/models/wan22-ti2v-5b --name wan22-ti2v-5b --link
+```
+
+The source can be a file, a repository directory, or an existing Werk model
+directory containing `manifest.json` and `files/`. Existing model metadata is
+retained. The active store holds the registration and optimized artifacts,
+while model files stay at their external location. This supports local and
+external models together; `--model-home` and `WERK_HOME` still select the
+complete store. `import` without `--link` continues to copy files.
+
+Import a collection containing several models with `--all`:
+
+```bash
+# Register every model from the RAID in the active store:
+werk import /mnt/f/Werk1112/models --all --link
+
+# Copy a collection into the active store instead:
+werk import /path/to/model-collection --all
+```
+
+`--all` examines the collection's immediate children for model directories and
+supported model files, ignoring unrelated entries. Each repository remains one
+model; its components and weight shards are not registered separately. The
+collection directory must not itself be a model repository. Discovery is not
+recursive.
+
+Existing Werk model directories retain their model IDs and metadata, including
+when copied. Other models use the directory name or file stem as their ID.
+`--name` is required for a single model and cannot be combined with `--all`.
+Before importing a collection, Werk checks for duplicate IDs, destination name
+collisions and models already installed in the active store. A conflict stops
+the operation before any models are imported; existing models are not
+overwritten. Successful imports print each model followed by the total count.
+
 ### Pull from Hugging Face
 
 ```bash
@@ -76,9 +114,18 @@ werk list --family flux --json
 werk inspect model-id
 ```
 
-`list` shows summaries and supports metadata filters. `inspect` prints the full
-stored/enriched manifest as JSON. Declared task support is not proof that an
-installed runtime can execute the model.
+`list` shows model metadata, a `managed` or `external` storage label, and the
+absolute storage path in `PATH`. For managed models, this is the directory
+containing `manifest.json` and `files/`; for external bindings, it is the
+external files' source path. It supports metadata filters and sizes table
+columns to their contents. When the table
+would exceed the terminal width, each model is shown as a labeled block with
+its full name and path. `list --json` prints the stored/enriched manifests.
+External bindings include a `storage` record with `kind: "external"` and their
+absolute path. They remain listed if the external disk is unmounted; loading
+them requires the recorded location to be accessible.
+`inspect` prints the full manifest as JSON. Declared task support is not proof
+that an installed runtime can execute the model.
 
 ### Select a tracked model file
 
@@ -98,8 +145,10 @@ werk remove model-id
 werk rm model-id
 ```
 
-This removes only the managed copy beneath the active Werk store. Backend
-environments, unrelated models and original import sources are separate.
+This removes the managed model directory and its local optimized artifacts.
+For external bindings, only the local registration and artifacts are removed;
+external model files are never deleted. Backend environments, unrelated models
+and original import sources are separate.
 
 The directory layout and retention rules are documented in
 [Models, manifests and the store](../concepts/models-manifests-and-store.md).
