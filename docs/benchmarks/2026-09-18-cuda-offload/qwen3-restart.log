@@ -1,0 +1,32 @@
+[werk chat] persistence enabled: 4 saved messages restored
+[werk chat] conversation: <test-home>/chat-sessions/d9aba39fc6adf57972b45aea7f12bf832ff0b4e647a60b8c3edd5834d96a78e8.json
+Using llama.cpp server CUDA backend
+[werk chat] native KV cache enabled; reuse depends on the prompt and backend
+Chatting with cuda-smoke-qwen3. Type /exit or /quit to stop.
+you> assistant> 37
+
+backend:              llama.cpp server CUDA
+total duration:       1.778187s
+load duration:        0us
+prompt total count:   76 token(s)
+prompt cached count:  45 token(s)
+prompt eval count:    31 token(s)
+prompt eval duration: 45.185ms
+prompt eval rate:     686.07 tokens/s
+eval count:           3 token(s)
+eval duration:        30.624ms
+first token:          730.2509ms
+eval rate:            97.96 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 5
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  llama.cpp request endpoint: /v1/chat/completions
+  chat template applied by backend/model: yes
+  llama.cpp native KV snapshot restored: 51 tokens; actual prefix reuse reported by backend usage
+  llama.cpp native KV snapshot saved: 78 tokens
+you> 

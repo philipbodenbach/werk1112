@@ -2064,7 +2064,57 @@ fn selected_lfs_include_files(root: &Path, primary: Option<&str>) -> Result<Vec<
             selected.push(projector);
         }
     }
-    Ok(selected)
+
+    let mut included = Vec::new();
+    for file in selected {
+        if let Some(shards) = gguf_shard_paths(&file)? {
+            for shard in &shards {
+                if !root.join(shard).is_file() {
+                    bail!(
+                        "split GGUF '{file}' is incomplete: missing shard '{shard}' in the Hugging Face repository"
+                    );
+                }
+            }
+            included.extend(shards);
+        } else {
+            included.push(file);
+        }
+    }
+    Ok(included)
+}
+
+/// Return every shard in a standard llama.cpp split GGUF filename family.
+pub(crate) fn gguf_shard_paths(path: &str) -> Result<Option<Vec<String>>> {
+    let Some((stem, extension)) = path.rsplit_once('.') else {
+        return Ok(None);
+    };
+    if !extension.eq_ignore_ascii_case("gguf") {
+        return Ok(None);
+    }
+    let Some((numbered_prefix, count)) = stem.rsplit_once("-of-") else {
+        return Ok(None);
+    };
+    let Some((prefix, index)) = numbered_prefix.rsplit_once('-') else {
+        return Ok(None);
+    };
+    if index.len() != 5
+        || count.len() != 5
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+        || !count.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Ok(None);
+    }
+
+    let index: usize = index.parse()?;
+    let count: usize = count.parse()?;
+    if index == 0 || count == 0 || index > count {
+        bail!("invalid split GGUF filename '{path}': shard index must be between 1 and {count}");
+    }
+    Ok(Some(
+        (1..=count)
+            .map(|index| format!("{prefix}-{index:05}-of-{count:05}.{extension}"))
+            .collect(),
+    ))
 }
 
 fn resolve_pull_file(root: &Path, file: &str) -> Result<String> {
@@ -4360,8 +4410,8 @@ fn infer_quantization_from_paths_and_json(
 
     let hint = paths.join(" ").to_ascii_lowercase();
     for quantization in [
-        "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_k_s", "q4_k_m", "q5_0", "q5_k_s",
-        "q5_k_m", "q6_k", "q8_0", "awq", "gptq", "nf4", "int4", "int8", "fp8",
+        "q2_k_s", "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_k_s", "q4_k_m", "q5_0",
+        "q5_k_s", "q5_k_m", "q6_k", "q8_0", "awq", "gptq", "nf4", "int4", "int8", "fp8",
     ] {
         if hint.contains(quantization) {
             return Some(quantization.to_string());
@@ -7092,6 +7142,144 @@ mod tests {
                 "Qwen3-VL-Q4_K_M.gguf".to_string(),
                 "mmproj-Qwen3-VL-f16.gguf".to_string(),
             ]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn split_gguf_paths_preserve_family_and_reject_invalid_shard_numbers() {
+        assert_eq!(
+            gguf_shard_paths("nested/model-Q2_K_S-00002-of-00002.GGUF").unwrap(),
+            Some(vec![
+                "nested/model-Q2_K_S-00001-of-00002.GGUF".to_string(),
+                "nested/model-Q2_K_S-00002-of-00002.GGUF".to_string(),
+            ])
+        );
+        for path in [
+            "model-Q2_K_S.gguf",
+            "model-1-of-2.gguf",
+            "model-00001-of-00002.safetensors",
+        ] {
+            assert!(gguf_shard_paths(path).unwrap().is_none(), "{path}");
+        }
+        for path in [
+            "model-00000-of-00002.gguf",
+            "model-00001-of-00000.gguf",
+            "model-00003-of-00002.gguf",
+        ] {
+            assert!(gguf_shard_paths(path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn split_gguf_pull_includes_complete_family_and_projector() {
+        let tmp = test_dir("split-gguf-pull-files");
+        let source = tmp.join("source");
+        fs::create_dir_all(source.join("Q2_K_S")).unwrap();
+        fs::create_dir_all(source.join("other")).unwrap();
+        let first = "Q2_K_S/DeepSeek-V4-Flash-Q2_K_S-00001-of-00002.gguf";
+        let second = "Q2_K_S/DeepSeek-V4-Flash-Q2_K_S-00002-of-00002.gguf";
+        let projector = "mmproj-model-f16.gguf";
+        write_lfs_pointer(&source.join(first), 5_250_000);
+        write_lfs_pointer(&source.join(second), 98_600_000_000);
+        write_lfs_pointer(&source.join(projector), 900_000_000);
+        write_lfs_pointer(
+            &source.join("other/DeepSeek-V4-Flash-Q2_K_S-00002-of-00002.gguf"),
+            123,
+        );
+        write_lfs_pointer(
+            &source.join("Q2_K_S/DeepSeek-V4-Flash-Q2_K_S-00002-of-00003.gguf"),
+            456,
+        );
+        write_lfs_pointer(
+            &source.join("Q2_K_S/DeepSeek-V4-Flash-Q4_K_M-00002-of-00002.gguf"),
+            789,
+        );
+
+        for primary in [first, second] {
+            let selected = selected_lfs_include_files(&source, Some(primary)).unwrap();
+            assert_eq!(selected, vec![first, second, projector]);
+            assert_eq!(
+                lfs_pointer_total_for_files(&source, &selected).unwrap(),
+                Some(99_505_250_000)
+            );
+        }
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn split_gguf_pull_rejects_missing_shards() {
+        let tmp = test_dir("split-gguf-missing-shards");
+        let source = tmp.join("source");
+        fs::create_dir_all(source.join("selected")).unwrap();
+        fs::create_dir_all(source.join("other")).unwrap();
+        let first = "selected/model-Q2_K_S-00001-of-00002.gguf";
+        let second = "selected/model-Q2_K_S-00002-of-00002.gguf";
+        write_lfs_pointer(&source.join(second), 98_600_000_000);
+        write_lfs_pointer(
+            &source.join("other/model-Q2_K_S-00001-of-00002.gguf"),
+            5_250_000,
+        );
+
+        let error = selected_lfs_include_files(&source, Some(second))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete"), "{error}");
+        assert!(error.contains(first), "{error}");
+
+        fs::remove_file(source.join(second)).unwrap();
+        write_lfs_pointer(&source.join(first), 5_250_000);
+        let error = selected_lfs_include_files(&source, Some(first))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(second), "{error}");
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn split_gguf_import_keeps_all_shards_with_first_shard_as_primary() {
+        let tmp = test_dir("split-gguf-import");
+        let source = tmp.join("source");
+        let filtered = tmp.join("filtered");
+        fs::create_dir_all(source.join("Q2_K_S")).unwrap();
+        let first = "Q2_K_S/DeepSeek-V4-Flash-Q2_K_S-00001-of-00002.gguf";
+        let second = "Q2_K_S/DeepSeek-V4-Flash-Q2_K_S-00002-of-00002.gguf";
+        write_lfs_pointer(&source.join(second), 98_600_000_000);
+        write_lfs_pointer(&source.join(first), 5_250_000);
+
+        assert_eq!(
+            default_lfs_include_file(&source).unwrap().as_deref(),
+            Some(first)
+        );
+        write_lfs_pointer(
+            &source.join("DeepSeek-V4-Flash-Q4_K_M-00001-of-00002.gguf"),
+            5_250_000,
+        );
+        let selected = selected_lfs_include_files(&source, Some(second)).unwrap();
+        fs::write(source.join(first), b"metadata").unwrap();
+        fs::write(source.join(second), vec![0_u8; 1024]).unwrap();
+        prepare_included_file_import_tree(&source, &selected, &filtered).unwrap();
+        ensure_no_lfs_pointers_remaining(&filtered).unwrap();
+        assert!(
+            !filtered
+                .join("DeepSeek-V4-Flash-Q4_K_M-00001-of-00002.gguf")
+                .exists()
+        );
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&filtered, "deepseek-q2-k-s").unwrap();
+        assert_eq!(manifest.model_path, Some(format!("files/{first}")));
+        assert_eq!(manifest.metadata.quantization.as_deref(), Some("q2_k_s"));
+        assert_eq!(manifest.files.len(), 2);
+        assert!(
+            store
+                .model_dir(&manifest.id)
+                .join("files")
+                .join(second)
+                .is_file()
         );
 
         let _ = fs::remove_dir_all(tmp);

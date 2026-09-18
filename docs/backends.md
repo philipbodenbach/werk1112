@@ -700,6 +700,7 @@ The install targets are:
 
 ~~~text
 llama-cuda
+llama-cuda-offload
 llama-rocm
 llama-vulkan
 llama-metal
@@ -719,6 +720,7 @@ There is currently no <code>werk backend uninstall</code> command. See
 | Target | Provisioning behavior | Main prerequisites | Validation |
 | --- | --- | --- | --- |
 | <code>llama-cuda</code> | Shallow-clones current llama.cpp and builds llama-server with CMake and GGML CUDA. | Git, CMake, C/C++ compiler, NVIDIA driver and CUDA toolkit. | llama-server help plus known CUDA initialization failures. |
+| <code>llama-cuda-offload</code> | Builds a pinned experimental CUDA expert-cache fork through the same installer and selects it for the existing CUDA adapter. | Same CUDA toolchain; see the limits below. | CUDA initialization and advertised expert/lazy-row/slot controls; installation does not certify a model. |
 | <code>llama-rocm</code> | Builds llama-server with GGML HIP. | Git, CMake, C/C++ compiler and compatible ROCm/HIP toolchain. | Executable help; a real HIP inference is not part of installation validation. |
 | <code>llama-vulkan</code> | Builds llama-server with GGML Vulkan. | Git, CMake, C/C++ compiler and Vulkan development SDK. | Executable help; a real Vulkan inference is not part of installation validation. |
 | <code>llama-metal</code> | Builds llama-server with GGML Metal. | macOS, Xcode command-line tools and CMake. | Rejected before build outside macOS; executable help after build. |
@@ -729,9 +731,61 @@ There is currently no <code>werk backend uninstall</code> command. See
 | <code>vllm</code> | Creates an isolated virtual environment and installs vLLM with pip on eligible generic Linux hosts. On DGX Spark and AMD Strix Halo this target stops with platform-specific container/environment guidance instead of installing an unverified generic wheel. | Native Linux x86_64, Python/venv, pip, compatible PyTorch and accelerator stack. | Import/version and runtime health checks. |
 | <code>qwen-tts</code> | Creates an isolated virtual environment and installs exactly qwen-tts 0.1.1. | Python 3.9+, venv, pip and platform-compatible PyTorch/audio dependencies. | Exact package version and Qwen3TTSModel import. |
 
+### Experimental CUDA expert offload
+
+`werk backend install llama-cuda-offload` uses the existing llama.cpp installer,
+process adapter, streaming chat and persistence path. It builds
+[GenerelSchwerz/llama.cpp](https://github.com/GenerelSchwerz/llama.cpp/blob/907a73da9a149faa8c42ccde890f1d575586810f/docs/fork-features.md)
+at `907a73da9a149faa8c42ccde890f1d575586810f`. The fork supplies the native CUDA
+expert kernels and cache; the ordinary upstream build does not expose these
+controls. Werk applies one loading change: when expert caching is enabled,
+disable eager mmap prefetch so startup does not fault in the whole expert file.
+
+The source and build live below `backends/llama-cuda/offload-<revision>/`.
+The existing CUDA discovery pointer selects the resulting executable after
+validation. `werk backend install llama-cuda` selects the normal build again.
+An explicit `WERK_LLAMA_SERVER_CUDA` or `WERK_LLAMA_SERVER` still takes precedence.
+
+After installing Werk normally and building the optional runtime:
+
+```bash
+werk backend install llama-cuda-offload
+
+WERK_LLAMA_ARGS='--moe-expert-cache-size 8 --moe-expert-cache-host-pinned-mb 512 --load-mode mmap --lazy-mode on --fit off --no-warmup --reasoning off' \
+werk --backend cuda --ctx-size 4096 --ubatch-size 64 \
+  chat ggml-org/DeepSeek-V4-Flash-GGUF \
+  --verbose --persistence --session auto-test
+```
+
+Use the installed ID for the complete selected quantization; both GGUF shards
+must be present. Under WSL, keep the weights on the Linux filesystem for this
+test. Use `WERK_LLAMA_LOG=1` to expose the native expert hit/miss/eviction logs.
+
+- `8` is the number of resident expert slabs **per expert tensor**, not MiB and
+  not a process-wide automatic budget. Native metadata, scratch space, dense
+  weights and KV memory consume additional VRAM. Increase it only after measuring
+  available VRAM. `512` bounds the model's pinned host source/staging allocation;
+  the OS file cache remains separately managed and reclaimable.
+- `--lazy-mode on` reads supported PLE/N-gram table rows on demand. It uses the
+  native mmap/file-cache path, not oMLX's separately bounded row LRU. Models
+  without such tensors, including the inspected DeepSeek V4 architecture, have
+  no N-gram weights to offload. This is unrelated to speculative N-gram decoding.
+- The expert cache supports layer split. Tensor split is rejected by the fork.
+  Quantization, auxiliary tensors and platform CUDA behavior remain native
+  compatibility constraints.
+- Persistent chat snapshots reuse the existing private slot machinery. A
+  restored conversation alone is not evidence of KV reuse: check a nonzero
+  `prompt cached count` after restarting the same session. Model weights and
+  hot VRAM expert slots are loaded again on restart.
+- This runtime is experimental. The WSL/RTX 3090 native suite passed cached
+  matmul/prefill/overflow and pageable staging cases but failed a host-registration
+  boundary fixture (`auxiliary_alias_not_identity`). A complete DeepSeek Q2_K_S
+  end-to-end offload benchmark has not been verified. Do not infer full macOS
+  oMLX parity or support for every MoE model from the available controls.
+
 Important limitations:
 
-- llama.cpp provisioning follows the current upstream default branch rather
+- Ordinary llama.cpp provisioning follows the current upstream default branch rather
   than a Werk-pinned commit, so identical Werk versions can build different
   upstream revisions at different times;
 - the ONNX installers do not download or build a runner today;

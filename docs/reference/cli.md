@@ -92,13 +92,27 @@ overwritten. Successful imports print each model followed by the total count.
 werk pull organization/repository --name local-name
 ```
 
-Select one file from a multi-quant repository:
+Select a variant from a multi-quant repository:
 
 ```bash
 werk pull organization/model-GGUF \
   --file model.Q4_K_M.gguf \
   --name model-q4
 ```
+
+For a split GGUF, select its first shard. Werk downloads every matching shard
+in the same directory, validates that the set is complete, and uses the first
+shard as the runtime entry point. Other quantization variants are excluded:
+
+```bash
+werk pull ggml-org/DeepSeek-V4-Flash-GGUF \
+  --file DeepSeek-V4-Flash-Q2_K_S-00001-of-00002.gguf \
+  --name deepseek-v4-flash-q2-k-s
+```
+
+Automatic GGUF selection also includes the complete shard set. A separate
+`--name` lets multiple variants coexist; pulling into an existing model ID
+does not replace that model.
 
 Pull currently uses Git plus Git LFS. Gated repositories require accepted
 upstream conditions and a token from `werk auth huggingface login`, an accepted
@@ -489,6 +503,19 @@ and the backend recomputes the prompt. Local vLLM receives the same validated
 automatic-prefix-cache default as `serve --persistence`; explicit runtime
 arguments still win. This cache remains vLLM-owned and does not survive its
 process restart. Exiting the chat still stops its owned backend workers.
+
+The existing llama.cpp route also saves native slot snapshots for persistent
+text chats on Unix when the running server passes the save/erase/restore/replay
+probe. It restores a compatible snapshot on the next process start and reports
+actual prefix hits as `prompt cached count` in `--verbose` output. Snapshots are
+namespaced by model files, runtime executable/libraries, native environment and
+effective arguments; incompatible or corrupt snapshots are rebuilt from the
+conversation. Each runtime namespace retains its latest completed snapshot,
+with a 2 GiB snapshot limit. This does not persist loaded model weights or add
+cross-restart named Werk Protocol states.
+
+For the optional CUDA expert-cache runtime and an offload test command, see
+[CUDA expert offload](../backends.md#experimental-cuda-expert-offload).
 
 Archives and supported native KV caches survive exit. Use
 [`werk cache list` and `werk cache purge`](#local-persistence-caches) to inspect

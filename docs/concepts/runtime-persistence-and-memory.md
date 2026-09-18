@@ -97,6 +97,14 @@ resident weights were restored; terminal startup reports native cache support
 separately. The [terminal chat options](../reference/cli.md#persistent-terminal-chat)
 do not alter the named state capability matrix above.
 
+On the existing Unix llama.cpp route, persistent terminal text chats additionally
+use private native slot snapshots after the live save/erase/restore/replay probe
+passes. The latest snapshot for each compatible runtime namespace can survive
+restart; response usage, not the existence of a file or conversation, determines
+reported prefix hits. Newer llama.cpp releases reset idle-slot timing counters,
+so the probe reads the completed response's cache count before falling back to
+the legacy slot counter. Named runtime-control states remain process-bound.
+
 Local storage cleanup is available through `werk cache list` and
 `werk cache purge <CACHE-ID>` or `werk cache purge --all`. The inventory
 separates persistent chat KV data and message archives under `chat-sessions/`,

@@ -48,13 +48,12 @@ use crate::{
         TransformersCompatBackend, VllmBackend, backend_doctor_checks,
         backend_supports_accelerator, backend_supports_format,
         backend_supports_images as runtime_supports_images, candle_gguf_tokenizer_rejection,
-        current_host_is_strix_halo, install_managed_llama_server,
-        install_managed_llama_server_with_options, install_managed_onnx_runtime,
-        install_managed_qwen_tts, install_managed_vllm, llama_server_help_ok, managed_backend_dir,
-        managed_runner_path as managed_onnx_runner_path, managed_vllm_dir, probe_device,
-        runtime_descriptor, runtime_registry, runtime_supports_model,
-        validated_backend_install_command, vllm_architecture_supports_images, vllm_doctor_checks,
-        vllm_rocm_signals,
+        current_host_is_strix_halo, install_managed_llama_server_with_options,
+        install_managed_onnx_runtime, install_managed_qwen_tts, install_managed_vllm,
+        llama_server_help_ok, managed_backend_dir, managed_runner_path as managed_onnx_runner_path,
+        managed_vllm_dir, probe_device, runtime_descriptor, runtime_registry,
+        runtime_supports_model, validated_backend_install_command,
+        vllm_architecture_supports_images, vllm_doctor_checks, vllm_rocm_signals,
     },
     banner::print_banner,
     cache::{self, CacheKind, CachePurgeReport, CacheSelection},
@@ -385,6 +384,8 @@ pub enum BenchCompareArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendInstallArg {
     LlamaCuda,
+    /// Experimental pinned CUDA runtime with MoE caching and lazy PLE reads.
+    LlamaCudaOffload,
     LlamaRocm,
     LlamaVulkan,
     LlamaMetal,
@@ -401,7 +402,7 @@ pub enum BackendInstallArg {
 impl BackendInstallArg {
     fn mode(self) -> Option<LlamaCppMode> {
         match self {
-            Self::LlamaCuda => Some(LlamaCppMode::Cuda),
+            Self::LlamaCuda | Self::LlamaCudaOffload => Some(LlamaCppMode::Cuda),
             Self::LlamaRocm => Some(LlamaCppMode::Rocm),
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaMetal => Some(LlamaCppMode::Metal),
@@ -819,7 +820,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            help = "For remote Hugging Face estimates, estimate one repository file, for example model.Q4_K_M.gguf"
+            help = "For remote Hugging Face estimates, select a repository file; matching GGUF shards are included automatically"
         )]
         file: Option<String>,
 
@@ -998,7 +999,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            help = "Download one repository file, for example model.Q4_K_M.gguf"
+            help = "Download a repository file, for example model.Q4_K_M.gguf; matching GGUF shards are included automatically"
         )]
         file: Option<String>,
     },
@@ -1868,7 +1869,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             match command {
                 BackendCommands::Install { target } => {
                     if let Some(mode) = target.mode() {
-                        let executable = install_managed_llama_server(&store, mode)?;
+                        let executable = install_managed_llama_server_with_options(
+                            &store,
+                            mode,
+                            LlamaServerInstallOptions {
+                                verbose: true,
+                                cuda_offload: target == BackendInstallArg::LlamaCudaOffload,
+                            },
+                        )?;
                         println!(
                             "Installed {} llama-server: {}",
                             display_llama_mode(mode),
@@ -4658,6 +4666,7 @@ struct WeightAccounting {
     ignored: Vec<EstimateFileEntry>,
     selected: Vec<String>,
     confidence: EstimateConfidence,
+    warnings: Vec<String>,
 }
 
 impl WeightAccounting {
@@ -4780,6 +4789,16 @@ fn estimate_model_memory(
         system.total_bytes,
         system.available_bytes,
     );
+    let result = if !accounting.warnings.is_empty() && result == EstimateResult::Ok {
+        EstimateResult::Warning
+    } else {
+        result
+    };
+    let recommendation = if accounting.warnings.is_empty() {
+        estimate_recommendation(result).to_string()
+    } else {
+        "Resolve the GGUF shard warnings before relying on this memory estimate.".to_string()
+    };
     let confidence = accounting
         .confidence
         .min(kv_cache.confidence)
@@ -4812,9 +4831,9 @@ fn estimate_model_memory(
         confidence,
         measured_peak_memory_bytes: latest_estimate_observation(store, manifest)
             .and_then(|observation| observation.measured_peak_memory_bytes),
-        notes: Vec::new(),
+        notes: accounting.warnings,
         result,
-        recommendation: estimate_recommendation(result).to_string(),
+        recommendation,
     }
 }
 
@@ -4860,16 +4879,12 @@ fn estimate_huggingface_model(
 
     if let Some(include_file) = include_file {
         let selected_path = format!("files/{}", normalize_remote_hf_file_path(include_file)?);
-        if let Some(file) = manifest
-            .files
-            .iter()
-            .find(|file| file.path == selected_path)
-        {
-            accounting = single_selected_weight_accounting(
-                &manifest,
-                file,
-                "explicit --file selected for remote estimate",
-            );
+        if let Some(selected_accounting) = selected_model_weight_accounting(
+            &manifest,
+            &selected_path,
+            "explicit --file selected for remote estimate",
+        ) {
+            accounting = selected_accounting;
             manifest.model_path = Some(selected_path);
         } else {
             bail!("file '{include_file}' was not found in Hugging Face repo '{repo}'");
@@ -4888,6 +4903,16 @@ fn estimate_huggingface_model(
         system.total_bytes,
         system.available_bytes,
     );
+    let result = if !accounting.warnings.is_empty() && result == EstimateResult::Ok {
+        EstimateResult::Warning
+    } else {
+        result
+    };
+    let recommendation = if accounting.warnings.is_empty() {
+        estimate_recommendation(result).to_string()
+    } else {
+        "Resolve the GGUF shard warnings before relying on this memory estimate.".to_string()
+    };
     let confidence = accounting
         .confidence
         .min(kv_cache.confidence)
@@ -4899,6 +4924,7 @@ fn estimate_huggingface_model(
     let mut notes = vec![
         "Remote estimate uses Hugging Face metadata and small config/index files only; it does not download model weights.".to_string(),
     ];
+    notes.extend(accounting.warnings);
     if model_files_bytes == 0 {
         notes.push(
             "Hugging Face metadata did not include file sizes, so the memory estimate is incomplete."
@@ -4939,7 +4965,7 @@ fn estimate_huggingface_model(
         measured_peak_memory_bytes: None,
         notes,
         result,
-        recommendation: estimate_recommendation(result).to_string(),
+        recommendation,
     })
 }
 
@@ -5499,14 +5525,12 @@ fn estimate_weight_accounting(store: &ModelStore, manifest: &ModelManifest) -> W
 fn estimate_weight_accounting_without_store(manifest: &ModelManifest) -> WeightAccounting {
     let selected_model_path = manifest.model_path.clone();
     let selected = selected_model_path.iter().cloned().collect::<Vec<_>>();
-    let selected_file = selected_model_path
-        .as_deref()
-        .and_then(|path| manifest.files.iter().find(|file| file.path == path));
-
     if matches!(manifest.format, ModelFormat::Gguf | ModelFormat::Onnx)
-        && let Some(file) = selected_file
+        && let Some(path) = selected_model_path.as_deref()
+        && let Some(accounting) =
+            selected_model_weight_accounting(manifest, path, "selected runtime model file")
     {
-        return single_selected_weight_accounting(manifest, file, "selected runtime model file");
+        return accounting;
     }
 
     if matches!(
@@ -5559,7 +5583,89 @@ fn estimate_weight_accounting_without_store(manifest: &ModelManifest) -> WeightA
         ignored,
         selected,
         confidence,
+        warnings: Vec::new(),
     }
+}
+
+fn selected_model_weight_accounting(
+    manifest: &ModelManifest,
+    selected_path: &str,
+    reason: &str,
+) -> Option<WeightAccounting> {
+    let (selected, mut warnings) = if manifest.format == ModelFormat::Gguf {
+        match crate::model_store::gguf_shard_paths(selected_path) {
+            Ok(Some(shards)) => (shards, Vec::new()),
+            Err(err) => (
+                vec![selected_path.to_string()],
+                vec![format!(
+                    "Cannot determine the complete GGUF shard set: {err}"
+                )],
+            ),
+            Ok(None) => {
+                let file = manifest
+                    .files
+                    .iter()
+                    .find(|file| file.path == selected_path)?;
+                return Some(single_selected_weight_accounting(manifest, file, reason));
+            }
+        }
+    } else {
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == selected_path)?;
+        return Some(single_selected_weight_accounting(manifest, file, reason));
+    };
+
+    let files_by_path = manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<HashMap<_, _>>();
+    let mut counted = Vec::new();
+    let mut missing = Vec::new();
+    let mut unknown_sizes = Vec::new();
+    for path in &selected {
+        if let Some(file) = files_by_path.get(path.as_str()) {
+            counted.push(estimate_file_entry(file, "shard of selected GGUF model"));
+            if file.size == 0 {
+                unknown_sizes.push(path.as_str());
+            }
+        } else {
+            missing.push(path.as_str());
+        }
+    }
+    if let Some(first_missing) = missing.first() {
+        warnings.push(format!(
+            "GGUF shard set is incomplete: {} required shard(s) are missing, including '{first_missing}'. The weight total is only a lower bound.",
+            missing.len()
+        ));
+    }
+    if let Some(first_unknown) = unknown_sizes.first() {
+        warnings.push(format!(
+            "GGUF shard sizes are incomplete: {} shard(s) have no size, including '{first_unknown}'. The weight total is only a lower bound.",
+            unknown_sizes.len()
+        ));
+    }
+    let selected_paths = selected.iter().map(String::as_str).collect::<HashSet<_>>();
+    let ignored = manifest
+        .files
+        .iter()
+        .filter(|file| !selected_paths.contains(file.path.as_str()))
+        .map(|file| estimate_file_entry(file, "not selected for this model"))
+        .collect();
+
+    Some(WeightAccounting {
+        counted,
+        ignored,
+        selected,
+        confidence: if warnings.is_empty() {
+            EstimateConfidence::High
+        } else {
+            EstimateConfidence::Low
+        },
+        warnings,
+    })
 }
 
 fn single_selected_weight_accounting(
@@ -5578,6 +5684,7 @@ fn single_selected_weight_accounting(
         ignored,
         selected: vec![selected_file.path.clone()],
         confidence: EstimateConfidence::High,
+        warnings: Vec::new(),
     }
 }
 
@@ -5641,6 +5748,7 @@ fn safetensors_index_weight_accounting_from_value(
         } else {
             EstimateConfidence::High
         },
+        warnings: Vec::new(),
     })
 }
 
@@ -9595,6 +9703,7 @@ fn backend_unavailability_reason(
                     mode,
                     LlamaServerInstallOptions {
                         verbose: selection_options.verbose_backend_installs,
+                        ..Default::default()
                     },
                 )
                 .and_then(|_| LlamaServerBackend::probe(store, mode).map(|_| ()))
@@ -15479,6 +15588,82 @@ mod tests {
     }
 
     #[test]
+    fn estimate_gguf_counts_all_selected_variant_shards() {
+        let store = test_store("estimate-gguf-shards");
+        let mut manifest = test_manifest(ModelFormat::Gguf, Some("deepseek-moe"));
+        let first = "files/Q2_K_S/model-Q2_K_S-00001-of-00002.gguf";
+        let second = "files/Q2_K_S/model-Q2_K_S-00002-of-00002.gguf";
+        let total_bytes = 98_600_000_000;
+        manifest.files = vec![
+            model_file(first, 5 * MIB),
+            model_file(second, total_bytes - 5 * MIB),
+            model_file("files/Q4_K_M/model-Q4_K_M-00001-of-00002.gguf", 80 * GIB),
+            model_file("files/other/model-Q2_K_S-00001-of-00002.gguf", 80 * GIB),
+            model_file("files/tokenizer.json", MIB),
+        ];
+
+        for selected in [first, second] {
+            manifest.model_path = Some(selected.to_string());
+            let accounting = estimate_weight_accounting_without_store(&manifest);
+            assert_eq!(accounting.total_bytes(), total_bytes);
+            assert_eq!(accounting.selected, vec![first, second]);
+            assert_eq!(accounting.counted.len(), 2);
+            assert_eq!(accounting.ignored.len(), 3);
+            assert_eq!(accounting.confidence, EstimateConfidence::High);
+            assert!(accounting.warnings.is_empty());
+
+            let report = estimate_model_memory(
+                &store,
+                &manifest,
+                SystemMemory {
+                    total_bytes: Some(64 * GIB),
+                    available_bytes: Some(48 * GIB),
+                },
+            );
+            assert_eq!(report.weight_files_bytes, total_bytes);
+            assert_eq!(report.result, EstimateResult::LikelyOom);
+        }
+    }
+
+    #[test]
+    fn estimate_incomplete_gguf_shards_warn_instead_of_reporting_fit() {
+        let store = test_store("estimate-incomplete-gguf-shards");
+        let first = "files/model-Q2_K_S-00001-of-00002.gguf";
+        let second = "files/model-Q2_K_S-00002-of-00002.gguf";
+        for (files, unavailable_path) in [
+            (vec![model_file(first, 5 * MIB)], second),
+            (vec![model_file(second, 5 * MIB)], first),
+            (
+                vec![model_file(first, 5 * MIB), model_file(second, 0)],
+                second,
+            ),
+        ] {
+            let mut manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+            manifest.model_path = Some(first.to_string());
+            manifest.files = files;
+            let accounting = estimate_weight_accounting_without_store(&manifest);
+            assert_eq!(accounting.total_bytes(), 5 * MIB);
+            assert_eq!(accounting.selected, vec![first, second]);
+            assert_eq!(accounting.confidence, EstimateConfidence::Low);
+            assert_eq!(accounting.warnings.len(), 1);
+            assert!(accounting.warnings[0].contains(unavailable_path));
+
+            let report = estimate_model_memory(
+                &store,
+                &manifest,
+                SystemMemory {
+                    total_bytes: Some(64 * GIB),
+                    available_bytes: Some(48 * GIB),
+                },
+            );
+            assert_eq!(report.confidence, EstimateConfidence::Low);
+            assert_eq!(report.result, EstimateResult::Warning);
+            assert!(report.notes[0].contains("only a lower bound"));
+            assert!(report.recommendation.contains("GGUF shard warnings"));
+        }
+    }
+
+    #[test]
     fn estimate_weight_filtering_ignores_metadata_files() {
         let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("llama"));
         manifest.model_path = Some("files/model.safetensors".to_string());
@@ -15762,6 +15947,46 @@ mod tests {
 
         assert_eq!(manifest.format, ModelFormat::Gguf);
         assert_eq!(manifest.model_path.as_deref(), Some("files/tiny.Q8_0.gguf"));
+    }
+
+    #[test]
+    fn estimate_remote_explicit_gguf_file_counts_matching_shards() {
+        let first = "Q2_K_S/model-Q2_K_S-00001-of-00002.gguf";
+        let second = "Q2_K_S/model-Q2_K_S-00002-of-00002.gguf";
+        let total_bytes = 98_600_000_000;
+        let remote = remote_hf_test_model(
+            "org/Split-GGUF",
+            Some(serde_json::json!({"model_type": "deepseek_moe"})),
+            &[
+                (first, 5 * MIB),
+                (second, total_bytes - 5 * MIB),
+                ("model.Q4_K_M.gguf", 150 * GIB),
+            ],
+        );
+
+        for requested in [first.to_string(), format!("files/{second}")] {
+            let manifest = remote_hf_manifest(&remote, Some(&requested)).unwrap();
+            let selected_path = format!(
+                "files/{}",
+                normalize_remote_hf_file_path(&requested).unwrap()
+            );
+            assert_eq!(manifest.model_path.as_deref(), Some(selected_path.as_str()));
+            let accounting = selected_model_weight_accounting(
+                &manifest,
+                &selected_path,
+                "explicit --file selected for remote estimate",
+            )
+            .unwrap();
+
+            assert_eq!(accounting.total_bytes(), total_bytes);
+            assert_eq!(
+                accounting.selected,
+                vec![format!("files/{first}"), format!("files/{second}")]
+            );
+            assert_eq!(accounting.ignored.len(), 1);
+            assert_eq!(accounting.ignored[0].path, "files/model.Q4_K_M.gguf");
+            assert!(accounting.warnings.is_empty());
+        }
     }
 
     #[test]

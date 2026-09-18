@@ -1,0 +1,409 @@
+{
+  "metadata": {
+    "command": [
+      "werk",
+      "--model-home",
+      "<test-home>/model-home",
+      "--no-auto-install-backends",
+      "--backend",
+      "cuda",
+      "--ctx-size",
+      "4096",
+      "--batch-size",
+      "2048",
+      "--ubatch-size",
+      "512",
+      "--kv-cache-type",
+      "f16",
+      "chat",
+      "deepseek-test",
+      "--verbose",
+      "--persistence",
+      "--session",
+      "upstream-check",
+      "--max-tokens",
+      "8",
+      "--temperature",
+      "0"
+    ],
+    "model_source": "<werk-home>/models/deepseek-v4-flash-q2-k-s/files",
+    "runtime": "<werk-home>/backends/llama-cuda/upstream-ec928150501c/build/bin/llama-server",
+    "native_args": "--cpu-moe --reasoning off --verbosity 4",
+    "removed_inherited_environment_keys": [],
+    "linux_page_bytes": 4096,
+    "sample_interval_seconds": 1,
+    "phase_timeout_seconds": 900,
+    "cpu_thread_policy": "native default; no threads override",
+    "cpu_model": "Intel(R) Xeon(R) CPU E5-2673 v3 @ 2.40GHz",
+    "logical_cpus": 48,
+    "uname": [
+      "Linux",
+      "<wsl-host>",
+      "6.18.33.2-microsoft-standard-WSL2",
+      "#1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026",
+      "x86_64"
+    ],
+    "runtime_version": "version: 0.4.1-dev (build 1, commit ec92815)\nbuilt with GNU 11.4.0 for Linux x86_64\n"
+  },
+  "phases": [
+    {
+      "phase": 0,
+      "exit_code": 0,
+      "wall_seconds": 334.0050440359919,
+      "timed_out": false,
+      "communicate_errors": [],
+      "log_path": "<test-home>/phase-0.log",
+      "sample_path": "<test-home>/phase-0-samples.jsonl",
+      "werk_stats": {
+        "total_duration": [
+          "71.692041s",
+          "54.01619s"
+        ],
+        "first_token": [
+          "45.850902s",
+          "28.774962s"
+        ],
+        "prompt_total_tokens": [
+          "14 token(s)",
+          "33 token(s)"
+        ],
+        "prompt_cached_tokens": [
+          "0 token(s)",
+          "21 token(s)"
+        ],
+        "prompt_eval_tokens": [
+          "14 token(s)",
+          "12 token(s)"
+        ],
+        "prompt_eval_duration": [
+          "45.834571s",
+          "28.766817s"
+        ],
+        "prompt_eval_rate": [
+          "0.31 tokens/s",
+          "0.42 tokens/s"
+        ],
+        "generated_tokens": [
+          "8 token(s)",
+          "8 token(s)"
+        ],
+        "generation_duration": [
+          "25.851606s",
+          "25.24113s"
+        ],
+        "generation_rate": [
+          "0.31 tokens/s",
+          "0.32 tokens/s"
+        ],
+        "finish_reason": [
+          "length",
+          "length"
+        ],
+        "persistence_lines": [
+          "[werk chat] persistence enabled: 0 saved messages",
+          "[werk chat] native KV cache unavailable: llama.cpp capability probe did not prove restored cache reuse",
+          "[werk chat] conversation persistence active; native KV persistence unavailable on this route"
+        ],
+        "native_snapshot_restored": false,
+        "native_snapshot_saved": false,
+        "native_kv_unavailable": true
+      },
+      "resources": {
+        "observed_processes": [
+          {
+            "pid": 408097,
+            "comm": "werk",
+            "state": "S",
+            "ppid": 408032,
+            "pgrp": 408097,
+            "start_ticks": 21853841,
+            "cpu_seconds": 1.61,
+            "minor_faults": 27241,
+            "major_faults": 16,
+            "rss_bytes": 175767552,
+            "read_bytes": 256844928,
+            "write_bytes": 20480,
+            "rchar": 107099660,
+            "wchar": 185935
+          },
+          {
+            "pid": 408159,
+            "comm": "llama-server",
+            "state": "D",
+            "ppid": 408097,
+            "pgrp": 408097,
+            "start_ticks": 21853927,
+            "cpu_seconds": 0.1,
+            "minor_faults": 27408,
+            "major_faults": 0,
+            "rss_bytes": 184688640,
+            "read_bytes": 20544,
+            "write_bytes": 0,
+            "rchar": 68059,
+            "wchar": 23
+          },
+          {
+            "pid": 408177,
+            "comm": "llama-server",
+            "state": "R",
+            "ppid": 408097,
+            "pgrp": 408097,
+            "start_ticks": 21853971,
+            "cpu_seconds": 1647.73,
+            "minor_faults": 2396799,
+            "major_faults": 735260,
+            "rss_bytes": 61101895680,
+            "read_bytes": 183909908544,
+            "write_bytes": 13004800,
+            "rchar": 27414641,
+            "wchar": 12986811
+          },
+          {
+            "pid": 408606,
+            "comm": "llama-server",
+            "state": "D",
+            "ppid": 408097,
+            "pgrp": 408097,
+            "start_ticks": 21865404,
+            "cpu_seconds": 0.37,
+            "minor_faults": 27754,
+            "major_faults": 716,
+            "rss_bytes": 199479296,
+            "read_bytes": 160579648,
+            "write_bytes": 0,
+            "rchar": 3757635,
+            "wchar": 58159
+          }
+        ],
+        "observed_process_tree_cpu_seconds": 1649.81,
+        "mean_cpu_percent_one_core_100": 493.94763027058326,
+        "peak_process_tree_rss_bytes": 61269798912,
+        "native_server_storage_read_bytes": 184070508736,
+        "native_server_read_syscall_chars": 31240335,
+        "native_server_major_faults": 735976,
+        "system_vm_counter_deltas": {
+          "pgfault": 3786593,
+          "pgmajfault": 740992,
+          "pswpin": 1534,
+          "pswpout": 395102,
+          "pgpgin": 180451612,
+          "pgpgout": 1597636
+        },
+        "system_swap_in_bytes": 6283264,
+        "system_swap_out_bytes": 1618337792,
+        "system_mem_kib_start": {
+          "MemTotal": 65613288,
+          "MemAvailable": 59820020,
+          "MemFree": 39553796,
+          "Cached": 20750280,
+          "Buffers": 33380,
+          "SwapTotal": 16777216,
+          "SwapFree": 16728668,
+          "Dirty": 184,
+          "Writeback": 0
+        },
+        "system_mem_kib_end": {
+          "MemTotal": 65613288,
+          "MemAvailable": 61321864,
+          "MemFree": 1034208,
+          "Cached": 60740432,
+          "Buffers": 2476,
+          "SwapTotal": 16777216,
+          "SwapFree": 15139404,
+          "Dirty": 696,
+          "Writeback": 0
+        },
+        "notes": [
+          "Process counters are sampled once per second and may miss short-lived processes or final increments.",
+          "RSS includes file-backed pages and shared mappings; summing processes can count shared pages more than once.",
+          "read_bytes measures Linux-accounted storage reads including file-backed cache misses; it does not measure host physical SSD traffic.",
+          "rchar measures read-like syscall characters; mmap page faults are not fully represented by rchar.",
+          "Major faults can involve file-backed weights or swap and do not by themselves prove swap activity.",
+          "pswpin/pswpout are system-wide swap-page counters; pgpgin/pgpgout use KiB despite sharing the vm counter object."
+        ]
+      }
+    },
+    {
+      "phase": 1,
+      "exit_code": 0,
+      "wall_seconds": 344.5091073839867,
+      "timed_out": false,
+      "communicate_errors": [],
+      "log_path": "<test-home>/phase-1.log",
+      "sample_path": "<test-home>/phase-1-samples.jsonl",
+      "werk_stats": {
+        "total_duration": [
+          "156.883445s"
+        ],
+        "first_token": [
+          "138.940674s"
+        ],
+        "prompt_total_tokens": [
+          "52 token(s)"
+        ],
+        "prompt_cached_tokens": [
+          "0 token(s)"
+        ],
+        "prompt_eval_tokens": [
+          "52 token(s)"
+        ],
+        "prompt_eval_duration": [
+          "138.908561s"
+        ],
+        "prompt_eval_rate": [
+          "0.37 tokens/s"
+        ],
+        "generated_tokens": [
+          "8 token(s)"
+        ],
+        "generation_duration": [
+          "17.952909s"
+        ],
+        "generation_rate": [
+          "0.45 tokens/s"
+        ],
+        "finish_reason": [
+          "length"
+        ],
+        "persistence_lines": [
+          "[werk chat] persistence enabled: 4 saved messages restored",
+          "[werk chat] native KV cache unavailable: llama.cpp capability probe did not prove restored cache reuse",
+          "[werk chat] conversation persistence active; native KV persistence unavailable on this route"
+        ],
+        "native_snapshot_restored": false,
+        "native_snapshot_saved": false,
+        "native_kv_unavailable": true
+      },
+      "resources": {
+        "observed_processes": [
+          {
+            "pid": 409042,
+            "comm": "werk",
+            "state": "S",
+            "ppid": 408032,
+            "pgrp": 409042,
+            "start_ticks": 21887243,
+            "cpu_seconds": 1.64,
+            "minor_faults": 27516,
+            "major_faults": 671,
+            "rss_bytes": 175804416,
+            "read_bytes": 191550112960,
+            "write_bytes": 13021184,
+            "rchar": 134513449,
+            "wchar": 13172329
+          },
+          {
+            "pid": 409094,
+            "comm": "llama-server",
+            "state": "R",
+            "ppid": 409042,
+            "pgrp": 409042,
+            "start_ticks": 21887320,
+            "cpu_seconds": 0.16,
+            "minor_faults": 26047,
+            "major_faults": 27,
+            "rss_bytes": 177065984,
+            "read_bytes": 40667584,
+            "write_bytes": 0,
+            "rchar": 24176,
+            "wchar": 0
+          },
+          {
+            "pid": 409120,
+            "comm": "llama-server",
+            "state": "D",
+            "ppid": 409042,
+            "pgrp": 409042,
+            "start_ticks": 21887409,
+            "cpu_seconds": 1766.84,
+            "minor_faults": 3199000,
+            "major_faults": 702794,
+            "rss_bytes": 64377495552,
+            "read_bytes": 190798790720,
+            "write_bytes": 13008896,
+            "rchar": 27414543,
+            "wchar": 12984739
+          },
+          {
+            "pid": 409377,
+            "comm": "llama-server",
+            "state": "D",
+            "ppid": 409042,
+            "pgrp": 409042,
+            "start_ticks": 21895655,
+            "cpu_seconds": 0.02,
+            "minor_faults": 1181,
+            "major_faults": 7,
+            "rss_bytes": 13889536,
+            "read_bytes": 29004608,
+            "write_bytes": 0,
+            "rchar": 22512,
+            "wchar": 0
+          },
+          {
+            "pid": 409386,
+            "comm": "llama-server",
+            "state": "R",
+            "ppid": 409042,
+            "pgrp": 409042,
+            "start_ticks": 21895749,
+            "cpu_seconds": 0.11,
+            "minor_faults": 27409,
+            "major_faults": 0,
+            "rss_bytes": 184344576,
+            "read_bytes": 20544,
+            "write_bytes": 0,
+            "rchar": 67961,
+            "wchar": 23
+          }
+        ],
+        "observed_process_tree_cpu_seconds": 1768.77,
+        "mean_cpu_percent_one_core_100": 513.4174865306377,
+        "peak_process_tree_rss_bytes": 64546615296,
+        "native_server_storage_read_bytes": 190868483456,
+        "native_server_read_syscall_chars": 27529192,
+        "native_server_major_faults": 702828,
+        "system_vm_counter_deltas": {
+          "pgfault": 4504836,
+          "pgmajfault": 715985,
+          "pswpin": 12625,
+          "pswpout": 597013,
+          "pgpgin": 187897704,
+          "pgpgout": 2417116
+        },
+        "system_swap_in_bytes": 51712000,
+        "system_swap_out_bytes": 2445365248,
+        "system_mem_kib_start": {
+          "MemTotal": 65613288,
+          "MemAvailable": 61322432,
+          "MemFree": 1034108,
+          "Cached": 60740440,
+          "Buffers": 2616,
+          "SwapTotal": 16777216,
+          "SwapFree": 15139404,
+          "Dirty": 696,
+          "Writeback": 0
+        },
+        "system_mem_kib_end": {
+          "MemTotal": 65613288,
+          "MemAvailable": 63637600,
+          "MemFree": 1189524,
+          "Cached": 62883180,
+          "Buffers": 2196,
+          "SwapTotal": 16777216,
+          "SwapFree": 12896488,
+          "Dirty": 1132,
+          "Writeback": 0
+        },
+        "notes": [
+          "Process counters are sampled once per second and may miss short-lived processes or final increments.",
+          "RSS includes file-backed pages and shared mappings; summing processes can count shared pages more than once.",
+          "read_bytes measures Linux-accounted storage reads including file-backed cache misses; it does not measure host physical SSD traffic.",
+          "rchar measures read-like syscall characters; mmap page faults are not fully represented by rchar.",
+          "Major faults can involve file-backed weights or swap and do not by themselves prove swap activity.",
+          "pswpin/pswpout are system-wide swap-page counters; pgpgin/pgpgout use KiB despite sharing the vm counter object."
+        ]
+      }
+    }
+  ]
+}

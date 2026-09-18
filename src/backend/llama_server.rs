@@ -14,11 +14,13 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+mod cuda_offload;
 mod runtime_state;
 
 use runtime_state::{
-    LlamaProcessStateRuntime, LlamaRuntimeStateAdapter, cleanup_llama_snapshot_dir,
-    llama_state_args_are_effective, prepare_llama_state_snapshot_dir, probe_llama_process_identity,
+    LlamaChatPersistence, LlamaProcessStateRuntime, LlamaRuntimeStateAdapter,
+    cleanup_llama_snapshot_dir, llama_state_args_are_effective, prepare_llama_state_snapshot_dir,
+    probe_llama_process_identity,
 };
 
 use super::{
@@ -75,6 +77,7 @@ struct LlamaServerProcess {
 
 struct LlamaServerChatSession {
     server: Arc<LlamaServerProcess>,
+    persistence: Option<Arc<LlamaChatPersistence>>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +106,7 @@ pub struct BackendDoctorCheck {
 struct ServerCompletion {
     text: String,
     prompt_tokens: usize,
+    cached_prompt_tokens: Option<usize>,
     completion_tokens: usize,
     prompt_seconds: f64,
     decode_seconds: f64,
@@ -298,7 +302,7 @@ impl LlamaServerBackend {
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
             timings: GenerationTimings {
-                cached_prompt_tokens: None,
+                cached_prompt_tokens: completion.cached_prompt_tokens,
                 load_seconds,
                 warmup_seconds: 0.0,
                 first_token_seconds: completion.first_token_seconds,
@@ -329,7 +333,28 @@ impl GenerationBackend for LlamaServerBackend {
             return Ok(None);
         }
         let (server, _, _) = self.cached_server(manifest, false)?;
-        Ok(Some(Box::new(LlamaServerChatSession { server })))
+        Ok(Some(Box::new(LlamaServerChatSession {
+            server,
+            persistence: None,
+        })))
+    }
+
+    fn start_persistent_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        _seed: Option<u64>,
+        cache_directory: &Path,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        if manifest.format != ModelFormat::Gguf {
+            return Ok(None);
+        }
+        let (server, _, _) = self.cached_server(manifest, false)?;
+        let persistence =
+            LlamaChatPersistence::open(&server, &self.store, manifest, cache_directory)?;
+        Ok(Some(Box::new(LlamaServerChatSession {
+            server,
+            persistence: Some(Arc::new(persistence)),
+        })))
     }
 
     fn task_readiness(
@@ -398,7 +423,9 @@ impl ChatGenerationSession for LlamaServerChatSession {
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
         let total_started = Instant::now();
         self.server.print_debug(&request, true);
-        let completion = self.server.complete(&request, None)?;
+        let completion =
+            self.server
+                .complete_with_cache(&request, None, self.persistence.as_deref())?;
         Ok(GenerateResponse {
             text: completion.text,
             assistant_message: None,
@@ -406,7 +433,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
             timings: GenerationTimings {
-                cached_prompt_tokens: None,
+                cached_prompt_tokens: completion.cached_prompt_tokens,
                 load_seconds: 0.0,
                 warmup_seconds: 0.0,
                 first_token_seconds: completion.first_token_seconds,
@@ -420,12 +447,13 @@ impl ChatGenerationSession for LlamaServerChatSession {
 
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream {
         let server = self.server.clone();
+        let persistence = self.persistence.clone();
         let (tx, rx) = mpsc::channel(16);
         tokio::task::spawn_blocking(move || {
             let total_started = Instant::now();
             server.print_debug(&request, true);
             let result = server
-                .complete(&request, Some(tx.clone()))
+                .complete_with_cache(&request, Some(tx.clone()), persistence.as_deref())
                 .map(|completion| GenerateResponse {
                     text: completion.text,
                     assistant_message: None,
@@ -433,7 +461,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                     completion_tokens: completion.completion_tokens,
                     finish_reason: completion.finish_reason,
                     timings: GenerationTimings {
-                        cached_prompt_tokens: None,
+                        cached_prompt_tokens: completion.cached_prompt_tokens,
                         load_seconds: 0.0,
                         warmup_seconds: 0.0,
                         first_token_seconds: completion.first_token_seconds,
@@ -572,6 +600,15 @@ impl LlamaServerProcess {
         request: &GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<ServerCompletion> {
+        self.complete_with_cache(request, tx, None)
+    }
+
+    fn complete_with_cache(
+        &self,
+        request: &GenerateRequest,
+        tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+        persistence: Option<&LlamaChatPersistence>,
+    ) -> Result<ServerCompletion> {
         let _state_operation = self
             .state_gate
             .lock()
@@ -583,6 +620,7 @@ impl LlamaServerProcess {
             );
         }
         let started = Instant::now();
+        let cache_notice = persistence.map(|cache| cache.restore(self)).transpose()?;
         let use_chat_endpoint = !request.messages.is_empty() || request_has_images(request);
         let (path, body) = if use_chat_endpoint {
             ("/v1/chat/completions", chat_completion_body(request))
@@ -603,15 +641,27 @@ impl LlamaServerProcess {
             ..Default::default()
         };
         let mut sse = SseAccumulator::default();
+        let mut finished = false;
+        if let Some(notice) = cache_notice {
+            completion.backend_diagnostics.push(notice);
+        }
 
         stream_body(&mut stream, |bytes| {
             sse.push(bytes, |event| {
                 if event == "[DONE]" {
-                    completion.finish_reason = "stop".to_string();
+                    finished = true;
                     return Ok(());
                 }
                 let value: Value = serde_json::from_str(event)
                     .with_context(|| format!("invalid llama-server SSE event: {event}"))?;
+                if let Some(error) = value.get("error") {
+                    bail!("llama-server generation failed: {error}");
+                }
+                finished |= value.get("stop").and_then(Value::as_bool) == Some(true)
+                    || value
+                        .pointer("/choices/0/finish_reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| !reason.is_empty());
                 let chunk = if use_chat_endpoint {
                     update_chat_completion_from_event(&mut completion, &value);
                     if chat_delta_has_reasoning_content(&value) {
@@ -638,6 +688,11 @@ impl LlamaServerProcess {
             })
         })?;
 
+        if !finished {
+            bail!(
+                "llama-server stream ended before a completion marker; native snapshot not saved"
+            );
+        }
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
         if use_chat_endpoint
             && completion.text.trim().is_empty()
@@ -647,6 +702,9 @@ impl LlamaServerProcess {
             bail!(
                 "llama.cpp generated hidden reasoning without assistant text; retry with a larger --max-tokens value or disable reasoning for this model"
             );
+        }
+        if let Some(cache) = persistence {
+            completion.backend_diagnostics.push(cache.save(self));
         }
         Ok(completion)
     }
@@ -1160,6 +1218,9 @@ fn safe_manifest_relative_path(path: &Path) -> bool {
 }
 
 fn update_completion_from_event(completion: &mut ServerCompletion, value: &Value) {
+    if let Some(tokens) = usize_field_any(value, &[&["timings", "cache_n"]]) {
+        completion.cached_prompt_tokens = Some(tokens);
+    }
     if value.get("stop").and_then(Value::as_bool).unwrap_or(false) {
         completion.finish_reason = "stop".to_string();
     }
@@ -1192,13 +1253,15 @@ fn update_completion_from_event(completion: &mut ServerCompletion, value: &Value
         value,
         &[
             &["tokens_evaluated"],
-            &["prompt_n"],
             &["n_prompt"],
-            &["timings", "prompt_n"],
             &["timings", "n_prompt"],
             &["timings", "tokens_evaluated"],
         ],
-    ) && should_update_count(completion.prompt_tokens, value)
+    )
+    .or_else(|| {
+        usize_field_any(value, &[&["prompt_n"], &["timings", "prompt_n"]])
+            .map(|evaluated| evaluated.saturating_add(completion.cached_prompt_tokens.unwrap_or(0)))
+    }) && should_update_count(completion.prompt_tokens, value)
     {
         completion.prompt_tokens = value;
     }
@@ -1215,6 +1278,7 @@ fn update_completion_from_event(completion: &mut ServerCompletion, value: &Value
 }
 
 fn update_chat_completion_from_event(completion: &mut ServerCompletion, value: &Value) {
+    update_completion_from_event(completion, value);
     if let Some(choice) = value
         .get("choices")
         .and_then(Value::as_array)
@@ -1225,6 +1289,12 @@ fn update_chat_completion_from_event(completion: &mut ServerCompletion, value: &
         completion.finish_reason = reason.to_string();
     }
     if let Some(usage) = value.get("usage") {
+        if let Some(tokens) = usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+        {
+            completion.cached_prompt_tokens = usize::try_from(tokens).ok();
+        }
         if let Some(tokens) = usage.get("prompt_tokens").and_then(Value::as_u64) {
             completion.prompt_tokens = tokens as usize;
         }
@@ -1494,13 +1564,17 @@ fn help_has_exact_option(help: &str, option: &str) -> bool {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LlamaServerInstallOptions {
     pub verbose: bool,
+    pub cuda_offload: bool,
 }
 
 pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<PathBuf> {
     install_managed_llama_server_with_options(
         store,
         mode,
-        LlamaServerInstallOptions { verbose: true },
+        LlamaServerInstallOptions {
+            verbose: true,
+            ..Default::default()
+        },
     )
 }
 
@@ -1512,14 +1586,24 @@ pub fn install_managed_llama_server_with_options(
     if mode == LlamaCppMode::Metal && !cfg!(target_os = "macos") {
         bail!("llama.cpp Metal backend can only be built on macOS");
     }
+    if options.cuda_offload && mode != LlamaCppMode::Cuda {
+        bail!("the expert-cache runtime requires CUDA");
+    }
 
-    let root = managed_backend_dir(store, mode);
+    let base_root = managed_backend_dir(store, mode);
+    let root = if options.cuda_offload {
+        base_root.join(format!("offload-{}", cuda_offload::REVISION))
+    } else {
+        base_root
+    };
     let source_dir = root.join("llama.cpp");
     let build_dir = root.join("build");
     fs::create_dir_all(&root)
         .with_context(|| format!("failed to create backend cache {}", root.display()))?;
 
-    if !source_dir.join(".git").is_dir() {
+    if options.cuda_offload {
+        cuda_offload::prepare_source(&source_dir, options.verbose)?;
+    } else if !source_dir.join(".git").is_dir() {
         if source_dir.exists() {
             bail!(
                 "managed llama.cpp source directory exists but is not a git checkout: {}",
@@ -1657,13 +1741,19 @@ pub fn install_managed_llama_server_with_options(
         options.verbose,
     )?;
 
-    let executable = find_managed_server(store, mode).ok_or_else(|| {
-        anyhow!(
-            "llama-server build finished, but no executable was found under {}",
-            root.display()
-        )
-    })?;
+    let executable = server_candidates_under(&root)
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            anyhow!(
+                "llama-server build finished, but no executable was found under {}",
+                root.display()
+            )
+        })?;
     validate_llama_server(&executable, mode)?;
+    if options.cuda_offload {
+        cuda_offload::validate_runtime(&executable)?;
+    }
     fs::write(
         managed_path_file(store, mode),
         executable.display().to_string(),
@@ -1989,6 +2079,10 @@ fn find_managed_server(store: &ModelStore, mode: LlamaCppMode) -> Option<PathBuf
 
 fn managed_server_candidates(store: &ModelStore, mode: LlamaCppMode) -> Vec<PathBuf> {
     let root = managed_backend_dir(store, mode);
+    server_candidates_under(&root)
+}
+
+fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
     let source = root.join("llama.cpp");
     let build = root.join("build");
     let exe = default_executable_name();
@@ -3356,7 +3450,9 @@ Agent 3
         let mut completion = ServerCompletion::default();
         let value = json!({
             "choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 4, "completion_tokens": 2}
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2,
+                "prompt_tokens_details": {"cached_tokens": 3}},
+            "timings": {"prompt_n": 1, "cache_n": 3, "prompt_ms": 10.0, "predicted_ms": 20.0}
         });
 
         assert_eq!(chat_delta_content(&value).as_deref(), Some("hello"));
@@ -3365,6 +3461,16 @@ Agent 3
         assert_eq!(completion.prompt_tokens, 4);
         assert_eq!(completion.completion_tokens, 2);
         assert_eq!(completion.finish_reason, "stop");
+        assert_eq!(completion.cached_prompt_tokens, Some(3));
+        assert_eq!(completion.prompt_seconds, 0.01);
+        assert_eq!(completion.decode_seconds, 0.02);
+        update_chat_completion_from_event(
+            &mut completion,
+            &json!({"usage": {
+                "prompt_tokens": 4, "prompt_tokens_details": {"cached_tokens": 0}
+            }}),
+        );
+        assert_eq!(completion.cached_prompt_tokens, Some(0));
     }
 
     #[test]
@@ -3600,6 +3706,26 @@ Agent 3
         assert!((completion.prompt_seconds - 0.214738).abs() < 0.000001);
         assert!((completion.decode_seconds - 16.418107).abs() < 0.000001);
         assert_eq!(completion.finish_reason, "stop");
+    }
+
+    #[test]
+    fn completion_timing_counts_include_cached_prefix_in_prompt_total() {
+        let mut completion = ServerCompletion::default();
+        update_completion_from_event(
+            &mut completion,
+            &json!({
+                "timings": {"prompt_n": 16, "cache_n": 30}
+            }),
+        );
+        assert_eq!(completion.prompt_tokens, 46);
+        assert_eq!(completion.cached_prompt_tokens, Some(30));
+        update_completion_from_event(
+            &mut completion,
+            &json!({
+                "tokens_evaluated": 50, "timings": {"prompt_n": 20, "cache_n": 30}
+            }),
+        );
+        assert_eq!(completion.prompt_tokens, 50);
     }
 
     #[test]
