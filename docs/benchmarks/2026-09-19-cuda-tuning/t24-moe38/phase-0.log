@@ -1,0 +1,376 @@
+Using llama.cpp server CUDA backend
+0.00.084.038 I cmn  common_param: common_params_print_info: build 1 (ec92815) with GNU 11.4.0 for Linux x86_64
+0.00.084.095 I cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+0.00.084.096 I cmn  common_param: device_info:
+0.00.316.525 I cmn  common_param:   - CUDA0   : NVIDIA GeForce RTX 3090 (24575 MiB, 23303 MiB free)
+0.00.316.589 I cmn  common_param:   - CPU     : Intel(R) Xeon(R) CPU E5-2673 v3 @ 2.40GHz (100579 MiB, 100579 MiB free)
+0.00.316.727 I cmn  common_param: system_info: n_threads = 24 (n_threads_batch = 24) / 48 | CUDA : ARCHS = 860 | USE_GRAPHS = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.316.830 I srv          init: running without SSL
+0.00.316.978 I srv          init: using 47 threads for HTTP server
+0.00.317.769 W srv  llama_server: -----------------
+0.00.317.805 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.317.805 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.317.806 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.317.806 W srv  llama_server: -----------------
+0.00.317.842 I srv         start: binding port with default address family
+0.00.319.556 I srv    load_model: loading model '<werk-home>/models/deepseek-v4-flash-q2-k-s/files/DeepSeek-V4-Flash-Q2_K_S-00001-of-00002.gguf'
+0.00.319.637 I srv    load_model: local path '<werk-home>/models/deepseek-v4-flash-q2-k-s/files/DeepSeek-V4-Flash-Q2_K_S-00001-of-00002.gguf'
+0.00.319.682 I cmn  common_init_: fitting params to device memory ...
+0.00.319.686 I cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.319.810 I common_params_fit_impl: getting device memory data for initial parameters:
+0.01.108.612 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.01.108.656 I common_memory_breakdown_print: |   - CUDA0 (RTX 3090)   | 24575 = 23291 + (17785 = 16875 +      75 +     835) +      -16501 |
+0.01.108.657 I common_memory_breakdown_print: |   - Host               |                  77163 = 77144 +       0 +      19                |
+0.01.148.803 I common_params_fit_impl: projected to use 17785 MiB of device memory vs. 23291 MiB of free device memory
+0.01.148.851 I common_params_fit_impl: will leave 5505 >= 1024 MiB of free device memory, no changes needed
+0.01.148.852 I common_fit_params: successfully fit params to free device memory
+0.01.148.859 I common_fit_params: fitting params to free memory took 0.83 seconds
+0.01.208.413 I llama_model_loader: additional 1 GGUFs metadata loaded.
+0.01.208.454 I llama_model_loader: loaded meta data with 61 key-value pairs and 1328 tensors from <werk-home>/models/deepseek-v4-flash-q2-k-s/files/DeepSeek-V4-Flash-Q2_K_S-00001-of-00002.gguf (version GGUF V3 (latest))
+0.01.208.503 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.01.208.508 I llama_model_loader: - kv   0:                       general.architecture str              = deepseek4
+0.01.208.512 I llama_model_loader: - kv   1:                    tokenizer.chat_template str              = {%- if not add_generation_prompt is d...
+0.01.208.513 I llama_model_loader: - kv   2:                               general.type str              = model
+0.01.208.518 I llama_model_loader: - kv   3:                     general.sampling.top_p f32              = 1.000000
+0.01.208.519 I llama_model_loader: - kv   4:                      general.sampling.temp f32              = 1.000000
+0.01.208.520 I llama_model_loader: - kv   5:                               general.name str              = DeepSeek-V4-Flash
+0.01.208.521 I llama_model_loader: - kv   6:                         general.size_label str              = 256x8.4B
+0.01.208.522 I llama_model_loader: - kv   7:                            general.license str              = mit
+0.01.208.524 I llama_model_loader: - kv   8:                      deepseek4.block_count u32              = 43
+0.01.208.525 I llama_model_loader: - kv   9:                   deepseek4.context_length u32              = 1048576
+0.01.208.526 I llama_model_loader: - kv  10:                 deepseek4.embedding_length u32              = 4096
+0.01.208.526 I llama_model_loader: - kv  11:             deepseek4.attention.head_count u32              = 64
+0.01.208.527 I llama_model_loader: - kv  12:          deepseek4.attention.head_count_kv u32              = 1
+0.01.208.528 I llama_model_loader: - kv  13:                deepseek4.rope.scaling.type str              = yarn
+0.01.208.530 I llama_model_loader: - kv  14:              deepseek4.rope.scaling.factor f32              = 16.000000
+0.01.208.531 I llama_model_loader: - kv  15: deepseek4.rope.scaling.original_context_length u32              = 65536
+0.01.208.533 I llama_model_loader: - kv  16:      deepseek4.rope.scaling.yarn_beta_fast f32              = 32.000000
+0.01.208.534 I llama_model_loader: - kv  17:      deepseek4.rope.scaling.yarn_beta_slow f32              = 1.000000
+0.01.208.535 I llama_model_loader: - kv  18:                   deepseek4.rope.freq_base f32              = 10000.000000
+0.01.208.537 I llama_model_loader: - kv  19: deepseek4.attention.layer_norm_rms_epsilon f32              = 0.000001
+0.01.208.537 I llama_model_loader: - kv  20:                     deepseek4.expert_count u32              = 256
+0.01.208.538 I llama_model_loader: - kv  21:                deepseek4.expert_used_count u32              = 6
+0.01.208.539 I llama_model_loader: - kv  22:               deepseek4.expert_gating_func u32              = 4
+0.01.208.539 I llama_model_loader: - kv  23:             deepseek4.attention.key_length u32              = 512
+0.01.208.540 I llama_model_loader: - kv  24:           deepseek4.attention.value_length u32              = 512
+0.01.208.541 I llama_model_loader: - kv  25:             deepseek4.rope.dimension_count u32              = 64
+0.01.208.541 I llama_model_loader: - kv  26:            deepseek4.attention.q_lora_rank u32              = 1024
+0.01.208.542 I llama_model_loader: - kv  27:         deepseek4.attention.sliding_window u32              = 128
+0.01.208.543 I llama_model_loader: - kv  28:       deepseek4.expert_feed_forward_length u32              = 2048
+0.01.208.544 I llama_model_loader: - kv  29:              deepseek4.expert_shared_count u32              = 1
+0.01.208.545 I llama_model_loader: - kv  30:             deepseek4.expert_weights_scale f32              = 1.500000
+0.01.208.546 I llama_model_loader: - kv  31:              deepseek4.expert_weights_norm bool             = true
+0.01.208.584 I llama_model_loader: - kv  32:                 deepseek4.swiglu_clamp_exp arr[f32,43]      = [10.000000, 10.000000, 10.000000, 10....
+0.01.208.602 I llama_model_loader: - kv  33:               deepseek4.swiglu_clamp_shexp arr[f32,43]      = [10.000000, 10.000000, 10.000000, 10....
+0.01.208.603 I llama_model_loader: - kv  34:     deepseek4.attention.indexer.head_count u32              = 64
+0.01.208.604 I llama_model_loader: - kv  35:     deepseek4.attention.indexer.key_length u32              = 128
+0.01.208.605 I llama_model_loader: - kv  36:          deepseek4.attention.indexer.top_k u32              = 512
+0.01.208.606 I llama_model_loader: - kv  37:     deepseek4.attention.output_group_count u32              = 8
+0.01.208.606 I llama_model_loader: - kv  38:       deepseek4.attention.output_lora_rank u32              = 1024
+0.01.208.611 I llama_model_loader: - kv  39:        deepseek4.attention.compress_ratios arr[i32,44]      = [0, 0, 4, 128, 4, 128, 4, 128, 4, 128...
+0.01.208.613 I llama_model_loader: - kv  40: deepseek4.attention.compress_rope_freq_base f32              = 160000.000000
+0.01.208.614 I llama_model_loader: - kv  41:           deepseek4.hyper_connection.count u32              = 4
+0.01.208.615 I llama_model_loader: - kv  42: deepseek4.hyper_connection.sinkhorn_iterations u32              = 20
+0.01.208.616 I llama_model_loader: - kv  43:         deepseek4.hyper_connection.epsilon f32              = 0.000001
+0.01.208.617 I llama_model_loader: - kv  44:                 deepseek4.hash_layer_count u32              = 3
+0.01.208.617 I llama_model_loader: - kv  45:             deepseek4.embedding_length_out u32              = 16384
+0.01.208.618 I llama_model_loader: - kv  46:                       tokenizer.ggml.model str              = gpt2
+0.01.208.619 I llama_model_loader: - kv  47:                         tokenizer.ggml.pre str              = joyai-llm
+0.01.229.832 I llama_model_loader: - kv  48:                      tokenizer.ggml.tokens arr[str,129280]  = ["<｜begin▁of▁sentence｜>", "<�...
+0.01.235.404 I llama_model_loader: - kv  49:                  tokenizer.ggml.token_type arr[i32,129280]  = [3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+0.01.255.723 I llama_model_loader: - kv  50:                      tokenizer.ggml.merges arr[str,127741]  = ["Ġ t", "Ġ a", "i n", "Ġ Ġ", "h e...
+0.01.255.764 I llama_model_loader: - kv  51:                tokenizer.ggml.bos_token_id u32              = 0
+0.01.255.766 I llama_model_loader: - kv  52:                tokenizer.ggml.eos_token_id u32              = 1
+0.01.255.767 I llama_model_loader: - kv  53:            tokenizer.ggml.padding_token_id u32              = 1
+0.01.255.768 I llama_model_loader: - kv  54:               tokenizer.ggml.add_bos_token bool             = false
+0.01.255.768 I llama_model_loader: - kv  55:               tokenizer.ggml.add_eos_token bool             = false
+0.01.255.769 I llama_model_loader: - kv  56:               general.quantization_version u32              = 2
+0.01.255.771 I llama_model_loader: - kv  57:                          general.file_type u32              = 38
+0.01.255.772 I llama_model_loader: - kv  58:                                   split.no u16              = 0
+0.01.255.773 I llama_model_loader: - kv  59:                                split.count u16              = 2
+0.01.255.774 I llama_model_loader: - kv  60:                        split.tensors.count i32              = 1328
+0.01.255.775 I llama_model_loader: - type  f32:  492 tensors
+0.01.255.776 I llama_model_loader: - type q8_0:  660 tensors
+0.01.255.777 I llama_model_loader: - type q2_K:  129 tensors
+0.01.255.777 I llama_model_loader: - type q6_K:    1 tensors
+0.01.255.778 I llama_model_loader: - type  i32:    3 tensors
+0.01.255.778 I llama_model_loader: - type bf16:   43 tensors
+0.01.255.781 I print_info: file format = GGUF V3 (latest)
+0.01.255.781 I print_info: file type   = MXFP4 MoE
+0.01.255.804 I print_info: file size   = 91.82 GiB (2.77 BPW) 
+0.01.256.473 I llama_prepare_model_devices: using device CUDA0 (NVIDIA GeForce RTX 3090) (0000:03:00.0) - 23303 MiB free
+0.01.416.665 I load: 0 unused tokens
+0.01.463.985 I load: printing all EOG tokens:
+0.01.464.031 I load:   - 1 ('<｜end▁of▁sentence｜>')
+0.01.464.566 I load: special tokens cache size = 1283
+0.01.541.697 I load: token to piece cache size = 0.8346 MB
+0.01.541.758 I print_info: arch                  = deepseek4
+0.01.541.759 I print_info: vocab_only            = 0
+0.01.541.760 I print_info: no_alloc              = 0
+0.01.541.760 I print_info: n_ctx_train           = 1048576
+0.01.541.761 I print_info: n_embd_inp            = 4096
+0.01.541.762 I print_info: n_embd                = 4096
+0.01.541.762 I print_info: n_embd_out            = 16384
+0.01.541.763 I print_info: n_layer               = 43
+0.01.541.763 I print_info: n_layer_all           = 43
+0.01.541.774 I print_info: n_head                = 64
+0.01.541.777 I print_info: n_head_kv             = 1
+0.01.541.777 I print_info: n_rot                 = 64
+0.01.541.778 I print_info: n_swa                 = 128
+0.01.541.778 I print_info: is_swa_any            = 1
+0.01.541.779 I print_info: non_causal_type       = 2
+0.01.541.779 I print_info: n_embd_head_k         = 512
+0.01.541.780 I print_info: n_embd_head_v         = 512
+0.01.541.782 I print_info: n_gqa                 = 64
+0.01.541.784 I print_info: n_embd_k_gqa          = 512
+0.01.541.786 I print_info: n_embd_v_gqa          = 512
+0.01.541.788 I print_info: f_norm_eps            = 0.0e+00
+0.01.541.789 I print_info: f_norm_rms_eps        = 1.0e-06
+0.01.541.790 I print_info: f_clamp_kqv           = 0.0e+00
+0.01.541.791 I print_info: f_max_alibi_bias      = 0.0e+00
+0.01.541.791 I print_info: f_logit_scale         = 0.0e+00
+0.01.541.792 I print_info: f_attn_scale          = 0.0e+00
+0.01.541.793 I print_info: f_attn_value_scale    = 0.0000
+0.01.541.794 I print_info: n_ff                  = 0
+0.01.541.795 I print_info: n_expert              = 256
+0.01.541.796 I print_info: n_expert_used         = 6
+0.01.541.796 I print_info: n_expert_groups       = 0
+0.01.541.797 I print_info: n_group_used          = 0
+0.01.541.797 I print_info: causal attn           = 1
+0.01.541.798 I print_info: pooling type          = -1
+0.01.541.798 I print_info: rope type             = 0
+0.01.541.798 I print_info: rope scaling          = yarn
+0.01.541.800 I print_info: freq_base_train       = 10000.0
+0.01.541.801 I print_info: freq_scale_train      = 0.0625
+0.01.541.802 I print_info: freq_base_swa         = 10000.0
+0.01.541.803 I print_info: freq_scale_swa        = 1
+0.01.541.804 I print_info: n_embd_head_k_swa     = 512
+0.01.541.804 I print_info: n_embd_head_v_swa     = 512
+0.01.541.805 I print_info: n_rot_swa             = 64
+0.01.541.805 I print_info: n_ctx_orig_yarn       = 65536
+0.01.541.806 I print_info: rope_yarn_log_mul     = 0.0000
+0.01.541.807 I print_info: rope_finetuned        = unknown
+0.01.541.808 I print_info: model type            = ?B
+0.01.541.809 I print_info: model params          = 284.33 B
+0.01.541.810 I print_info: general.name          = DeepSeek-V4-Flash
+0.01.541.812 I print_info: vocab type            = BPE
+0.01.541.812 I print_info: n_vocab               = 129280
+0.01.541.813 I print_info: n_merges              = 127741
+0.01.541.814 I print_info: BOS token             = 0 '<｜begin▁of▁sentence｜>'
+0.01.541.814 I print_info: EOS token             = 1 '<｜end▁of▁sentence｜>'
+0.01.541.815 I print_info: EOT token             = 1 '<｜end▁of▁sentence｜>'
+0.01.541.815 I print_info: PAD token             = 1 '<｜end▁of▁sentence｜>'
+0.01.541.816 I print_info: LF token              = 201 'Ċ'
+0.01.541.817 I print_info: FIM PRE token         = 128801 '<｜fim▁begin｜>'
+0.01.541.818 I print_info: FIM SUF token         = 128800 '<｜fim▁hole｜>'
+0.01.541.818 I print_info: FIM MID token         = 128802 '<｜fim▁end｜>'
+0.01.541.819 I print_info: EOG token             = 1 '<｜end▁of▁sentence｜>'
+0.01.541.820 I print_info: max token length      = 256
+0.01.542.494 I load_tensors: loading model tensors, this can take a while... (load_mode = mmap)
+0.01.552.614 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.02.039.343 I load_tensors: offloading output layer to GPU
+0.02.039.435 I load_tensors: offloading 42 repeating layers to GPU
+0.02.039.437 I load_tensors: offloaded 44/44 layers to GPU
+0.02.039.449 I load_tensors:   CPU_Mapped model buffer size = 87224.56 MiB
+0.02.039.453 I load_tensors:        CUDA0 model buffer size = 16875.51 MiB
+0.06.012.653 I cmn  common_init_: added <｜end▁of▁sentence｜> logit bias = -inf
+0.06.014.191 I llama_context: constructing llama_context
+0.06.014.238 I llama_context: n_seq_max             = 1
+0.06.014.239 I llama_context: n_ctx                 = 4096
+0.06.014.239 I llama_context: n_ctx_seq             = 4096
+0.06.014.240 I llama_context: n_batch               = 2048
+0.06.014.241 I llama_context: n_ubatch              = 512
+0.06.014.241 I llama_context: causal_attn           = 1
+0.06.014.242 I llama_context: flash_attn            = auto
+0.06.014.243 I llama_context: kv_unified            = false
+0.06.014.247 I llama_context: freq_base             = 10000.0
+0.06.014.248 I llama_context: freq_scale            = 0.0625
+0.06.014.249 I llama_context: n_rs_seq              = 0
+0.06.014.249 I llama_context: n_outputs_max         = 1
+0.06.014.250 I llama_context: n_outputs_max_per_seq = 1
+0.06.014.251 I llama_context: n_ctx_seq (4096) < n_ctx_train (1048576) -- the full capacity of the model will not be utilized
+0.06.016.695 I llama_context:  CUDA_Host  output buffer size =     0.49 MiB
+0.06.016.753 I llama_kv_cache_dsv4: creating DSV4 raw KV cache
+0.06.016.755 I llama_kv_cache_iswa: creating non-SWA KV cache, size = 4096 cells
+0.06.016.821 I llama_kv_cache: size =    0.00 MiB (  4096 cells,   0 layers,  1/1 seqs), K (f16):    0.00 MiB, V (f16):    0.00 MiB
+0.06.016.822 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 0
+0.06.016.823 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.06.016.824 I llama_kv_cache_iswa: creating     SWA KV cache, size = 768 cells
+0.06.017.872 I llama_kv_cache:      CUDA0 KV buffer size =    32.25 MiB
+0.06.020.005 I llama_kv_cache: size =   32.25 MiB (   768 cells,  43 layers,  1/1 seqs), K (f16):   32.25 MiB, V (f16):    0.00 MiB
+0.06.020.079 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 512
+0.06.020.084 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.06.020.090 I llama_kv_cache_dsv4: creating DSV4 CSA compressed KV cache, size = 1024 cells
+0.06.020.962 I llama_kv_cache:      CUDA0 KV buffer size =    21.00 MiB
+0.06.022.163 I llama_kv_cache: size =   21.00 MiB (  1024 cells,  21 layers,  1/1 seqs), K (f16):   21.00 MiB, V (f16):    0.00 MiB
+0.06.022.209 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 512
+0.06.022.209 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.06.022.211 I llama_kv_cache_dsv4: creating DSV4 HCA compressed KV cache, size = 32 cells
+0.06.023.036 I llama_kv_cache:      CUDA0 KV buffer size =     5.00 MiB
+0.06.023.463 I llama_kv_cache: size =    5.00 MiB (   256 cells,  20 layers,  1/1 seqs), K (f16):    5.00 MiB, V (f16):    0.00 MiB
+0.06.023.525 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 512
+0.06.023.526 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.06.023.528 I llama_kv_cache_dsv4: creating DSV4 lightning-indexer KV cache, size = 1024 cells
+0.06.024.453 I llama_kv_cache:      CUDA0 KV buffer size =     5.25 MiB
+0.06.024.949 I llama_kv_cache: size =    5.25 MiB (  1024 cells,  21 layers,  1/1 seqs), K (f16):    5.25 MiB, V (f16):    0.00 MiB
+0.06.025.032 I llama_kv_cache: attn_rot_k = 1, n_embd_head_k_all = 128
+0.06.025.033 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.06.025.075 I llama_kv_cache_dsv4: creating DSV4 CSA compressor state
+0.06.026.474 I llama_dsv4_comp_state:      CUDA0 DSV4 csa state buffer size =     1.31 MiB
+0.06.026.516 I llama_dsv4_comp_state: csa ratio = 4, state = 8 x 1024, streams = 1, rs_seq = 0, layers = 21, size =    1.31 MiB
+0.06.026.518 I llama_kv_cache_dsv4: creating DSV4 HCA compressor state
+0.06.027.790 I llama_dsv4_comp_state:      CUDA0 DSV4 hca state buffer size =    10.00 MiB
+0.06.027.906 I llama_dsv4_comp_state: hca ratio = 128, state = 128 x 512, streams = 1, rs_seq = 0, layers = 20, size =   10.00 MiB
+0.06.027.909 I llama_kv_cache_dsv4: creating DSV4 lightning-indexer compressor state
+0.06.028.272 I llama_dsv4_comp_state:      CUDA0 DSV4 lid state buffer size =     0.33 MiB
+0.06.028.367 I llama_dsv4_comp_state: lid ratio = 4, state = 8 x 256, streams = 1, rs_seq = 0, layers = 21, size =    0.33 MiB
+0.06.029.142 I sched_reserve: reserving ...
+0.06.059.097 I resolve_fused_ops: Flash Attention enabled
+0.06.059.152 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.06.064.418 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.06.069.631 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.06.074.515 I resolve_fused_ops: fused DeepSeek V4 HC post enabled
+0.06.131.144 I sched_reserve:      CUDA0 compute buffer size =   835.26 MiB
+0.06.131.191 I sched_reserve:  CUDA_Host compute buffer size =    19.09 MiB
+0.06.131.192 I sched_reserve: graph nodes  = 8349
+0.06.131.193 I sched_reserve: graph splits = 116 (with bs=512), 78 (with bs=1)
+0.06.131.196 I sched_reserve: reserve took 101.94 ms, sched copies = 1
+0.06.131.333 I cmn          init: llama threadpool init, n_threads = 24
+0.06.131.413 I cmn  common_init_: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.06.981.849 I cmn  common_conte: the context does not support partial sequence removal
+0.06.986.284 I srv    load_model: speculative decoding will use checkpoints
+0.06.986.322 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 4096, kv_unified = 'false'
+0.06.986.349 I spec common_specu: no implementations specified for speculative decoding
+0.06.986.353 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 4096
+0.06.986.572 I srv    load_model: prompt cache is disabled - use `--cache-ram N` to enable it
+0.06.986.607 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.06.986.607 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.06.997.714 I srv          init: init: chat template, example_format: '<｜begin▁of▁sentence｜>You are a helpful assistant<｜User｜>Hello<｜Assistant｜></think>Hi there<｜end▁of▁sentence｜><｜User｜>How are you?<｜Assistant｜></think>'
+0.06.999.399 I srv          init: init: chat template, thinking = 0
+0.06.999.450 I srv          init: preserve_reasoning kwarg: true
+0.06.999.483 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.06.999.534 I srv  llama_server: model loaded
+0.06.999.573 I srv  llama_server: listening on http://127.0.0.1:38397
+0.07.000.045 I srv  update_slots: all slots are idle
+Chatting with deepseek-test. Type /exit or /quit to stop.
+you> assistant> 0.07.581.066 I srv  server_strea: conv_id= (empty=1)
+0.07.582.180 I srv    operator(): chat format: peg-native
+0.07.583.533 I slot get_availabl: id  0 | task -1 |  - skipping, slot is empty
+0.07.583.623 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+0.07.583.766 I slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> ?top-p -> min-p -> ?xtc -> temp-ext -> dist 
+0.07.583.866 I slot launch_slot_: id  0 | task -1 | sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 40, top_p = 1.000, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.07.583.935 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.07.584.028 I slot   operator(): id  0 | task 0 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 23
+0.07.584.113 I slot   operator(): id  0 | task 0 | cached n_tokens = 0, memory_seq_rm [0, end)
+0.07.900.061 I slot   operator(): id  0 | task 0 | cached n_tokens = 1, memory_seq_rm [1, end)
+0.07.919.483 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 0, pos_max = 0, n_tokens = 1, size = 11.687 MiB)
+0.08.944.754 I slot   operator(): id  0 | task 0 | cached n_tokens = 19, memory_seq_rm [19, end)
+0.08.944.856 I slot init_sampler: id  0 | task 0 | init sampler, took 0.02 ms, tokens: text = 23, total = 23
+0.09.021.686 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 18, pos_max = 18, n_tokens = 19, size = 12.443 MiB)
+This is an excellent question because ownership and borrowing are the core innovations that make Rust both safe and fast, without a garbage collector. Let's break it down.
+
+### The Core Concepts
+
+**1. Ownership (The Single Rule)**
+Every value in Rust has a single *owner* at any given time. The owner is the variable that holds the value. When the owner goes out of scope, the value is dropped (memory is freed). This is deterministic and happens at compile-time.
+
+**0.23.263.141 I slot print_timing: id  0 | task 0 | n_gen =    100, tg =   7.24 t/s, tg_3s =   7.31 t/s
+2. The Rules of Ownership**
+- Each value in Rust has a single owner.
+- There can be either0.26.336.247 I slot print_timing: id  0 | task 0 | n_gen =    122, tg =   7.22 t/s, tg_3s =   7.16 t/s
+ one mutable reference or any number0.27.181.392 I slot print_timing: id  0 | task 0 | prompt eval time =    1998.74 ms /    23 tokens (   86.90 ms per token,    11.51 tokens per second)
+0.27.181.428 I slot print_timing: id  0 | task 0 |        eval time =   17598.56 ms /   128 tokens (  138.57 ms per token,     7.22 tokens per second)
+0.27.181.430 I slot print_timing: id  0 | task 0 |       total time =   19597.30 ms /   151 tokens
+0.27.181.438 I slot print_timing: id  0 | task 0 |    graphs reused =        127
+0.27.181.484 I slot      release: id  0 | task 0 | stop processing: n_tokens = 150, truncated = 0
+0.27.181.496 I srv  update_slots: all slots are idle
+ of
+note: response reached --max-tokens (128) and may be incomplete; rerun with a larger --max-tokens value for more.
+
+backend:              llama.cpp server CUDA
+total duration:       19.60626s
+load duration:        0us
+prompt total count:   23 token(s)
+prompt cached count:  0 token(s)
+prompt eval count:    23 token(s)
+prompt eval duration: 1.998737s
+prompt eval rate:     11.51 tokens/s
+eval count:           128 token(s)
+eval duration:        17.598562s
+first token:          2.007529s
+eval rate:            7.27 tokens/s
+finish reason:        length
+
+backend stats:
+  history messages: 1
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: no
+  llama.cpp request endpoint: /v1/chat/completions
+  chat template applied by backend/model: yes
+you> assistant> 0.27.184.444 I srv  server_strea: conv_id= (empty=1)
+0.27.185.393 I srv    operator(): chat format: peg-native
+0.27.186.546 I slot get_availabl: id  0 | task -1 |  - checking sim = 1.000 (23/23) > 0.100
+0.27.186.594 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 1.000 (> 0.100 thold), f_keep = 0.153
+0.27.186.669 I slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> ?top-p -> min-p -> ?xtc -> temp-ext -> dist 
+0.27.186.716 I slot launch_slot_: id  0 | task -1 | sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 40, top_p = 1.000, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.27.186.720 I slot launch_slot_: id  0 | task 131 | processing task, is_child = 0
+0.27.186.727 I slot   operator(): id  0 | task 131 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 23
+0.27.186.733 I slot   operator(): id  0 | task 131 | checking checkpoint with [18, 18] against 22...
+0.27.199.293 I slot   operator(): id  0 | task 131 | restored context checkpoint (pos_min = 18, pos_max = 18, n_tokens = 19, n_past = 19, size = 12.443 MiB)
+0.27.199.364 I slot   operator(): id  0 | task 131 | cached n_tokens = 19, memory_seq_rm [19, end)
+0.27.199.459 I slot init_sampler: id  0 | task 131 | init sampler, took 0.01 ms, tokens: text = 23, total = 23
+0.27.199.495 I slot create_check: id  0 | task 131 | superseding context checkpoint at n_tokens = 19
+0.27.215.786 I slot create_check: id  0 | task 131 | created context checkpoint 2 of 32 (pos_min = 18, pos_max = 18, n_tokens = 19, size = 12.443 MiB)
+This is an excellent question because ownership and borrowing are the core innovations that make Rust both safe and fast, without a garbage collector. Let's break it down.
+
+### The Core Concepts
+
+**1. Ownership (The Single Rule)**
+Every value in Rust has a single *owner* at any given time. The owner is the variable that holds the value. When the owner goes out of scope, the value is dropped (memory is freed). This is deterministic and happens at compile-time.
+
+**0.41.691.688 I slot print_timing: id  0 | task 131 | n_gen =    100, tg =   7.03 t/s, tg_3s =   7.10 t/s
+2. The Rules of Ownership**
+- Each value in Rust has a single owner.
+- There can be either0.44.810.932 I slot print_timing: id  0 | task 131 | n_gen =    122, tg =   7.03 t/s, tg_3s =   7.05 t/s
+ one mutable reference or any number0.45.640.305 I slot print_timing: id  0 | task 131 | prompt eval time =     422.53 ms /     4 tokens (  105.63 ms per token,     9.47 tokens per second)
+0.45.640.342 I slot print_timing: id  0 | task 131 |        eval time =   18030.99 ms /   128 tokens (  141.98 ms per token,     7.04 tokens per second)
+0.45.640.344 I slot print_timing: id  0 | task 131 |       total time =   18453.51 ms /   132 tokens
+0.45.640.345 I slot print_timing: id  0 | task 131 |    graphs reused =        253
+0.45.640.379 I slot      release: id  0 | task 131 | stop processing: n_tokens = 150, truncated = 0
+0.45.640.397 I srv  update_slots: all slots are idle
+ of
+note: response reached --max-tokens (128) and may be incomplete; rerun with a larger --max-tokens value for more.
+
+backend:              llama.cpp server CUDA
+total duration:       18.458684s
+load duration:        0us
+prompt total count:   23 token(s)
+prompt cached count:  19 token(s)
+prompt eval count:    4 token(s)
+prompt eval duration: 422.526ms
+prompt eval rate:     9.47 tokens/s
+eval count:           128 token(s)
+eval duration:        18.030985s
+first token:          427.5575ms
+eval rate:            7.10 tokens/s
+finish reason:        length
+
+backend stats:
+  history messages: 1
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: no
+  llama.cpp request endpoint: /v1/chat/completions
+  chat template applied by backend/model: yes
+you> 
