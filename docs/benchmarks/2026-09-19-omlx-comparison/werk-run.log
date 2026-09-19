@@ -1,0 +1,28 @@
+oMLX expert cache: 16491 MiB (auto) upper budget; SSD offload active, native memory guard may reduce residency
+oMLX N-gram cache: 64 MiB initial, 2069 MiB upper budget (auto); shares memory with the expert cache
+In computing, a token is a fundamental unit of data, such as a word, number, or punctuation mark, that serves as the basic building block for processing text in natural language models. In the context of blockchain and cryptocurrency, a token represents a digital asset or utility that exists on an existing blockchain, distinct from the
+note: response reached --max-tokens (64) and may be incomplete; rerun with a larger --max-tokens value for more.
+
+backend:              oMLX
+total duration:       23.440376s
+load duration:        0us
+prompt total count:   22 token(s)
+prompt cached count:  0 token(s)
+prompt eval count:    22 token(s)
+prompt eval duration: 9.06s
+prompt eval rate:     2.43 tokens/s
+eval count:           64 token(s)
+eval duration:        14.35s
+first token:          9.06s
+eval rate:            4.46 tokens/s
+finish reason:        length
+
+backend stats:
+  history messages: 1
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 0
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":22507954,"allocator_clears":0,"budget_reductions":0,"cache_budget_bytes":17293080552,"cache_budget_mode":"auto","cache_evictions":1944,"cache_hits":27081,"cache_misses":8198,"disk_bytes_read":22665963200,"disk_read_seconds":11.320976,"effective_cache_budget_bytes":17293080552,"execution":"grouped","forward_calls":3168,"forward_seconds":21.712359,"materialize_seconds":0.221724,"ngram_cache_budget_bytes":2170023677,"ngram_cache_budget_mode":"auto","ngram_cache_evictions":0,"ngram_cache_hits":48,"ngram_cache_misses":1328,"ngram_effective_cache_budget_bytes":67108864,"ngram_requested_rows":1376,"ngram_resident_cache_bytes":1115520,"ngram_unique_rows":1376,"output_evaluations":6771,"prefill_cache_growth_bytes":11277901440,"prefill_samples_corrected":1,"resident_cache_bytes":17291059200,"routing_seconds":3.455068,"tensor_materializations":8198}

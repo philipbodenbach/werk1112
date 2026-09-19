@@ -14,17 +14,37 @@ from pathlib import Path
 import weakref
 
 try:
-    from _werk_omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer
+    from _werk_omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature, expert_read_workers
     from _werk_omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
     from _werk_omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
 except ImportError:  # Direct repository tests.
-    from omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer
+    from omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature, expert_read_workers
     from omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
     from omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
 
 
 ARCHITECTURES = {"qwen4_exp", "glm5_next"}
 _MANAGER = None
+
+
+def configure_glm_thinking(tokenizer, architecture):
+    """Add an explicit no-thinking branch to the legacy GLM template in memory.
+
+    Keep the checkpoint's default/explicit thinking prompts byte-identical.
+    Templates already implementing the switch remain authoritative.
+    """
+    template = tokenizer.chat_template
+    if (architecture != "glm5_next" or not isinstance(template, str)
+            or "enable_thinking" in template):
+        return
+    opening = "<|assistant|>{{- '<think>' -}}"
+    effort = "{%- if effective_reasoning_effort is not none -%}"
+    if template.count(opening) != 1 or template.count(effort) != 1:
+        raise ValueError("unsupported GLM thinking template; cannot honor enable_thinking")
+    template = template.replace(effort,
+        "{%- if effective_reasoning_effort is not none and enable_thinking is not sameas false -%}")
+    tokenizer.chat_template = template.replace(opening,
+        "<|assistant|>{{- '<think></think>' if enable_thinking is sameas false else '<think>' -}}")
 
 
 def automatic_ngram_budget(*, metal_limit, available_memory, base_bytes,
@@ -229,6 +249,7 @@ class TextCheckpoint:
             import psutil
             metal_limit = get_effective_metal_cap_bytes()
             available_memory = psutil.virtual_memory().available
+            self.select_resident_experts(metal_limit, available_memory)
             if self.ngram_budget_mode == "auto":
                 self.ngram_budget_bytes = automatic_ngram_budget(
                     metal_limit=metal_limit, available_memory=available_memory,
@@ -239,10 +260,33 @@ class TextCheckpoint:
                 initial = min(self.ngram_initial_cache_bytes, self.ngram_budget_bytes)
                 self.base_bytes += initial - self.ngram_initial_cache_bytes
                 self.ngram_initial_cache_bytes = initial
-        if self.cache_budget_mode == "auto":
+        if self.cache_budget_mode == "auto" and self.experts_enabled:
             self.cache_bytes = automatic_cache_budget(
                 self, metal_limit=metal_limit, available_memory=available_memory)
         self.resident_estimate_bytes = self.base_bytes + min(self.cache_bytes, self.total_expert_bytes) + _WORKSPACE_BYTES
+
+    def select_resident_experts(self, metal_limit, available_memory):
+        """Resolve Auto once before loading; explicit budgets keep streaming.
+
+        Preserve space for workspace, allocator and OS. Native experts are
+        accounted as base weights, so later cache admission cannot evict them.
+        """
+        if self.cache_budget_mode != "auto" or not self.experts_enabled:
+            return
+        room = min(int(metal_limit * .90), max(0, available_memory - 2 * GiB))
+        room -= _WORKSPACE_BYTES + _ALLOCATOR_CACHE_BYTES
+        resident = self.base_bytes + self.total_expert_bytes
+        if resident > room:
+            return
+        self.experts_enabled = False
+        self.cache_bytes = 0
+        self.base_bytes = resident
+        if (self.ngram_budget_mode == "auto"
+                and resident - self.ngram_initial_cache_bytes + self.ngram_storage_bytes <= room):
+            self.base_bytes += self.ngram_storage_bytes - self.ngram_initial_cache_bytes
+            self.ngrams_enabled = False
+            self.ngram_budget_mode = "disabled"
+            self.ngram_budget_bytes = self.ngram_initial_cache_bytes = 0
 
 
 class TextExpertManager(ExpertManager):
@@ -250,7 +294,8 @@ class TextExpertManager(ExpertManager):
         super().__init__(checkpoint, execution=execution)
         if checkpoint.experts_enabled and checkpoint.inventory.architecture in ARCHITECTURES:
             self._retention = ExpertRetention(self.effective_cache_bytes)
-        self.reader = RangeReader(prefetch_workers=4 if checkpoint.inventory.architecture in ARCHITECTURES else 0)
+        self.reader = RangeReader(prefetch_workers=expert_read_workers()
+                                  if checkpoint.inventory.architecture in ARCHITECTURES else 0)
         self.ngram_cache = SharedCache(max(1, checkpoint.ngram_initial_cache_bytes))
         self._ngram_auto_target = checkpoint.ngram_initial_cache_bytes
         self._ngram_last_evictions = 0
@@ -260,9 +305,16 @@ class TextExpertManager(ExpertManager):
         self.access.expert_groups = lambda layer, indices: (
             [index for _, index in group] for group in self._groups(layer, indices))
         self.access.prefetch_experts = self.prefetch_experts
+        self.access.prefetch_ready_experts = self.prefetch_experts
+
+    def _resize_cache(self, budget):
+        if not self.checkpoint.experts_enabled:
+            self.effective_cache_bytes = 0
+            return
+        super()._resize_cache(budget)
 
     @contextmanager
-    def prefetch_experts(self, layer, indices):
+    def prefetch_experts(self, layer, indices, ready=None):
         with self._lock:
             keys = {(layer, int(index)) for index in indices}
             prior_leases = set(self._leased)
@@ -275,7 +327,10 @@ class TextExpertManager(ExpertManager):
                     for suffix in ('weight', 'scales', 'biases')]
                 # Raw read-ahead plus independent row copies fit in the
                 # existing workspace, including small expert-cache budgets.
-                with self.reader.prefetch(tensors, max_bytes=_WORKSPACE_BYTES // 8):
+                cached = [int(index) for index in indices if (layer, int(index)) in self._cache]
+                callback = (lambda: ready(cached)) if ready is not None and cached and tensors else None
+                with self.reader.prefetch(tensors, max_bytes=_WORKSPACE_BYTES // 8,
+                                         while_reading=callback):
                     yield
             finally:
                 self._leased.difference_update(keys - prior_leases)
@@ -406,6 +461,38 @@ def _canonical_name(name, architecture=None):
     raise ValueError(f"unverified native text tensor name: {name}")
 
 
+def _check_resident_shards(selected):
+    for path, expected in {tensor.path: tensor.signature for tensor in selected.values()}.items():
+        if signature(path.stat()) != expected:
+            raise ValueError("checkpoint changed during resident weight loading")
+
+
+def _load_resident_weights(selected, architecture):
+    """Use MLX lazy file loads, retaining only the selected resident tensors.
+
+    Dropping unselected arrays before evaluation avoids reading offloaded PLE,
+    experts, vision and MTP payloads even when they share the same shard.
+    The caller checks shard identities again after materializing the model.
+    """
+    import mlx.core as mx
+
+    _check_resident_shards(selected)
+    shards = {}
+    for name, tensor in selected.items():
+        shards.setdefault(tensor.path, []).append(name)
+    weights = {}
+    for path, names in shards.items():
+        arrays = mx.load(str(path))
+        for name in names:
+            value = arrays[name]
+            if tuple(value.shape) != selected[name].shape:
+                raise ValueError("resident tensor shape differs from checkpoint inventory")
+            weights[_canonical_name(name, architecture)] = value
+        del arrays
+    _check_resident_shards(selected)
+    return weights
+
+
 def load_text_model(manager, tokenizer_config=None, **kwargs):
     import mlx.core as mx
     import mlx.nn as nn
@@ -449,7 +536,7 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
             selected.update(current.categories["experts"])
         if not cp.ngrams_enabled:
             selected.update(current.categories["ple"])
-        weights = {_canonical_name(name, current.architecture): manager._read(name) for name in selected}
+        weights = _load_resident_weights(selected, current.architecture)
         # Retain installed normalization/layout logic, including Qwen's
         # direct-gamma checkpoint conversion and GLM's FP32 routing parameters.
         weights = root.sanitize(weights)
@@ -472,6 +559,7 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
         # its additional full copy is not part of the bounded loader contract.
         nn.Module.load_weights(root, list(weights.items()), strict=True)
         mx.eval(root.parameters())
+        _check_resident_shards(selected)
         del weights
         prepare_attention_fusion(root, cp)
         mx.clear_cache()
@@ -496,6 +584,7 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
         model = TextModel()
         tokenizer = utils.load_tokenizer(cp.path, tokenizer_config,
                                          eos_token_ids=cp.config.get("eos_token_id", cp.config["text_config"].get("eos_token_id")))
+        configure_glm_thinking(tokenizer, current.architecture)
         manager._model_ref = weakref.ref(model)
         weakref.finalize(model, manager.deactivate)
         return (model, tokenizer, cp.config) if kwargs.get("return_config") else (model, tokenizer)

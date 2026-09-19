@@ -285,9 +285,10 @@ selected loading mode.
 
 ### Experimental oMLX expert offload
 
-For supported DeepSeek V4 affine checkpoints on oMLX 0.6.4, Werk now selects
-an automatic SSD-backed expert cache when `WERK_OMLX_EXPERT_CACHE_MB` is unset
-or `auto`. Both `chat` and `serve` use the same selection: at worker startup,
+Without offload settings, Werk preserves native oMLX loading.
+For supported DeepSeek V4 affine checkpoints on oMLX 0.6.4, explicitly setting
+`WERK_OMLX_EXPERT_CACHE_MB=auto` selects an automatic SSD-backed expert cache.
+Both `chat` and `serve` use the same selection: at worker startup,
 retain at most the model's expert bytes and the space left by current available
 system memory and the effective Metal cap, reserving base weights, workspace,
 and system headroom. Native admission further reduces residency for KV/attention
@@ -399,8 +400,11 @@ The expert status endpoint reports this as `last_decode_admission`.
 
 GLM, Qwen and DeepSeek expert offload use a segmented LRU: repeated accesses protect hot experts
 within at most 80% of the existing expert budget, leaving a recency-adaptive
-region for new demand. Up to four file readers fetch missing tensors of each
-bounded expert group in parallel. Pins, leases and native memory limits remain
+region for new demand. Parallel file readers fetch missing tensors of each
+bounded expert group: Qwen/GLM use the logical CPU count capped at 16 (four
+when unavailable), while DeepSeek retains four readers. Threads start on
+demand and the bounded staging allocation does not grow with thread count.
+Pins, leases and native memory limits remain
 authoritative; all MLX operations stay on the owning executor. These are
 automatic adapter choices, including when the expert budget is `auto`.
 DeepSeek retains its native BF16/FP16 expert metadata conversion and uses the
@@ -413,10 +417,36 @@ They do not enable MTP. See the [GLM decode measurements and design](glm-decode-
 GLM tool calls require the verified native `glm47` parser described above.
 The text adapter does not enable vision or MTP.
 
+For the verified Qwen/GLM text adapters, automatic expert selection first checks
+whether all expert weights fit alongside base weights, auxiliary caches and the
+existing system/workspace reserves. If they fit, Werk keeps the installed native
+expert modules and reports `native resident execution`; their weights are charged
+as base memory rather than evictable cache. If automatic Qwen N-gram tables also
+fit, they remain resident. Otherwise the row cache remains active independently.
+Positive expert-cache limits always retain offload. Selection happens once at
+worker startup; native KV/attention admission still applies to later requests.
+
+The offloaded Qwen/GLM single-token path reuses the shared input directly and
+combines each leased group's outputs before scattering them, avoiding repeated
+input gathers, per-expert output scatters and redundant synchronization. It does
+not allocate a second packed copy of expert weights. Prefill retains its bounded
+chunked path. See the [local comparison](benchmarks/2026-09-19-omlx-comparison/README.md).
+
+For mixed cached/missing expert groups during Qwen/GLM decode, bounded parallel
+reads now start before evaluating cached experts. GPU work stays on the owning
+executor and every routed expert stays leased through its completed evaluation.
+The same staging ceiling applies; small-budget groups and groups without both
+hits and misses retain the ordinary path. Exceptions drain all readers before
+releasing temporary storage. DeepSeek retains its separate execution path.
+With overlap, `disk_read_seconds` counts foreground scheduling and waiting,
+excluding cached-expert computation performed while reads run; it is not total
+background I/O duration. Compare full request/decode time to assess speedup.
+
 Qwen PLE N-gram tables have a separate row cache, controlled through
 `WERK_OMLX_NGRAM_CACHE_MB` or API `werk.omlx.ngram_cache_mb`:
 
-- Unset/`auto`: demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries and isolated decode budget checks up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
+- Unset/`0`: native resident tables.
+- Explicit `auto`: resident tables when the automatic resident selection above fits; otherwise demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries and isolated decode budget checks up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
 - API `ngram_cache_mb: "auto"`: explicitly override a fixed server setting with Auto. Omission inherits.
 - Positive integer: manual upper bound in MiB; the API accepts 1–1048576.
 - `0`: resident tables. It does not disable expert offload.

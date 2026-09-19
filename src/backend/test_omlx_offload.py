@@ -174,6 +174,59 @@ class InventoryTests(unittest.TestCase):
 
 
 class RangeReaderTests(unittest.TestCase):
+    def test_reader_concurrency_is_resource_bounded(self):
+        for cpus, expected in ((None, 4), (1, 1), (8, 8), (14, 14), (64, 16)):
+            with patch.object(offload.os, 'cpu_count', return_value=cpus):
+                self.assertEqual(offload.expert_read_workers(), expected)
+        with self.assertRaises(ValueError):
+            offload.RangeReader(prefetch_workers=17)
+
+    def test_prefetch_runs_owner_work_while_reads_are_pending(self):
+        import threading
+        tensors = [self.tensor(str(i), bytes([i]) * 256) for i in range(2)]
+        reader = offload.RangeReader(prefetch_workers=2)
+        self.addCleanup(reader.close)
+        started, release = threading.Event(), threading.Event()
+        original = reader._isolated_read
+        owner = threading.get_ident()
+        def read(tensor):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError('owner work did not overlap')
+            return original(tensor)
+        def work():
+            self.assertEqual(threading.get_ident(), owner)
+            self.assertTrue(started.wait(5))
+            release.set()
+        with patch.object(reader, '_isolated_read', side_effect=read):
+            with reader.prefetch(tensors, while_reading=work):
+                self.assertEqual([reader.read(t) for t in tensors], [bytes([i]) * 256 for i in range(2)])
+        self.assertEqual(reader.logical_bytes, 512)
+        self.assertIsNone(reader._prefetched)
+
+    def test_owner_failure_drains_reads_and_budget_fallback_skips_callback(self):
+        tensors = [self.tensor(str(i), bytes([i]) * 256) for i in range(2)]
+        reader = offload.RangeReader(prefetch_workers=2)
+        self.addCleanup(reader.close)
+        completed = []
+        original = reader._isolated_read
+        def read(tensor):
+            try:
+                return original(tensor)
+            finally:
+                completed.append(tensor)
+        def fail():
+            raise RuntimeError('owner failed')
+        with patch.object(reader, '_isolated_read', side_effect=read):
+            with self.assertRaisesRegex(RuntimeError, 'owner failed'):
+                with reader.prefetch(tensors, while_reading=fail): pass
+        self.assertCountEqual(completed, tensors)
+        self.assertIsNone(reader._prefetched)
+        with reader.prefetch(tensors, max_bytes=1, while_reading=fail):
+            self.assertEqual(reader.read(tensors[0]), bytes(256))
+        with reader.prefetch(tensors):
+            self.assertEqual(reader.read(tensors[1]), bytes([1]) * 256)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -417,6 +470,43 @@ class NativeOffloadTests(unittest.TestCase):
                     expected.append(mx.stack(outputs))
                 expected=mx.stack(expected)[None];mx.eval(actual,expected)
                 np.testing.assert_allclose(np.array(actual),np.array(expected),atol=1e-4,rtol=1e-3)
+            # Single-token decode must preserve unsorted and duplicate routes,
+            # including the weighted reduction, with one leased expert group.
+            cache.resize(2 * inv.layer_bytes[0] * inv.experts + 2048)
+            access.expert_groups = lambda layer, experts: [list(experts)]
+            decode_x = x[:, :1]
+            decode_indices = mx.array([[[3, 1, 3]]])
+            scores = mx.array([[[.2, .3, .5]]], dtype=decode_x.dtype)
+            expected = []
+            for expert in (3, 1, 3):
+                def project(name, value):
+                    prefix = f'model.layers.0.mlp.switch_mlp.{name}'
+                    w, s, b = (weights[prefix+'.'+suffix][expert] for suffix in ('weight','scales','biases'))
+                    return mx.quantized_matmul(value,w,s,b,transpose=True,bits=4,group_size=32)
+                expected.append(project('down_proj', activation(project('up_proj', decode_x), project('gate_proj', decode_x))))
+            expected = mx.stack(expected, axis=-2)
+            actual = streamed(decode_x, decode_indices)
+            reduced = streamed(decode_x, decode_indices, scores, weighted_sum=True)
+            expected_reduced = (expected * scores[..., None]).sum(-2)
+            mx.eval(actual, expected, reduced, expected_reduced)
+            np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-4, rtol=1e-3)
+            np.testing.assert_allclose(np.array(reduced), np.array(expected_reduced), atol=1e-4, rtol=1e-3)
+            # Split cached/cold execution must preserve duplicate routes and
+            # weighted reduction, regardless of expert execution order.
+            from contextlib import contextmanager
+            callbacks = []
+            @contextmanager
+            def prefetch_ready(layer, group, ready):
+                ready([3])
+                callbacks.append(layer)
+                yield
+            access.prefetch_ready_experts = prefetch_ready
+            split = streamed(decode_x, decode_indices)
+            split_reduced = streamed(decode_x, decode_indices, scores, weighted_sum=True)
+            mx.eval(split, split_reduced)
+            np.testing.assert_array_equal(np.array(split), np.array(actual))
+            np.testing.assert_array_equal(np.array(split_reduced), np.array(reduced))
+            self.assertEqual(callbacks, [0, 0])
             embedding=runtime.streamed_embedding(access,0)
             ids=mx.array([[0,5,10,5],[4,1,8,0]])
             actual=embedding(ids)

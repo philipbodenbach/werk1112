@@ -1,0 +1,9 @@
+{
+  "physical_memory_GiB": 48,
+  "binary": "/Users/philipbodenbach/.cargo/bin/werk",
+  "binary_sha256": "a62422307b75e64c4a43c2620803d0b36cf4ca5d0193b2e14d3d22572fbcb176",
+  "model": "Vontra/GLM-5.3-Flash-MLX-oQ2-MTP",
+  "base_GiB": 8.910329457372427,
+  "expert_GiB": 88.59375,
+  "reasoning_effort": "low"
+}

@@ -6915,6 +6915,11 @@ async fn chat_loop(
         || run
             .as_ref()
             .is_some_and(|run| !image_urls_from_messages(&run.messages).is_empty());
+    // oMLX loads its worker here, before the generation timer starts. Its
+    // prepared sessions correctly report no new load during generation, so
+    // retain this separate startup interval for the first completed turn.
+    let preparation_started = (matches!(selected_backend, BackendChoice::Omlx) && !has_images)
+        .then(Instant::now);
     let native_session = if !has_images
         && let Some(storage) = persistence.as_ref().filter(|storage| storage.is_durable())
     {
@@ -6956,6 +6961,9 @@ async fn chat_loop(
     } else {
         None
     };
+    let mut pending_preparation_seconds = preparation_started
+        .map(|started| started.elapsed().as_secs_f64())
+        .unwrap_or_default();
 
     if interactive {
         println!(
@@ -7123,6 +7131,8 @@ async fn chat_loop(
                     finish_reason = response_finish_reason;
                     prompt_tokens = tokens_in;
                     completion_tokens = tokens;
+                    let mut response_timings = response_timings;
+                    account_chat_preparation(&mut response_timings, &mut pending_preparation_seconds);
                     timings = Some(response_timings);
                     backend_diagnostics = prompt_diagnostics.clone();
                     backend_diagnostics.extend(response_backend_diagnostics);
@@ -7554,6 +7564,14 @@ fn prompt_huggingface_token() -> Result<String> {
         bail!("Hugging Face token cannot be empty");
     }
     Ok(token)
+}
+
+fn account_chat_preparation(timings: &mut GenerationTimings, pending_seconds: &mut f64) {
+    let preparation_seconds = std::mem::take(pending_seconds);
+    timings.load_seconds += preparation_seconds;
+    timings.total_seconds += preparation_seconds;
+    // Prompt/decode rates and first-token latency still describe the request
+    // made to the prepared backend, rather than model startup or user input.
 }
 
 fn prepare_backend_for_chat(
@@ -15120,6 +15138,45 @@ mod tests {
         assert!(error.to_string().contains("same destination"));
         assert!(output_dir.exists());
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn omlx_chat_preparation_is_reported_once_without_changing_generation_rates() {
+        let mut pending = 3.0;
+        let generation = GenerationTimings {
+            load_seconds: 0.25,
+            total_seconds: 2.0,
+            prompt_seconds: 0.5,
+            decode_seconds: 1.25,
+            first_token_seconds: 0.5,
+            ..Default::default()
+        };
+        let mut first = generation;
+        account_chat_preparation(&mut first, &mut pending);
+        assert_eq!(first.load_seconds, 3.25);
+        assert_eq!(first.total_seconds, 5.0);
+        assert_eq!(first.prompt_seconds, generation.prompt_seconds);
+        assert_eq!(first.decode_seconds, generation.decode_seconds);
+        assert_eq!(first.first_token_seconds, generation.first_token_seconds);
+        assert_eq!(pending, 0.0);
+
+        let mut next = GenerationTimings {
+            load_seconds: 0.0,
+            ..generation
+        };
+        account_chat_preparation(&mut next, &mut pending);
+        assert_eq!(next.load_seconds, 0.0);
+        assert_eq!(next.total_seconds, generation.total_seconds);
+
+        let mut output = Vec::new();
+        write_verbose_stats(&mut output, Some("oMLX"), 22, 4, "stop", first, &[]).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.lines().any(|line| {
+            line.starts_with("load duration:") && line.ends_with("3.25s")
+        }));
+        assert!(output.lines().any(|line| {
+            line.starts_with("total duration:") && line.ends_with("5s")
+        }));
     }
 
     #[test]

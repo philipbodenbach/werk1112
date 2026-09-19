@@ -1,8 +1,8 @@
 use super::*;
 
 #[test]
-fn expert_cache_defaults_to_auto_with_explicit_small_and_large_overrides() {
-    assert_eq!(expert_cache_bytes(None).unwrap(), Some(0));
+fn expert_cache_defaults_to_native_with_explicit_auto_small_and_large_overrides() {
+    assert_eq!(expert_cache_bytes(None).unwrap(), None);
     assert_eq!(expert_cache_bytes(Some("auto".into())).unwrap(), Some(0));
     assert_eq!(
         expert_cache_bytes(Some("4194304".into())).unwrap(),
@@ -163,6 +163,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path=='/api/status': return self.reply({'version':settings.get('version','test-0.6.4')})
         if self.path=='/werk/persistence/status': return self.reply({'installed':True,'active':settings.get('cache_active',True),'format':'omlx-exact-prefix-v1','model_id':'physical / model'})
         if self.path=='/werk/experts/status':
+            if settings.get('native_experts'):
+                return self.reply({'active':True,'cache_budget_bytes':0,'cache_budget_mode':'auto','experts_offloaded':False,'ngram_offload':'disabled','ngram_cache_budget_bytes':0})
             budget=int(os.environ.get('WERK_OMLX_EXPERT_CACHE_BYTES','0'))
             return self.reply({'active':True,'cache_budget_bytes':budget or 8*1024**3,'cache_budget_mode':'explicit' if budget else 'auto'})
         if self.path=='/v1/models/status':
@@ -1036,7 +1038,7 @@ fn server_prefix_cache_unavailable_or_disabled_keeps_one_ordinary_worker() {
 
 #[test]
 fn ngram_budget_is_independent_and_changes_worker_and_persistence_identity() {
-    assert_eq!(ngram_cache_bytes(None).unwrap(), None);
+    assert_eq!(ngram_cache_bytes(None).unwrap(), Some(0));
     assert_eq!(ngram_cache_bytes(Some("auto".into())).unwrap(), None);
     assert_eq!(ngram_cache_bytes(Some("0".into())).unwrap(), Some(0));
     assert_eq!(
@@ -1061,7 +1063,11 @@ fn ngram_budget_is_independent_and_changes_worker_and_persistence_identity() {
             configured.invocation().unwrap().expert_cache_bytes,
             base.invocation().unwrap().expert_cache_bytes
         );
-        assert_ne!(configured.cache_identity(), identity);
+        if budget == 0 {
+            assert_eq!(configured.cache_identity(), identity);
+        } else {
+            assert_ne!(configured.cache_identity(), identity);
+        }
     }
     assert_eq!(base.cache_identity(), identity);
 }
@@ -1748,6 +1754,27 @@ fn auto_expert_cache_activates_only_for_probe_verified_models() {
         assert_eq!(server.expert_offload, supported);
         assert_eq!(server.expert_cache_bytes, Some(0));
         drop(servers);
+        drop(backend);
+        drop(fixture);
+    }
+}
+
+#[test]
+fn auto_native_experts_require_verified_text_adapter_and_preserve_explicit_limits() {
+    for (verified, budget, succeeds) in [(true, 0, true), (false, 0, false), (true, 1024, false)] {
+        let (fixture, mut backend, manifest) = server_cache_fixture(json!({"version":"0.6.4", "native_experts":true}));
+        backend.invocation.as_mut().unwrap().expert_cache_bytes = Some(budget);
+        backend.test_probe.as_mut().unwrap().runtime["expert_offload"] = if verified {
+            json!({"loader":"installed_native_text_port"})
+        } else {
+            json!({"cache_budget_mode":"auto"})
+        };
+        let result = backend.prepare(&manifest);
+        assert_eq!(result.is_ok(), succeeds, "{result:?}");
+        if succeeds {
+            let servers = backend.servers.lock().unwrap();
+            assert!(!servers.values().next().unwrap().expert_offload);
+        }
         drop(backend);
         drop(fixture);
     }

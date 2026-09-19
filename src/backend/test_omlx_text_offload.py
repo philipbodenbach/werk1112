@@ -16,6 +16,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import omlx_text_offload as adapter
 
 
+class GlmThinkingTemplateTests(unittest.TestCase):
+    def test_explicit_false_closes_thinking_and_removes_effort(self):
+        from jinja2 import Environment
+        source = ("{%- set effective_reasoning_effort = reasoning_effort | default('max') -%}"
+                  "{%- if effective_reasoning_effort is not none -%}"
+                  "<|system|>Reasoning Effort: {{ effective_reasoning_effort }}{%- endif -%}"
+                  "<|user|>{{ messages[0].content }}"
+                  "{%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}")
+        tokenizer = SimpleNamespace(chat_template=source)
+        adapter.configure_glm_thinking(tokenizer, "glm5_next")
+        env = Environment()
+        render = lambda text, **kw: env.from_string(text).render(
+            messages=[{"content": "Hello"}], add_generation_prompt=True, **kw)
+        for controls in ({}, {"enable_thinking": True}, {"reasoning_effort": "low"}):
+            self.assertEqual(render(source, **controls), render(tokenizer.chat_template, **controls))
+        self.assertEqual(render(tokenizer.chat_template, enable_thinking=False),
+                         "<|user|>Hello<|assistant|><think></think>")
+        patched = tokenizer.chat_template
+        adapter.configure_glm_thinking(tokenizer, "glm5_next")
+        self.assertEqual(tokenizer.chat_template, patched)
+
+    def test_other_templates_are_not_rewritten(self):
+        for architecture, source in (("qwen4_exp", "native"),
+                                     ("glm5_next", "{{ enable_thinking }}")):
+            tokenizer = SimpleNamespace(chat_template=source)
+            adapter.configure_glm_thinking(tokenizer, architecture)
+            self.assertEqual(tokenizer.chat_template, source)
+        with self.assertRaisesRegex(ValueError, "unsupported GLM"):
+            adapter.configure_glm_thinking(SimpleNamespace(chat_template="unknown"), "glm5_next")
+
+
 class NamespaceTests(unittest.TestCase):
     def test_quantization_modules_and_weights_share_native_namespace(self):
         self.assertEqual(adapter._canonical_name("lm_head"), "language_model.lm_head")
@@ -25,6 +56,28 @@ class NamespaceTests(unittest.TestCase):
 
 
 class NgramAutoBudgetTests(unittest.TestCase):
+    def test_auto_selects_native_only_when_resident_weights_fit(self):
+        from test_omlx_offload import write_fixture
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            write_fixture(path)
+            cp = adapter.TextCheckpoint(path, 0)
+            cp.select_resident_experts(8 * adapter.GiB, 8 * adapter.GiB)
+            self.assertFalse(cp.experts_enabled)
+            self.assertFalse(cp.ngrams_enabled)
+            self.assertEqual(cp.cache_bytes, 0)
+            self.assertEqual(cp.base_bytes, cp.dense_bytes + cp.total_expert_bytes + cp.ngram_storage_bytes)
+            manager = adapter.TextExpertManager(cp)
+            manager._resize_cache(8 * adapter.GiB)
+            self.assertEqual(manager.effective_cache_bytes, 0)
+            cp = adapter.TextCheckpoint(path, 0)
+            cp.select_resident_experts(8 * adapter.GiB, 2 * adapter.GiB)
+            self.assertTrue(cp.experts_enabled)
+            cp = adapter.TextCheckpoint(path, 1024**2)
+            cp.select_resident_experts(8 * adapter.GiB, 8 * adapter.GiB)
+            self.assertTrue(cp.experts_enabled)
+            self.assertEqual(cp.cache_bytes, 1024**2)
+
     def test_text_prefill_reserve_tracks_native_peak_and_vocabulary(self):
         manager = object.__new__(adapter.TextExpertManager)
         manager.checkpoint = SimpleNamespace(config={"text_config": {"vocab_size": 248320}})
@@ -167,6 +220,34 @@ def tiny_config(architecture):
 
 @unittest.skipUnless(os.getenv("WERK_TEST_MLX_EXPERTS") == "1", "native Metal opt-in")
 class NativeTextLoaderTests(unittest.TestCase):
+    def test_resident_shards_preserve_dtypes_and_reject_changed_checkpoint(self):
+        import mlx.core as mx
+        from omlx_offload import signature
+
+        with tempfile.TemporaryDirectory() as directory:
+            selected = {}
+            expected = {}
+            for index, dtype in enumerate((mx.bfloat16, mx.uint32)):
+                path = Path(directory) / f"model-{index}.safetensors"
+                name = f"model.layers.{index}.weight"
+                value = mx.array([[1, 2], [3, 4]], dtype=dtype)
+                mx.save_safetensors(str(path), {name: value, "vision_tower.excluded": mx.ones((8,))})
+                selected[name] = SimpleNamespace(path=path, signature=signature(path.stat()), shape=(2, 2))
+                expected[adapter._canonical_name(name, "qwen4_exp")] = value
+            weights = adapter._load_resident_weights(selected, "qwen4_exp")
+            self.assertEqual(set(weights), set(expected))
+            mx.eval(weights)
+            adapter._check_resident_shards(selected)
+            for name, value in weights.items():
+                self.assertEqual(value.dtype, expected[name].dtype)
+                self.assertTrue(mx.array_equal(value, expected[name]).item())
+            with path.open("ab") as file:
+                file.write(b"changed")
+            with self.assertRaisesRegex(ValueError, "checkpoint changed"):
+                adapter._check_resident_shards(selected)
+            with self.assertRaisesRegex(ValueError, "checkpoint changed"):
+                adapter._load_resident_weights(selected, "qwen4_exp")
+
     def test_qwen_tool_probe_matches_native_tokenizer_and_typed_parser(self):
         import omlx_probe as probe
         from mlx_lm import utils
@@ -342,10 +423,13 @@ class NativeTextLoaderTests(unittest.TestCase):
                                      for name, value in weights.items()}
                 mx.save_safetensors(str(path / "model.safetensors"), saved_weights)
                 reference.load_weights(list(reference.sanitize(dict(weights)).items()), strict=True)
-                modes = [(16384, 1024), (16384, 0), (None, 1024), (None, 0)] if architecture == "qwen4_exp" else [(16384, None), (None, 0)]
+                modes = [(16384, 1024), (16384, 0), (None, 1024), (None, 0), (0, None)] if architecture == "qwen4_exp" else [(16384, None), (None, 0), (0, None)]
                 for expert_budget, ngram_budget in modes:
                     with self.subTest(expert_budget=expert_budget, ngram_budget=ngram_budget):
                         cp = adapter.TextCheckpoint(path, expert_budget, ngram_budget)
+                        if expert_budget == 0:
+                            cp.configure_auto()
+                            self.assertFalse(cp.experts_enabled)
                         manager = adapter.TextExpertManager(cp)
                         with patch("mlx_lm.utils.load_tokenizer", return_value=object()):
                             model, _ = adapter.load_text_model(manager)
@@ -402,8 +486,9 @@ class NativeTextLoaderTests(unittest.TestCase):
         bootstrap += "from omlx_supervisor import main\nmain()\n"
         launcher = Path(sys.executable).parent / "omlx"
         self.assertTrue(launcher.is_file())
-        for architecture in ("qwen4_exp", "glm5_next"):
-            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as directory:
+        for architecture, expert_mode in (("qwen4_exp", "16384"), ("glm5_next", "16384"),
+                                          ("qwen4_exp", "0"), ("glm5_next", "0")):
+            with self.subTest(architecture=architecture, expert_mode=expert_mode), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 path = root / "model"
                 path.mkdir()
@@ -431,7 +516,7 @@ class NativeTextLoaderTests(unittest.TestCase):
                 with socket.socket() as sock:
                     sock.bind(("127.0.0.1", 0))
                     port = sock.getsockname()[1]
-                environment = dict(os.environ, HF_HOME=str(root / "hf"), WERK_OMLX_EXPERT_MODEL_DIR=str(path), WERK_OMLX_EXPERT_CACHE_BYTES="16384",
+                environment = dict(os.environ, HF_HOME=str(root / "hf"), WERK_OMLX_EXPERT_MODEL_DIR=str(path), WERK_OMLX_EXPERT_CACHE_BYTES=expert_mode,
                                    WERK_OMLX_PERSISTENCE_DIR=str(root / "prefix"), WERK_OMLX_PERSISTENCE_MODEL_DIR=str(path))
                 if architecture == "qwen4_exp": environment["WERK_OMLX_NGRAM_CACHE_BYTES"] = "1024"
                 else: environment.pop("WERK_OMLX_NGRAM_CACHE_BYTES", None)
@@ -459,7 +544,9 @@ class NativeTextLoaderTests(unittest.TestCase):
                                 time.sleep(0.1)
                         name = next(item["id"] for item in discovered["data"] if item["id"] == path.name)
                         request(f"/v1/models/{name}/load", {})
-                        self.assertTrue(request("/werk/experts/status")["active"])
+                        status = request("/werk/experts/status")
+                        self.assertTrue(status["active"])
+                        self.assertEqual(status["experts_offloaded"], expert_mode != "0")
                         for prompt in ("word2 word3 word4 word5", "word2 word3 word4 word5 word6"):
                             stream = request("/v1/chat/completions", {"model": name, "messages": [{"role": "user", "content": prompt}],
                                 "max_tokens": 4, "temperature": 0, "stream": True, "chat_template_kwargs": {"enable_thinking": False}}, stream=True)

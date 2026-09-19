@@ -1,0 +1,26 @@
+oMLX expert cache: 24292 MiB (auto) upper budget; SSD offload active, native memory guard may reduce residency
+A token is a small unit of text—typically a word, part of a word, or punctuation—that language models break text into before processing it. Tokens are the basic vocabulary pieces the model reads and generates, since models work with these discrete units rather than raw characters. For example, "unbelievable" might be split into tokens like "un," "believ," and "able," and common short words like "the" usually count as single tokens.
+
+backend:              oMLX
+total duration:       51.875249s
+load duration:        0us
+prompt total count:   22 token(s)
+prompt cached count:  0 token(s)
+prompt eval count:    22 token(s)
+prompt eval duration: 11.83s
+prompt eval rate:     1.86 tokens/s
+eval count:           94 token(s)
+eval duration:        40.02s
+first token:          11.83s
+eval rate:            2.35 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 1
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 0
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false,"reasoning_effort":"low"},"max_tokens":256,"reasoning_effort":"low","temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":45198588,"allocator_clears":177,"budget_reductions":59,"cache_budget_bytes":25472562768,"cache_budget_mode":"auto","cache_evictions":9203,"cache_hits":23315,"cache_misses":12301,"disk_bytes_read":96739000320,"disk_read_seconds":27.005738,"effective_cache_budget_bytes":24374015378,"execution":"grouped","forward_calls":4074,"forward_seconds":50.936062,"materialize_seconds":0.446331,"ngram_cache_budget_bytes":0,"ngram_cache_budget_mode":"disabled","ngram_cache_evictions":0,"ngram_cache_hits":0,"ngram_cache_misses":0,"ngram_effective_cache_budget_bytes":0,"ngram_requested_rows":0,"ngram_resident_cache_bytes":0,"ngram_unique_rows":0,"output_evaluations":4471,"prefill_cache_growth_bytes":24945623040,"prefill_samples_corrected":1,"resident_cache_bytes":24363663360,"routing_seconds":8.913842,"tensor_materializations":12301}

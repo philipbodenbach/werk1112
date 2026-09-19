@@ -1078,9 +1078,9 @@ impl OmlxInvocation {
 }
 
 fn expert_cache_bytes(value: Option<OsString>) -> Result<Option<u64>> {
-    // Internally Some(0) selects auto; the public numeric 0 still disables offload.
+    // Native loading is the default. Some(0) is explicit auto; public 0 disables offload.
     let Some(value) = value else {
-        return Ok(Some(0));
+        return Ok(None);
     };
     if value == "auto" {
         return Ok(Some(0));
@@ -1115,8 +1115,9 @@ fn thinking_enabled(value: Option<OsString>) -> Result<Option<bool>> {
 }
 
 fn ngram_cache_bytes(value: Option<OsString>) -> Result<Option<u64>> {
+    // Resident tables are the default; None represents explicitly requested auto.
     let Some(value) = value else {
-        return Ok(None);
+        return Ok(Some(0));
     };
     if value == "auto" {
         return Ok(None);
@@ -1592,8 +1593,11 @@ impl OmlxProcess {
             let status =
                 process.json_request("GET", "/werk/experts/status", None, deadline.remaining()?)?;
             let actual = status.get("cache_budget_bytes").and_then(Value::as_u64);
+            let native_experts = native_weight_adapter
+                && status.get("experts_offloaded").and_then(Value::as_bool) == Some(false)
+                && actual == Some(0);
             let confirmed = if requested_bytes == 0 {
-                actual.is_some_and(|bytes| bytes > 0)
+                (actual.is_some_and(|bytes| bytes > 0) || native_experts)
                     && status.get("cache_budget_mode").and_then(Value::as_str) == Some("auto")
             } else {
                 actual == Some(requested_bytes)
@@ -1601,16 +1605,20 @@ impl OmlxProcess {
             if status.get("active").and_then(Value::as_bool) != Some(true) || !confirmed {
                 bail!("oMLX did not confirm activating the requested bounded expert cache");
             }
-            process.expert_offload = true;
-            eprintln!(
-                "oMLX expert cache: {} MiB ({}) upper budget; SSD offload active, native memory guard may reduce residency",
-                actual.unwrap_or_default() / (1024 * 1024),
-                if requested_bytes == 0 {
-                    "auto"
-                } else {
-                    "explicit"
-                }
-            );
+            process.expert_offload = !native_experts;
+            if native_experts {
+                eprintln!("oMLX experts: native resident execution (auto; weights fit available memory)");
+            } else {
+                eprintln!(
+                    "oMLX expert cache: {} MiB ({}) upper budget; SSD offload active, native memory guard may reduce residency",
+                    actual.unwrap_or_default() / (1024 * 1024),
+                    if requested_bytes == 0 {
+                        "auto"
+                    } else {
+                        "explicit"
+                    }
+                );
+            }
         }
         if native_weight_adapter {
             let status =

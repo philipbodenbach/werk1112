@@ -20,6 +20,11 @@ import weakref
 
 MiB = 1024**2
 GiB = 1024**3
+
+
+def expert_read_workers():
+    """Bound I/O concurrency without increasing the caller's staging budget."""
+    return min(16, max(1, os.cpu_count() or 4))
 DTYPES = {'U32': 4, 'I32': 4, 'F32': 4, 'F16': 2, 'BF16': 2,
           'I64': 8, 'U64': 8, 'I16': 2, 'U16': 2, 'I8': 1, 'U8': 1, 'BOOL': 1}
 EXPERT = re.compile(r'^(?:language_model\.)?model\.layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$')
@@ -413,8 +418,8 @@ class RangeReader:
     def __init__(self, max_open_files=16, prefetch_workers=0):
         self.max_open_files = integer(max_open_files, 'open file limit', 1)
         self.prefetch_workers = integer(prefetch_workers, 'prefetch workers')
-        if self.prefetch_workers > 4:
-            raise ValueError('checkpoint prefetch supports at most four readers')
+        if self.prefetch_workers > 16:
+            raise ValueError('checkpoint prefetch supports at most sixteen readers')
         self._read_pool = None
         self._fds = OrderedDict()
         self._lock = threading.RLock()
@@ -487,7 +492,7 @@ class RangeReader:
             self.read_seconds+=time.perf_counter()-started
 
     @contextmanager
-    def prefetch(self, tensors, max_bytes=256*MiB):
+    def prefetch(self, tensors, max_bytes=256*MiB, while_reading=None):
         """Read adjacent needed ranges together, with bounded temporary storage.
 
         Each returned row owns its bytes. A cached MLX expert therefore cannot
@@ -506,7 +511,7 @@ class RangeReader:
             self._prefetched = {}
             try:
                 if self.prefetch_workers and len(tensors) > 1:
-                    self._parallel_prefetch(tensors)
+                    self._parallel_prefetch(tensors, while_reading)
                     yield
                     return
                 runs = []
@@ -545,22 +550,31 @@ class RangeReader:
         finally:
             reader.close()
 
-    def _parallel_prefetch(self, tensors):
+    def _parallel_prefetch(self, tensors, while_reading=None):
         from concurrent.futures import ThreadPoolExecutor, wait
         if self._read_pool is None:
             self._read_pool = ThreadPoolExecutor(
                 max_workers=self.prefetch_workers, thread_name_prefix='werk-expert-read')
         started = time.perf_counter()
         futures = []
+        scheduled = None
         try:
             for tensor in tensors:
                 futures.append(self._read_pool.submit(self._isolated_read, tensor))
+            scheduled = time.perf_counter()
+            if while_reading is not None:
+                # Only file reads run on pool threads. The caller's MLX work
+                # stays on its owning executor, inside its existing leases.
+                while_reading()
         finally:
             # Drain all readers even if scheduling or a read fails. At most
             # the caller's bounded group is in flight; no work escapes its
             # workspace lifetime and no worker retains raw bytes for later.
+            waiting = time.perf_counter()
             wait(futures)
-            self.read_seconds += time.perf_counter() - started
+            # Count foreground I/O scheduling/wait, excluding overlapped GPU
+            # work. Forward time still includes the entire operation.
+            self.read_seconds += (scheduled or waiting) - started + time.perf_counter() - waiting
         failure = None
         for tensor, future in zip(tensors, futures):
             try:
