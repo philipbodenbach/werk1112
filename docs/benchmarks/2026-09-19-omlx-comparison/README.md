@@ -77,8 +77,57 @@ demonstrates substantial weight movement and cache churn. Both mechanisms can
 contribute to the reported discrepancy; the original GLM/native versus
 Qwen/Werk numbers still cannot quantify their individual contributions.
 
-The next optimization target is native batched expert execution over retained
-weights, avoiding Python routing and per-expert dispatch, while keeping the
-bounded offload cache. The resident-loader optimization addresses startup,
-not this repeated decode work. Full-model native parity requires an identical
-model on a machine with sufficient RAM or a smaller common checkpoint.
+## Implemented changes and controlled before/after
+
+Automatic Qwen/GLM selection now retains native expert modules if all experts
+fit with base weights, auxiliary caches, OS headroom and workspace. Automatic
+PLE tables also remain resident when the full combination fits. Positive cache
+budgets still force bounded streaming. This branch was verified with Qwen/GLM
+fixtures, including real private workers, streaming and prefix persistence;
+the 99-GiB checkpoint cannot exercise that branch on this 48-GiB machine.
+
+For offloaded single-token decode, every expert uses the same input directly.
+The adapter concatenates the outputs of each leased group and scatters once per
+group, instead of gathering the input and scattering output separately for each
+expert. Initial zero-buffer evaluation and final unweighted reshape evaluation
+are no longer separate synchronization points. Every group is still evaluated
+before releasing its expert leases. Weight storage and cache limits are unchanged.
+
+A trial that packed cached weights for native gather kernels on every token was
+slower and was discarded. The retained offload optimization does **not** eliminate
+all Python dispatch or use native batched expert kernels.
+
+`expert-layer-optimized.json` compares old, new and native implementations in
+the same process, with alternating order and identical real weights:
+
+| Warm execution | Median |
+| --- | ---: |
+| Native | 0.300 ms |
+| Old Werk | 0.939 ms |
+| New Werk | 0.692 ms |
+
+That is 26.2% less time (1.36x throughput) for this isolated expert call, with zero
+warm weight reads. The remaining gap to native is 2.31x for this measurement.
+
+`full_model_ab.py` then ran the old and newly installed release binaries in
+before/after/after/before order, each in a fresh worker. Both used exactly
+16,384 MiB expert cache, automatic N-gram cache, the same 22-token prompt,
+temperature zero, thinking disabled and a 64-token output limit.
+
+| Binary | Decode rates | Mean |
+| --- | --- | ---: |
+| Before | 4.48, 4.45 tokens/s | 4.465 tokens/s |
+| After | 4.73, 4.74 tokens/s | 4.735 tokens/s |
+
+The observed full-model improvement is **6.0%**. All four answers are identical,
+and each run reads exactly 22,693,611,200 logical weight bytes. N-gram usage stays
+within the same 64-MiB initial allocation. Raw logs and binary hashes are in
+`full-model-ab/`. Two observations per binary establish a local result, not a
+cross-hardware performance guarantee. This is a before/after Werk comparison,
+not full-model vanilla oMLX throughput.
+
+The resident-loader optimization addresses startup, not this repeated decode
+work. Full-model native parity still requires an identical model on a machine
+with sufficient RAM or a smaller common checkpoint. A future native gather path
+for offload needs reusable packed storage with correct shared eviction accounting,
+rather than copying the selected weights into a fresh pack at every token.
