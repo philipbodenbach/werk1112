@@ -16,6 +16,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import omlx_text_offload as adapter
 
 
+class GlmThinkingTemplateTests(unittest.TestCase):
+    def test_explicit_false_closes_thinking_and_removes_effort(self):
+        from jinja2 import Environment
+        source = ("{%- set effective_reasoning_effort = reasoning_effort | default('max') -%}"
+                  "{%- if effective_reasoning_effort is not none -%}"
+                  "<|system|>Reasoning Effort: {{ effective_reasoning_effort }}{%- endif -%}"
+                  "<|user|>{{ messages[0].content }}"
+                  "{%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}")
+        tokenizer = SimpleNamespace(chat_template=source)
+        adapter.configure_glm_thinking(tokenizer, "glm5_next")
+        env = Environment()
+        render = lambda text, **kw: env.from_string(text).render(
+            messages=[{"content": "Hello"}], add_generation_prompt=True, **kw)
+        for controls in ({}, {"enable_thinking": True}, {"reasoning_effort": "low"}):
+            self.assertEqual(render(source, **controls), render(tokenizer.chat_template, **controls))
+        self.assertEqual(render(tokenizer.chat_template, enable_thinking=False),
+                         "<|user|>Hello<|assistant|><think></think>")
+        patched = tokenizer.chat_template
+        adapter.configure_glm_thinking(tokenizer, "glm5_next")
+        self.assertEqual(tokenizer.chat_template, patched)
+
+    def test_other_templates_are_not_rewritten(self):
+        for architecture, source in (("qwen4_exp", "native"),
+                                     ("glm5_next", "{{ enable_thinking }}")):
+            tokenizer = SimpleNamespace(chat_template=source)
+            adapter.configure_glm_thinking(tokenizer, architecture)
+            self.assertEqual(tokenizer.chat_template, source)
+        with self.assertRaisesRegex(ValueError, "unsupported GLM"):
+            adapter.configure_glm_thinking(SimpleNamespace(chat_template="unknown"), "glm5_next")
+
+
 class NamespaceTests(unittest.TestCase):
     def test_quantization_modules_and_weights_share_native_namespace(self):
         self.assertEqual(adapter._canonical_name("lm_head"), "language_model.lm_head")

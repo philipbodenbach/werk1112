@@ -1,0 +1,30 @@
+[werk run] persistence enabled: 2 saved messages restored
+[werk run] conversation: /Users/philipbodenbach/.local/share/werk1112/chat-sessions/b8ac8a7bea774a06ab7176c272fdc006889b2129ab016e180583e5753d52479b.json
+oMLX expert cache: 24292 MiB (auto) upper budget; SSD offload active, native memory guard may reduce residency
+oMLX native short-prefix cache unavailable for this runtime/model; ordinary prefix caching remains active
+[werk run] native KV cache enabled; reuse depends on the prompt and backend
+A token is a small piece of data that represents something larger, such as an object, a value, or a right to access a resource. In computing, tokens are used in programming languages, where they represent the smallest units of meaningful text, such as keywords, operators, or identifiers. In security systems, tokens are used to represent authentication credentials or permissions, allowing users to access specific resources or perform certain actions.
+
+backend:              oMLX
+total duration:       42.386638s
+load duration:        4.041604s
+prompt total count:   113 token(s)
+prompt cached count:  100 token(s)
+prompt eval count:    13 token(s)
+prompt eval duration: 7.47s
+prompt eval rate:     1.74 tokens/s
+eval count:           83 token(s)
+eval duration:        30.84s
+first token:          7.47s
+eval rate:            2.69 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 3
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  oMLX cached prompt tokens: 100
+  oMLX request controls (omitted values inherit runtime defaults): {"chat_template_kwargs":{"enable_thinking":false},"max_tokens":256,"temperature":0.0}
+  oMLX experts (worker interval; reads include OS file cache): {"allocator_cache_bytes":0,"allocator_clears":144,"budget_reductions":50,"cache_budget_bytes":25472562768,"cache_budget_mode":"auto","cache_evictions":8030,"cache_hits":19671,"cache_misses":11096,"disk_bytes_read":87262494720,"disk_read_seconds":17.721846,"effective_cache_budget_bytes":24112325954,"execution":"grouped","forward_calls":3612,"forward_seconds":37.180214,"materialize_seconds":0.449697,"ngram_cache_budget_bytes":0,"ngram_cache_budget_mode":"disabled","ngram_cache_evictions":0,"ngram_cache_hits":0,"ngram_cache_misses":0,"ngram_effective_cache_budget_bytes":0,"ngram_requested_rows":0,"ngram_resident_cache_bytes":0,"ngram_unique_rows":0,"output_evaluations":7154,"prefill_cache_growth_bytes":17356554240,"prefill_samples_corrected":1,"resident_cache_bytes":24112005120,"routing_seconds":6.776428,"tensor_materializations":11096}

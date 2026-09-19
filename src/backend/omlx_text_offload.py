@@ -27,6 +27,26 @@ ARCHITECTURES = {"qwen4_exp", "glm5_next"}
 _MANAGER = None
 
 
+def configure_glm_thinking(tokenizer, architecture):
+    """Add an explicit no-thinking branch to the legacy GLM template in memory.
+
+    Keep the checkpoint's default/explicit thinking prompts byte-identical.
+    Templates already implementing the switch remain authoritative.
+    """
+    template = tokenizer.chat_template
+    if (architecture != "glm5_next" or not isinstance(template, str)
+            or "enable_thinking" in template):
+        return
+    opening = "<|assistant|>{{- '<think>' -}}"
+    effort = "{%- if effective_reasoning_effort is not none -%}"
+    if template.count(opening) != 1 or template.count(effort) != 1:
+        raise ValueError("unsupported GLM thinking template; cannot honor enable_thinking")
+    template = template.replace(effort,
+        "{%- if effective_reasoning_effort is not none and enable_thinking is not sameas false -%}")
+    tokenizer.chat_template = template.replace(opening,
+        "<|assistant|>{{- '<think></think>' if enable_thinking is sameas false else '<think>' -}}")
+
+
 def automatic_ngram_budget(*, metal_limit, available_memory, base_bytes,
                            expert_minimum, minimum_row_bytes, maximum_row_cache_bytes):
     """A device ceiling, not a reservation: growth follows actual row evictions.
@@ -564,6 +584,7 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
         model = TextModel()
         tokenizer = utils.load_tokenizer(cp.path, tokenizer_config,
                                          eos_token_ids=cp.config.get("eos_token_id", cp.config["text_config"].get("eos_token_id")))
+        configure_glm_thinking(tokenizer, current.architecture)
         manager._model_ref = weakref.ref(model)
         weakref.finalize(model, manager.deactivate)
         return (model, tokenizer, cp.config) if kwargs.get("return_config") else (model, tokenizer)
