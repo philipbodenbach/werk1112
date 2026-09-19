@@ -2335,6 +2335,7 @@ mod tests {
 
     fn manifest(format: ModelFormat, architecture: Option<&str>) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: "test-model".to_string(),
             source: ModelSource::LocalPath {
                 path: "test".to_string(),

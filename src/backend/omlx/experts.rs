@@ -327,6 +327,7 @@ mod tests {
             ));
             let store = ModelStore::resolve(Some(root.clone())).unwrap();
             let manifest = ModelManifest {
+                storage: Default::default(),
                 id: "owner/model".to_string(),
                 source: crate::model_store::ModelSource::LocalPath {
                     path: "fixture".to_string(),

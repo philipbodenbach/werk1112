@@ -6710,6 +6710,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "clap",
+ "console",
  "crc32fast",
  "cudarc 0.19.8",
  "fs2",

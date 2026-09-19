@@ -708,7 +708,7 @@ fn companion_model_path(store: &ModelStore, manifest: &ModelManifest) -> PathBuf
     {
         return store.absolute_model_file(manifest, model_path);
     }
-    store.model_dir(&manifest.id).join("files")
+    store.model_files_dir(manifest)
 }
 
 pub(super) fn companion_inputs(
@@ -1322,8 +1322,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn companion_model_path_supports_external_repositories_and_single_files() {
+        let directory = CompanionTestDirectory::new("external-model-path");
+        let store = directory.store();
+        let external = directory.0.join("raid/flux");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("model_index.json"), b"{}").unwrap();
+        let mut manifest = media_manifest("flux", InferenceTask::ImageGeneration);
+        manifest.storage = crate::model_store::ModelStorage::External {
+            path: external.clone(),
+        };
+
+        assert_eq!(companion_model_path(&store, &manifest), external);
+        assert!(!store.model_dir(&manifest.id).join("files").exists());
+
+        manifest.metadata.repository_layout = RepositoryLayout::SingleFile;
+        manifest.model_path = Some("files/model.safetensors".to_string());
+        assert_eq!(
+            companion_model_path(&store, &manifest),
+            external.join("model.safetensors")
+        );
+
+        let local = qwen_voice_design_manifest();
+        assert_eq!(
+            companion_model_path(&store, &local),
+            store.model_dir(&local.id).join("files")
+        );
+    }
+
     fn qwen_voice_design_manifest() -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: "qwen-voice-design".to_string(),
             source: ModelSource::LocalPath {
                 path: "qwen-voice-design".to_string(),
@@ -1348,6 +1378,7 @@ mod tests {
 
     fn media_manifest(id: &str, task: InferenceTask) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: id.to_string(),
             source: ModelSource::LocalPath {
                 path: id.to_string(),

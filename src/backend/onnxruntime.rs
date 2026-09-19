@@ -1292,8 +1292,7 @@ fn onnx_genai_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Option<
         .filter(|file| file.path.ends_with("/genai_config.json"))
         .filter_map(|file| {
             store
-                .model_dir(&manifest.id)
-                .join(&file.path)
+                .absolute_model_file(manifest, &file.path)
                 .parent()
                 .map(Path::to_path_buf)
         })
@@ -1468,6 +1467,7 @@ for raw in sys.stdin:
 
     fn manifest_with_model_path(id: &str, model_path: Option<&str>) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: id.to_string(),
             source: ModelSource::LocalPath {
                 path: "test".to_string(),
@@ -1744,6 +1744,27 @@ for raw in sys.stdin:
         );
         assert!(message.contains("timed out"), "{message}");
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn onnx_genai_model_dir_resolves_external_inventory_candidates() {
+        let tmp = test_dir("external-candidate");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let external = tmp.join("raid/phi");
+        let model_dir = external.join("cpu/int4");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("genai_config.json"), b"{}").unwrap();
+        let mut manifest = manifest_with_model_path("phi", None);
+        manifest.storage = crate::model_store::ModelStorage::External { path: external };
+        manifest.files = vec![ModelFile {
+            path: "files/cpu/int4/genai_config.json".to_string(),
+            size: 2,
+            checksum: "crc32:0".to_string(),
+        }];
+
+        assert_eq!(onnx_genai_model_dir(&store, &manifest), Some(model_dir));
+        assert!(!store.model_dir(&manifest.id).join("files").exists());
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]

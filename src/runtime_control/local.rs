@@ -4096,6 +4096,7 @@ mod tests {
             let store = ModelStore::resolve(Some(root.clone())).unwrap();
             store.ensure().unwrap();
             let manifest = ModelManifest {
+                storage: Default::default(),
                 id: "model".to_string(),
                 source: ModelSource::HuggingFace {
                     repo: "test/model".to_string(),

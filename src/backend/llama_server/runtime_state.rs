@@ -23,6 +23,8 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
+mod chat_persistence;
+pub(super) use chat_persistence::LlamaChatPersistence;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -1320,12 +1322,12 @@ fn functional_probe_llama_state(server: &LlamaServerProcess) -> Result<()> {
         let snapshot = save_llama_slot(server, &probe_name, prompt_tokens)?;
         erase_llama_slot(server, Some(prompt_tokens))?;
         restore_llama_slot(server, &probe_name, prompt_tokens, snapshot.bytes)?;
-        let replay_tokens = run_llama_prefill(server, &probe_input)?;
+        let (replay_tokens, cached_tokens) = run_llama_prefill_with_cache(server, &probe_input)?;
         if replay_tokens != prompt_tokens {
             bail!("llama.cpp capability probe replay changed tokenization");
         }
         let status = llama_slot_status(server)?;
-        if status.is_processing || status.prompt_tokens_cache < prompt_tokens.saturating_sub(1) {
+        if status.is_processing || cached_tokens < prompt_tokens.saturating_sub(1) {
             bail!("llama.cpp capability probe did not prove restored cache reuse");
         }
         erase_llama_slot(server, Some(prompt_tokens))?;
@@ -1337,6 +1339,13 @@ fn functional_probe_llama_state(server: &LlamaServerProcess) -> Result<()> {
 }
 
 fn run_llama_prefill(server: &LlamaServerProcess, input: &PrefillInput) -> Result<u64> {
+    run_llama_prefill_with_cache(server, input).map(|(tokens, _)| tokens)
+}
+
+fn run_llama_prefill_with_cache(
+    server: &LlamaServerProcess,
+    input: &PrefillInput,
+) -> Result<(u64, u64)> {
     let (path, body) = llama_state_request_body(input, Some(0), None);
     let response = control_json_request(&server.url, path, "POST", Some(&body))?;
     if !response.is_object() {
@@ -1351,7 +1360,14 @@ fn run_llama_prefill(server: &LlamaServerProcess, input: &PrefillInput) -> Resul
     if status.is_processing || status.prompt_tokens == 0 {
         bail!("llama.cpp prefill did not leave a valid idle prompt slot");
     }
-    Ok(status.prompt_tokens)
+    // Recent servers reset slot timing counters on release. The completed
+    // request carries the authoritative reuse count; older builds expose it on /slots.
+    let cached_tokens = response
+        .pointer("/timings/cache_n")
+        .or_else(|| response.pointer("/usage/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(status.prompt_tokens_cache);
+    Ok((status.prompt_tokens, cached_tokens))
 }
 
 fn run_llama_decode(
@@ -2481,6 +2497,108 @@ mod tests {
     }
 
     #[test]
+    fn chat_snapshot_survives_process_replacement_and_rejects_corruption() {
+        let root = test_root("chat-restart");
+        let store = ModelStore::resolve(Some(root.clone())).unwrap();
+        let cache_root = root.join("chat-cache");
+        for iteration in 0..3 {
+            let snapshots = root.join(format!("snapshots-{iteration}"));
+            ensure_real_directory(&snapshots, true).unwrap();
+            let fake = spawn_fake_state_server(snapshots.clone(), false);
+            let process = test_process(fake.url.clone(), snapshots);
+            let cache = LlamaChatPersistence::open(&process, &store, &test_manifest(), &cache_root)
+                .unwrap();
+            if iteration == 0 {
+                assert!(cache.restore(&process).unwrap().contains("cold session"));
+                run_llama_prefill(
+                    &process,
+                    &PrefillInput::Text {
+                        text: STATE_CAPABILITY_PROBE_PROMPT.into(),
+                    },
+                )
+                .unwrap();
+                assert!(cache.save(&process).contains("saved: 7 tokens"));
+            } else if iteration == 1 {
+                assert!(
+                    cache
+                        .restore(&process)
+                        .unwrap()
+                        .contains("restored: 7 tokens")
+                );
+                assert_eq!(llama_slot_status(&process).unwrap().prompt_tokens, 7);
+                // Corrupt the durable bytes without changing their length.
+                let namespace = fs::read_dir(&cache_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let record: Value =
+                    serde_json::from_slice(&fs::read(namespace.join("latest.json")).unwrap())
+                        .unwrap();
+                let path = namespace.join(record["filename"].as_str().unwrap());
+                fs::write(path, b"wrong-slot-data").unwrap();
+            } else {
+                assert!(
+                    cache
+                        .restore(&process)
+                        .unwrap()
+                        .contains("checksum mismatch")
+                );
+                assert_eq!(llama_slot_status(&process).unwrap().prompt_tokens, 0);
+            }
+            drop(process);
+            fake.finish();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_or_error_streams_do_not_become_completed_turns() {
+        let root = test_root("incomplete-stream");
+        for (index, body) in [
+            "data: {\"content\":\"partial\"}\n\n",
+            "data: {\"error\":{\"message\":\"decode failed\"}}\n\n",
+            "data: {\"content\":\"answer\",\"stop\":true}\n\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let join = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_fake_request(&mut stream).unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let snapshots = root.join(format!("snapshots-{index}"));
+            ensure_real_directory(&snapshots, true).unwrap();
+            let process = test_process(url, snapshots);
+            let result = process.complete(
+                &crate::backend::GenerateRequest {
+                    prompt: "hello".into(),
+                    messages: vec![],
+                    image_urls: vec![],
+                    max_tokens: 8,
+                    temperature: None,
+                    top_p: None,
+                    stop: vec![],
+                    seed: None,
+                    stream_granularity: crate::backend::StreamGranularity::Token,
+                    verbose: false,
+                    debug: false,
+                    tool_config: None,
+                },
+                None,
+            );
+            assert_eq!(result.is_ok(), index == 2);
+            drop(process);
+            join.join().unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn functional_probe_fails_closed_on_untruthful_slot_save_metadata() {
         let root = test_root("functional-probe-invalid");
         let snapshot_dir = root.join("snapshots");
@@ -2868,12 +2986,13 @@ mod tests {
                             cache_tokens = 7;
                         }
                         slot_tokens = 7;
-                        json!({"id_slot": 0, "content": "", "tokens_predicted": 0})
+                        json!({"id_slot": 0, "content": "", "tokens_predicted": 0,
+                            "timings": {"cache_n": cache_tokens}})
                     }
                     ("GET", "/slots") => json!([{
                         "id": 0,
                         "n_prompt_tokens": slot_tokens,
-                        "n_prompt_tokens_cache": cache_tokens,
+                        "n_prompt_tokens_cache": 0,
                         "is_processing": false,
                     }]),
                     ("POST", "/slots/0?action=save") => {
@@ -3006,23 +3125,7 @@ mod tests {
             model_path: PathBuf::from("model.gguf"),
             projector_path: None,
             model_id: "test-model".to_string(),
-            model_identity: ModelRuntimeIdentity::from_manifest(&ModelManifest {
-                id: "test-model".to_string(),
-                source: ModelSource::LocalPath {
-                    path: "test".to_string(),
-                },
-                format: ModelFormat::Gguf,
-                architecture: Some("llama".to_string()),
-                tokenizer_path: None,
-                config_path: None,
-                model_path: Some("model.gguf".to_string()),
-                backend: "llama-server".to_string(),
-                created_unix: 1,
-                files: Vec::new(),
-                artifacts: Vec::new(),
-                metadata: ModelMetadata::default(),
-            })
-            .unwrap(),
+            model_identity: ModelRuntimeIdentity::from_manifest(&test_manifest()).unwrap(),
             url,
             pid: std::process::id(),
             mode: LlamaCppMode::Cpu,
@@ -3041,6 +3144,26 @@ mod tests {
                 }),
                 configured: true,
             },
+        }
+    }
+
+    fn test_manifest() -> ModelManifest {
+        ModelManifest {
+            storage: Default::default(),
+            id: "test-model".to_string(),
+            source: ModelSource::LocalPath {
+                path: "test".to_string(),
+            },
+            format: ModelFormat::Gguf,
+            architecture: Some("llama".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: Some("model.gguf".to_string()),
+            backend: "llama-server".to_string(),
+            created_unix: 1,
+            files: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: ModelMetadata::default(),
         }
     }
 

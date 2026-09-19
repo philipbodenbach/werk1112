@@ -1,5 +1,7 @@
 mod chat_persistence;
 mod media_diagnostics;
+mod model_list;
+mod run_inference;
 mod terminal_activity;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -47,13 +49,12 @@ use crate::{
         TransformersCompatBackend, VllmBackend, backend_doctor_checks,
         backend_supports_accelerator, backend_supports_format,
         backend_supports_images as runtime_supports_images, candle_gguf_tokenizer_rejection,
-        current_host_is_strix_halo, install_managed_llama_server,
-        install_managed_llama_server_with_options, install_managed_onnx_runtime,
-        install_managed_qwen_tts, install_managed_vllm, llama_server_help_ok, managed_backend_dir,
-        managed_runner_path as managed_onnx_runner_path, managed_vllm_dir, probe_device,
-        runtime_descriptor, runtime_registry, runtime_supports_model,
-        validated_backend_install_command, vllm_architecture_supports_images, vllm_doctor_checks,
-        vllm_rocm_signals,
+        current_host_is_strix_halo, install_managed_llama_server_with_options,
+        install_managed_onnx_runtime, install_managed_qwen_tts, install_managed_vllm,
+        llama_server_help_ok, managed_backend_dir, managed_runner_path as managed_onnx_runner_path,
+        managed_vllm_dir, probe_device, runtime_descriptor, runtime_registry,
+        runtime_supports_model, validated_backend_install_command,
+        vllm_architecture_supports_images, vllm_doctor_checks, vllm_rocm_signals,
     },
     banner::print_banner,
     cache::{self, CacheKind, CachePurgeReport, CacheSelection},
@@ -384,6 +385,8 @@ pub enum BenchCompareArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendInstallArg {
     LlamaCuda,
+    /// Experimental pinned CUDA runtime with MoE caching and lazy PLE reads.
+    LlamaCudaOffload,
     LlamaRocm,
     LlamaVulkan,
     LlamaMetal,
@@ -400,7 +403,7 @@ pub enum BackendInstallArg {
 impl BackendInstallArg {
     fn mode(self) -> Option<LlamaCppMode> {
         match self {
-            Self::LlamaCuda => Some(LlamaCppMode::Cuda),
+            Self::LlamaCuda | Self::LlamaCudaOffload => Some(LlamaCppMode::Cuda),
             Self::LlamaRocm => Some(LlamaCppMode::Rocm),
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaMetal => Some(LlamaCppMode::Metal),
@@ -465,11 +468,25 @@ pub struct ChatPersistenceArgs {
         help = "Conversation reuse: prefer resumes if present, required needs a saved conversation, disabled starts fresh; implies --persistence"
     )]
     pub persistence_reuse: Option<ServePersistenceReuseArg>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Conversation storage: disk/auto survives exit; memory/ephemeral lasts only for this process; implies --persistence"
+    )]
+    pub persistence_mode: Option<ServePersistenceModeArg>,
+
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=MAX_PERSISTENCE_TTL_SECONDS), help = "Expire saved conversation after this many seconds; implies --persistence")]
+    pub persistence_ttl_seconds: Option<u64>,
 }
 
 impl ChatPersistenceArgs {
     fn is_enabled(&self) -> bool {
-        self.persistence || self.session.is_some() || self.persistence_reuse.is_some()
+        self.persistence
+            || self.session.is_some()
+            || self.persistence_reuse.is_some()
+            || self.persistence_mode.is_some()
+            || self.persistence_ttl_seconds.is_some()
     }
 
     fn open(
@@ -481,12 +498,15 @@ impl ChatPersistenceArgs {
             return Ok(None);
         }
         let policy = PersistencePolicy {
-            mode: PersistenceMode::Disk,
+            mode: self
+                .persistence_mode
+                .map(Into::into)
+                .unwrap_or(PersistenceMode::Disk),
             reuse: self
                 .persistence_reuse
                 .map(Into::into)
                 .unwrap_or(ReuseMode::Prefer),
-            ttl_seconds: None,
+            ttl_seconds: self.persistence_ttl_seconds,
             pin: false,
         };
         ChatPersistence::open(
@@ -659,18 +679,20 @@ pub enum Commands {
     },
 
     #[command(
-        about = "Run one prompt against an installed model and print the response",
-        hide = true
+        about = "Run text, vision, tools, image, audio, or video inference with an installed model"
     )]
     Run {
         #[arg(help = "Installed model id")]
         model: String,
 
-        #[arg(required = true, num_args = 1.., help = "Prompt text")]
+        #[arg(required_unless_present_any = ["request", "task", "inputs"], num_args = 1.., help = "Prompt text")]
         prompt: Vec<String>,
 
-        #[arg(long, default_value_t = DEFAULT_MAX_NEW_TOKENS, help = "Maximum generated tokens")]
-        max_tokens: usize,
+        #[arg(
+            long,
+            help = "Maximum generated tokens (default: 256, or request JSON value)"
+        )]
+        max_tokens: Option<usize>,
 
         #[arg(long, help = "Sampling temperature")]
         temperature: Option<f64>,
@@ -700,6 +722,12 @@ pub enum Commands {
 
         #[arg(long, help = "Print backend internals and resolved runtime details")]
         debug: bool,
+
+        #[command(flatten)]
+        options: run_inference::RunOptions,
+
+        #[command(flatten)]
+        persistence: ChatPersistenceArgs,
     },
 
     #[command(about = "Start an interactive terminal chat with an installed model")]
@@ -818,7 +846,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            help = "For remote Hugging Face estimates, estimate one repository file, for example model.Q4_K_M.gguf"
+            help = "For remote Hugging Face estimates, select a repository file; matching GGUF shards are included automatically"
         )]
         file: Option<String>,
 
@@ -961,13 +989,30 @@ pub enum Commands {
         command: RuntimeCommands,
     },
 
-    #[command(about = "Copy a local model file or directory into the managed model store")]
+    #[command(about = "Import local models, copying their files or binding external paths")]
     Import {
-        #[arg(help = "Model file or directory to copy")]
+        #[arg(help = "Model file or directory, or a collection directory with --all")]
         path: PathBuf,
 
-        #[arg(long, help = "Installed model id")]
-        name: String,
+        #[arg(
+            long,
+            required_unless_present = "all",
+            conflicts_with = "all",
+            help = "Installed model id; required unless --all is used"
+        )]
+        name: Option<String>,
+
+        #[arg(
+            long,
+            help = "Import each model directly inside a collection directory, preserving existing Werk model ids"
+        )]
+        all: bool,
+
+        #[arg(
+            long,
+            help = "Register the existing model in place without copying its files"
+        )]
+        link: bool,
     },
 
     #[command(about = "Pull a Hugging Face repository into the managed model store")]
@@ -980,7 +1025,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            help = "Download one repository file, for example model.Q4_K_M.gguf"
+            help = "Download a repository file, for example model.Q4_K_M.gguf; matching GGUF shards are included automatically"
         )]
         file: Option<String>,
     },
@@ -995,7 +1040,7 @@ pub enum Commands {
         id: String,
     },
 
-    #[command(about = "List installed models")]
+    #[command(about = "List installed models and their local storage paths")]
     List {
         #[arg(long, value_parser = parse_inference_task, help = "Filter by supported task")]
         task: Option<InferenceTask>,
@@ -1565,77 +1610,29 @@ pub async fn run(cli: Cli) -> Result<()> {
             images,
             verbose,
             debug,
+            options,
+            persistence,
         } => {
-            let prompt = prompt.join(" ");
-            let images = normalize_cli_image_sources(&images)?;
-            let store = ModelStore::resolve(model_home)?;
-            let backend_choice = resolve_backend(backend_override, device_override)?;
-            let manifest = store.get(&model)?;
-            let selected_route = routed_backend_for_request_with_tools(
-                &store,
-                backend_choice,
-                &manifest,
-                !images.is_empty(),
-                false,
-                selection_options,
-            )?;
-            let selected_backend = selected_route.choice;
-            selected_route.report();
-            print_routing_debug(
-                &store,
+            run_inference::execute(
+                model_home,
                 backend_override,
-                &manifest,
-                !images.is_empty(),
-                &selected_route,
-                debug,
-            );
-            let backend = selected_route.build(store, llama_options.clone(), selection_options)?;
-            let messages = vec![vision_user_message(&prompt, &images)];
-            let prompt = prompt_for_backend(&manifest, &messages, selected_backend, chat_template);
-            let prompt_diagnostics = prompt_diagnostics(&prompt, messages.len(), None);
-            let request_messages = generation_request_messages(&prompt, &messages);
-            let request_image_urls = if request_messages.is_empty() {
-                images
-            } else {
-                image_urls_from_messages(&request_messages)
-            };
-            let request = GenerateRequest {
-                prompt: prompt.prompt,
-                messages: request_messages,
-                image_urls: request_image_urls,
+                device_override,
+                llama_options,
+                selection_options,
+                model,
+                prompt,
                 max_tokens,
                 temperature,
                 top_p,
-                stop: prompt.stop,
                 seed,
-                stream_granularity: StreamGranularity::Chunk,
+                chat_template,
+                images,
                 verbose,
                 debug,
-                tool_config: None,
-            };
-            let activity = ActivitySpec::chat();
-            let response = with_activity(
-                generation_activity_enabled(debug),
-                activity.kind(),
-                activity.message(&manifest.id),
-                || backend.generate(&manifest, request),
-            )?;
-            println!("{}", response.text.trim());
-            io::stdout().flush()?;
-            if verbose {
-                let mut stderr = io::stderr().lock();
-                writeln!(stderr)?;
-                write_verbose_stats(
-                    &mut stderr,
-                    Some(verbose_backend_label(selected_backend)),
-                    response.prompt_tokens,
-                    response.completion_tokens,
-                    &response.finish_reason,
-                    response.timings,
-                    &merged_diagnostics(&prompt_diagnostics, &response.backend_diagnostics),
-                )?;
-            }
-            Ok(())
+                options,
+                persistence,
+            )
+            .await
         }
         Commands::Chat {
             model,
@@ -1651,8 +1648,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             debug,
             persistence,
         } => {
-            let selection_options = selection_options
-                .with_vllm_automatic_prefix_caching(persistence.is_enabled().then_some(true));
+            let selection_options = conversation_selection_options(selection_options, &persistence);
             let images = normalize_cli_image_sources(&images)?;
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
@@ -1662,12 +1658,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 || persistence
                     .as_ref()
                     .is_some_and(|(_, messages)| !image_urls_from_messages(messages).is_empty());
+            let requires_tools = persistence
+                .as_ref()
+                .is_some_and(|(_, messages)| messages.iter().any(ChatMessage::uses_tool_calling));
             let selected_route = routed_backend_for_request_with_tools(
                 &store,
                 backend_choice,
                 &manifest,
                 has_images,
-                false,
+                requires_tools,
                 selection_options,
             )?;
             let selected_backend = selected_route.choice;
@@ -1700,6 +1699,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 debug,
                 terminal_spinner_enabled(debug),
                 persistence,
+                None,
             )
             .await
         }
@@ -1850,7 +1850,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             match command {
                 BackendCommands::Install { target } => {
                     if let Some(mode) = target.mode() {
-                        let executable = install_managed_llama_server(&store, mode)?;
+                        let executable = install_managed_llama_server_with_options(
+                            &store,
+                            mode,
+                            LlamaServerInstallOptions {
+                                verbose: true,
+                                cuda_offload: target == BackendInstallArg::LlamaCudaOffload,
+                            },
+                        )?;
                         println!(
                             "Installed {} llama-server: {}",
                             display_llama_mode(mode),
@@ -2081,10 +2088,36 @@ pub async fn run(cli: Cli) -> Result<()> {
         })
         .await
         .context("runtime-control client task failed")?,
-        Commands::Import { path, name } => {
+        Commands::Import {
+            path,
+            name,
+            all,
+            link,
+        } => {
             let store = ModelStore::resolve(model_home)?;
-            let manifest = store.import_path(&path, &name)?;
-            print_manifest_summary("Imported", &manifest);
+            let manifests = if all {
+                store.import_collection(&path, link)?
+            } else {
+                let name = name.context("a single model import requires --name")?;
+                vec![if link {
+                    store.link_path(&path, &name)?
+                } else {
+                    store.import_path(&path, &name)?
+                }]
+            };
+            let action = if link { "Linked" } else { "Imported" };
+            for manifest in &manifests {
+                print_manifest_summary(action, manifest);
+                if link {
+                    println!(
+                        "External path: {}",
+                        store.model_location(manifest).display()
+                    );
+                }
+            }
+            if all {
+                println!("{action} {} models.", manifests.len());
+            }
             Ok(())
         }
         Commands::Pull { repo, name, file } => {
@@ -2143,25 +2176,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&manifests)?);
                 return Ok(());
             }
-            if manifests.is_empty() {
-                println!("No matching models installed in {}", store.home().display());
-            } else {
-                println!(
-                    "{:<26} {:<14} {:<14} {:<18} TASKS",
-                    "MODEL", "LAYOUT", "FAMILY", "ARCHITECTURE"
-                );
-                for manifest in manifests {
-                    println!(
-                        "{:<26} {:<14} {:<14} {:<18} {}",
-                        manifest.id,
-                        manifest.metadata.repository_layout,
-                        manifest.metadata.family.as_deref().unwrap_or("-"),
-                        manifest.architecture.unwrap_or_else(|| "-".to_string()),
-                        join_display(&manifest.metadata.tasks)
-                    );
-                }
-            }
-            Ok(())
+            model_list::print(&store, &manifests)
         }
         Commands::Parameters {
             model,
@@ -2875,20 +2890,40 @@ fn execute_media_args<T: Serialize>(
     request.parameters = media_parameters(args, routing_args, task)?;
     request.routing = media_routing(routing_args, backend, device)?;
 
+    execute_media_request(
+        store,
+        request,
+        requested_output,
+        routing_args.verbose,
+        routing_args.debug,
+        false,
+    )
+}
+
+fn execute_media_request(
+    store: &ModelStore,
+    request: InferenceRequest,
+    requested_output: Option<PathBuf>,
+    verbose: bool,
+    debug: bool,
+    json_output: bool,
+) -> Result<()> {
+    let model = request.model.clone();
+    let task = request.task;
     let service = InferenceService::new(store.clone());
     let activity = ActivitySpec::for_task(task);
     let total_started = Instant::now();
     let service_started = Instant::now();
     let attempts = RefCell::new(Vec::<RuntimeAttemptTiming>::new());
     let execution = with_activity(
-        generation_activity_enabled(routing_args.debug),
+        generation_activity_enabled(debug),
         activity.kind(),
-        activity.message(model),
+        activity.message(&model),
         || {
             service.execute_with_observers(
                 request,
                 |effective, estimate, plan| {
-                    if routing_args.debug {
+                    if debug {
                         let mut stderr = io::stderr().lock();
                         let _ = write_media_routing_debug(&mut stderr, effective, estimate, plan);
                     }
@@ -2901,7 +2936,7 @@ fn execute_media_args<T: Serialize>(
     let mut result = match execution {
         Ok(result) => result,
         Err(error) => {
-            if routing_args.verbose || routing_args.debug {
+            if verbose || debug {
                 let attempts = attempts.borrow();
                 if !attempts.is_empty() {
                     let mut stderr = io::stderr().lock();
@@ -2926,12 +2961,16 @@ fn execute_media_args<T: Serialize>(
         service_seconds,
         publication_seconds: publication_started.elapsed().as_secs_f64(),
     };
-    print_inference_result(&result, false);
-    if routing_args.verbose {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_inference_result(&result, false);
+    }
+    if verbose {
         let mut stderr = io::stderr().lock();
         write_media_verbose_stats(&mut stderr, &result, timings)?;
     }
-    if routing_args.debug {
+    if debug {
         let mut stderr = io::stderr().lock();
         write_media_backend_debug(&mut stderr, &result)?;
     }
@@ -4495,8 +4534,8 @@ fn should_print_startup_banner_for(
     }
 
     match command {
+        Commands::Run { options, .. } => !options.json,
         Commands::Serve { .. }
-        | Commands::Run { .. }
         | Commands::Image { .. }
         | Commands::Video { .. }
         | Commands::Audio { .. } => true,
@@ -4632,6 +4671,7 @@ struct WeightAccounting {
     ignored: Vec<EstimateFileEntry>,
     selected: Vec<String>,
     confidence: EstimateConfidence,
+    warnings: Vec<String>,
 }
 
 impl WeightAccounting {
@@ -4754,6 +4794,16 @@ fn estimate_model_memory(
         system.total_bytes,
         system.available_bytes,
     );
+    let result = if !accounting.warnings.is_empty() && result == EstimateResult::Ok {
+        EstimateResult::Warning
+    } else {
+        result
+    };
+    let recommendation = if accounting.warnings.is_empty() {
+        estimate_recommendation(result).to_string()
+    } else {
+        "Resolve the GGUF shard warnings before relying on this memory estimate.".to_string()
+    };
     let confidence = accounting
         .confidence
         .min(kv_cache.confidence)
@@ -4786,9 +4836,9 @@ fn estimate_model_memory(
         confidence,
         measured_peak_memory_bytes: latest_estimate_observation(store, manifest)
             .and_then(|observation| observation.measured_peak_memory_bytes),
-        notes: Vec::new(),
+        notes: accounting.warnings,
         result,
-        recommendation: estimate_recommendation(result).to_string(),
+        recommendation,
     }
 }
 
@@ -4834,16 +4884,12 @@ fn estimate_huggingface_model(
 
     if let Some(include_file) = include_file {
         let selected_path = format!("files/{}", normalize_remote_hf_file_path(include_file)?);
-        if let Some(file) = manifest
-            .files
-            .iter()
-            .find(|file| file.path == selected_path)
-        {
-            accounting = single_selected_weight_accounting(
-                &manifest,
-                file,
-                "explicit --file selected for remote estimate",
-            );
+        if let Some(selected_accounting) = selected_model_weight_accounting(
+            &manifest,
+            &selected_path,
+            "explicit --file selected for remote estimate",
+        ) {
+            accounting = selected_accounting;
             manifest.model_path = Some(selected_path);
         } else {
             bail!("file '{include_file}' was not found in Hugging Face repo '{repo}'");
@@ -4862,6 +4908,16 @@ fn estimate_huggingface_model(
         system.total_bytes,
         system.available_bytes,
     );
+    let result = if !accounting.warnings.is_empty() && result == EstimateResult::Ok {
+        EstimateResult::Warning
+    } else {
+        result
+    };
+    let recommendation = if accounting.warnings.is_empty() {
+        estimate_recommendation(result).to_string()
+    } else {
+        "Resolve the GGUF shard warnings before relying on this memory estimate.".to_string()
+    };
     let confidence = accounting
         .confidence
         .min(kv_cache.confidence)
@@ -4873,6 +4929,7 @@ fn estimate_huggingface_model(
     let mut notes = vec![
         "Remote estimate uses Hugging Face metadata and small config/index files only; it does not download model weights.".to_string(),
     ];
+    notes.extend(accounting.warnings);
     if model_files_bytes == 0 {
         notes.push(
             "Hugging Face metadata did not include file sizes, so the memory estimate is incomplete."
@@ -4913,7 +4970,7 @@ fn estimate_huggingface_model(
         measured_peak_memory_bytes: None,
         notes,
         result,
-        recommendation: estimate_recommendation(result).to_string(),
+        recommendation,
     })
 }
 
@@ -5098,6 +5155,7 @@ fn remote_hf_manifest(remote: &RemoteHfModel, include_file: Option<&str>) -> Res
     let architecture = remote_architecture_from_config(remote.config.as_ref());
 
     Ok(ModelManifest {
+        storage: Default::default(),
         id: remote.repo.clone(),
         source: ModelSource::HuggingFace {
             repo: remote.repo.clone(),
@@ -5472,14 +5530,12 @@ fn estimate_weight_accounting(store: &ModelStore, manifest: &ModelManifest) -> W
 fn estimate_weight_accounting_without_store(manifest: &ModelManifest) -> WeightAccounting {
     let selected_model_path = manifest.model_path.clone();
     let selected = selected_model_path.iter().cloned().collect::<Vec<_>>();
-    let selected_file = selected_model_path
-        .as_deref()
-        .and_then(|path| manifest.files.iter().find(|file| file.path == path));
-
     if matches!(manifest.format, ModelFormat::Gguf | ModelFormat::Onnx)
-        && let Some(file) = selected_file
+        && let Some(path) = selected_model_path.as_deref()
+        && let Some(accounting) =
+            selected_model_weight_accounting(manifest, path, "selected runtime model file")
     {
-        return single_selected_weight_accounting(manifest, file, "selected runtime model file");
+        return accounting;
     }
 
     if matches!(
@@ -5532,7 +5588,89 @@ fn estimate_weight_accounting_without_store(manifest: &ModelManifest) -> WeightA
         ignored,
         selected,
         confidence,
+        warnings: Vec::new(),
     }
+}
+
+fn selected_model_weight_accounting(
+    manifest: &ModelManifest,
+    selected_path: &str,
+    reason: &str,
+) -> Option<WeightAccounting> {
+    let (selected, mut warnings) = if manifest.format == ModelFormat::Gguf {
+        match crate::model_store::gguf_shard_paths(selected_path) {
+            Ok(Some(shards)) => (shards, Vec::new()),
+            Err(err) => (
+                vec![selected_path.to_string()],
+                vec![format!(
+                    "Cannot determine the complete GGUF shard set: {err}"
+                )],
+            ),
+            Ok(None) => {
+                let file = manifest
+                    .files
+                    .iter()
+                    .find(|file| file.path == selected_path)?;
+                return Some(single_selected_weight_accounting(manifest, file, reason));
+            }
+        }
+    } else {
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == selected_path)?;
+        return Some(single_selected_weight_accounting(manifest, file, reason));
+    };
+
+    let files_by_path = manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<HashMap<_, _>>();
+    let mut counted = Vec::new();
+    let mut missing = Vec::new();
+    let mut unknown_sizes = Vec::new();
+    for path in &selected {
+        if let Some(file) = files_by_path.get(path.as_str()) {
+            counted.push(estimate_file_entry(file, "shard of selected GGUF model"));
+            if file.size == 0 {
+                unknown_sizes.push(path.as_str());
+            }
+        } else {
+            missing.push(path.as_str());
+        }
+    }
+    if let Some(first_missing) = missing.first() {
+        warnings.push(format!(
+            "GGUF shard set is incomplete: {} required shard(s) are missing, including '{first_missing}'. The weight total is only a lower bound.",
+            missing.len()
+        ));
+    }
+    if let Some(first_unknown) = unknown_sizes.first() {
+        warnings.push(format!(
+            "GGUF shard sizes are incomplete: {} shard(s) have no size, including '{first_unknown}'. The weight total is only a lower bound.",
+            unknown_sizes.len()
+        ));
+    }
+    let selected_paths = selected.iter().map(String::as_str).collect::<HashSet<_>>();
+    let ignored = manifest
+        .files
+        .iter()
+        .filter(|file| !selected_paths.contains(file.path.as_str()))
+        .map(|file| estimate_file_entry(file, "not selected for this model"))
+        .collect();
+
+    Some(WeightAccounting {
+        counted,
+        ignored,
+        selected,
+        confidence: if warnings.is_empty() {
+            EstimateConfidence::High
+        } else {
+            EstimateConfidence::Low
+        },
+        warnings,
+    })
 }
 
 fn single_selected_weight_accounting(
@@ -5551,6 +5689,7 @@ fn single_selected_weight_accounting(
         ignored,
         selected: vec![selected_file.path.clone()],
         confidence: EstimateConfidence::High,
+        warnings: Vec::new(),
     }
 }
 
@@ -5559,7 +5698,7 @@ fn safetensors_index_weight_accounting(
     manifest: &ModelManifest,
 ) -> Option<WeightAccounting> {
     let index_path = find_safetensors_index_path(manifest)?;
-    let index_abs = store.model_dir(&manifest.id).join(&index_path);
+    let index_abs = store.absolute_model_file(manifest, &index_path);
     let data = fs::read_to_string(index_abs).ok()?;
     let value: Value = serde_json::from_str(&data).ok()?;
     safetensors_index_weight_accounting_from_value(manifest, &index_path, &value)
@@ -5614,6 +5753,7 @@ fn safetensors_index_weight_accounting_from_value(
         } else {
             EstimateConfidence::High
         },
+        warnings: Vec::new(),
     })
 }
 
@@ -5843,7 +5983,7 @@ fn scale_bytes(bytes: u64, factor: f64) -> u64 {
 
 fn read_estimate_config(store: &ModelStore, manifest: &ModelManifest) -> Option<EstimateConfig> {
     let config_path = manifest.config_path.as_deref()?;
-    let path = store.model_dir(&manifest.id).join(config_path);
+    let path = store.absolute_model_file(manifest, config_path);
     let data = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&data).ok()?;
     Some(parse_estimate_config(&value))
@@ -6707,6 +6847,28 @@ impl AssistantPendingSpinner {
     }
 }
 
+fn conversation_selection_options(
+    options: SelectionOptions,
+    persistence: &ChatPersistenceArgs,
+) -> SelectionOptions {
+    let config = ServePersistenceArgs {
+        persistence: persistence.is_enabled(),
+        persistence_mode: persistence
+            .persistence_mode
+            .or(Some(ServePersistenceModeArg::Disk)),
+        persistence_reuse: persistence.persistence_reuse,
+        persistence_ttl_seconds: persistence.persistence_ttl_seconds,
+        persistence_pin: false,
+    };
+    if !persistence.is_enabled() {
+        return options;
+    }
+    let config = config.server_config();
+    options
+        .with_vllm_automatic_prefix_caching(Some(config.defaults().reuse != ReuseMode::Disabled))
+        .with_omlx_server_prefix_cache(server_omlx_prefix_cache_enabled(&config))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn chat_loop(
     backend: Arc<dyn GenerationBackend>,
@@ -6725,25 +6887,34 @@ async fn chat_loop(
     debug: bool,
     show_loading_spinner: bool,
     persistence: Option<(ChatPersistence, Vec<ChatMessage>)>,
+    mut run: Option<run_inference::RunTurn>,
 ) -> Result<()> {
+    let interactive = run.is_none();
+    let command_label = if interactive { "chat" } else { "run" };
+    let stream_output = interactive || run.as_ref().is_some_and(|run| run.stream);
+    let json_output = run.as_ref().is_some_and(|run| run.json);
     let (mut persistence, mut archive) = match persistence {
         Some((storage, archive)) => (Some(storage), archive),
         None => (None, Vec::new()),
     };
     if let Some(storage) = persistence.as_ref() {
         eprintln!(
-            "[werk chat] persistence enabled: {} saved messages{}",
+            "[werk {command_label}] persistence enabled: {} saved messages{}",
             archive.len(),
             if storage.resumed() { " restored" } else { "" }
         );
         if let Some(path) = storage.path() {
-            eprintln!("[werk chat] conversation: {}", path.display());
+            eprintln!("[werk {command_label}] conversation: {}", path.display());
         }
         if let Some(notice) = storage.notice() {
-            eprintln!("[werk chat] {notice}");
+            eprintln!("[werk {command_label}] {notice}");
         }
     }
-    let has_images = !images.is_empty() || !image_urls_from_messages(&archive).is_empty();
+    let has_images = !images.is_empty()
+        || !image_urls_from_messages(&archive).is_empty()
+        || run
+            .as_ref()
+            .is_some_and(|run| !image_urls_from_messages(&run.messages).is_empty());
     let native_session = if !has_images
         && let Some(storage) = persistence.as_ref().filter(|storage| storage.is_durable())
     {
@@ -6758,7 +6929,7 @@ async fn chat_loop(
         ) {
             Ok(session) => session,
             Err(error) => {
-                eprintln!("[werk chat] native KV cache unavailable: {error:#}");
+                eprintln!("[werk {command_label}] native KV cache unavailable: {error:#}");
                 None
             }
         }
@@ -6767,7 +6938,7 @@ async fn chat_loop(
     };
     if persistence.is_some() {
         eprintln!(
-            "[werk chat] {}",
+            "[werk {command_label}] {}",
             if native_session.is_some() {
                 "native KV cache enabled; reuse depends on the prompt and backend"
             } else {
@@ -6786,30 +6957,37 @@ async fn chat_loop(
         None
     };
 
-    println!(
-        "Chatting with {}. Type /exit or /quit to stop.",
-        manifest.id
-    );
+    if interactive {
+        println!(
+            "Chatting with {}. Type /exit or /quit to stop.",
+            manifest.id
+        );
+    }
     let mut messages = archive.clone();
     let mut input_reader = ChatInputReader::new();
 
     loop {
-        let Some(input) = input_reader.read_line("you> ")? else {
-            break;
+        let new_messages = if let Some(run) = run.as_mut() {
+            std::mem::take(&mut run.messages)
+        } else {
+            let Some(input) = input_reader.read_line("you> ")? else {
+                break;
+            };
+            let input = input.trim();
+            if input.is_empty() {
+                continue;
+            }
+            if matches!(input, "/exit" | "/quit") {
+                break;
+            }
+            vec![vision_user_message(input, &images)]
         };
-
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if matches!(input, "/exit" | "/quit") {
-            break;
-        }
-
-        let user_message = vision_user_message(input, &images);
-
-        let mut request_messages =
-            request_messages_for_turn(&mut messages, user_message.clone(), history_enabled);
+        let mut request_messages = if history_enabled {
+            messages.extend(new_messages.iter().cloned());
+            messages.clone()
+        } else {
+            new_messages.clone()
+        };
         let removed_messages = trim_chat_history_to_context(
             &manifest,
             selected_backend,
@@ -6823,7 +7001,7 @@ async fn chat_loop(
         }
         if removed_messages > 0 {
             eprintln!(
-                "[werk chat] context window: removed {removed_messages} old message(s) to fit {} tokens",
+                "[werk {command_label}] context window: removed {removed_messages} old message(s) to fit {} tokens",
                 context_size.unwrap_or_default()
             );
         }
@@ -6835,12 +7013,22 @@ async fn chat_loop(
         );
         let prompt_diagnostics =
             prompt_diagnostics(&prompt, request_messages.len(), Some(history_enabled));
-        let generation_messages = generation_request_messages(&prompt, &request_messages);
+        let requires_tools = run.as_ref().is_some_and(|run| run.requires_tools)
+            || request_messages.iter().any(ChatMessage::uses_tool_calling);
+        let generation_messages = if requires_tools {
+            request_messages.clone()
+        } else {
+            generation_request_messages(&prompt, &request_messages)
+        };
         let request_image_urls = if generation_messages.is_empty() {
             image_urls_from_messages(&request_messages)
         } else {
             image_urls_from_messages(&generation_messages)
         };
+        let mut stop = prompt.stop;
+        if let Some(run) = run.as_ref() {
+            stop.extend(run.stop.clone());
+        }
         let request = GenerateRequest {
             prompt: prompt.prompt,
             messages: generation_messages,
@@ -6848,18 +7036,22 @@ async fn chat_loop(
             max_tokens,
             temperature,
             top_p,
-            stop: prompt.stop,
+            stop,
             seed,
             stream_granularity,
             verbose,
             debug,
-            tool_config: None,
+            tool_config: run.as_ref().and_then(|run| run.tool_config.clone()),
         };
 
-        print!("assistant> ");
-        io::stdout().flush()?;
+        if interactive {
+            print!("assistant> ");
+            io::stdout().flush()?;
+        }
 
         let mut assistant = String::new();
+        let mut tool_calls = run_inference::ToolCallAccumulator::default();
+        let mut stream_error = None;
         let mut prompt_tokens = 0usize;
         let mut completion_tokens = 0usize;
         let mut finish_reason = String::new();
@@ -6867,8 +7059,9 @@ async fn chat_loop(
         let mut backend_diagnostics = Vec::new();
         let mut completed = false;
         let mut last_flush = Instant::now();
-        let mut pending_spinner =
-            AssistantPendingSpinner::new(io::stdout().is_terminal() && !debug);
+        let mut pending_spinner = AssistantPendingSpinner::new(
+            stream_output && !json_output && io::stdout().is_terminal() && !debug,
+        );
         let mut stream = if let Some(session) = chat_session.as_ref() {
             session.generate_stream(request)
         } else {
@@ -6894,21 +7087,30 @@ async fn chat_loop(
                     if !chunk.is_empty() {
                         pending_spinner.clear()?;
                     }
-                    print!("{chunk}");
-                    if chunk.contains('\n') || last_flush.elapsed() >= Duration::from_millis(16) {
-                        io::stdout().flush()?;
-                        last_flush = Instant::now();
+                    if stream_output {
+                        if json_output {
+                            println!("{}", json!({"type": "text_delta", "text": chunk}));
+                        } else {
+                            print!("{chunk}");
+                        }
+                        if chunk.contains('\n') || last_flush.elapsed() >= Duration::from_millis(16)
+                        {
+                            io::stdout().flush()?;
+                            last_flush = Instant::now();
+                        }
                     }
                     assistant.push_str(&chunk);
                 }
-                Ok(GenerateStreamEvent::ToolCallDelta(tool_calls)) => {
+                Ok(GenerateStreamEvent::ToolCallDelta(deltas)) => {
                     pending_spinner.clear()?;
-                    if debug {
-                        eprintln!(
-                            "\n[werk chat] received {} unexpected tool-call delta(s)",
-                            tool_calls.len()
+                    if stream_output && json_output {
+                        println!(
+                            "{}",
+                            json!({"type": "tool_call_delta", "tool_calls": deltas})
                         );
+                        io::stdout().flush()?;
                     }
+                    tool_calls.extend(deltas)?;
                 }
                 Ok(GenerateStreamEvent::Done {
                     finish_reason: response_finish_reason,
@@ -6929,25 +7131,72 @@ async fn chat_loop(
                 }
                 Err(message) => {
                     pending_spinner.clear()?;
-                    println!("\nerror: {message}");
+                    stream_error = Some(message);
                     break;
                 }
             }
         }
+        if !completed {
+            let error = stream_error
+                .unwrap_or_else(|| "backend stream ended without a completion event".into());
+            if !interactive {
+                bail!("{error}");
+            }
+            println!("\nerror: {error}");
+            if persistence.is_some() {
+                messages.clone_from(&archive);
+            }
+            continue;
+        }
+        let tool_calls = tool_calls.finish()?;
+        let assistant_message = ChatMessage {
+            role: "assistant".into(),
+            content: (!assistant.is_empty() || tool_calls.is_empty())
+                .then(|| MessageContent::Text(assistant.clone())),
+            name: None,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            tool_call_id: None,
+        };
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "type": "completion", "model": manifest.id,
+                    "message": assistant_message, "finish_reason": finish_reason,
+                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                              "total_tokens": prompt_tokens + completion_tokens}
+                }))?
+            );
+        } else {
+            if stream_output {
+                println!();
+            } else {
+                println!("{}", assistant.trim());
+            }
+            if let Some(calls) = assistant_message.tool_calls.as_ref() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"tool_calls": calls}))?
+                );
+            }
+        }
         io::stdout().flush()?;
-        println!();
         if matches!(finish_reason.as_str(), "length" | "max_new_tokens")
             && !assistant.trim().is_empty()
         {
-            println!(
+            eprintln!(
                 "note: response reached --max-tokens ({max_tokens}) and may be incomplete; rerun with a larger --max-tokens value for more."
             );
         }
         if verbose && let Some(timings) = timings {
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout)?;
+            let mut output: Box<dyn Write> = if interactive {
+                Box::new(io::stdout())
+            } else {
+                Box::new(io::stderr())
+            };
+            writeln!(output)?;
             write_verbose_stats(
-                &mut stdout,
+                &mut output,
                 Some(verbose_backend_label(selected_backend)),
                 prompt_tokens,
                 completion_tokens,
@@ -6956,21 +7205,24 @@ async fn chat_loop(
                 &backend_diagnostics,
             )?;
         }
-
-        finish_chat_turn(
+        finish_conversation_turn(
             &mut messages,
             &mut archive,
             persistence.as_mut(),
-            user_message,
-            assistant,
+            new_messages,
+            assistant_message,
             history_enabled,
             completed,
         )?;
+        if !interactive {
+            break;
+        }
     }
 
     Ok(())
 }
 
+#[cfg(test)]
 fn finish_chat_turn(
     messages: &mut Vec<ChatMessage>,
     archive: &mut Vec<ChatMessage>,
@@ -6980,32 +7232,58 @@ fn finish_chat_turn(
     history_enabled: bool,
     completed: bool,
 ) -> Result<()> {
-    if history_enabled && !assistant.trim().is_empty() && (persistence.is_none() || completed) {
-        let assistant_message = ChatMessage {
-            role: "assistant".to_string(),
+    finish_conversation_turn(
+        messages,
+        archive,
+        persistence,
+        vec![user_message],
+        ChatMessage {
+            role: "assistant".into(),
             content: Some(MessageContent::Text(assistant)),
             name: None,
             tool_calls: None,
             tool_call_id: None,
-        };
+        },
+        history_enabled,
+        completed,
+    )
+}
+
+fn finish_conversation_turn(
+    messages: &mut Vec<ChatMessage>,
+    archive: &mut Vec<ChatMessage>,
+    persistence: Option<&mut ChatPersistence>,
+    new_messages: Vec<ChatMessage>,
+    assistant: ChatMessage,
+    history_enabled: bool,
+    completed: bool,
+) -> Result<()> {
+    let has_output = assistant
+        .content
+        .as_ref()
+        .is_some_and(|content| !content.as_text().trim().is_empty())
+        || assistant
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+    if history_enabled && has_output && completed {
         if let Some(storage) = persistence {
             let mut next_archive = archive.clone();
-            next_archive.push(user_message);
-            next_archive.push(assistant_message.clone());
+            next_archive.extend(new_messages);
+            next_archive.push(assistant.clone());
             storage
                 .save_completed_turn(&next_archive)
-                .context("chat answer was generated but the conversation could not be saved")?;
+                .context("answer was generated but the conversation could not be saved")?;
             *archive = next_archive;
         }
-        messages.push(assistant_message);
+        messages.push(assistant);
     } else if persistence.is_some() {
-        // An interrupted or failed answer must not become the context of a
-        // later successful turn or replace the last complete disk archive.
         messages.clone_from(archive);
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn request_messages_for_turn(
     history: &mut Vec<ChatMessage>,
     user_message: ChatMessage,
@@ -7077,7 +7355,7 @@ fn trim_chat_history_to_context(
 
         let Some(start) = messages
             .iter()
-            .position(|message| !message.role.eq_ignore_ascii_case("system"))
+            .position(|message| !matches!(message.role.as_str(), "system" | "developer"))
         else {
             bail!(
                 "system prompt is too large for the {context_size}-token context; increase --ctx-size"
@@ -7089,7 +7367,15 @@ fn trim_chat_history_to_context(
             );
         }
 
-        let remove_count = if messages
+        // Keep tool calls and their results together. Never discard part of
+        // the current user turn while fitting a resumed tool conversation.
+        let remove_count = if messages.iter().any(ChatMessage::uses_tool_calling) {
+            messages[start + 1..]
+                .iter()
+                .position(|message| message.role.eq_ignore_ascii_case("user"))
+                .map(|offset| offset + 1)
+                .context("current tool conversation exceeds the context window; increase --ctx-size or reduce the request")?
+        } else if messages
             .get(start + 1)
             .is_some_and(|message| message.role.eq_ignore_ascii_case("assistant"))
         {
@@ -7112,7 +7398,17 @@ fn estimate_chat_prompt_tokens(prompt: &PromptSpec, messages: &[ChatMessage]) ->
                 .as_ref()
                 .map(cli_message_content_tokens)
                 .unwrap_or_default();
-            content_tokens + 16
+            let tool_tokens = message.tool_calls.as_ref().map_or(0, |calls| {
+                calls
+                    .iter()
+                    .map(|call| {
+                        (call.id.len() + call.function.name.len() + call.function.arguments.len())
+                            .div_ceil(3)
+                            + 16
+                    })
+                    .sum::<usize>()
+            });
+            content_tokens + tool_tokens + 16
         })
         .sum::<usize>()
         + 16;
@@ -7246,12 +7542,6 @@ fn prompt_diagnostics(
         ));
     }
     diagnostics
-}
-
-fn merged_diagnostics(first: &[String], second: &[String]) -> Vec<String> {
-    let mut merged = first.to_vec();
-    merged.extend_from_slice(second);
-    merged
 }
 
 fn prompt_huggingface_token() -> Result<String> {
@@ -8208,10 +8498,16 @@ fn configured_omlx_backend(
     store: &ModelStore,
     server_prefix_cache: bool,
 ) -> Result<Arc<OmlxBackend>> {
-    type Cache = HashMap<(PathBuf, String), Weak<OmlxBackend>>;
+    type Cache = HashMap<(PathBuf, String, bool), Weak<OmlxBackend>>;
     static BACKENDS: OnceLock<Mutex<Cache>> = OnceLock::new();
     let discovered = OmlxBackend::new(store.clone()).with_server_prefix_cache(server_prefix_cache);
-    let key = (store.home().to_path_buf(), discovered.cache_identity());
+    // Preserve the requested policy even if discovery is unavailable (and its
+    // error string cannot encode worker cache settings on this host).
+    let key = (
+        store.home().to_path_buf(),
+        discovered.cache_identity(),
+        server_prefix_cache,
+    );
     let mut backends = BACKENDS
         .get_or_init(Mutex::default)
         .lock()
@@ -9568,6 +9864,7 @@ fn backend_unavailability_reason(
                     mode,
                     LlamaServerInstallOptions {
                         verbose: selection_options.verbose_backend_installs,
+                        ..Default::default()
                     },
                 )
                 .and_then(|_| LlamaServerBackend::probe(store, mode).map(|_| ()))
@@ -11037,6 +11334,88 @@ mod tests {
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn external_import_preserves_global_model_home_option() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "--model-home",
+            "/tmp/local-werk",
+            "import",
+            "/mnt/raid/large-model",
+            "--name",
+            "large-model",
+            "--link",
+        ])
+        .unwrap();
+        assert_eq!(cli.model_home, Some(PathBuf::from("/tmp/local-werk")));
+        match cli.command.unwrap() {
+            Commands::Import {
+                path,
+                name,
+                all,
+                link,
+            } => {
+                assert_eq!(path, PathBuf::from("/mnt/raid/large-model"));
+                assert_eq!(name.as_deref(), Some("large-model"));
+                assert!(!all);
+                assert!(link);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn collection_import_supports_copy_and_link_with_global_model_home() {
+        for link in [false, true] {
+            let mut args = vec![
+                "werk",
+                "--model-home",
+                "/tmp/local-werk",
+                "import",
+                "/mnt/f/Werk1112/models",
+                "--all",
+            ];
+            if link {
+                args.push("--link");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.model_home, Some(PathBuf::from("/tmp/local-werk")));
+            match cli.command.unwrap() {
+                Commands::Import {
+                    path,
+                    name,
+                    all,
+                    link: parsed_link,
+                } => {
+                    assert_eq!(path, PathBuf::from("/mnt/f/Werk1112/models"));
+                    assert!(name.is_none());
+                    assert!(all);
+                    assert_eq!(parsed_link, link);
+                }
+                command => panic!("unexpected command: {command:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn import_requires_either_a_single_model_name_or_all() {
+        for suffix in [vec![], vec!["--link"]] {
+            let mut args = vec!["werk", "import", "/tmp/model"];
+            args.extend(suffix);
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+        for suffix in [vec![], vec!["--link"]] {
+            let mut args = vec!["werk", "import", "/tmp/models", "--all", "--name", "model"];
+            args.extend(suffix);
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn editable_line_inserts_at_cursor() {
@@ -11252,9 +11631,16 @@ mod tests {
 
         let cli = Cli::try_parse_from(["werk", "import", "/tmp/model", "--name", "local"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Import { path, name } => {
+            Commands::Import {
+                path,
+                name,
+                all,
+                link,
+            } => {
                 assert_eq!(path, PathBuf::from("/tmp/model"));
-                assert_eq!(name, "local");
+                assert_eq!(name.as_deref(), Some("local"));
+                assert!(!all);
+                assert!(!link);
             }
             command => panic!("unexpected command: {command:?}"),
         }
@@ -11329,7 +11715,7 @@ mod tests {
             } => {
                 assert_eq!(model, "gemma-2b-it");
                 assert_eq!(prompt, vec!["hello"]);
-                assert_eq!(max_tokens, DEFAULT_MAX_NEW_TOKENS);
+                assert_eq!(max_tokens, None);
                 assert_eq!(images, vec!["image.png"]);
                 assert!(debug);
             }
@@ -11339,7 +11725,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["werk", "run", "tiny", "hello", "--max-tokens", "42"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Run { max_tokens, .. } => assert_eq!(max_tokens, 42),
+            Commands::Run { max_tokens, .. } => assert_eq!(max_tokens, Some(42)),
             command => panic!("unexpected command: {command:?}"),
         }
 
@@ -13290,7 +13676,7 @@ mod tests {
         let debug_run = Commands::Run {
             model: "tiny".to_string(),
             prompt: vec!["hello".to_string()],
-            max_tokens: 128,
+            max_tokens: Some(128),
             temperature: None,
             top_p: None,
             seed: None,
@@ -13298,6 +13684,8 @@ mod tests {
             images: Vec::new(),
             verbose: false,
             debug: true,
+            options: run_inference::RunOptions::default(),
+            persistence: ChatPersistenceArgs::default(),
         };
         assert!(command_backend_install_verbose(&debug_run));
     }
@@ -14426,7 +14814,7 @@ mod tests {
         let run = Commands::Run {
             model: "tiny".to_string(),
             prompt: vec!["hello".to_string()],
-            max_tokens: 128,
+            max_tokens: Some(128),
             temperature: None,
             top_p: None,
             seed: None,
@@ -14434,6 +14822,8 @@ mod tests {
             images: Vec::new(),
             verbose: false,
             debug: false,
+            options: run_inference::RunOptions::default(),
+            persistence: ChatPersistenceArgs::default(),
         };
         assert!(should_print_startup_banner_for(&run, true, true));
         assert!(!should_print_startup_banner_for(&run, false, true));
@@ -15363,6 +15753,82 @@ mod tests {
     }
 
     #[test]
+    fn estimate_gguf_counts_all_selected_variant_shards() {
+        let store = test_store("estimate-gguf-shards");
+        let mut manifest = test_manifest(ModelFormat::Gguf, Some("deepseek-moe"));
+        let first = "files/Q2_K_S/model-Q2_K_S-00001-of-00002.gguf";
+        let second = "files/Q2_K_S/model-Q2_K_S-00002-of-00002.gguf";
+        let total_bytes = 98_600_000_000;
+        manifest.files = vec![
+            model_file(first, 5 * MIB),
+            model_file(second, total_bytes - 5 * MIB),
+            model_file("files/Q4_K_M/model-Q4_K_M-00001-of-00002.gguf", 80 * GIB),
+            model_file("files/other/model-Q2_K_S-00001-of-00002.gguf", 80 * GIB),
+            model_file("files/tokenizer.json", MIB),
+        ];
+
+        for selected in [first, second] {
+            manifest.model_path = Some(selected.to_string());
+            let accounting = estimate_weight_accounting_without_store(&manifest);
+            assert_eq!(accounting.total_bytes(), total_bytes);
+            assert_eq!(accounting.selected, vec![first, second]);
+            assert_eq!(accounting.counted.len(), 2);
+            assert_eq!(accounting.ignored.len(), 3);
+            assert_eq!(accounting.confidence, EstimateConfidence::High);
+            assert!(accounting.warnings.is_empty());
+
+            let report = estimate_model_memory(
+                &store,
+                &manifest,
+                SystemMemory {
+                    total_bytes: Some(64 * GIB),
+                    available_bytes: Some(48 * GIB),
+                },
+            );
+            assert_eq!(report.weight_files_bytes, total_bytes);
+            assert_eq!(report.result, EstimateResult::LikelyOom);
+        }
+    }
+
+    #[test]
+    fn estimate_incomplete_gguf_shards_warn_instead_of_reporting_fit() {
+        let store = test_store("estimate-incomplete-gguf-shards");
+        let first = "files/model-Q2_K_S-00001-of-00002.gguf";
+        let second = "files/model-Q2_K_S-00002-of-00002.gguf";
+        for (files, unavailable_path) in [
+            (vec![model_file(first, 5 * MIB)], second),
+            (vec![model_file(second, 5 * MIB)], first),
+            (
+                vec![model_file(first, 5 * MIB), model_file(second, 0)],
+                second,
+            ),
+        ] {
+            let mut manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+            manifest.model_path = Some(first.to_string());
+            manifest.files = files;
+            let accounting = estimate_weight_accounting_without_store(&manifest);
+            assert_eq!(accounting.total_bytes(), 5 * MIB);
+            assert_eq!(accounting.selected, vec![first, second]);
+            assert_eq!(accounting.confidence, EstimateConfidence::Low);
+            assert_eq!(accounting.warnings.len(), 1);
+            assert!(accounting.warnings[0].contains(unavailable_path));
+
+            let report = estimate_model_memory(
+                &store,
+                &manifest,
+                SystemMemory {
+                    total_bytes: Some(64 * GIB),
+                    available_bytes: Some(48 * GIB),
+                },
+            );
+            assert_eq!(report.confidence, EstimateConfidence::Low);
+            assert_eq!(report.result, EstimateResult::Warning);
+            assert!(report.notes[0].contains("only a lower bound"));
+            assert!(report.recommendation.contains("GGUF shard warnings"));
+        }
+    }
+
+    #[test]
     fn estimate_weight_filtering_ignores_metadata_files() {
         let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("llama"));
         manifest.model_path = Some("files/model.safetensors".to_string());
@@ -15427,6 +15893,38 @@ mod tests {
                 .iter()
                 .any(|file| file.path == "files/unreferenced.safetensors")
         );
+    }
+
+    #[test]
+    fn estimate_reads_external_config_and_shard_index() {
+        let store = test_store("estimate-external");
+        let external = store.home().join("raid");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("config.json"), r#"{"hidden_size":2048}"#).unwrap();
+        fs::write(
+            external.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001.safetensors","b":"model-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("llama"));
+        manifest.storage = crate::model_store::ModelStorage::External { path: external };
+        manifest.config_path = Some("files/config.json".to_string());
+        manifest.files = vec![
+            model_file("files/model.safetensors.index.json", 128),
+            model_file("files/model-00001.safetensors", 2 * GIB),
+            model_file("files/model-00002.safetensors", 2 * GIB),
+            model_file("files/unreferenced.safetensors", 10 * GIB),
+        ];
+        assert_eq!(
+            read_estimate_config(&store, &manifest).unwrap().hidden_size,
+            Some(2048)
+        );
+        assert_eq!(
+            estimate_weight_accounting(&store, &manifest).total_bytes(),
+            4 * GIB
+        );
+        assert!(!store.model_dir(&manifest.id).join("files").exists());
+        fs::remove_dir_all(store.home()).unwrap();
     }
 
     #[test]
@@ -15614,6 +16112,46 @@ mod tests {
 
         assert_eq!(manifest.format, ModelFormat::Gguf);
         assert_eq!(manifest.model_path.as_deref(), Some("files/tiny.Q8_0.gguf"));
+    }
+
+    #[test]
+    fn estimate_remote_explicit_gguf_file_counts_matching_shards() {
+        let first = "Q2_K_S/model-Q2_K_S-00001-of-00002.gguf";
+        let second = "Q2_K_S/model-Q2_K_S-00002-of-00002.gguf";
+        let total_bytes = 98_600_000_000;
+        let remote = remote_hf_test_model(
+            "org/Split-GGUF",
+            Some(serde_json::json!({"model_type": "deepseek_moe"})),
+            &[
+                (first, 5 * MIB),
+                (second, total_bytes - 5 * MIB),
+                ("model.Q4_K_M.gguf", 150 * GIB),
+            ],
+        );
+
+        for requested in [first.to_string(), format!("files/{second}")] {
+            let manifest = remote_hf_manifest(&remote, Some(&requested)).unwrap();
+            let selected_path = format!(
+                "files/{}",
+                normalize_remote_hf_file_path(&requested).unwrap()
+            );
+            assert_eq!(manifest.model_path.as_deref(), Some(selected_path.as_str()));
+            let accounting = selected_model_weight_accounting(
+                &manifest,
+                &selected_path,
+                "explicit --file selected for remote estimate",
+            )
+            .unwrap();
+
+            assert_eq!(accounting.total_bytes(), total_bytes);
+            assert_eq!(
+                accounting.selected,
+                vec![format!("files/{first}"), format!("files/{second}")]
+            );
+            assert_eq!(accounting.ignored.len(), 1);
+            assert_eq!(accounting.ignored[0].path, "files/model.Q4_K_M.gguf");
+            assert!(accounting.warnings.is_empty());
+        }
     }
 
     #[test]
@@ -15815,6 +16353,7 @@ mod tests {
 
     fn test_manifest(format: ModelFormat, architecture: Option<&str>) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: "test-model".to_string(),
             source: ModelSource::LocalPath {
                 path: "test".to_string(),

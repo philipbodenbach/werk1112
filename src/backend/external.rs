@@ -1824,7 +1824,7 @@ fn transformers_model_cache_key(
 }
 
 fn original_mlx_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Result<PathBuf> {
-    let model_dir = store.model_dir(&manifest.id).join("files");
+    let model_dir = store.model_files_dir(manifest);
     if !model_dir.is_dir() {
         bail!(
             "model files directory does not exist: {}",
@@ -3571,6 +3571,53 @@ mod tests {
     }
 
     #[test]
+    fn external_mlx_and_transformers_model_directories_use_bound_files() {
+        let root = test_root("external-model-directory");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        let external = root.join("raid/qwen");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
+        let mut manifest = test_manifest("Qwen3-4B-mlx", "qwen3");
+        manifest.storage = crate::model_store::ModelStorage::External {
+            path: external.clone(),
+        };
+
+        assert_eq!(resolve_mlx_model_dir(&store, &manifest).unwrap(), external);
+        manifest.format = ModelFormat::SafeTensors;
+        assert_eq!(original_mlx_model_dir(&store, &manifest).unwrap(), external);
+        assert!(!store.model_dir(&manifest.id).join("files").exists());
+        assert!(!store.artifacts_dir(&manifest.id).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_mlx_model_keeps_generated_compatibility_artifacts_local() {
+        let root = test_root("external-mlx-artifacts");
+        let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+        let external = root.join("raid/gemma");
+        fs::create_dir_all(&external).unwrap();
+        let original_config =
+            r#"{"model_type":"gemma4_unified","text_config":{"model_type":"gemma4_unified_text"}}"#;
+        fs::write(external.join("config.json"), original_config).unwrap();
+        fs::write(external.join("model.safetensors"), b"weights").unwrap();
+        let mut manifest = test_manifest("gemma4", "gemma4_unified");
+        manifest.storage = crate::model_store::ModelStorage::External {
+            path: external.clone(),
+        };
+
+        let compatibility = resolve_mlx_model_dir(&store, &manifest).unwrap();
+
+        assert!(compatibility.starts_with(store.artifacts_dir(&manifest.id)));
+        assert!(compatibility.join("model.safetensors").is_file());
+        assert_eq!(
+            fs::read_to_string(external.join("config.json")).unwrap(),
+            original_config
+        );
+        assert!(!external.join(GEMMA4_UNIFIED_MLX_COMPAT_MODEL_FILE).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn normal_mlx_model_uses_original_model_directory() {
         let store = test_store("normal-mlx-dir");
         let manifest = test_manifest("Qwen3-4B-mlx", "qwen3");
@@ -4018,6 +4065,7 @@ ValueError: Model type chatglm not supported."#;
 
     fn test_manifest(id: &str, architecture: &str) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: id.to_string(),
             source: ModelSource::LocalPath {
                 path: "test".to_string(),

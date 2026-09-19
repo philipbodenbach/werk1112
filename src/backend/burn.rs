@@ -1107,6 +1107,7 @@ mod tests {
 
     fn manifest(id: &str, checksum: &str) -> ModelManifest {
         ModelManifest {
+            storage: Default::default(),
             id: id.to_string(),
             source: ModelSource::LocalPath {
                 path: format!("/{id}"),

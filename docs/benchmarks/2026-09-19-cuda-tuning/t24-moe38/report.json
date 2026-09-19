@@ -1,0 +1,217 @@
+{
+  "metadata": {
+    "command": [
+      "werk",
+      "--threads-batch",
+      "24",
+      "--threads",
+      "24",
+      "--model-home",
+      "<test-home>/model-home",
+      "--no-auto-install-backends",
+      "--backend",
+      "cuda",
+      "--ctx-size",
+      "4096",
+      "--batch-size",
+      "2048",
+      "--ubatch-size",
+      "512",
+      "--kv-cache-type",
+      "f16",
+      "chat",
+      "deepseek-test",
+      "--verbose",
+      "--no-history",
+      "--max-tokens",
+      "128",
+      "--temperature",
+      "0"
+    ],
+    "model_source": "<werk-home>/models/deepseek-v4-flash-q2-k-s/files",
+    "runtime": "<werk-home>/backends/llama-cuda/upstream-ec928150501c/build/bin/llama-server",
+    "native_args": "--n-cpu-moe 38 --reasoning off --verbosity 4",
+    "removed_inherited_environment_keys": [],
+    "linux_page_bytes": 4096,
+    "sample_interval_seconds": 1,
+    "phase_timeout_seconds": 900,
+    "cpu_thread_policy": {
+      "generation": 24,
+      "prompt": 24,
+      "unset": "native default"
+    },
+    "cpu_model": "Intel(R) Xeon(R) CPU E5-2673 v3 @ 2.40GHz",
+    "logical_cpus": 48,
+    "uname": [
+      "Linux",
+      "<wsl-host>",
+      "6.18.33.2-microsoft-standard-WSL2",
+      "#1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026",
+      "x86_64"
+    ],
+    "runtime_version": "version: 0.4.1-dev (build 1, commit ec92815)\nbuilt with GNU 11.4.0 for Linux x86_64\n",
+    "runtime_version_exit_code": 0,
+    "prompts_by_phase": [
+      "Explain how Rust ownership and borrowing work. Give a detailed practical example and discuss the tradeoffs.\nExplain how Rust ownership and borrowing work. Give a detailed practical example and discuss the tradeoffs.\n/exit\n"
+    ]
+  },
+  "phases": [
+    {
+      "phase": 0,
+      "exit_code": 0,
+      "wall_seconds": 47.58837739499995,
+      "timed_out": false,
+      "communicate_errors": [],
+      "log_path": "<test-home>/phase-0.log",
+      "sample_path": "<test-home>/phase-0-samples.jsonl",
+      "werk_stats": {
+        "total_duration": [
+          "19.60626s",
+          "18.458684s"
+        ],
+        "first_token": [
+          "2.007529s",
+          "427.5575ms"
+        ],
+        "prompt_total_tokens": [
+          "23 token(s)",
+          "23 token(s)"
+        ],
+        "prompt_cached_tokens": [
+          "0 token(s)",
+          "19 token(s)"
+        ],
+        "prompt_eval_tokens": [
+          "23 token(s)",
+          "4 token(s)"
+        ],
+        "prompt_eval_duration": [
+          "1.998737s",
+          "422.526ms"
+        ],
+        "prompt_eval_rate": [
+          "11.51 tokens/s",
+          "9.47 tokens/s"
+        ],
+        "generated_tokens": [
+          "128 token(s)",
+          "128 token(s)"
+        ],
+        "generation_duration": [
+          "17.598562s",
+          "18.030985s"
+        ],
+        "generation_rate": [
+          "7.27 tokens/s",
+          "7.10 tokens/s"
+        ],
+        "finish_reason": [
+          "length",
+          "length"
+        ],
+        "persistence_lines": [],
+        "native_snapshot_restored": false,
+        "native_snapshot_saved": false,
+        "native_kv_unavailable": false
+      },
+      "resources": {
+        "observed_processes": [
+          {
+            "pid": 21982,
+            "comm": "werk",
+            "state": "S",
+            "ppid": 21867,
+            "pgrp": 21982,
+            "start_ticks": 444055,
+            "cpu_seconds": 0.29,
+            "minor_faults": 27148,
+            "major_faults": 0,
+            "rss_bytes": 175841280,
+            "read_bytes": 18412672,
+            "write_bytes": 12288,
+            "rchar": 19074581,
+            "wchar": 178974
+          },
+          {
+            "pid": 22045,
+            "comm": "llama-server",
+            "state": "R",
+            "ppid": 21982,
+            "pgrp": 21982,
+            "start_ticks": 444150,
+            "cpu_seconds": 0.06,
+            "minor_faults": 23444,
+            "major_faults": 0,
+            "rss_bytes": 155070464,
+            "read_bytes": 832,
+            "write_bytes": 0,
+            "rchar": 22512,
+            "wchar": 0
+          },
+          {
+            "pid": 22062,
+            "comm": "llama-server",
+            "state": "R",
+            "ppid": 21982,
+            "pgrp": 21982,
+            "start_ticks": 444193,
+            "cpu_seconds": 820.15,
+            "minor_faults": 215676,
+            "major_faults": 74,
+            "rss_bytes": 98927333376,
+            "read_bytes": 11640896,
+            "write_bytes": 24576,
+            "rchar": 14450771,
+            "wchar": 26999
+          }
+        ],
+        "observed_process_tree_cpu_seconds": 820.5,
+        "mean_cpu_percent_one_core_100": 1724.1604881577846,
+        "peak_process_tree_rss_bytes": 99103174656,
+        "native_server_storage_read_bytes": 11641728,
+        "native_server_read_syscall_chars": 14473283,
+        "native_server_major_faults": 74,
+        "system_vm_counter_deltas": {
+          "pgfault": 494281,
+          "pgmajfault": 194,
+          "pswpin": 0,
+          "pswpout": 0,
+          "pgpgin": 8316,
+          "pgpgout": 3224
+        },
+        "system_swap_in_bytes": 0,
+        "system_swap_out_bytes": 0,
+        "system_mem_kib_start": {
+          "MemTotal": 102993340,
+          "MemAvailable": 98280000,
+          "MemFree": 1848020,
+          "Cached": 97129048,
+          "Buffers": 13460,
+          "SwapTotal": 26214400,
+          "SwapFree": 26213460,
+          "Dirty": 1764,
+          "Writeback": 0
+        },
+        "system_mem_kib_end": {
+          "MemTotal": 102993340,
+          "MemAvailable": 98384008,
+          "MemFree": 1932428,
+          "Cached": 97147924,
+          "Buffers": 13892,
+          "SwapTotal": 26214400,
+          "SwapFree": 26213460,
+          "Dirty": 2108,
+          "Writeback": 0
+        },
+        "notes": [
+          "Process counters are sampled once per second and may miss short-lived processes or final increments.",
+          "RSS includes file-backed pages and shared mappings; summing processes can count shared pages more than once.",
+          "read_bytes measures Linux-accounted storage reads including file-backed cache misses; it does not measure host physical SSD traffic.",
+          "rchar measures read-like syscall characters; mmap page faults are not fully represented by rchar.",
+          "Major faults can involve file-backed weights or swap and do not by themselves prove swap activity.",
+          "pswpin/pswpout are system-wide swap-page counters; pgpgin/pgpgout use KiB despite sharing the vm counter object."
+        ]
+      }
+    }
+  ]
+}

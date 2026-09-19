@@ -62,6 +62,7 @@ impl GenerationBackend for OptionsBackend {
 
 fn install_model(store: &ModelStore) {
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "options-model".into(),
         source: ModelSource::LocalPath {
             path: "fixture".into(),

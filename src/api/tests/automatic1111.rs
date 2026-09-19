@@ -484,6 +484,7 @@ fn install_model_clone(store: &ModelStore, source: &str, id: &str) {
 
 fn install_non_image_model(store: &ModelStore, id: &str) {
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: id.to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),

@@ -598,8 +598,36 @@ fn native_cache_diagnostics_report_only_upstream_cached_token_counts() {
     );
 }
 
+#[test]
+fn model_directory_resolves_external_config_and_files_fallback() {
+    let root = env::temp_dir().join(format!("werk-omlx-external-{}", random_id().unwrap()));
+    let store = ModelStore::resolve(Some(root.join("store"))).unwrap();
+    let external = root.join("raid/qwen");
+    fs::create_dir_all(external.join("snapshot")).unwrap();
+    fs::write(external.join("config.json"), b"{}").unwrap();
+    fs::write(external.join("snapshot/config.json"), b"{}").unwrap();
+    let mut manifest = fixture_manifest();
+    manifest.storage = crate::model_store::ModelStorage::External {
+        path: external.clone(),
+    };
+    manifest.config_path = Some("files/snapshot/config.json".to_string());
+
+    assert_eq!(
+        resolve_model_dir(&store, &manifest).unwrap(),
+        external.join("snapshot").canonicalize().unwrap()
+    );
+    manifest.config_path = None;
+    assert_eq!(
+        resolve_model_dir(&store, &manifest).unwrap(),
+        external.canonicalize().unwrap()
+    );
+    assert!(!store.model_dir(&manifest.id).join("files").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn fixture_manifest() -> ModelManifest {
     ModelManifest {
+        storage: Default::default(),
         id: "owner/model".into(),
         source: crate::model_store::ModelSource::LocalPath {
             path: "fixture".into(),

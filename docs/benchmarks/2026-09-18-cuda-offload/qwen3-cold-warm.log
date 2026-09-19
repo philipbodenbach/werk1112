@@ -1,0 +1,58 @@
+[werk chat] persistence enabled: 0 saved messages
+[werk chat] conversation: <test-home>/chat-sessions/d9aba39fc6adf57972b45aea7f12bf832ff0b4e647a60b8c3edd5834d96a78e8.json
+Using llama.cpp server CUDA backend
+[werk chat] native KV cache enabled; reuse depends on the prompt and backend
+Chatting with cuda-smoke-qwen3. Type /exit or /quit to stop.
+you> assistant> OK
+
+backend:              llama.cpp server CUDA
+total duration:       435.6517ms
+load duration:        0us
+prompt total count:   23 token(s)
+prompt cached count:  0 token(s)
+prompt eval count:    23 token(s)
+prompt eval duration: 39.147ms
+prompt eval rate:     587.53 tokens/s
+eval count:           2 token(s)
+eval duration:        23.725ms
+first token:          69.9459ms
+eval rate:            84.30 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 1
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  llama.cpp request endpoint: /v1/chat/completions
+  chat template applied by backend/model: yes
+  llama.cpp native KV persistence: cold session
+  llama.cpp native KV snapshot saved: 24 tokens
+you> assistant> 37
+
+backend:              llama.cpp server CUDA
+total duration:       761.7816ms
+load duration:        0us
+prompt total count:   49 token(s)
+prompt cached count:  19 token(s)
+prompt eval count:    30 token(s)
+prompt eval duration: 41.677ms
+prompt eval rate:     719.82 tokens/s
+eval count:           3 token(s)
+eval duration:        16.231ms
+first token:          58.3189ms
+eval rate:            184.83 tokens/s
+finish reason:        stop
+
+backend stats:
+  history messages: 3
+  chat template source: model
+  chat template: model
+  chat template applied by werk: no
+  history enabled: yes
+  llama.cpp request endpoint: /v1/chat/completions
+  chat template applied by backend/model: yes
+  llama.cpp native KV persistence: using live slot; reuse reported by backend usage
+  llama.cpp native KV snapshot saved: 51 tokens
+you> 

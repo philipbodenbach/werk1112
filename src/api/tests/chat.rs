@@ -233,6 +233,7 @@ impl GenerationBackend for VisionRecordingBackend {
 async fn models_and_chat_routes_use_openai_shapes() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "mock".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -584,6 +585,7 @@ async fn unsupported_backend_rejects_tool_calling_before_backend_execution() {
 
 fn install_tool_chat_model(store: &ModelStore) {
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "tool-model".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -613,6 +615,7 @@ fn install_tool_chat_model(store: &ModelStore) {
 async fn vision_chat_preserves_ordered_parts_and_bypasses_text_session_cache() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "qwen3-vl-test".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -794,6 +797,7 @@ async fn model_retrieve_route_requires_bearer_auth() {
 fn model_retrieve_app() -> Router {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "mock".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -825,6 +829,7 @@ fn model_retrieve_app() -> Router {
 async fn server_api_keys_require_matching_bearer_token() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "mock".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -899,6 +904,7 @@ async fn server_api_keys_require_matching_bearer_token() {
 async fn server_default_model_is_used_when_request_omits_model() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "mock".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -954,6 +960,7 @@ async fn server_default_model_is_used_when_request_omits_model() {
 async fn chat_route_rejects_image_generation_only_models_before_backend_loading() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "image-only".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -1012,6 +1019,7 @@ async fn chat_route_rejects_image_generation_only_models_before_backend_loading(
 async fn chat_route_uses_prompt_options_resolver_before_generation() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "mock".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -1076,6 +1084,7 @@ async fn chat_route_uses_prompt_options_resolver_before_generation() {
 async fn chat_route_trims_complete_old_turns_for_gguf_context() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "mock-gguf".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),
@@ -1138,6 +1147,7 @@ async fn chat_route_trims_complete_old_turns_for_gguf_context() {
 async fn chat_route_reports_when_current_message_cannot_fit_gguf_context() {
     let store = test_store();
     let manifest = ModelManifest {
+        storage: Default::default(),
         id: "mock-gguf".to_string(),
         source: ModelSource::LocalPath {
             path: "test".to_string(),

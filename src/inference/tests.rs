@@ -101,6 +101,7 @@ fn image_manifest() -> ModelManifest {
         .generation_defaults
         .insert("image.steps".to_string(), Value::from(35));
     ModelManifest {
+        storage: Default::default(),
         id: "flux".to_string(),
         source: ModelSource::LocalPath {
             path: "fixture".to_string(),
@@ -124,6 +125,7 @@ fn image_manifest() -> ModelManifest {
 
 fn video_manifest(family: &str) -> ModelManifest {
     ModelManifest {
+        storage: Default::default(),
         id: family.to_string(),
         source: ModelSource::LocalPath {
             path: "fixture".to_string(),

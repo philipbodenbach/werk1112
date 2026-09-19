@@ -1033,6 +1033,7 @@ mod tests {
     #[test]
     fn inferred_llama3_template_replaces_missing_preferred_gguf_template() {
         let mut manifest = ModelManifest {
+            storage: Default::default(),
             id: "renamed-model".to_string(),
             source: ModelSource::LocalPath {
                 path: "model".to_string(),
@@ -1097,6 +1098,7 @@ mod tests {
     #[test]
     fn tinyllama_uses_chatml_prompt_shape() {
         let manifest = ModelManifest {
+            storage: Default::default(),
             id: "TinyLLama-1B-GGUF".to_string(),
             source: ModelSource::HuggingFace {
                 repo: "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF".to_string(),
@@ -1141,6 +1143,7 @@ mod tests {
     #[test]
     fn qwen3_uses_chatml_prompt_shape_and_stops() {
         let manifest = ModelManifest {
+            storage: Default::default(),
             id: "Qwen3-14B".to_string(),
             source: ModelSource::HuggingFace {
                 repo: "Qwen/Qwen3-14B".to_string(),
@@ -1190,6 +1193,7 @@ mod tests {
     #[test]
     fn phi3_uses_expected_chat_template_and_assistant_turn_end() {
         let manifest = ModelManifest {
+            storage: Default::default(),
             id: "microsoft/Phi-3-mini-4k-instruct-onnx".to_string(),
             source: ModelSource::HuggingFace {
                 repo: "microsoft/Phi-3-mini-4k-instruct-onnx".to_string(),
@@ -1257,6 +1261,7 @@ mod tests {
     #[test]
     fn phi3_repeated_short_prompt_history_keeps_turns_separate() {
         let manifest = ModelManifest {
+            storage: Default::default(),
             id: "Phi3".to_string(),
             source: ModelSource::LocalPath {
                 path: "phi3".to_string(),

@@ -10,6 +10,32 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Added
 
+- `werk run` now shares chat sessions, transcript/native KV persistence,
+  streaming, and context handling with `chat`. JSON requests expose the existing
+  OpenAI tool/vision/runtime controls and canonical media inference service,
+  including image, audio, video and embedding tasks, parameters, inputs, routing,
+  and output publication. Structured output supports JSON and streamed NDJSON.
+- Conversation storage mode and TTL options for both `run` and `chat`, with the
+  same managed vLLM/oMLX prefix-cache defaults as `serve`.
+
+- Native persistent terminal-chat snapshots through the existing llama.cpp slot
+  adapter, with runtime/model compatibility namespaces, corruption checks and
+  backend-reported prefix hits. Newer servers' response counters are accepted
+  when idle-slot counters reset after completion.
+- Opt-in `werk backend install llama-cuda-offload` builds a pinned experimental
+  CUDA MoE-cache runtime through the existing installer and adapter; supported
+  PLE tables can use native lazy reads. See the documented WSL test limitation
+  and differences from oMLX's automatic budgets and row cache.
+- `werk import DIRECTORY --all` imports a collection of model directories and
+  supported model files, retaining existing Werk model IDs and metadata. Combine
+  it with `--link` to register a RAID collection without copying weights.
+  Collection imports check model ID and destination conflicts before writing;
+  individual repositories remain intact, including components and shards.
+- `werk import --link` registers existing external model files without copying
+  weights, including existing Werk model directories and their metadata. Mix
+  local and RAID models in one store; `werk list` identifies external storage,
+  and removal preserves external files. Whole-store `--model-home` and
+  `WERK_HOME` selection remains available.
 - Grouped oMLX expert execution with batched tensor materialization, protected
   active groups and reduced allocator flushing; `WERK_OMLX_EXPERT_EXECUTION=serial`
   retains the prior path for comparison. Verbose diagnostics expose worker
@@ -42,6 +68,13 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Fixed
 
+- Download all matching shards when selecting a split GGUF with `werk pull`,
+  including automatic selection. Reject incomplete shard sets before downloading
+  and count the complete selected variant in memory estimates.
+- Buffer GGUF architecture and chat metadata reads to avoid excessive small
+  reads and long delays on mounted storage, including Windows drives in WSL.
+- Show each model's absolute local storage path in `werk list`, align columns
+  to their contents and use labeled blocks when the table exceeds the terminal width.
 - Reuse successful oMLX compatibility probes across chat requests and sessions,
   with bounded caching and model/runtime dependency invalidation, avoiding
   repeated Python imports before each HTTP response.
