@@ -1,0 +1,7 @@
+{
+  "binary": "/Users/philipbodenbach/.cargo/bin/werk",
+  "sha256": "881ff635ffe1b147e0b59211c6fdaf4becb3a4d560cc708d7493379c87146d2e",
+  "matches_benchmarked_binary": true,
+  "offload_tests_passed": 42,
+  "rust_omlx_tests_passed": 79
+}

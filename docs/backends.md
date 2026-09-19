@@ -400,8 +400,11 @@ The expert status endpoint reports this as `last_decode_admission`.
 
 GLM, Qwen and DeepSeek expert offload use a segmented LRU: repeated accesses protect hot experts
 within at most 80% of the existing expert budget, leaving a recency-adaptive
-region for new demand. Up to four file readers fetch missing tensors of each
-bounded expert group in parallel. Pins, leases and native memory limits remain
+region for new demand. Parallel file readers fetch missing tensors of each
+bounded expert group: Qwen/GLM use the logical CPU count capped at 16 (four
+when unavailable), while DeepSeek retains four readers. Threads start on
+demand and the bounded staging allocation does not grow with thread count.
+Pins, leases and native memory limits remain
 authoritative; all MLX operations stay on the owning executor. These are
 automatic adapter choices, including when the expert budget is `auto`.
 DeepSeek retains its native BF16/FP16 expert metadata conversion and uses the
@@ -428,6 +431,16 @@ combines each leased group's outputs before scattering them, avoiding repeated
 input gathers, per-expert output scatters and redundant synchronization. It does
 not allocate a second packed copy of expert weights. Prefill retains its bounded
 chunked path. See the [local comparison](benchmarks/2026-09-19-omlx-comparison/README.md).
+
+For mixed cached/missing expert groups during Qwen/GLM decode, bounded parallel
+reads now start before evaluating cached experts. GPU work stays on the owning
+executor and every routed expert stays leased through its completed evaluation.
+The same staging ceiling applies; small-budget groups and groups without both
+hits and misses retain the ordinary path. Exceptions drain all readers before
+releasing temporary storage. DeepSeek retains its separate execution path.
+With overlap, `disk_read_seconds` counts foreground scheduling and waiting,
+excluding cached-expert computation performed while reads run; it is not total
+background I/O duration. Compare full request/decode time to assess speedup.
 
 Qwen PLE N-gram tables have a separate row cache, controlled through
 `WERK_OMLX_NGRAM_CACHE_MB` or API `werk.omlx.ngram_cache_mb`:

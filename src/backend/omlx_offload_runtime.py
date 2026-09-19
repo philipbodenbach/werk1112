@@ -117,10 +117,27 @@ def streamed_experts(access,layer,activation,workspace_bytes=1024**3):
             for group in groups:
                 chunk=max(1,min(128,workspace_bytes//max(1,16*len(group)*(access.inventory.hidden+access.inventory.intermediate))))
                 with ExitStack() as leases:
-                    if hasattr(access, 'prefetch_experts'):
+                    completed = set()
+                    def ready(experts):
+                        nonlocal output
+                        acquired = []
+                        for expert in experts:
+                            rows, slots = np.nonzero(routes == expert)
+                            weights = leases.enter_context(access.expert(layer, int(expert)))
+                            acquired.append((weights, rows, slots))
+                        values, positions = decode_group(flat, acquired)
+                        output = output.at[positions].add(values)
+                        mx.eval(output)
+                        access.output_evaluations += 1
+                        completed.update(experts)
+                    if routes.shape[0] == 1 and hasattr(access, 'prefetch_ready_experts'):
+                        leases.enter_context(access.prefetch_ready_experts(layer, group, ready=ready))
+                    elif hasattr(access, 'prefetch_experts'):
                         leases.enter_context(access.prefetch_experts(layer, group))
                     acquired=[]
                     for expert in group:
+                        if expert in completed:
+                            continue
                         rows,slots=np.nonzero(routes==expert)
                         weights=leases.enter_context(access.expert(layer,int(expert)))
                         acquired.append((weights,rows,slots))

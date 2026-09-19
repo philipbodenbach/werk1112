@@ -14,11 +14,11 @@ from pathlib import Path
 import weakref
 
 try:
-    from _werk_omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature
+    from _werk_omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature, expert_read_workers
     from _werk_omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
     from _werk_omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
 except ImportError:  # Direct repository tests.
-    from omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature
+    from omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature, expert_read_workers
     from omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
     from omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
 
@@ -274,7 +274,8 @@ class TextExpertManager(ExpertManager):
         super().__init__(checkpoint, execution=execution)
         if checkpoint.experts_enabled and checkpoint.inventory.architecture in ARCHITECTURES:
             self._retention = ExpertRetention(self.effective_cache_bytes)
-        self.reader = RangeReader(prefetch_workers=4 if checkpoint.inventory.architecture in ARCHITECTURES else 0)
+        self.reader = RangeReader(prefetch_workers=expert_read_workers()
+                                  if checkpoint.inventory.architecture in ARCHITECTURES else 0)
         self.ngram_cache = SharedCache(max(1, checkpoint.ngram_initial_cache_bytes))
         self._ngram_auto_target = checkpoint.ngram_initial_cache_bytes
         self._ngram_last_evictions = 0
@@ -284,6 +285,7 @@ class TextExpertManager(ExpertManager):
         self.access.expert_groups = lambda layer, indices: (
             [index for _, index in group] for group in self._groups(layer, indices))
         self.access.prefetch_experts = self.prefetch_experts
+        self.access.prefetch_ready_experts = self.prefetch_experts
 
     def _resize_cache(self, budget):
         if not self.checkpoint.experts_enabled:
@@ -292,7 +294,7 @@ class TextExpertManager(ExpertManager):
         super()._resize_cache(budget)
 
     @contextmanager
-    def prefetch_experts(self, layer, indices):
+    def prefetch_experts(self, layer, indices, ready=None):
         with self._lock:
             keys = {(layer, int(index)) for index in indices}
             prior_leases = set(self._leased)
@@ -305,7 +307,10 @@ class TextExpertManager(ExpertManager):
                     for suffix in ('weight', 'scales', 'biases')]
                 # Raw read-ahead plus independent row copies fit in the
                 # existing workspace, including small expert-cache budgets.
-                with self.reader.prefetch(tensors, max_bytes=_WORKSPACE_BYTES // 8):
+                cached = [int(index) for index in indices if (layer, int(index)) in self._cache]
+                callback = (lambda: ready(cached)) if ready is not None and cached and tensors else None
+                with self.reader.prefetch(tensors, max_bytes=_WORKSPACE_BYTES // 8,
+                                         while_reading=callback):
                     yield
             finally:
                 self._leased.difference_update(keys - prior_leases)
