@@ -466,6 +466,11 @@ werk chat model-id --max-tokens 128
 chat streams decoded pieces by default. Use `--stream-granularity chunk` to
 reduce terminal flushes and `--verbose` for prompt/decode timing and throughput.
 
+For oMLX `run` and `chat`, the first completed turn includes worker/model
+preparation in `load duration` and `total duration`, including persistent-session
+startup. Later turns do not count that startup again. Prompt/decode timings and
+first-token latency describe the request to the prepared backend.
+
 ### One-shot inference with `run`
 
 `run` shares chat's conversation/session implementation and the media inference
