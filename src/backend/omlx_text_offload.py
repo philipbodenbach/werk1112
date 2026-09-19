@@ -14,11 +14,11 @@ from pathlib import Path
 import weakref
 
 try:
-    from _werk_omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer
+    from _werk_omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature
     from _werk_omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
     from _werk_omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
 except ImportError:  # Direct repository tests.
-    from omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer
+    from omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature
     from omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
     from omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
 
@@ -406,6 +406,38 @@ def _canonical_name(name, architecture=None):
     raise ValueError(f"unverified native text tensor name: {name}")
 
 
+def _check_resident_shards(selected):
+    for path, expected in {tensor.path: tensor.signature for tensor in selected.values()}.items():
+        if signature(path.stat()) != expected:
+            raise ValueError("checkpoint changed during resident weight loading")
+
+
+def _load_resident_weights(selected, architecture):
+    """Use MLX lazy file loads, retaining only the selected resident tensors.
+
+    Dropping unselected arrays before evaluation avoids reading offloaded PLE,
+    experts, vision and MTP payloads even when they share the same shard.
+    The caller checks shard identities again after materializing the model.
+    """
+    import mlx.core as mx
+
+    _check_resident_shards(selected)
+    shards = {}
+    for name, tensor in selected.items():
+        shards.setdefault(tensor.path, []).append(name)
+    weights = {}
+    for path, names in shards.items():
+        arrays = mx.load(str(path))
+        for name in names:
+            value = arrays[name]
+            if tuple(value.shape) != selected[name].shape:
+                raise ValueError("resident tensor shape differs from checkpoint inventory")
+            weights[_canonical_name(name, architecture)] = value
+        del arrays
+    _check_resident_shards(selected)
+    return weights
+
+
 def load_text_model(manager, tokenizer_config=None, **kwargs):
     import mlx.core as mx
     import mlx.nn as nn
@@ -449,7 +481,7 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
             selected.update(current.categories["experts"])
         if not cp.ngrams_enabled:
             selected.update(current.categories["ple"])
-        weights = {_canonical_name(name, current.architecture): manager._read(name) for name in selected}
+        weights = _load_resident_weights(selected, current.architecture)
         # Retain installed normalization/layout logic, including Qwen's
         # direct-gamma checkpoint conversion and GLM's FP32 routing parameters.
         weights = root.sanitize(weights)
@@ -472,6 +504,7 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
         # its additional full copy is not part of the bounded loader contract.
         nn.Module.load_weights(root, list(weights.items()), strict=True)
         mx.eval(root.parameters())
+        _check_resident_shards(selected)
         del weights
         prepare_attention_fusion(root, cp)
         mx.clear_cache()

@@ -167,6 +167,34 @@ def tiny_config(architecture):
 
 @unittest.skipUnless(os.getenv("WERK_TEST_MLX_EXPERTS") == "1", "native Metal opt-in")
 class NativeTextLoaderTests(unittest.TestCase):
+    def test_resident_shards_preserve_dtypes_and_reject_changed_checkpoint(self):
+        import mlx.core as mx
+        from omlx_offload import signature
+
+        with tempfile.TemporaryDirectory() as directory:
+            selected = {}
+            expected = {}
+            for index, dtype in enumerate((mx.bfloat16, mx.uint32)):
+                path = Path(directory) / f"model-{index}.safetensors"
+                name = f"model.layers.{index}.weight"
+                value = mx.array([[1, 2], [3, 4]], dtype=dtype)
+                mx.save_safetensors(str(path), {name: value, "vision_tower.excluded": mx.ones((8,))})
+                selected[name] = SimpleNamespace(path=path, signature=signature(path.stat()), shape=(2, 2))
+                expected[adapter._canonical_name(name, "qwen4_exp")] = value
+            weights = adapter._load_resident_weights(selected, "qwen4_exp")
+            self.assertEqual(set(weights), set(expected))
+            mx.eval(weights)
+            adapter._check_resident_shards(selected)
+            for name, value in weights.items():
+                self.assertEqual(value.dtype, expected[name].dtype)
+                self.assertTrue(mx.array_equal(value, expected[name]).item())
+            with path.open("ab") as file:
+                file.write(b"changed")
+            with self.assertRaisesRegex(ValueError, "checkpoint changed"):
+                adapter._check_resident_shards(selected)
+            with self.assertRaisesRegex(ValueError, "checkpoint changed"):
+                adapter._load_resident_weights(selected, "qwen4_exp")
+
     def test_qwen_tool_probe_matches_native_tokenizer_and_typed_parser(self):
         import omlx_probe as probe
         from mlx_lm import utils
