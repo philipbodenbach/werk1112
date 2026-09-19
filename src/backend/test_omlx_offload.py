@@ -417,6 +417,27 @@ class NativeOffloadTests(unittest.TestCase):
                     expected.append(mx.stack(outputs))
                 expected=mx.stack(expected)[None];mx.eval(actual,expected)
                 np.testing.assert_allclose(np.array(actual),np.array(expected),atol=1e-4,rtol=1e-3)
+            # Single-token decode must preserve unsorted and duplicate routes,
+            # including the weighted reduction, with one leased expert group.
+            cache.resize(2 * inv.layer_bytes[0] * inv.experts + 2048)
+            access.expert_groups = lambda layer, experts: [list(experts)]
+            decode_x = x[:, :1]
+            decode_indices = mx.array([[[3, 1, 3]]])
+            scores = mx.array([[[.2, .3, .5]]], dtype=decode_x.dtype)
+            expected = []
+            for expert in (3, 1, 3):
+                def project(name, value):
+                    prefix = f'model.layers.0.mlp.switch_mlp.{name}'
+                    w, s, b = (weights[prefix+'.'+suffix][expert] for suffix in ('weight','scales','biases'))
+                    return mx.quantized_matmul(value,w,s,b,transpose=True,bits=4,group_size=32)
+                expected.append(project('down_proj', activation(project('up_proj', decode_x), project('gate_proj', decode_x))))
+            expected = mx.stack(expected, axis=-2)
+            actual = streamed(decode_x, decode_indices)
+            reduced = streamed(decode_x, decode_indices, scores, weighted_sum=True)
+            expected_reduced = (expected * scores[..., None]).sum(-2)
+            mx.eval(actual, expected, reduced, expected_reduced)
+            np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-4, rtol=1e-3)
+            np.testing.assert_allclose(np.array(reduced), np.array(expected_reduced), atol=1e-4, rtol=1e-3)
             embedding=runtime.streamed_embedding(access,0)
             ids=mx.array([[0,5,10,5],[4,1,8,0]])
             actual=embedding(ids)

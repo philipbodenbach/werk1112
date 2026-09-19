@@ -1592,8 +1592,11 @@ impl OmlxProcess {
             let status =
                 process.json_request("GET", "/werk/experts/status", None, deadline.remaining()?)?;
             let actual = status.get("cache_budget_bytes").and_then(Value::as_u64);
+            let native_experts = native_weight_adapter
+                && status.get("experts_offloaded").and_then(Value::as_bool) == Some(false)
+                && actual == Some(0);
             let confirmed = if requested_bytes == 0 {
-                actual.is_some_and(|bytes| bytes > 0)
+                (actual.is_some_and(|bytes| bytes > 0) || native_experts)
                     && status.get("cache_budget_mode").and_then(Value::as_str) == Some("auto")
             } else {
                 actual == Some(requested_bytes)
@@ -1601,16 +1604,20 @@ impl OmlxProcess {
             if status.get("active").and_then(Value::as_bool) != Some(true) || !confirmed {
                 bail!("oMLX did not confirm activating the requested bounded expert cache");
             }
-            process.expert_offload = true;
-            eprintln!(
-                "oMLX expert cache: {} MiB ({}) upper budget; SSD offload active, native memory guard may reduce residency",
-                actual.unwrap_or_default() / (1024 * 1024),
-                if requested_bytes == 0 {
-                    "auto"
-                } else {
-                    "explicit"
-                }
-            );
+            process.expert_offload = !native_experts;
+            if native_experts {
+                eprintln!("oMLX experts: native resident execution (auto; weights fit available memory)");
+            } else {
+                eprintln!(
+                    "oMLX expert cache: {} MiB ({}) upper budget; SSD offload active, native memory guard may reduce residency",
+                    actual.unwrap_or_default() / (1024 * 1024),
+                    if requested_bytes == 0 {
+                        "auto"
+                    } else {
+                        "explicit"
+                    }
+                );
+            }
         }
         if native_weight_adapter {
             let status =

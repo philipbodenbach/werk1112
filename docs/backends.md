@@ -416,7 +416,22 @@ The text adapter does not enable vision or MTP.
 Qwen PLE N-gram tables have a separate row cache, controlled through
 `WERK_OMLX_NGRAM_CACHE_MB` or API `werk.omlx.ngram_cache_mb`:
 
-- Unset/`auto`: demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries and isolated decode budget checks up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
+For the verified Qwen/GLM text adapters, automatic expert selection first checks
+whether all expert weights fit alongside base weights, auxiliary caches and the
+existing system/workspace reserves. If they fit, Werk keeps the installed native
+expert modules and reports `native resident execution`; their weights are charged
+as base memory rather than evictable cache. If automatic Qwen N-gram tables also
+fit, they remain resident. Otherwise the row cache remains active independently.
+Positive expert-cache limits always retain offload. Selection happens once at
+worker startup; native KV/attention admission still applies to later requests.
+
+The offloaded Qwen/GLM single-token path reuses the shared input directly and
+combines each leased group's outputs before scattering them, avoiding repeated
+input gathers, per-expert output scatters and redundant synchronization. It does
+not allocate a second packed copy of expert weights. Prefill retains its bounded
+chunked path. See the [local comparison](benchmarks/2026-09-19-omlx-comparison/README.md).
+
+- Unset/`auto`: resident tables when the automatic resident selection above fits; otherwise demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries and isolated decode budget checks up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
 - API `ngram_cache_mb: "auto"`: explicitly override a fixed server setting with Auto. Omission inherits.
 - Positive integer: manual upper bound in MiB; the API accepts 1–1048576.
 - `0`: resident tables. It does not disable expert offload.

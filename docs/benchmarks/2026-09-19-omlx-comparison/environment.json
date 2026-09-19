@@ -1,0 +1,17 @@
+{
+  "physical_memory_GiB": 48,
+  "packages": {
+    "mlx-lm": "0.31.3",
+    "mlx-vlm": "0.6.3",
+    "mlx": "0.32.0",
+    "omlx": "0.6.4"
+  },
+  "werk_sha256": "3fc6213601001978382b41ced3488b31c4f95cdf45d5d7cd6f4c7c0637cdbb3f",
+  "model_categories_GiB": {
+    "base": 4.981,
+    "experts": 63.281,
+    "ple": 29.802,
+    "vision": 0.836
+  },
+  "note": "No full native model run: base plus experts alone exceed physical RAM."
+}

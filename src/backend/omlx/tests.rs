@@ -163,6 +163,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path=='/api/status': return self.reply({'version':settings.get('version','test-0.6.4')})
         if self.path=='/werk/persistence/status': return self.reply({'installed':True,'active':settings.get('cache_active',True),'format':'omlx-exact-prefix-v1','model_id':'physical / model'})
         if self.path=='/werk/experts/status':
+            if settings.get('native_experts'):
+                return self.reply({'active':True,'cache_budget_bytes':0,'cache_budget_mode':'auto','experts_offloaded':False})
             budget=int(os.environ.get('WERK_OMLX_EXPERT_CACHE_BYTES','0'))
             return self.reply({'active':True,'cache_budget_bytes':budget or 8*1024**3,'cache_budget_mode':'explicit' if budget else 'auto'})
         if self.path=='/v1/models/status':
@@ -1748,6 +1750,27 @@ fn auto_expert_cache_activates_only_for_probe_verified_models() {
         assert_eq!(server.expert_offload, supported);
         assert_eq!(server.expert_cache_bytes, Some(0));
         drop(servers);
+        drop(backend);
+        drop(fixture);
+    }
+}
+
+#[test]
+fn auto_native_experts_require_verified_text_adapter_and_preserve_explicit_limits() {
+    for (verified, budget, succeeds) in [(true, 0, true), (false, 0, false), (true, 1024, false)] {
+        let (fixture, mut backend, manifest) = server_cache_fixture(json!({"version":"0.6.4", "native_experts":true}));
+        backend.invocation.as_mut().unwrap().expert_cache_bytes = Some(budget);
+        backend.test_probe.as_mut().unwrap().runtime["expert_offload"] = if verified {
+            json!({"loader":"installed_native_text_port"})
+        } else {
+            json!({"cache_budget_mode":"auto"})
+        };
+        let result = backend.prepare(&manifest);
+        assert_eq!(result.is_ok(), succeeds, "{result:?}");
+        if succeeds {
+            let servers = backend.servers.lock().unwrap();
+            assert!(!servers.values().next().unwrap().expert_offload);
+        }
         drop(backend);
         drop(fixture);
     }

@@ -229,6 +229,7 @@ class TextCheckpoint:
             import psutil
             metal_limit = get_effective_metal_cap_bytes()
             available_memory = psutil.virtual_memory().available
+            self.select_resident_experts(metal_limit, available_memory)
             if self.ngram_budget_mode == "auto":
                 self.ngram_budget_bytes = automatic_ngram_budget(
                     metal_limit=metal_limit, available_memory=available_memory,
@@ -239,10 +240,33 @@ class TextCheckpoint:
                 initial = min(self.ngram_initial_cache_bytes, self.ngram_budget_bytes)
                 self.base_bytes += initial - self.ngram_initial_cache_bytes
                 self.ngram_initial_cache_bytes = initial
-        if self.cache_budget_mode == "auto":
+        if self.cache_budget_mode == "auto" and self.experts_enabled:
             self.cache_bytes = automatic_cache_budget(
                 self, metal_limit=metal_limit, available_memory=available_memory)
         self.resident_estimate_bytes = self.base_bytes + min(self.cache_bytes, self.total_expert_bytes) + _WORKSPACE_BYTES
+
+    def select_resident_experts(self, metal_limit, available_memory):
+        """Resolve Auto once before loading; explicit budgets keep streaming.
+
+        Preserve space for workspace, allocator and OS. Native experts are
+        accounted as base weights, so later cache admission cannot evict them.
+        """
+        if self.cache_budget_mode != "auto" or not self.experts_enabled:
+            return
+        room = min(int(metal_limit * .90), max(0, available_memory - 2 * GiB))
+        room -= _WORKSPACE_BYTES + _ALLOCATOR_CACHE_BYTES
+        resident = self.base_bytes + self.total_expert_bytes
+        if resident > room:
+            return
+        self.experts_enabled = False
+        self.cache_bytes = 0
+        self.base_bytes = resident
+        if (self.ngram_budget_mode == "auto"
+                and resident - self.ngram_initial_cache_bytes + self.ngram_storage_bytes <= room):
+            self.base_bytes += self.ngram_storage_bytes - self.ngram_initial_cache_bytes
+            self.ngrams_enabled = False
+            self.ngram_budget_mode = "disabled"
+            self.ngram_budget_bytes = self.ngram_initial_cache_bytes = 0
 
 
 class TextExpertManager(ExpertManager):
@@ -260,6 +284,12 @@ class TextExpertManager(ExpertManager):
         self.access.expert_groups = lambda layer, indices: (
             [index for _, index in group] for group in self._groups(layer, indices))
         self.access.prefetch_experts = self.prefetch_experts
+
+    def _resize_cache(self, budget):
+        if not self.checkpoint.experts_enabled:
+            self.effective_cache_bytes = 0
+            return
+        super()._resize_cache(budget)
 
     @contextmanager
     def prefetch_experts(self, layer, indices):

@@ -76,6 +76,22 @@ def streamed_experts(access,layer,activation,workspace_bytes=1024**3):
     import mlx.nn as nn
     import numpy as np
 
+    def decode_group(flat, acquired):
+        # Decode has one input row shared by every expert. Keep existing cache
+        # allocations: packing them every token costs more than it saves.
+        values = []
+        for weights, _, _ in acquired:
+            def project(name, value):
+                w, scales, biases = weights[name]
+                return mx.quantized_matmul(value, w, scales, biases, transpose=True,
+                                           **access.inventory.projections[layer,name][1])
+            up, gate = project('up_proj', flat), project('gate_proj', flat)
+            values.append(project('down_proj', activation(up, gate)).astype(flat.dtype))
+        values = mx.concatenate(values, axis=0)
+        positions = np.concatenate([slots for _, _, slots in acquired])
+        order = np.repeat(np.arange(len(acquired)), [len(slots) for _, _, slots in acquired])
+        return values[mx.array(order)], mx.array(positions)
+
     class StreamedExperts(nn.Module):
         def __init__(self):
             super().__init__()
@@ -93,7 +109,6 @@ def streamed_experts(access,layer,activation,workspace_bytes=1024**3):
             output_size=routes.size*x.shape[-1]*x.itemsize
             if output_size>workspace_bytes//2: raise ValueError('expert output exceeds workspace')
             output=mx.zeros((routes.size,x.shape[-1]),dtype=x.dtype)
-            mx.eval(output)
             # Native activation/dtype and routing order stay unchanged. The
             # owner's grouping includes pins and falls back to one expert for
             # small budgets. Complete the graph before releasing any group.
@@ -109,6 +124,13 @@ def streamed_experts(access,layer,activation,workspace_bytes=1024**3):
                         rows,slots=np.nonzero(routes==expert)
                         weights=leases.enter_context(access.expert(layer,int(expert)))
                         acquired.append((weights,rows,slots))
+                    if routes.shape[0] == 1:
+                        values, positions = decode_group(flat, acquired)
+                        output = output.at[positions].add(values)
+                        mx.eval(output)
+                        access.output_evaluations += 1
+                        del values, positions, weights, acquired
+                        continue
                     for offset in range(0,max(len(rows) for _,rows,_ in acquired),chunk):
                         for weights,rows,slots in acquired:
                             r=rows[offset:offset+chunk];s=slots[offset:offset+chunk]
@@ -128,7 +150,7 @@ def streamed_experts(access,layer,activation,workspace_bytes=1024**3):
             if weighted_sum:
                 if scores is None or scores.shape!=indices.shape: raise ValueError('weighted experts require matching scores')
                 output=(output*scores[...,None]).sum(-2).astype(x.dtype)
-            mx.eval(output)
+                mx.eval(output)
             access.forward_calls+=1;access.forward_seconds+=time.perf_counter()-started
             return output
     return StreamedExperts()
