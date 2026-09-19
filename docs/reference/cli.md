@@ -466,10 +466,111 @@ werk chat model-id --max-tokens 128
 chat streams decoded pieces by default. Use `--stream-granularity chunk` to
 reduce terminal flushes and `--verbose` for prompt/decode timing and throughput.
 
+### One-shot inference with `run`
+
+`run` shares chat's conversation/session implementation and the media inference
+service used by `serve`. It exits after one completed response:
+
+```bash
+werk run model-id "Explain Rust ownership" --max-tokens 256
+werk run model-id "Remember: my project is called Atlas" --session project
+werk run model-id "What is my project called?" --session project --stream
+werk chat model-id --session project
+```
+
+A model/session pair uses the same archive in `run` and `chat`. Backend, device,
+llama.cpp tuning, sampling, templates, image inputs, verbose diagnostics and
+supported native KV persistence use the existing chat implementation. Ordinary
+output is buffered; `--stream` streams text, and `--stream-granularity token|chunk`
+also enables streaming. `--no-history` (alias `--single-turn`) conflicts with
+persistence, as it does in `chat`.
+
+For structured conversations and tool calls, pass the existing OpenAI chat
+request schema. `--request -` reads JSON from stdin:
+
+```bash
+werk run model-id --request request.json --json --session tools
+```
+
+```json
+{
+  "messages": [{"role": "user", "content": "What is the weather in Berlin?"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "weather",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }
+  }],
+  "tool_choice": "auto",
+  "max_completion_tokens": 256
+}
+```
+
+This accepts messages (including image parts and tool results), tools,
+`tool_choice`, `parallel_tool_calls`, stop strings, sampling, streaming, and
+supported `werk.omlx` controls, as in `/v1/chat/completions`. The positional model
+selects the installed model; an optional JSON `model` must match its canonical
+ID. Explicit CLI sampling options override JSON values. Without an explicit
+limit, the JSON limit wins, otherwise the default is 256 tokens.
+
+Tool calls are returned to the caller, as with the HTTP API; Werk does not execute
+the declared functions. With a persistent session, the next invocation can send
+only new tool-result messages with the corresponding `tool_call_id`. Do not
+resubmit the saved transcript, since new messages are appended to that session.
+
+`--json` prints a completion object containing `model`, `message`, `finish_reason`
+and `usage`. Combined with streaming it emits newline-delimited `text_delta` and
+`tool_call_delta` events followed by that `completion` object. These are CLI JSON
+events, not HTTP SSE. Diagnostics go to stderr, with no startup banner on stdout.
+
+For media, `run` accepts all canonical inference tasks and parameters supported
+by the existing inference service and selected model/runtime:
+
+```bash
+werk run image-model "A mountain lake" --task image-generation \
+  --set image.width=1024 --set image.height=1024 --set image.steps=20 \
+  --output lake.png
+werk run speech-model "Hello from Werk" --task text-to-speech --output hello.wav
+werk run whisper-model --task speech-to-text --input audio=recording.wav --json
+werk run video-model "Clouds drifting across mountains" --task video-generation \
+  --output clouds.mp4
+werk run model-id --request media-request.json --json
+```
+
+`--input MODALITY[:ROLE]=PATH_OR_URL` is repeatable; use roles such as
+`image:mask_image`, `image:initial_image`, or `audio:reference_audio` for conditioned
+tasks. `--set PATH=VALUE` accepts canonical parameters and `routing.*` overrides
+(e.g. `routing.precision=float16`). A media request file uses the existing
+`InferenceRequest` schema:
+
+```json
+{
+  "task": "image_generation",
+  "prompt": "A mountain lake",
+  "parameters": {"image.width": 1024, "image.height": 1024, "image.steps": 20}
+}
+```
+
+If no task is supplied, text/vision models use conversation inference; a model
+with exactly one media task uses that task. Ambiguous media models require
+`--task`. `werk parameters MODEL --task TASK` lists applicable parameters.
+JSON task names use snake_case (`image_generation`); CLI names use hyphens
+(`image-generation`), following the existing schemas.
+Media outputs use the existing output store and CLI publication rules; `--json`
+returns the canonical inference result. Conversation persistence and text
+streaming flags do not apply to media tasks and produce an explicit error.
+Server transport settings and named Werk Protocol state management remain on
+`serve` and `werk runtime`; `run` does not start an HTTP listener.
+
 ### Persistent terminal chat
 
 `--persistence` saves completed conversation turns and resumes them on the
-next invocation. It is available for every chat backend, including automatic
+next invocation of `run` or `chat`. It is available for every chat backend, including automatic
 routing, and preserves the normal streaming path:
 
 ```bash
@@ -485,8 +586,9 @@ the conversation exists (the default), `required` fails if it does not exist,
 and `disabled` starts a fresh conversation that replaces the previous archive
 only after a completed answer. The reuse option also implies persistence.
 These options conflict with `--no-history` and its `--single-turn` alias.
-For terminal chat, the reuse policy controls the saved conversation; it does
-not disable a backend's independently managed prefix cache.
+The reuse policy controls the saved conversation and the default prefix-cache
+settings for managed vLLM/oMLX, as in `serve`. Explicit native runtime cache
+settings still take precedence; this flag does not purge existing caches.
 
 Private conversation archives live under `$WERK_HOME/chat-sessions/`, or the
 equivalent default Werk home. Only one process may open a given model/session
@@ -499,10 +601,10 @@ in the saved conversation and require an image-capable backend when resumed.
 Conversation history is portable text/message data, not a model or KV snapshot.
 Werk reports whether the selected route also enables persistent native KV
 caching. Unsupported native caches leave conversation persistence operational
-and the backend recomputes the prompt. Local vLLM receives the same validated
-automatic-prefix-cache default as `serve --persistence`; explicit runtime
+and the backend recomputes the prompt. Local vLLM and oMLX receive the same
+prefix-cache defaults as `serve --persistence`; explicit runtime
 arguments still win. This cache remains vLLM-owned and does not survive its
-process restart. Exiting the chat still stops its owned backend workers.
+process restart. Exiting `run` or `chat` still stops its owned backend workers.
 
 The existing llama.cpp route also saves native slot snapshots for persistent
 text chats on Unix when the running server passes the save/erase/restore/replay
@@ -521,10 +623,12 @@ Archives and supported native KV caches survive exit. Use
 [`werk cache list` and `werk cache purge`](#local-persistence-caches) to inspect
 or remove them; deleting just the KV entry preserves the conversation.
 
-The server's `--persistence-mode`, `--persistence-ttl-seconds` and
-`--persistence-pin` govern Werk Protocol Prefill state, and are not terminal
-conversation options. Ordinary chat persistence does not create named
-`/werk/v1/prefill` state handles.
+`run` and `chat` also accept `--persistence-mode disk|auto|memory|ephemeral`
+and `--persistence-ttl-seconds N` (1–2592000). Disk/auto keeps the conversation
+across process restarts; memory/ephemeral does not save a transcript or native
+snapshot to disk. TTL expires the saved conversation. These options imply
+persistence. `--persistence-pin` remains a server option for named Werk Protocol
+states; terminal conversations do not create `/werk/v1/prefill` state handles.
 
 ### Vision input
 

@@ -10,6 +10,14 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Added
 
+- `werk run` now shares chat sessions, transcript/native KV persistence,
+  streaming, and context handling with `chat`. JSON requests expose the existing
+  OpenAI tool/vision/runtime controls and canonical media inference service,
+  including image, audio, video and embedding tasks, parameters, inputs, routing,
+  and output publication. Structured output supports JSON and streamed NDJSON.
+- Conversation storage mode and TTL options for both `run` and `chat`, with the
+  same managed vLLM/oMLX prefix-cache defaults as `serve`.
+
 - Native persistent terminal-chat snapshots through the existing llama.cpp slot
   adapter, with runtime/model compatibility namespaces, corruption checks and
   backend-reported prefix hits. Newer servers' response counters are accepted

@@ -33,9 +33,10 @@ Save and resume a terminal conversation with any chat backend:
 
 ~~~bash
 werk chat MODEL --persistence --session project
+werk run MODEL "Continue with a short summary" --session project --stream
 ~~~
 
-Run the same command again to continue. Completed turns are saved locally,
+Both commands share the same model/session history. Completed turns are saved locally,
 including when runtime routing changes. Without `--session`, the name is
 `default` for that model. Native KV reuse is separate and backend-dependent;
 conversation persistence works even when the backend must recompute the prompt.
