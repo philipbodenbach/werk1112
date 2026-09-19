@@ -711,10 +711,11 @@ def probe(payload):
         raise ValueError(f"MLX Metal device is unavailable ({detail})")
     result = {"ok": True, "detail": detail, "runtime": runtime, "supports_tool_calling": False}
     if root is not None:
-        text_offload_requested = (payload.get("expert_cache_bytes") is not None or payload.get("ngram_cache_bytes") is not None)
-        # Qwen's default/explicit N-gram Auto also works with native experts.
+        text_offload_requested = (payload.get("expert_cache_bytes") is not None or bool(payload.get("ngram_cache_bytes")))
+        # Explicit N-gram Auto also works with native experts. Omitted budgets
+        # from Rust use 0 (resident); a missing field must also keep native loading.
         # Other architectures and unverified runtime versions keep their route.
-        text_offload_requested |= config.get("model_type") == "qwen4_exp" and payload.get("ngram_cache_bytes") is None
+        text_offload_requested |= config.get("model_type") == "qwen4_exp" and "ngram_cache_bytes" in payload and payload["ngram_cache_bytes"] is None
         text_offload_explicit = bool(payload.get("expert_cache_bytes") or payload.get("ngram_cache_bytes"))
         if (config.get("model_type") in ("qwen4_exp", "glm5_next") and text_offload_requested
                 and (runtime["omlx_version"] == "0.6.4" or text_offload_explicit)):

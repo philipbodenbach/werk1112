@@ -285,9 +285,10 @@ selected loading mode.
 
 ### Experimental oMLX expert offload
 
-For supported DeepSeek V4 affine checkpoints on oMLX 0.6.4, Werk now selects
-an automatic SSD-backed expert cache when `WERK_OMLX_EXPERT_CACHE_MB` is unset
-or `auto`. Both `chat` and `serve` use the same selection: at worker startup,
+Without offload settings, Werk preserves native oMLX loading.
+For supported DeepSeek V4 affine checkpoints on oMLX 0.6.4, explicitly setting
+`WERK_OMLX_EXPERT_CACHE_MB=auto` selects an automatic SSD-backed expert cache.
+Both `chat` and `serve` use the same selection: at worker startup,
 retain at most the model's expert bytes and the space left by current available
 system memory and the effective Metal cap, reserving base weights, workspace,
 and system headroom. Native admission further reduces residency for KV/attention
@@ -431,7 +432,8 @@ chunked path. See the [local comparison](benchmarks/2026-09-19-omlx-comparison/R
 Qwen PLE N-gram tables have a separate row cache, controlled through
 `WERK_OMLX_NGRAM_CACHE_MB` or API `werk.omlx.ngram_cache_mb`:
 
-- Unset/`auto`: resident tables when the automatic resident selection above fits; otherwise demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries and isolated decode budget checks up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
+- Unset/`0`: native resident tables.
+- Explicit `auto`: resident tables when the automatic resident selection above fits; otherwise demand-driven row caching, starting at at most 64 MiB. After demand evictions, the target can double at request/prefill boundaries and isolated decode budget checks up to a device- and model-dependent ceiling. With streamed experts, N-grams receive at most one eighth of shared cache room; both caches remain subject to native memory admission. Auto also works with native experts, whose full weights are then charged as base memory.
 - API `ngram_cache_mb: "auto"`: explicitly override a fixed server setting with Auto. Omission inherits.
 - Positive integer: manual upper bound in MiB; the API accepts 1–1048576.
 - `0`: resident tables. It does not disable expert offload.

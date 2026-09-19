@@ -847,6 +847,16 @@ def quantize(model, group_size=64, bits=4, mode="affine", class_predicate=None):
 
 
 class OmlxProbeTests(unittest.TestCase):
+    def test_default_budgets_keep_native_loader_for_supported_offload_models(self):
+        for architecture in ("qwen4_exp", "glm5_next", "deepseek_v4"):
+            with self.subTest(architecture=architecture), self.runtime({"model_type": architecture}) as runtime:
+                for budgets in ({}, {"expert_cache_bytes": None, "ngram_cache_bytes": 0}):
+                    with patch.object(probe_module, "prepare_runtime", side_effect=ValueError("native loader selected")) as native:
+                        with self.assertRaisesRegex(ValueError, "native loader selected"):
+                            probe_module.probe({"launcher": str(runtime.launcher),
+                                "model_dir": str(runtime.model_dir), **budgets})
+                        native.assert_called_once()
+
     def test_native_text_adapter_receives_independent_budgets_without_repository_code(self):
         helper = types.ModuleType("_werk_omlx_text_offload")
         calls = []
@@ -860,7 +870,10 @@ class OmlxProbeTests(unittest.TestCase):
                 config["model_file"] = "qwen4_exp.py"
             with self.runtime(config) as runtime, patch.dict(sys.modules, {"_werk_omlx_text_offload": helper}):
                 (runtime.model_dir / "qwen4_exp.py").write_text("raise AssertionError('must never execute checkpoint code')")
-                for expert_bytes, ngram_bytes in ((0, None), (None, 1024), (8192, 0)):
+                modes = [(0, None), (None, 1024), (8192, 0)]
+                if architecture == "qwen4_exp":
+                    modes.append((None, None))  # Explicit N-gram auto with native experts.
+                for expert_bytes, ngram_bytes in modes:
                     result = probe_module.probe({"launcher": str(runtime.launcher), "model_dir": str(runtime.model_dir),
                         "expert_cache_bytes": expert_bytes, "ngram_cache_bytes": ngram_bytes})
                     self.assertTrue(result["ok"])

@@ -1078,9 +1078,9 @@ impl OmlxInvocation {
 }
 
 fn expert_cache_bytes(value: Option<OsString>) -> Result<Option<u64>> {
-    // Internally Some(0) selects auto; the public numeric 0 still disables offload.
+    // Native loading is the default. Some(0) is explicit auto; public 0 disables offload.
     let Some(value) = value else {
-        return Ok(Some(0));
+        return Ok(None);
     };
     if value == "auto" {
         return Ok(Some(0));
@@ -1115,8 +1115,9 @@ fn thinking_enabled(value: Option<OsString>) -> Result<Option<bool>> {
 }
 
 fn ngram_cache_bytes(value: Option<OsString>) -> Result<Option<u64>> {
+    // Resident tables are the default; None represents explicitly requested auto.
     let Some(value) = value else {
-        return Ok(None);
+        return Ok(Some(0));
     };
     if value == "auto" {
         return Ok(None);
