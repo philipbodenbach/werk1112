@@ -1293,6 +1293,7 @@ fn protocol_resource_exhausted(message: impl Into<String>) -> ProtocolError {
 #[derive(Debug, Clone, Copy)]
 struct LlamaSlotStatus {
     prompt_tokens: u64,
+    prompt_tokens_reported: bool,
     prompt_tokens_cache: u64,
     is_processing: bool,
 }
@@ -1312,6 +1313,7 @@ fn functional_probe_llama_state(server: &LlamaServerProcess) -> Result<()> {
     functional_probe_llama_state_inner(server, false)
 }
 
+#[cfg(test)]
 fn functional_probe_llama_chat_state(server: &LlamaServerProcess) -> Result<()> {
     functional_probe_llama_state_inner(server, true)
 }
@@ -1333,6 +1335,31 @@ fn functional_probe_llama_state_inner(
         let snapshot = save_llama_slot(server, &probe_name, prompt_tokens)?;
         erase_llama_slot(server, Some(prompt_tokens))?;
         restore_llama_slot(server, &probe_name, prompt_tokens, snapshot.bytes)?;
+        // Chat needs continuation, not rewind. Prove it directly before doing
+        // an expensive full replay on hybrid/recurrent models. Older servers
+        // without a usable tokenizer retain the exact-replay path below.
+        if allow_continuation
+            && let Ok(mut tokens) =
+                tokenize_llama_probe(server, STATE_CAPABILITY_PROBE_PROMPT, true)
+            && tokens.len() as u64 == prompt_tokens
+            && let Ok(suffix) = tokenize_llama_probe(
+                server,
+                " Continue this private cache probe with new tokens.",
+                false,
+            )
+        {
+            tokens.extend(suffix);
+            let (path, mut body) = llama_state_request_body(&probe_input, Some(0), None);
+            body["prompt"] = serde_json::to_value(tokens)?;
+            let (total, cached) = run_llama_prefill_body_with_cache(server, path, &body)?;
+            if total <= prompt_tokens || cached < prompt_tokens || cached >= total {
+                bail!(
+                    "llama.cpp capability probe did not prove restored continuation reuse: cached {cached}/{total}"
+                );
+            }
+            erase_llama_slot(server, Some(total))?;
+            return Ok(());
+        }
         let (replay_tokens, cached_tokens) = run_llama_prefill_with_cache(server, &probe_input)?;
         if replay_tokens != prompt_tokens {
             bail!("llama.cpp capability probe replay changed tokenization");
@@ -1341,43 +1368,10 @@ fn functional_probe_llama_state_inner(
         if status.is_processing {
             bail!("llama.cpp capability probe left a busy slot");
         }
-        let mut final_tokens = prompt_tokens;
         if cached_tokens < prompt_tokens.saturating_sub(1) {
-            if !allow_continuation {
-                bail!("llama.cpp capability probe did not prove restored cache reuse");
-            }
-            // Hybrid/recurrent memory may support continuing a restored state
-            // without being able to rewind it for identical-prompt logits.
-            // Discard the replayed state: otherwise its fresh cache could make
-            // this second check pass even when disk restore is ineffective.
-            erase_llama_slot(server, Some(replay_tokens))?;
-            restore_llama_slot(server, &probe_name, prompt_tokens, snapshot.bytes)?;
-            let (path, mut body) = llama_state_request_body(&probe_input, Some(0), None);
-            // Use token IDs: concatenating text can change the BPE boundary,
-            // while an array of strings is interpreted as multiple requests.
-            let mut tokens = tokenize_llama_probe(server, STATE_CAPABILITY_PROBE_PROMPT, true)?;
-            if tokens.len() as u64 != prompt_tokens {
-                bail!("llama.cpp capability probe tokenized prefix changed length");
-            }
-            tokens.extend(tokenize_llama_probe(
-                server,
-                " Continue this private cache probe with new tokens.",
-                false,
-            )?);
-            body["prompt"] = serde_json::to_value(tokens)?;
-            let (continued_tokens, continued_cached) =
-                run_llama_prefill_body_with_cache(server, path, &body)?;
-            if continued_tokens <= prompt_tokens
-                || continued_cached < prompt_tokens
-                || continued_cached >= continued_tokens
-            {
-                bail!(
-                    "llama.cpp capability probe did not prove restored cache reuse: exact replay cached {cached_tokens}/{prompt_tokens}, continuation cached {continued_cached}/{continued_tokens}"
-                );
-            }
-            final_tokens = continued_tokens;
+            bail!("llama.cpp capability probe did not prove restored cache reuse");
         }
-        erase_llama_slot(server, Some(final_tokens))?;
+        erase_llama_slot(server, Some(prompt_tokens))?;
         Ok(())
     })();
     erase_slot_best_effort(server);
@@ -1575,10 +1569,12 @@ fn llama_slot_status(server: &LlamaServerProcess) -> Result<LlamaSlotStatus> {
         .find(|slot| slot.get("id").and_then(Value::as_u64) == Some(u64::from(STATE_SLOT_ID)))
         .ok_or_else(|| anyhow!("llama.cpp explicit state slot is missing"))?;
     Ok(LlamaSlotStatus {
-        prompt_tokens: slot
-            .get("n_prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        prompt_tokens: if slot.get("n_prompt_tokens").is_some() {
+            required_u64(slot, "n_prompt_tokens")?
+        } else {
+            0
+        },
+        prompt_tokens_reported: slot.get("n_prompt_tokens").is_some(),
         prompt_tokens_cache: slot
             .get("n_prompt_tokens_cache")
             .and_then(Value::as_u64)
@@ -1634,7 +1630,11 @@ fn restore_llama_slot(
         bail!("llama.cpp slot restore response failed validation");
     }
     let slot = llama_slot_status(server)?;
-    if slot.is_processing || slot.prompt_tokens != expected_tokens {
+    // Fresh upstream slots omit n_prompt_tokens until a generation task has
+    // run, even after successful restore. The action's exact n_restored/n_read
+    // above remain mandatory; if /slots reports a count it must also match.
+    if slot.is_processing || (slot.prompt_tokens_reported && slot.prompt_tokens != expected_tokens)
+    {
         bail!("llama.cpp restored slot status failed validation");
     }
     Ok(())
@@ -2620,6 +2620,7 @@ mod tests {
             FakeReuse::Exact,
             FakeReuse::ContinuationOnly,
             FakeReuse::BrokenRestore,
+            FakeReuse::WrongSlotCount,
         ] {
             for chat in [false, true] {
                 let root = test_root("probe-reuse-modes");
@@ -2642,7 +2643,7 @@ mod tests {
                             .iter()
                             .filter(|r| r.as_str() == "POST /slots/0?action=restore")
                             .count(),
-                        2
+                        1
                     );
                 }
                 assert!(fs::read_dir(&snapshots).unwrap().next().is_none());
@@ -2668,8 +2669,9 @@ mod tests {
             let process = test_process(fake.url.clone(), snapshots);
             let cache = LlamaChatPersistence::open(&process, &store, &test_manifest(), &cache_root)
                 .unwrap();
+            assert_eq!(cache.reuse_previously_observed, iteration == 2);
             if iteration == 0 {
-                assert!(cache.restore(&process).unwrap().contains("cold session"));
+                assert!(cache.restore(&process).unwrap().0.contains("cold session"));
                 run_llama_prefill(
                     &process,
                     &PrefillInput::Text {
@@ -2683,9 +2685,19 @@ mod tests {
                     cache
                         .restore(&process)
                         .unwrap()
+                        .0
                         .contains("restored: 7 tokens")
                 );
-                assert_eq!(llama_slot_status(&process).unwrap().prompt_tokens, 7);
+                let status = llama_slot_status(&process).unwrap();
+                assert!(!status.prompt_tokens_reported);
+                // A completed real request with a restored hit establishes
+                // historical evidence; a successful restore alone does not.
+                assert!(
+                    cache
+                        .observe_reuse(Some(7), 10, Some(7))
+                        .unwrap()
+                        .contains("reuse observed")
+                );
                 // Corrupt the durable bytes without changing their length.
                 let namespace = fs::read_dir(&cache_root)
                     .unwrap()
@@ -2703,14 +2715,127 @@ mod tests {
                     cache
                         .restore(&process)
                         .unwrap()
+                        .0
                         .contains("checksum mismatch")
                 );
                 assert_eq!(llama_slot_status(&process).unwrap().prompt_tokens, 0);
+                let namespace = fs::read_dir(&cache_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                assert!(!namespace.join("capability.json").exists());
             }
             drop(process);
-            fake.finish();
+            let requests = fake.finish();
+            if iteration > 0 {
+                assert!(!requests.iter().any(|r| r == "POST /completion"));
+            }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_requests_validate_restore_without_synthetic_inference() {
+        for reuse in [
+            FakeReuse::Exact,
+            FakeReuse::BrokenRestore,
+            FakeReuse::IncompleteStream,
+        ] {
+            let root = test_root("chat-real-request-reuse");
+            let store = ModelStore::resolve(Some(root.clone())).unwrap();
+            let cache_root = root.join("chat-cache");
+            for iteration in 0..2 {
+                let snapshots = root.join(format!("snapshots-{iteration}"));
+                ensure_real_directory(&snapshots, true).unwrap();
+                let fake = spawn_fake_state_server_with_reuse(
+                    snapshots.clone(),
+                    false,
+                    if iteration == 0 {
+                        FakeReuse::Exact
+                    } else {
+                        reuse
+                    },
+                );
+                let process = test_process(fake.url.clone(), snapshots);
+                let cache =
+                    LlamaChatPersistence::open(&process, &store, &test_manifest(), &cache_root)
+                        .unwrap();
+                assert!(!cache.reuse_previously_observed);
+                let request = crate::backend::GenerateRequest {
+                    prompt: "real user prompt".into(),
+                    messages: vec![],
+                    image_urls: vec![],
+                    max_tokens: 8,
+                    temperature: None,
+                    top_p: None,
+                    stop: vec![],
+                    seed: None,
+                    stream_granularity: crate::backend::StreamGranularity::Token,
+                    verbose: false,
+                    debug: false,
+                    tool_config: None,
+                };
+                let result = process.complete_with_cache(&request, None, Some(&cache));
+                let incomplete = iteration == 1 && reuse == FakeReuse::IncompleteStream;
+                assert_eq!(result.is_err(), incomplete);
+                let namespace = fs::read_dir(&cache_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let observed = iteration == 1 && reuse == FakeReuse::Exact;
+                assert_eq!(namespace.join("capability.json").exists(), observed);
+                if iteration == 1 && reuse == FakeReuse::BrokenRestore {
+                    assert!(
+                        result
+                            .unwrap()
+                            .backend_diagnostics
+                            .iter()
+                            .any(|s| s.contains("reuse not observed"))
+                    );
+                    // A later live hit must not disguise ineffective disk reuse.
+                    let live = process
+                        .complete_with_cache(&request, None, Some(&cache))
+                        .unwrap();
+                    assert_eq!(live.cached_prompt_tokens, Some(6));
+                    assert!(!namespace.join("capability.json").exists());
+                }
+                drop(process);
+                let requests = fake.finish();
+                let completions = if iteration == 1 && reuse == FakeReuse::BrokenRestore {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    requests.iter().filter(|r| *r == "POST /completion").count(),
+                    completions
+                );
+                assert!(
+                    !requests
+                        .iter()
+                        .any(|r| r == "POST /tokenize" || r == "POST /slots/0?action=erase")
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| *r == "POST /slots/0?action=restore")
+                        .count(),
+                    iteration
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| *r == "POST /slots/0?action=save")
+                        .count(),
+                    if incomplete { 0 } else { completions }
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -3102,6 +3227,8 @@ mod tests {
         Exact,
         ContinuationOnly,
         BrokenRestore,
+        WrongSlotCount,
+        IncompleteStream,
     }
 
     fn spawn_fake_state_server(snapshot_dir: PathBuf, corrupt_save: bool) -> FakeStateServer {
@@ -3122,6 +3249,7 @@ mod tests {
             let mut requests = Vec::new();
             let mut slot_tokens = 0u64;
             let mut restored = false;
+            let mut had_generation = false;
             loop {
                 if stop_rx.try_recv().is_ok() {
                     return Ok(requests);
@@ -3140,6 +3268,29 @@ mod tests {
                 let (method, target, body) =
                     read_fake_request(&mut stream).map_err(|error| error.to_string())?;
                 requests.push(format!("{method} {target}"));
+                if method == "POST" && target == "/completion" && body["stream"] == true {
+                    if body["prompt"] != "real user prompt" {
+                        return Err("unexpected synthetic inference before user request".into());
+                    }
+                    let cached =
+                        if slot_tokens == 7 && (!restored || reuse != FakeReuse::BrokenRestore) {
+                            6
+                        } else {
+                            0
+                        };
+                    had_generation = true;
+                    restored = false;
+                    slot_tokens = 7;
+                    let event = json!({
+                        "content": "answer", "stop": reuse != FakeReuse::IncompleteStream,
+                        "tokens_predicted": 1, "tokens_evaluated": 7,
+                        "timings": {"cache_n": cached},
+                    });
+                    let response = format!("data: {event}\n\n");
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response)
+                        .map_err(|error| error.to_string())?;
+                    continue;
+                }
                 let snapshot_bytes = b"fake-slot-state";
                 let response = match (method.as_str(), target.as_str()) {
                     ("POST", "/slots/0?action=erase") => {
@@ -3159,6 +3310,7 @@ mod tests {
                         json!({"tokens": if original { vec![1,2,3,4,5,6,7] } else { vec![8,9,10] }})
                     }
                     ("POST", "/completion") => {
+                        had_generation = true;
                         let continued =
                             body.get("prompt") == Some(&json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
                         if (!continued
@@ -3186,12 +3338,13 @@ mod tests {
                         json!({"id_slot": 0, "content": "", "tokens_predicted": 0,
                             "timings": {"cache_n": cache_tokens}})
                     }
-                    ("GET", "/slots") => json!([{
-                        "id": 0,
-                        "n_prompt_tokens": slot_tokens,
-                        "n_prompt_tokens_cache": 0,
-                        "is_processing": false,
-                    }]),
+                    ("GET", "/slots") => {
+                        if had_generation {
+                            json!([{"id":0, "n_prompt_tokens":if restored && reuse == FakeReuse::WrongSlotCount { slot_tokens + 1 } else { slot_tokens }, "n_prompt_tokens_cache":0, "is_processing":false}])
+                        } else {
+                            json!([{"id":0, "is_processing":false}])
+                        }
+                    }
                     ("POST", "/slots/0?action=save") => {
                         let filename = fake_filename(&body)?;
                         fs::write(snapshot_dir.join(filename), snapshot_bytes)
@@ -3327,6 +3480,7 @@ mod tests {
             pid: std::process::id(),
             mode: LlamaCppMode::Cpu,
             log_tail: Arc::new(Mutex::new(VecDeque::new())),
+            log_readers: Mutex::new(Vec::new()),
             state_gate: Mutex::new(()),
             state_runtime: LlamaProcessStateRuntime {
                 generation_id: Some("test-process-generation".to_string()),
@@ -3404,7 +3558,7 @@ mod tests {
         }
     }
 
-    fn test_root(name: &str) -> PathBuf {
+    pub(super) fn test_root(name: &str) -> PathBuf {
         let suffix = random_private_id("", 12).unwrap();
         let root = std::env::temp_dir().join(format!("werk-llama-state-{name}-{suffix}"));
         fs::create_dir(&root).unwrap();

@@ -5,6 +5,17 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Remove synthetic cache-probe inference from local llama.cpp `run`/`chat` startup.
+  New sessions execute the user request directly; existing snapshots keep full
+  integrity/restore checks. Record observed restored reuse only from a completed
+  real request with consistent positive cache usage. Cold/live-only hits and
+  incomplete responses cannot establish disk reuse; named state probes remain.
+- Accept missing prompt counters on a fresh idle llama.cpp slot after an exact
+  restore acknowledgement, preserving checks for incorrect or malformed counters.
+- Forward `--warmup-tokens 0` to llama-server's `--no-warmup` when supported.
+- Keep native startup logs captured and include them in errors; a failed
+  llama-server startup no longer triggers a second attempt as a KV fallback.
+
 - Add `run --server URL` for text/vision/tool calls through an existing `serve`
   worker, preserving client-side sessions and streaming via the shared OpenAI
   transport. Report native timing/cache metadata over the API.

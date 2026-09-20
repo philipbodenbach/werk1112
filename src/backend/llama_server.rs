@@ -71,6 +71,7 @@ struct LlamaServerProcess {
     pid: u32,
     mode: LlamaCppMode,
     log_tail: Arc<Mutex<VecDeque<String>>>,
+    log_readers: Mutex<Vec<thread::JoinHandle<()>>>,
     state_gate: Mutex<()>,
     state_runtime: LlamaProcessStateRuntime,
 }
@@ -117,7 +118,20 @@ struct ServerCompletion {
     saw_reasoning_content: bool,
 }
 
+#[derive(Debug)]
+struct LlamaStartupError(anyhow::Error);
+impl std::fmt::Display for LlamaStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for LlamaStartupError {}
+
 impl LlamaServerBackend {
+    pub(crate) fn is_startup_error(error: &anyhow::Error) -> bool {
+        error.is::<LlamaStartupError>()
+    }
+
     pub fn new(
         store: ModelStore,
         mode: LlamaCppMode,
@@ -352,7 +366,9 @@ impl GenerationBackend for LlamaServerBackend {
             return Ok(None);
         }
         let started = Instant::now();
-        let (server, _, _) = self.cached_server(manifest, false)?;
+        let (server, _, _) = self
+            .cached_server(manifest, false)
+            .map_err(|error| anyhow::Error::new(LlamaStartupError(error)))?;
         let startup_seconds = started.elapsed().as_secs_f64();
         let persistence =
             LlamaChatPersistence::open(&server, &self.store, manifest, cache_directory)?;
@@ -432,9 +448,17 @@ impl ChatGenerationSession for LlamaServerChatSession {
             self.startup_seconds
         )];
         if let Some(cache) = &self.persistence {
+            diagnostics.push(
+                "llama.cpp cache capability probe: skipped; reuse checked on actual requests"
+                    .into(),
+            );
             diagnostics.push(format!(
-                "llama.cpp cache capability probe duration: {:.6}s",
-                cache.probe_seconds
+                "llama.cpp cache restore verification: {}",
+                if cache.reuse_previously_observed {
+                    "reuse previously observed for this identity; current hit not guaranteed"
+                } else {
+                    "unverified; awaiting actual restored request"
+                }
             ));
         }
         diagnostics
@@ -569,12 +593,13 @@ impl LlamaServerProcess {
                 });
             }
         };
+        let mut log_readers = Vec::new();
         if !env_true("WERK_LLAMA_LOG") {
             if let Some(stdout) = child.stdout.take() {
-                spawn_log_tail_reader("stdout", stdout, log_tail.clone());
+                log_readers.push(spawn_log_tail_reader("stdout", stdout, log_tail.clone()));
             }
             if let Some(stderr) = child.stderr.take() {
-                spawn_log_tail_reader("stderr", stderr, log_tail.clone());
+                log_readers.push(spawn_log_tail_reader("stderr", stderr, log_tail.clone()));
             }
         }
         let pid = child.id();
@@ -591,6 +616,7 @@ impl LlamaServerProcess {
             pid,
             mode,
             log_tail,
+            log_readers: Mutex::new(log_readers),
             state_gate: Mutex::new(()),
             state_runtime: LlamaProcessStateRuntime {
                 generation_id,
@@ -642,6 +668,7 @@ impl LlamaServerProcess {
         let started = Instant::now();
         let restore_started = Instant::now();
         let cache_notice = persistence.map(|cache| cache.restore(self)).transpose()?;
+        let restored_tokens = cache_notice.as_ref().and_then(|(_, tokens)| *tokens);
         let restore_seconds = restore_started.elapsed().as_secs_f64();
         let use_chat_endpoint = !request.messages.is_empty() || request_has_images(request);
         let (path, body) = if use_chat_endpoint {
@@ -664,7 +691,7 @@ impl LlamaServerProcess {
         };
         let mut sse = SseAccumulator::default();
         let mut finished = false;
-        if let Some(notice) = cache_notice {
+        if let Some((notice, _)) = cache_notice {
             completion.backend_diagnostics.push(notice);
         }
 
@@ -715,6 +742,8 @@ impl LlamaServerProcess {
                 "llama-server stream ended before a completion marker; native snapshot not saved"
             );
         }
+        // Estimated display metrics must never become restore evidence.
+        let reported_prompt_tokens = completion.prompt_tokens;
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
         if use_chat_endpoint
             && completion.text.trim().is_empty()
@@ -726,6 +755,13 @@ impl LlamaServerProcess {
             );
         }
         if let Some(cache) = persistence {
+            if let Some(observation) = cache.observe_reuse(
+                restored_tokens,
+                reported_prompt_tokens,
+                completion.cached_prompt_tokens,
+            ) {
+                completion.backend_diagnostics.push(observation);
+            }
             completion.backend_diagnostics.push(format!(
                 "llama.cpp native KV restore duration: {restore_seconds:.6}s"
             ));
@@ -743,6 +779,7 @@ impl LlamaServerProcess {
         let started = Instant::now();
         loop {
             if let Some(status) = self.try_wait_status()? {
+                self.drain_exit_logs();
                 bail!(
                     "llama-server exited before becoming healthy ({status}){}",
                     self.formatted_log_tail()
@@ -775,6 +812,22 @@ impl LlamaServerProcess {
             .lock()
             .map_err(|_| anyhow!("llama-server child mutex poisoned"))?;
         Ok(child.try_wait()?)
+    }
+
+    fn drain_exit_logs(&self) {
+        if let Ok(mut readers) = self.log_readers.lock() {
+            let started = Instant::now();
+            while readers.iter().any(|reader| !reader.is_finished())
+                && started.elapsed() < Duration::from_millis(200)
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            for reader in readers.drain(..) {
+                if reader.is_finished() {
+                    let _ = reader.join();
+                }
+            }
+        }
     }
 
     fn formatted_log_tail(&self) -> String {
@@ -970,8 +1023,10 @@ fn llama_server_args_with_state(
     if supported.perf {
         args.push("--perf".to_string());
     }
-    if supported.log_disable && !env_true("WERK_LLAMA_LOG") {
-        args.push("--log-disable".to_string());
+    // Keep native logging enabled: pipes already keep normal output quiet,
+    // while the bounded tail explains startup failures.
+    if runtime_options.warmup_tokens == Some(0) && supported.no_warmup {
+        args.push("--no-warmup".to_string());
     }
     if non_thinking {
         if supported.reasoning {
@@ -1542,7 +1597,7 @@ struct SupportedArgs {
     flash_attn: bool,
     kv_offload: bool,
     perf: bool,
-    log_disable: bool,
+    no_warmup: bool,
     reasoning: bool,
     chat_template_kwargs: bool,
     mmproj: bool,
@@ -1567,7 +1622,7 @@ fn supported_args(executable: &PathBuf) -> SupportedArgs {
         flash_attn: text.contains("--flash-attn") || text.contains("-fa,"),
         kv_offload: text.contains("--kv-offload") || text.contains("-kvo,"),
         perf: text.contains("--perf"),
-        log_disable: text.contains("--log-disable"),
+        no_warmup: help_has_exact_option(&text, "--no-warmup"),
         reasoning: text.contains("--reasoning ") || text.contains("-rea,"),
         chat_template_kwargs: text.contains("--chat-template-kwargs"),
         mmproj: text.split_whitespace().any(|argument| {
@@ -2722,7 +2777,11 @@ fn command_check(command: &str, args: &[&str], detail: &str) -> BackendDoctorChe
     }
 }
 
-fn spawn_log_tail_reader<R>(label: &'static str, reader: R, tail: Arc<Mutex<VecDeque<String>>>)
+fn spawn_log_tail_reader<R>(
+    label: &'static str,
+    reader: R,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
@@ -2736,7 +2795,7 @@ where
                 tail.push_back(format!("{label}: {line}"));
             }
         }
-    });
+    })
 }
 
 fn cuda_init_failed(text: &str) -> bool {
@@ -3789,6 +3848,35 @@ Agent 3
     }
 
     #[test]
+    fn server_warmup_can_be_disabled_without_suppressing_failure_logs() {
+        let args = llama_server_args(
+            LlamaCppMode::Cuda,
+            Path::new("/tmp/model.gguf"),
+            None,
+            12345,
+            &LlamaRuntimeOptions {
+                warmup_tokens: Some(0),
+                ..Default::default()
+            },
+            &SupportedArgs {
+                no_warmup: true,
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(args.iter().any(|arg| arg == "--no-warmup"));
+        assert!(!args.iter().any(|arg| arg == "--log-disable"));
+        let error = anyhow::Error::new(LlamaStartupError(anyhow!(
+            "unknown model architecture: glm5next"
+        )));
+        assert!(LlamaServerBackend::is_startup_error(&error));
+        assert!(error.to_string().contains("glm5next"));
+        assert!(!LlamaServerBackend::is_startup_error(&anyhow!(
+            "snapshot unsupported"
+        )));
+    }
+
+    #[test]
     fn server_args_pass_flash_attention_value_before_kv_offload() {
         let args = llama_server_args(
             LlamaCppMode::Cuda,
@@ -3800,7 +3888,7 @@ Agent 3
                 flash_attn: true,
                 kv_offload: true,
                 perf: true,
-                log_disable: true,
+                no_warmup: true,
                 ..SupportedArgs::default()
             },
             false,
@@ -3824,7 +3912,7 @@ Agent 3
                 flash_attn: true,
                 kv_offload: true,
                 perf: false,
-                log_disable: false,
+                no_warmup: false,
                 ..SupportedArgs::default()
             },
             false,

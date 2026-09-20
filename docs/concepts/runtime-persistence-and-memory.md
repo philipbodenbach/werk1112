@@ -97,19 +97,15 @@ resident weights were restored; terminal startup reports native cache support
 separately. The [terminal chat options](../reference/cli.md#persistent-terminal-chat)
 do not alter the named state capability matrix above.
 
-On the existing Unix llama.cpp route, persistent terminal text chats additionally
-use private native slot snapshots after the live save/erase/restore/replay probe
-passes. The latest snapshot for each compatible runtime namespace can survive
-restart; response usage, not the existence of a file or conversation, determines
-reported prefix hits. Newer llama.cpp releases reset idle-slot timing counters,
-so the probe reads the completed response's cache count before falling back to
-the legacy slot counter. If identical-prompt replay cannot reuse a hybrid/recurrent
-state, terminal `run`/`chat` also tests continuation with an unchanged token-ID
-prefix plus new tokens. It erases and restores the original snapshot again
-before that test, and requires the backend to report reuse of the entire saved
-prefix. This does not relax the exact-replay probe for named runtime-control
-states, which remain process-bound. Successful probing establishes cache support;
-actual reuse still depends on the next request matching the saved token prefix.
+On the existing Unix llama.cpp route, persistent terminal text chats and local
+`run` use private native slot snapshots without a synthetic inference probe.
+With no snapshot, the user request runs directly and its completed state is
+saved. A later process checks compatibility, file integrity and native restore
+acknowledgements before using the snapshot. Only backend-reported prefix hits
+on the first real request after that restore establish observed disk reuse.
+Missing usage, zero hits and later live-slot hits do not establish that evidence.
+This is opportunistic chat caching, not a general state capability guarantee;
+named runtime-control states retain their exact-replay functional probe.
 
 Local storage cleanup is available through `werk cache list` and
 `werk cache purge <CACHE-ID>` or `werk cache purge --all`. The inventory
@@ -451,8 +447,8 @@ and the transport contract is in the [Werk Protocol 1.0 reference](../reference/
 
 `run --server http://127.0.0.1:11434` sends text/vision/tool requests through the
 existing `serve` API while keeping the portable session archive on the client.
-The running backend retains its live prefix cache, avoiding a worker startup,
-capability probe and disk-snapshot restore for each invocation. Server restarts
+The running backend retains its live prefix cache, avoiding worker startup
+and disk-snapshot restore for each invocation. Server restarts
 and competing prompts can invalidate that live prefix; this frontend does not
 claim cross-restart native KV persistence. Worker placement/thread settings
 belong to `serve`, while sampling and session selection belong to `run`.
@@ -464,3 +460,50 @@ index. Owner-only files, bounded lengths, no-follow checks, failure cleanup and
 conversation-based recovery are retained. Runtime/library identity hashing is
 unchanged. Preparation, probe and snapshot phase diagnostics make their cost
 visible without altering native prefill/decode rates.
+
+### Local llama.cpp startup and lazy restore validation
+
+Local `run` starts a new worker each time. Native KV snapshots preserve prefix
+state, not loaded model weights. Cold weight reads, CUDA initialization and
+native warmup can therefore dominate even with a valid saved snapshot.
+
+The general rule for local llama.cpp `run`/`chat` is: no snapshot means no restore
+work, and opening a session never evaluates a synthetic test prompt. Existing
+snapshots are verified and restored on the first real request. A complete,
+successful response with a positive, consistent backend cache count records
+observed restored reuse; a zero count is a cache miss, not proof of broken
+restore. Missing or inconsistent usage stays unverified. Subsequent live-slot
+hits cannot prove disk restore, and incomplete/error streams cannot establish
+reuse or publish a new snapshot. Named Werk Protocol state operations retain
+their explicit functional capability tests.
+
+A small `capability.json` receipt records historical observed reuse beside the
+session's snapshot. It is informational and does not bypass snapshot validation
+or claim any future hit. It requires the same model files, runtime binary and
+libraries, environment, effective arguments and receipt schema. Missing,
+malformed, oversized or old synthetic-probe receipts leave reuse unverified;
+they never trigger inference. Purging the session removes the receipt too.
+
+Fresh llama.cpp slots can omit prompt counters before their first generation.
+Restore still requires exact acknowledged token/byte counts and an idle slot;
+a reported slot counter must match. Restore failure invalidates the receipt,
+clears the slot and rebuilds from the conversation. Snapshot checksum, file-size
+and private-path checks remain mandatory.
+
+Verbose output reports `cache capability probe: skipped; reuse checked on actual
+requests`, distinguishes historical evidence from unverified state, and reports
+`native KV restored reuse observed` only after actual restored hits. These rules
+apply across supported llama.cpp models and CPU/GPU modes, not only Qwen/CUDA.
+
+`--warmup-tokens 0` now maps to `--no-warmup` on llama-server versions advertising
+that flag. It avoids the synthetic warmup but may shift work into the first
+real prefill. It does not remove loading or guarantee faster end-to-end inference.
+Changing launch arguments (including this switch) selects a different snapshot
+namespace; restored reuse there is initially unverified. This update also stops suppressing native
+logs, which changes the launch fingerprint once for previously quiet sessions.
+
+Startup errors now contain captured native logs. For example, the installed
+`ec928150501c` CUDA runtime rejects GLM-5.3-Flash with
+`unknown model architecture: 'glm5next'`. That is architecture support, not a
+KV-cache failure or an MoE-placement setting; Werk does not retry it as a
+nonpersistent request.

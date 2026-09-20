@@ -6931,6 +6931,7 @@ async fn chat_loop(
             },
         ) {
             Ok(session) => session,
+            Err(error) if LlamaServerBackend::is_startup_error(&error) => return Err(error),
             Err(error) => {
                 eprintln!("[werk {command_label}] native KV cache unavailable: {error:#}");
                 None

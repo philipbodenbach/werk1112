@@ -2,15 +2,13 @@
 
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) struct LlamaChatPersistence {
     directory: PathBuf,
+    identity: String,
     restore_attempted: AtomicBool,
-    pub(crate) probe_seconds: f64,
+    pub(crate) reuse_previously_observed: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -78,43 +76,84 @@ impl LlamaChatPersistence {
         ensure_real_directory(root, true)?;
         let directory = root.join(format!("llama-{}", key.trim_start_matches("sha256:")));
         ensure_real_directory(&directory, true)?;
-        let _gate = server
-            .state_gate
-            .lock()
-            .map_err(|_| anyhow!("llama.cpp state gate unavailable"))?;
-        let probe_started = Instant::now();
-        functional_probe_llama_chat_state(server)?;
+        // Opening a session must never execute synthetic inference. A missing
+        // receipt is unknown reuse, not a reason to run a model capability test.
+        let reuse_previously_observed = has_reuse_receipt(&directory, &key);
         Ok(Self {
             directory,
+            identity: key,
             restore_attempted: AtomicBool::new(false),
-            probe_seconds: probe_started.elapsed().as_secs_f64(),
+            reuse_previously_observed,
         })
     }
 
     // Called while holding the process state gate, including the following generation.
-    pub(crate) fn restore(&self, server: &LlamaServerProcess) -> Result<String> {
+    pub(crate) fn restore(&self, server: &LlamaServerProcess) -> Result<(String, Option<u64>)> {
         if self.restore_attempted.swap(true, Ordering::Relaxed) {
-            return Ok(
+            return Ok((
                 "llama.cpp native KV persistence: using live slot; reuse reported by backend usage"
                     .into(),
-            );
+                None,
+            ));
         }
         Ok(match self.restore_inner(server) {
-            Ok(Some(tokens)) => format!(
-                "llama.cpp native KV snapshot restored: {tokens} tokens; actual prefix reuse reported by backend usage"
+            Ok(Some(tokens)) => (
+                format!(
+                    "llama.cpp native KV snapshot restored: {tokens} tokens; actual prefix reuse reported by backend usage"
+                ),
+                Some(tokens),
             ),
-            Ok(None) => "llama.cpp native KV persistence: cold session".into(),
+            Ok(None) => (
+                "llama.cpp native KV persistence: cold session; restore reuse unverified".into(),
+                None,
+            ),
             Err(error) => {
+                let _ = fs::remove_file(self.directory.join("capability.json"));
                 if let Err(clear_error) = erase_llama_slot(server, None) {
                     self.restore_attempted.store(false, Ordering::Relaxed);
                     return Err(clear_error)
                         .context("cannot clear slot after failed native cache restore");
                 }
-                format!(
-                    "llama.cpp native KV snapshot not reused: {error}; rebuilding from conversation"
+                (
+                    format!(
+                        "llama.cpp native KV snapshot not reused: {error}; rebuilding from conversation"
+                    ),
+                    None,
                 )
             }
         })
+    }
+
+    // Only the request immediately following a successful restore can provide
+    // evidence about disk reuse. Later live-slot hits must not create a receipt.
+    // Call only after a complete, successful response, never from partial SSE.
+    pub(crate) fn observe_reuse(
+        &self,
+        restored_tokens: Option<u64>,
+        prompt_tokens: usize,
+        cached_tokens: Option<usize>,
+    ) -> Option<String> {
+        let restored = restored_tokens?;
+        match cached_tokens {
+            Some(cached) if cached > 0 && cached <= prompt_tokens && cached as u64 <= restored => {
+                // Best effort metadata: persistence of the observation must
+                // not turn a successful user response into an error.
+                let _ = publish_cache_json(
+                    &self.directory,
+                    "capability.json",
+                    &reuse_receipt(&self.identity),
+                );
+                Some(format!(
+                    "llama.cpp native KV restored reuse observed: {cached}/{prompt_tokens} prompt tokens"
+                ))
+            }
+            Some(0) => Some(
+                "llama.cpp native KV restored reuse not observed: backend reported 0 cached prompt tokens".into(),
+            ),
+            _ => Some(
+                "llama.cpp native KV restored reuse unverified: missing or inconsistent backend usage".into(),
+            ),
+        }
     }
 
     fn read_record(&self) -> Result<Option<Record>> {
@@ -200,26 +239,51 @@ impl LlamaChatPersistence {
     }
 
     fn publish(&self, record: &Record) -> Result<()> {
-        let temporary = self.directory.join(random_private_id("index_", 16)?);
-        let result = (|| {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            let mut file = options.open(&temporary)?;
-            serde_json::to_writer(&mut file, record)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            fs::rename(&temporary, self.directory.join("latest.json"))?;
-            #[cfg(unix)]
-            fs::File::open(&self.directory)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        result
+        publish_cache_json(&self.directory, "latest.json", record)
     }
+}
+
+// A receipt records observed reuse, never a general state capability or a hit
+// for the next user prompt. Named runtime states retain their functional probe.
+// It lives beside the snapshot and is removed by the normal session/cache purge.
+fn reuse_receipt(identity: &str) -> Value {
+    json!({"schema": "werk-chat-observed-reuse-v1", "identity": identity})
+}
+
+fn has_reuse_receipt(directory: &Path, identity: &str) -> bool {
+    let expected = reuse_receipt(identity);
+    let receipt = directory.join("capability.json");
+    let cached = (|| -> Result<Value> {
+        let (file, bytes) = open_bounded_regular_file(&receipt, None)?;
+        anyhow::ensure!(
+            bytes <= 4096,
+            "cache capability receipt exceeds its size limit"
+        );
+        Ok(serde_json::from_reader(file.take(4097))?)
+    })();
+    cached.is_ok_and(|value| value == expected)
+}
+
+fn publish_cache_json(directory: &Path, name: &str, value: &impl Serialize) -> Result<()> {
+    let temporary = directory.join(random_private_id("index_", 16)?);
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
+        serde_json::to_writer(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, directory.join(name))?;
+        #[cfg(unix)]
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn runtime_libraries(server: &LlamaServerProcess) -> Result<Vec<(PathBuf, String)>> {
@@ -293,6 +357,54 @@ fn persistent_args(args: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reuse_receipt_requires_actual_restored_hits_and_matching_identity() {
+        let root = super::super::tests::test_root("chat-proof-receipt");
+        let cache = LlamaChatPersistence {
+            directory: root.clone(),
+            identity: "model-runtime-a".into(),
+            restore_attempted: AtomicBool::new(false),
+            reuse_previously_observed: false,
+        };
+        assert!(!has_reuse_receipt(&root, &cache.identity));
+        for (restored, total, cached) in [
+            (None, 10, Some(7)), // live-slot reuse cannot establish disk reuse
+            (Some(7), 10, None),
+            (Some(7), 10, Some(0)),
+            (Some(7), 6, Some(7)),  // impossible usage
+            (Some(7), 10, Some(8)), // more reused than restored
+        ] {
+            cache.observe_reuse(restored, total, cached);
+            assert!(!root.join("capability.json").exists());
+        }
+        assert!(
+            cache
+                .observe_reuse(Some(7), 10, Some(6))
+                .unwrap()
+                .contains("observed: 6/10")
+        );
+        assert!(has_reuse_receipt(&root, &cache.identity));
+        assert!(!has_reuse_receipt(&root, "model-runtime-b"));
+        // A later cache miss can simply be a different prompt, not a failure
+        // of the previously observed restore. Retain historical evidence.
+        cache.observe_reuse(Some(7), 10, Some(0));
+        assert!(has_reuse_receipt(&root, &cache.identity));
+        fs::write(root.join("capability.json"), b"truncated").unwrap();
+        assert!(!has_reuse_receipt(&root, &cache.identity));
+        fs::write(root.join("capability.json"), vec![b'x'; 4097]).unwrap();
+        assert!(!has_reuse_receipt(&root, &cache.identity));
+        publish_cache_json(
+            &root,
+            "capability.json",
+            &json!({
+                "schema": "werk-chat-continuation-v1", "identity": cache.identity,
+            }),
+        )
+        .unwrap();
+        assert!(!has_reuse_receipt(&root, &cache.identity));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn persisted_identity_ignores_only_ephemeral_arguments() {

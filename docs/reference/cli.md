@@ -490,6 +490,15 @@ output is buffered; `--stream` streams text, and `--stream-granularity token|chu
 also enables streaming. `--no-history` (alias `--single-turn`) conflicts with
 persistence, as it does in `chat`.
 
+For local llama-server runs, `--warmup-tokens 0` disables native synthetic warmup
+when the runtime supports `--no-warmup`. Local llama.cpp `run`/`chat` never evaluate
+a separate test prompt for session persistence. A new session runs the user
+request and saves its state. Existing snapshots are checked on restore, and
+successful real requests report observed reuse from backend cache counts.
+Verbose output distinguishes unverified restore from historical observed reuse.
+Worker loading still occurs on every local process start; cold file reads may
+remain expensive, including during the first real prefill.
+
 To reuse a worker across separate text/vision/tool `run` processes, start the
 existing server once and point the client at it:
 
@@ -670,8 +679,8 @@ arguments still win. This cache remains vLLM-owned and does not survive its
 process restart. Exiting `run` or `chat` still stops its owned backend workers.
 
 The existing llama.cpp route also saves native slot snapshots for persistent
-text chats on Unix when the running server passes the save/erase/restore/replay
-probe. It restores a compatible snapshot on the next process start and reports
+text chats on Unix when the server exposes the required private slot operations.
+It restores a compatible snapshot on the next process start and reports
 actual prefix hits as `prompt cached count` in `--verbose` output. Snapshots are
 namespaced by model files, runtime executable/libraries, native environment and
 effective arguments; incompatible or corrupt snapshots are rebuilt from the

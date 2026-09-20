@@ -1,0 +1,109 @@
+{
+  "build": "development, no default features",
+  "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+  "runtime_revision": "ec928150501c2572fec05cb949061672bb424914",
+  "settings": {
+    "threads": 24,
+    "threads_batch": 24,
+    "context": 4096,
+    "warmup_tokens": 0,
+    "llama_args": "--n-cpu-moe 38 --reasoning off"
+  },
+  "runs": [
+    {
+      "run": 0,
+      "exit": 0,
+      "wall_seconds": 139.3146608339739,
+      "completion": {
+        "backend_diagnostics": [
+          "history messages: 1",
+          "chat template source: model",
+          "chat template: model",
+          "chat template applied by werk: no",
+          "history enabled: yes",
+          "llama.cpp worker startup duration: 65.649949s",
+          "llama.cpp cache capability probe: skipped; reuse checked on actual requests",
+          "llama.cpp cache restore verification: unverified; awaiting actual restored request",
+          "preparation duration: 73.140486s (included in load/total)",
+          "run elapsed through completion: 138.349674s",
+          "run first token including preparation: 127.009702s",
+          "llama.cpp request endpoint: /v1/chat/completions",
+          "chat template applied by backend/model: yes",
+          "llama.cpp native KV persistence: cold session; restore reuse unverified",
+          "llama.cpp native KV restore duration: 0.000023s",
+          "llama.cpp native KV snapshot saved: 24 tokens",
+          "llama.cpp native KV save duration: 10.508505s"
+        ],
+        "finish_reason": "stop",
+        "message": {
+          "content": "OK",
+          "role": "assistant"
+        },
+        "model": "qwen-lazy-check",
+        "timings": {
+          "cached_prompt_tokens": 0,
+          "decode_seconds": 0.8311470000000001,
+          "first_token_seconds": 53.342059565,
+          "load_seconds": 73.140486409,
+          "prompt_seconds": 53.336548,
+          "total_seconds": 137.822415945,
+          "warmup_seconds": 0.0
+        },
+        "type": "completion",
+        "usage": {
+          "completion_tokens": 2,
+          "prompt_tokens": 23,
+          "total_tokens": 25
+        }
+      }
+    },
+    {
+      "run": 1,
+      "exit": 0,
+      "wall_seconds": 49.75733287099865,
+      "completion": {
+        "backend_diagnostics": [
+          "history messages: 3",
+          "chat template source: model",
+          "chat template: model",
+          "chat template applied by werk: no",
+          "history enabled: yes",
+          "llama.cpp worker startup duration: 9.869291s",
+          "llama.cpp cache capability probe: skipped; reuse checked on actual requests",
+          "llama.cpp cache restore verification: unverified; awaiting actual restored request",
+          "preparation duration: 17.404790s (included in load/total)",
+          "run elapsed through completion: 48.388281s",
+          "run first token including preparation: 36.769894s",
+          "llama.cpp request endpoint: /v1/chat/completions",
+          "chat template applied by backend/model: yes",
+          "llama.cpp native KV snapshot restored: 24 tokens; actual prefix reuse reported by backend usage",
+          "llama.cpp native KV restored reuse observed: 24/53 prompt tokens",
+          "llama.cpp native KV restore duration: 10.649557s",
+          "llama.cpp native KV snapshot saved: 55 tokens",
+          "llama.cpp native KV save duration: 10.805462s"
+        ],
+        "finish_reason": "stop",
+        "message": {
+          "content": "37",
+          "role": "assistant"
+        },
+        "model": "qwen-lazy-check",
+        "timings": {
+          "cached_prompt_tokens": 24,
+          "decode_seconds": 0.796616,
+          "first_token_seconds": 18.881881239,
+          "load_seconds": 17.404790047,
+          "prompt_seconds": 8.226843,
+          "total_seconds": 47.904916635999996,
+          "warmup_seconds": 0.0
+        },
+        "type": "completion",
+        "usage": {
+          "completion_tokens": 3,
+          "prompt_tokens": 53,
+          "total_tokens": 56
+        }
+      }
+    }
+  ]
+}
