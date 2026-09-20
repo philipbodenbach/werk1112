@@ -6915,12 +6915,10 @@ async fn chat_loop(
         || run
             .as_ref()
             .is_some_and(|run| !image_urls_from_messages(&run.messages).is_empty());
-    // oMLX loads its worker here, before the generation timer starts. Its
-    // prepared sessions correctly report no new load during generation, so
-    // retain this separate startup interval for the first completed turn.
-    let preparation_started = (matches!(selected_backend, BackendChoice::Omlx) && !has_images)
-        .then(Instant::now);
+    // Includes worker startup and the optional native cache capability probe.
+    let preparation_started = Instant::now();
     let native_session = if !has_images
+        && !run.as_ref().is_some_and(|run| run.server)
         && let Some(storage) = persistence.as_ref().filter(|storage| storage.is_durable())
     {
         match with_activity(
@@ -6944,7 +6942,9 @@ async fn chat_loop(
     if persistence.is_some() {
         eprintln!(
             "[werk {command_label}] {}",
-            if native_session.is_some() {
+            if run.as_ref().is_some_and(|run| run.server) {
+                "conversation persistence active; live KV cache managed by werk serve (no client snapshot restore)"
+            } else if native_session.is_some() {
                 "native KV cache enabled; reuse depends on the prompt and backend"
             } else {
                 "conversation persistence active; native KV persistence unavailable on this route"
@@ -6961,9 +6961,15 @@ async fn chat_loop(
     } else {
         None
     };
-    let mut pending_preparation_seconds = preparation_started
-        .map(|started| started.elapsed().as_secs_f64())
+    let mut pending_preparation_seconds = preparation_started.elapsed().as_secs_f64();
+    let mut preparation_diagnostics = chat_session
+        .as_ref()
+        .map(|session| session.preparation_diagnostics())
         .unwrap_or_default();
+    preparation_diagnostics.push(format!(
+        "preparation duration: {:.6}s (included in load/total)",
+        pending_preparation_seconds
+    ));
 
     if interactive {
         println!(
@@ -7019,11 +7025,17 @@ async fn chat_loop(
             selected_backend,
             chat_template,
         );
-        let prompt_diagnostics =
-            prompt_diagnostics(&prompt, request_messages.len(), Some(history_enabled));
+        let prompt_diagnostics = if run.as_ref().is_some_and(|run| run.server) {
+            vec![
+                format!("history messages: {}", request_messages.len()),
+                "chat template: delegated to werk serve".into(),
+            ]
+        } else {
+            prompt_diagnostics(&prompt, request_messages.len(), Some(history_enabled))
+        };
         let requires_tools = run.as_ref().is_some_and(|run| run.requires_tools)
             || request_messages.iter().any(ChatMessage::uses_tool_calling);
-        let generation_messages = if requires_tools {
+        let generation_messages = if requires_tools || run.as_ref().is_some_and(|run| run.server) {
             request_messages.clone()
         } else {
             generation_request_messages(&prompt, &request_messages)
@@ -7033,7 +7045,11 @@ async fn chat_loop(
         } else {
             image_urls_from_messages(&generation_messages)
         };
-        let mut stop = prompt.stop;
+        let mut stop = if run.as_ref().is_some_and(|run| run.server) {
+            Vec::new()
+        } else {
+            prompt.stop
+        };
         if let Some(run) = run.as_ref() {
             stop.extend(run.stop.clone());
         }
@@ -7066,6 +7082,8 @@ async fn chat_loop(
         let mut timings = None;
         let mut backend_diagnostics = Vec::new();
         let mut completed = false;
+        let mut first_visible_seconds = None;
+        let turn_started = Instant::now();
         let mut last_flush = Instant::now();
         let mut pending_spinner = AssistantPendingSpinner::new(
             stream_output && !json_output && io::stdout().is_terminal() && !debug,
@@ -7092,6 +7110,15 @@ async fn chat_loop(
 
             match event {
                 Ok(GenerateStreamEvent::TextChunk(chunk)) => {
+                    let first_visible = !chunk.is_empty() && first_visible_seconds.is_none();
+                    if first_visible {
+                        first_visible_seconds = Some(
+                            run.as_ref()
+                                .map_or(turn_started, |run| run.started)
+                                .elapsed()
+                                .as_secs_f64(),
+                        );
+                    }
                     if !chunk.is_empty() {
                         pending_spinner.clear()?;
                     }
@@ -7101,7 +7128,9 @@ async fn chat_loop(
                         } else {
                             print!("{chunk}");
                         }
-                        if chunk.contains('\n') || last_flush.elapsed() >= Duration::from_millis(16)
+                        if first_visible
+                            || chunk.contains('\n')
+                            || last_flush.elapsed() >= Duration::from_millis(16)
                         {
                             io::stdout().flush()?;
                             last_flush = Instant::now();
@@ -7118,6 +7147,14 @@ async fn chat_loop(
                         );
                         io::stdout().flush()?;
                     }
+                    if !deltas.is_empty() && first_visible_seconds.is_none() {
+                        first_visible_seconds = Some(
+                            run.as_ref()
+                                .map_or(turn_started, |run| run.started)
+                                .elapsed()
+                                .as_secs_f64(),
+                        );
+                    }
                     tool_calls.extend(deltas)?;
                 }
                 Ok(GenerateStreamEvent::Done {
@@ -7132,9 +7169,24 @@ async fn chat_loop(
                     prompt_tokens = tokens_in;
                     completion_tokens = tokens;
                     let mut response_timings = response_timings;
-                    account_chat_preparation(&mut response_timings, &mut pending_preparation_seconds);
+                    account_chat_preparation(
+                        &mut response_timings,
+                        &mut pending_preparation_seconds,
+                    );
                     timings = Some(response_timings);
                     backend_diagnostics = prompt_diagnostics.clone();
+                    backend_diagnostics.append(&mut preparation_diagnostics);
+                    if let Some(run) = run.as_ref() {
+                        backend_diagnostics.push(format!(
+                            "run elapsed through completion: {:.6}s",
+                            run.started.elapsed().as_secs_f64()
+                        ));
+                        if let Some(seconds) = first_visible_seconds {
+                            backend_diagnostics.push(format!(
+                                "run first token including preparation: {seconds:.6}s"
+                            ));
+                        }
+                    }
                     backend_diagnostics.extend(response_backend_diagnostics);
                     pending_spinner.clear()?;
                     break;
@@ -7174,7 +7226,8 @@ async fn chat_loop(
                     "type": "completion", "model": manifest.id,
                     "message": assistant_message, "finish_reason": finish_reason,
                     "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                              "total_tokens": prompt_tokens + completion_tokens}
+                              "total_tokens": prompt_tokens + completion_tokens},
+                    "timings": timings, "backend_diagnostics": backend_diagnostics
                 }))?
             );
         } else {
@@ -7207,7 +7260,11 @@ async fn chat_loop(
             writeln!(output)?;
             write_verbose_stats(
                 &mut output,
-                Some(verbose_backend_label(selected_backend)),
+                Some(if run.as_ref().is_some_and(|run| run.server) {
+                    "Werk serve (HTTP)"
+                } else {
+                    verbose_backend_label(selected_backend)
+                }),
                 prompt_tokens,
                 completion_tokens,
                 &finish_reason,

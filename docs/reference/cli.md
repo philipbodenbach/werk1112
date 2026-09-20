@@ -490,6 +490,64 @@ output is buffered; `--stream` streams text, and `--stream-granularity token|chu
 also enables streaming. `--no-history` (alias `--single-turn`) conflicts with
 persistence, as it does in `chat`.
 
+To reuse a worker across separate text/vision/tool `run` processes, start the
+existing server once and point the client at it:
+
+```bash
+# Terminal 1: worker settings belong to serve.
+WERK_LLAMA_ARGS='--n-cpu-moe 38 --reasoning off' \
+werk --backend cuda --threads 24 --threads-batch 24 --ctx-size 4096 \
+  serve --model vumpt/Qwen3.8-Flash-Next-GGUF --persistence \
+  --host 127.0.0.1 --port 11434 --allow-unauthenticated
+
+# Terminal 2: reuse the running worker; each invocation exits normally.
+werk run vumpt/Qwen3.8-Flash-Next-GGUF "Explain Rust ownership briefly." \
+  --server http://127.0.0.1:11434 --session qwen-test --persistence \
+  --stream --verbose --max-tokens 128
+```
+
+This Qwen example uses 38 CPU expert layers out of the installed GGUF's 48
+blocks. It retains the measured 24-thread configuration; it is not a claim of
+optimal settings for every machine or quantization. `--n-cpu-moe` is static CPU
+expert placement, not an adaptive expert cache.
+
+`--server` uses the existing `/v1/chat/completions` API, including images, tools,
+sampling and request-scoped `werk.omlx` controls. It starts no local worker and
+never silently falls back to local inference. The model must be registered in
+both client and server stores under the same ID. `--model-home` on the client
+selects its model metadata and conversation archive; it does not redirect the
+server store. CLI `--image` files are read on the client and sent as data URLs.
+Paths inside JSON requests refer to the server filesystem; use data URLs for
+separate hosts. Media `run` requests continue to use the local media
+service; combining them with `--server` is rejected.
+
+Set backend/device/context/thread options and `WERK_LLAMA_ARGS` on the server.
+Worker CLI options on a remote `run` are rejected. For authenticated servers,
+provide `--api-key` or `WERK_API_KEY` to the client. The example explicitly binds
+an unauthenticated development server to loopback; HTTP URLs require host and
+port. There is no automatic server discovery or background daemon.
+
+Sessions still save the transcript locally. Prefix reuse now depends on the
+server's live cache: restarting the server or another request replacing that
+prefix may require prefill again. This route does not upload or restore local
+KV snapshots. Local `run` without `--server` retains native disk snapshots where
+supported. Neither transcript persistence nor live cache hits imply persistent
+MoE expert residency.
+
+Verbose text diagnostics now include `preparation duration` (worker preparation
+and optional capability probe), plus llama.cpp worker startup, cache probe,
+restore and save durations. Preparation is included once in `load duration`
+and `total duration`. `first token` continues to measure the generation request;
+`run first token including preparation` measures from entry to `run` until the
+first nonempty text/tool delta arrives. With `--stream`, the first text delta is
+flushed immediately. `run elapsed through completion` also includes snapshot
+saving; final transcript publication and process exit follow it. Interactive
+chat waiting for input is excluded. Native prefill/decode rates are unchanged.
+CLI JSON completions also include `timings` and `backend_diagnostics`; the HTTP
+API includes native values under `werk.timings` and `werk.backend_diagnostics`.
+An available native cache count appears as `usage.prompt_tokens_details.cached_tokens`;
+unknown counts remain absent.
+
 For structured conversations and tool calls, pass the existing OpenAI chat
 request schema. `--request -` reads JSON from stdin:
 

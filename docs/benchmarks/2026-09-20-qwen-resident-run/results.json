@@ -1,0 +1,172 @@
+{
+  "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+  "quantization": "Q4_K_M",
+  "architecture": "qwen4exp",
+  "llama_revision": "ec928150501c2572fec05cb949061672bb424914",
+  "settings": {
+    "threads": 24,
+    "threads_batch": 24,
+    "ctx": 4096,
+    "cpu_moe_layers": 38
+  },
+  "server_startup_seconds": 93.67624504401465,
+  "gpu_after_first": "memory.used [MiB], memory.free [MiB]\n23766 MiB, 560 MiB\n",
+  "runs": [
+    {
+      "run": 0,
+      "exit": 0,
+      "wall_seconds": 45.04694270901382,
+      "first_visible_seconds": 44.24576239901944,
+      "completion": {
+        "backend_diagnostics": [
+          "history messages: 1",
+          "chat template: delegated to werk serve",
+          "preparation duration: 0.013392s (included in load/total)",
+          "run elapsed through completion: 44.993043s",
+          "run first token including preparation: 44.213239s",
+          "worker ownership: existing werk serve; live prefix cache is server-managed",
+          "llama.cpp request endpoint: /v1/chat/completions",
+          "chat template applied by backend/model: yes"
+        ],
+        "finish_reason": "stop",
+        "message": {
+          "content": "OK",
+          "role": "assistant"
+        },
+        "model": "qwen-cache-test",
+        "timings": {
+          "cached_prompt_tokens": 0,
+          "decode_seconds": 0.7790750000000001,
+          "first_token_seconds": 44.197597103,
+          "load_seconds": 0.013391799,
+          "prompt_seconds": 43.704619,
+          "total_seconds": 44.990701017,
+          "warmup_seconds": 0.0
+        },
+        "type": "completion",
+        "usage": {
+          "completion_tokens": 2,
+          "prompt_tokens": 23,
+          "total_tokens": 25
+        }
+      }
+    },
+    {
+      "run": 1,
+      "exit": 0,
+      "wall_seconds": 8.282374230999267,
+      "first_visible_seconds": 7.369310021982528,
+      "completion": {
+        "backend_diagnostics": [
+          "history messages: 3",
+          "chat template: delegated to werk serve",
+          "preparation duration: 0.000044s (included in load/total)",
+          "run elapsed through completion: 8.235065s",
+          "run first token including preparation: 7.340300s",
+          "worker ownership: existing werk serve; live prefix cache is server-managed",
+          "llama.cpp request endpoint: /v1/chat/completions",
+          "chat template applied by backend/model: yes"
+        ],
+        "finish_reason": "stop",
+        "message": {
+          "content": "37",
+          "role": "assistant"
+        },
+        "model": "qwen-cache-test",
+        "timings": {
+          "cached_prompt_tokens": 24,
+          "decode_seconds": 0.89449,
+          "first_token_seconds": 7.33819683,
+          "load_seconds": 4.35e-05,
+          "prompt_seconds": 7.328911,
+          "total_seconds": 8.232929045,
+          "warmup_seconds": 0.0
+        },
+        "type": "completion",
+        "usage": {
+          "completion_tokens": 3,
+          "prompt_tokens": 53,
+          "total_tokens": 56
+        }
+      }
+    },
+    {
+      "run": 2,
+      "exit": 0,
+      "wall_seconds": 17.223897543008206,
+      "first_visible_seconds": 4.674409492989071,
+      "completion": {
+        "backend_diagnostics": [
+          "history messages: 5",
+          "chat template: delegated to werk serve",
+          "preparation duration: 0.000037s (included in load/total)",
+          "run elapsed through completion: 17.167501s",
+          "run first token including preparation: 4.634109s",
+          "worker ownership: existing werk serve; live prefix cache is server-managed",
+          "llama.cpp request endpoint: /v1/chat/completions",
+          "chat template applied by backend/model: yes"
+        ],
+        "finish_reason": "stop",
+        "message": {
+          "content": "Rust ownership is a set of rules that ensures memory safety without a garbage collector by assigning each value a single owner responsible for its memory. When the owner goes out of scope, the value is automatically dropped, and ownership can be transferred through moves or shared via borrowing with strict compile-time checks. This system prevents data races and memory errors at compile time by enforcing that there is either one mutable reference or any number of immutable references to a value at any given time.",
+          "role": "assistant"
+        },
+        "model": "qwen-cache-test",
+        "timings": {
+          "cached_prompt_tokens": 55,
+          "decode_seconds": 12.532766,
+          "first_token_seconds": 4.631457006,
+          "load_seconds": 3.71e-05,
+          "prompt_seconds": 4.621334,
+          "total_seconds": 17.164714362,
+          "warmup_seconds": 0.0
+        },
+        "type": "completion",
+        "usage": {
+          "completion_tokens": 94,
+          "prompt_tokens": 77,
+          "total_tokens": 171
+        }
+      }
+    },
+    {
+      "run": 3,
+      "exit": 0,
+      "wall_seconds": 8.761250654992182,
+      "first_visible_seconds": 1.7112404580111615,
+      "completion": {
+        "backend_diagnostics": [
+          "history messages: 7",
+          "chat template: delegated to werk serve",
+          "preparation duration: 0.000038s (included in load/total)",
+          "run elapsed through completion: 8.719713s",
+          "run first token including preparation: 1.686041s",
+          "worker ownership: existing werk serve; live prefix cache is server-managed",
+          "llama.cpp request endpoint: /v1/chat/completions",
+          "chat template applied by backend/model: yes"
+        ],
+        "finish_reason": "stop",
+        "message": {
+          "content": "Rust borrowing allows you to access data without taking ownership, using immutable references for read-only access or mutable references for exclusive modification. The compiler enforces strict rules to ensure that you cannot have a mutable reference and any other references to the same data simultaneously, preventing data races. This mechanism enables safe and efficient data sharing while maintaining memory safety guarantees at compile time.",
+          "role": "assistant"
+        },
+        "model": "qwen-cache-test",
+        "timings": {
+          "cached_prompt_tokens": 170,
+          "decode_seconds": 7.033879,
+          "first_token_seconds": 1.68384047,
+          "load_seconds": 3.83e-05,
+          "prompt_seconds": 1.670885,
+          "total_seconds": 8.717506863,
+          "warmup_seconds": 0.0
+        },
+        "type": "completion",
+        "usage": {
+          "completion_tokens": 73,
+          "prompt_tokens": 192,
+          "total_tokens": 265
+        }
+      }
+    }
+  ]
+}

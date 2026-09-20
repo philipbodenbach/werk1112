@@ -2,11 +2,15 @@
 
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 pub(crate) struct LlamaChatPersistence {
     directory: PathBuf,
     restore_attempted: AtomicBool,
+    pub(crate) probe_seconds: f64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -78,10 +82,12 @@ impl LlamaChatPersistence {
             .state_gate
             .lock()
             .map_err(|_| anyhow!("llama.cpp state gate unavailable"))?;
-        functional_probe_llama_state(server)?;
+        let probe_started = Instant::now();
+        functional_probe_llama_chat_state(server)?;
         Ok(Self {
             directory,
             restore_attempted: AtomicBool::new(false),
+            probe_seconds: probe_started.elapsed().as_secs_f64(),
         })
     }
 
@@ -132,12 +138,12 @@ impl LlamaChatPersistence {
         let name = format!("{}.bin", random_private_id("chat_restore_", 16)?);
         let target = private_snapshot_path(server, &name)?;
         let result = (|| {
-            copy_bounded_snapshot(
+            let sha256 = copy_snapshot_with_sha256(
                 &self.directory.join(&record.filename),
                 &target,
                 record.bytes,
             )?;
-            if sha256_regular_file(&target, STATE_SNAPSHOT_MAX_BYTES)? != record.sha256 {
+            if sha256 != record.sha256 {
                 bail!("native cache checksum mismatch");
             }
             restore_llama_slot(server, &name, record.tokens, record.bytes)?;
@@ -163,16 +169,16 @@ impl LlamaChatPersistence {
         let result = (|| {
             let info = save_llama_slot(server, &name, status.prompt_tokens)?;
             let source = private_snapshot_path(server, &name)?;
+            let target = self.directory.join(&name);
+            let sha256 = copy_snapshot_with_sha256(&source, &target, info.bytes)?;
             let record = Record {
                 version: 1,
                 filename: name.clone(),
                 tokens: status.prompt_tokens,
                 bytes: info.bytes,
-                sha256: sha256_regular_file(&source, STATE_SNAPSHOT_MAX_BYTES)?,
+                sha256,
             };
             let previous = self.read_record().ok().flatten();
-            let target = self.directory.join(&name);
-            copy_bounded_snapshot(&source, &target, info.bytes)?;
             if let Err(error) = self.publish(&record) {
                 // A directory fsync can fail after the new index was renamed.
                 // Keep the bytes if that index may already reference them.

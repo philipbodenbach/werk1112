@@ -1309,6 +1309,17 @@ struct LlamaDecoded {
 }
 
 fn functional_probe_llama_state(server: &LlamaServerProcess) -> Result<()> {
+    functional_probe_llama_state_inner(server, false)
+}
+
+fn functional_probe_llama_chat_state(server: &LlamaServerProcess) -> Result<()> {
+    functional_probe_llama_state_inner(server, true)
+}
+
+fn functional_probe_llama_state_inner(
+    server: &LlamaServerProcess,
+    allow_continuation: bool,
+) -> Result<()> {
     let probe_input = PrefillInput::Text {
         text: STATE_CAPABILITY_PROBE_PROMPT.to_string(),
     };
@@ -1327,15 +1338,75 @@ fn functional_probe_llama_state(server: &LlamaServerProcess) -> Result<()> {
             bail!("llama.cpp capability probe replay changed tokenization");
         }
         let status = llama_slot_status(server)?;
-        if status.is_processing || cached_tokens < prompt_tokens.saturating_sub(1) {
-            bail!("llama.cpp capability probe did not prove restored cache reuse");
+        if status.is_processing {
+            bail!("llama.cpp capability probe left a busy slot");
         }
-        erase_llama_slot(server, Some(prompt_tokens))?;
+        let mut final_tokens = prompt_tokens;
+        if cached_tokens < prompt_tokens.saturating_sub(1) {
+            if !allow_continuation {
+                bail!("llama.cpp capability probe did not prove restored cache reuse");
+            }
+            // Hybrid/recurrent memory may support continuing a restored state
+            // without being able to rewind it for identical-prompt logits.
+            // Discard the replayed state: otherwise its fresh cache could make
+            // this second check pass even when disk restore is ineffective.
+            erase_llama_slot(server, Some(replay_tokens))?;
+            restore_llama_slot(server, &probe_name, prompt_tokens, snapshot.bytes)?;
+            let (path, mut body) = llama_state_request_body(&probe_input, Some(0), None);
+            // Use token IDs: concatenating text can change the BPE boundary,
+            // while an array of strings is interpreted as multiple requests.
+            let mut tokens = tokenize_llama_probe(server, STATE_CAPABILITY_PROBE_PROMPT, true)?;
+            if tokens.len() as u64 != prompt_tokens {
+                bail!("llama.cpp capability probe tokenized prefix changed length");
+            }
+            tokens.extend(tokenize_llama_probe(
+                server,
+                " Continue this private cache probe with new tokens.",
+                false,
+            )?);
+            body["prompt"] = serde_json::to_value(tokens)?;
+            let (continued_tokens, continued_cached) =
+                run_llama_prefill_body_with_cache(server, path, &body)?;
+            if continued_tokens <= prompt_tokens
+                || continued_cached < prompt_tokens
+                || continued_cached >= continued_tokens
+            {
+                bail!(
+                    "llama.cpp capability probe did not prove restored cache reuse: exact replay cached {cached_tokens}/{prompt_tokens}, continuation cached {continued_cached}/{continued_tokens}"
+                );
+            }
+            final_tokens = continued_tokens;
+        }
+        erase_llama_slot(server, Some(final_tokens))?;
         Ok(())
     })();
     erase_slot_best_effort(server);
     remove_private_snapshot(server, &probe_name);
     result
+}
+
+fn tokenize_llama_probe(
+    server: &LlamaServerProcess,
+    text: &str,
+    add_special: bool,
+) -> Result<Vec<u32>> {
+    let response = control_json_request(
+        &server.url,
+        "/tokenize",
+        "POST",
+        Some(&json!({"content": text, "add_special": add_special, "parse_special": true})),
+    )?;
+    let tokens: Vec<u32> = serde_json::from_value(
+        response
+            .get("tokens")
+            .cloned()
+            .context("llama.cpp probe tokenizer returned no tokens")?,
+    )
+    .context("llama.cpp probe tokenizer returned invalid token IDs")?;
+    if tokens.is_empty() || tokens.len() > 4096 || tokens.iter().any(|id| *id > i32::MAX as u32) {
+        bail!("llama.cpp probe tokenizer returned invalid tokens");
+    }
+    Ok(tokens)
 }
 
 fn run_llama_prefill(server: &LlamaServerProcess, input: &PrefillInput) -> Result<u64> {
@@ -1347,7 +1418,15 @@ fn run_llama_prefill_with_cache(
     input: &PrefillInput,
 ) -> Result<(u64, u64)> {
     let (path, body) = llama_state_request_body(input, Some(0), None);
-    let response = control_json_request(&server.url, path, "POST", Some(&body))?;
+    run_llama_prefill_body_with_cache(server, path, &body)
+}
+
+fn run_llama_prefill_body_with_cache(
+    server: &LlamaServerProcess,
+    path: &str,
+    body: &Value,
+) -> Result<(u64, u64)> {
+    let response = control_json_request(&server.url, path, "POST", Some(body))?;
     if !response.is_object() {
         bail!("llama.cpp prefill returned an invalid response");
     }
@@ -1925,10 +2004,24 @@ fn copy_bounded_snapshot(source: &Path, target: &Path, expected_bytes: u64) -> R
 }
 
 fn copy_bounded_snapshot_file(
-    mut source_file: fs::File,
+    source_file: fs::File,
     target: &Path,
     expected_bytes: u64,
 ) -> Result<u64> {
+    copy_snapshot_file(source_file, target, expected_bytes, false).map(|v| v.0)
+}
+
+fn copy_snapshot_with_sha256(source: &Path, target: &Path, expected_bytes: u64) -> Result<String> {
+    let (file, _) = open_bounded_regular_file(source, Some(expected_bytes))?;
+    copy_snapshot_file(file, target, expected_bytes, true).map(|v| v.1)
+}
+
+fn copy_snapshot_file(
+    mut source_file: fs::File,
+    target: &Path,
+    expected_bytes: u64,
+    hash: bool,
+) -> Result<(u64, String)> {
     let source_metadata = source_file.metadata()?;
     if !source_metadata.is_file()
         || source_metadata.len() != expected_bytes
@@ -1943,6 +2036,7 @@ fn copy_bounded_snapshot_file(
     options.mode(0o600).custom_flags(libc::O_CLOEXEC);
     let mut target_file = options.open(target)?;
     let result = (|| {
+        let mut hasher = Sha256::new();
         let mut copied = 0u64;
         let mut buffer = [0u8; 1024 * 1024];
         loop {
@@ -1955,13 +2049,16 @@ fn copy_bounded_snapshot_file(
                 bail!("runtime-state snapshot changed while it was copied");
             }
             target_file.write_all(&buffer[..read])?;
+            if hash {
+                hasher.update(&buffer[..read]);
+            }
         }
         if copied != expected_bytes {
             bail!("runtime-state snapshot changed while it was copied");
         }
         target_file.flush()?;
         target_file.sync_all()?;
-        Ok(copied)
+        Ok((copied, format!("sha256:{:x}", hasher.finalize())))
     })();
     if result.is_err() {
         let _ = fs::remove_file(target);
@@ -2391,6 +2488,27 @@ mod tests {
         join.join().unwrap();
     }
 
+    #[test]
+    fn snapshot_copy_hashes_exact_bytes_and_preserves_existing_targets() {
+        let root = test_root("snapshot-copy-hash");
+        let source = root.join("source.bin");
+        let target = root.join("target.bin");
+        // Cross the copy buffer boundary, including an incomplete final chunk.
+        let bytes = vec![0x5a; 1024 * 1024 + 17];
+        fs::write(&source, &bytes).unwrap();
+        assert_eq!(
+            copy_snapshot_with_sha256(&source, &target, bytes.len() as u64).unwrap(),
+            sha256_bytes(&bytes)
+        );
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        assert!(copy_snapshot_with_sha256(&source, &target, bytes.len() as u64).is_err());
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        let invalid = root.join("invalid.bin");
+        assert!(copy_snapshot_with_sha256(&source, &invalid, bytes.len() as u64 + 1).is_err());
+        assert!(!invalid.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_snapshot_copy_is_owner_only_and_never_follows_symlinks() {
@@ -2497,6 +2615,44 @@ mod tests {
     }
 
     #[test]
+    fn chat_probe_accepts_continuation_without_weakening_named_state_probe() {
+        for reuse in [
+            FakeReuse::Exact,
+            FakeReuse::ContinuationOnly,
+            FakeReuse::BrokenRestore,
+        ] {
+            for chat in [false, true] {
+                let root = test_root("probe-reuse-modes");
+                let snapshots = root.join("snapshots");
+                ensure_real_directory(&snapshots, true).unwrap();
+                let fake = spawn_fake_state_server_with_reuse(snapshots.clone(), false, reuse);
+                let process = test_process(fake.url.clone(), snapshots.clone());
+                let result = if chat {
+                    functional_probe_llama_chat_state(&process)
+                } else {
+                    functional_probe_llama_state(&process)
+                };
+                let requests = fake.finish();
+                let should_pass =
+                    reuse == FakeReuse::Exact || (chat && reuse == FakeReuse::ContinuationOnly);
+                assert_eq!(result.is_ok(), should_pass, "chat={chat}: {result:?}");
+                if chat && reuse != FakeReuse::Exact {
+                    assert_eq!(
+                        requests
+                            .iter()
+                            .filter(|r| r.as_str() == "POST /slots/0?action=restore")
+                            .count(),
+                        2
+                    );
+                }
+                assert!(fs::read_dir(&snapshots).unwrap().next().is_none());
+                drop(process);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn chat_snapshot_survives_process_replacement_and_rejects_corruption() {
         let root = test_root("chat-restart");
         let store = ModelStore::resolve(Some(root.clone())).unwrap();
@@ -2504,7 +2660,11 @@ mod tests {
         for iteration in 0..3 {
             let snapshots = root.join(format!("snapshots-{iteration}"));
             ensure_real_directory(&snapshots, true).unwrap();
-            let fake = spawn_fake_state_server(snapshots.clone(), false);
+            let fake = spawn_fake_state_server_with_reuse(
+                snapshots.clone(),
+                false,
+                FakeReuse::ContinuationOnly,
+            );
             let process = test_process(fake.url.clone(), snapshots);
             let cache = LlamaChatPersistence::open(&process, &store, &test_manifest(), &cache_root)
                 .unwrap();
@@ -2937,7 +3097,22 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FakeReuse {
+        Exact,
+        ContinuationOnly,
+        BrokenRestore,
+    }
+
     fn spawn_fake_state_server(snapshot_dir: PathBuf, corrupt_save: bool) -> FakeStateServer {
+        spawn_fake_state_server_with_reuse(snapshot_dir, corrupt_save, FakeReuse::Exact)
+    }
+
+    fn spawn_fake_state_server_with_reuse(
+        snapshot_dir: PathBuf,
+        corrupt_save: bool,
+        reuse: FakeReuse,
+    ) -> FakeStateServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2946,7 +3121,7 @@ mod tests {
             let started = Instant::now();
             let mut requests = Vec::new();
             let mut slot_tokens = 0u64;
-            let mut cache_tokens = 0u64;
+            let mut restored = false;
             loop {
                 if stop_rx.try_recv().is_ok() {
                     return Ok(requests);
@@ -2970,22 +3145,44 @@ mod tests {
                     ("POST", "/slots/0?action=erase") => {
                         let erased = slot_tokens;
                         slot_tokens = 0;
-                        cache_tokens = 0;
                         json!({"id_slot": 0, "n_erased": erased})
                     }
+                    ("POST", "/tokenize") => {
+                        let original = body.get("content").and_then(Value::as_str)
+                            == Some(STATE_CAPABILITY_PROBE_PROMPT);
+                        if body.get("add_special").and_then(Value::as_bool) != Some(original) {
+                            return Err(
+                                "probe tokenization must add special tokens only to the prefix"
+                                    .into(),
+                            );
+                        }
+                        json!({"tokens": if original { vec![1,2,3,4,5,6,7] } else { vec![8,9,10] }})
+                    }
                     ("POST", "/completion") => {
-                        if body.get("prompt").and_then(Value::as_str)
-                            != Some(STATE_CAPABILITY_PROBE_PROMPT)
+                        let continued =
+                            body.get("prompt") == Some(&json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
+                        if (!continued
+                            && body.get("prompt").and_then(Value::as_str)
+                                != Some(STATE_CAPABILITY_PROBE_PROMPT))
                             || body.get("n_predict").and_then(Value::as_u64) != Some(0)
                             || body.get("id_slot").and_then(Value::as_u64) != Some(0)
                             || body.get("cache_prompt").and_then(Value::as_bool) != Some(true)
                         {
                             return Err("probe request was not exact".to_string());
                         }
-                        if slot_tokens == 7 {
-                            cache_tokens = 7;
-                        }
-                        slot_tokens = 7;
+                        let cache_tokens = if slot_tokens == 7
+                            && (!restored
+                                || reuse == FakeReuse::Exact
+                                || (reuse == FakeReuse::ContinuationOnly && continued))
+                        {
+                            7
+                        } else {
+                            0
+                        };
+                        // After replay this is a freshly computed live cache,
+                        // even when the preceding disk restore was ineffective.
+                        restored = false;
+                        slot_tokens = if continued { 10 } else { 7 };
                         json!({"id_slot": 0, "content": "", "tokens_predicted": 0,
                             "timings": {"cache_n": cache_tokens}})
                     }
@@ -3010,8 +3207,8 @@ mod tests {
                         let filename = fake_filename(&body)?;
                         let bytes = fs::read(snapshot_dir.join(filename))
                             .map_err(|error| error.to_string())?;
+                        restored = true;
                         slot_tokens = 7;
-                        cache_tokens = 7;
                         json!({
                             "id_slot": 0,
                             "filename": filename,

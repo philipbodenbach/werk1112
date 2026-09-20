@@ -103,7 +103,13 @@ passes. The latest snapshot for each compatible runtime namespace can survive
 restart; response usage, not the existence of a file or conversation, determines
 reported prefix hits. Newer llama.cpp releases reset idle-slot timing counters,
 so the probe reads the completed response's cache count before falling back to
-the legacy slot counter. Named runtime-control states remain process-bound.
+the legacy slot counter. If identical-prompt replay cannot reuse a hybrid/recurrent
+state, terminal `run`/`chat` also tests continuation with an unchanged token-ID
+prefix plus new tokens. It erases and restores the original snapshot again
+before that test, and requires the backend to report reuse of the entire saved
+prefix. This does not relax the exact-replay probe for named runtime-control
+states, which remain process-bound. Successful probing establishes cache support;
+actual reuse still depends on the next request matching the saved token prefix.
 
 Local storage cleanup is available through `werk cache list` and
 `werk cache purge <CACHE-ID>` or `werk cache purge --all`. The inventory
@@ -440,3 +446,21 @@ the value is not exposed as a `STRING` or JSON output. See the
 
 CLI examples are in the [runtime-control CLI section](../reference/cli.md#runtime-control),
 and the transport contract is in the [Werk Protocol 1.0 reference](../reference/werk-protocol-v1.md).
+
+### Reusing a worker from `run`
+
+`run --server http://127.0.0.1:11434` sends text/vision/tool requests through the
+existing `serve` API while keeping the portable session archive on the client.
+The running backend retains its live prefix cache, avoiding a worker startup,
+capability probe and disk-snapshot restore for each invocation. Server restarts
+and competing prompts can invalidate that live prefix; this frontend does not
+claim cross-restart native KV persistence. Worker placement/thread settings
+belong to `serve`, while sampling and session selection belong to `run`.
+
+For local llama.cpp sessions, durable snapshot copying now calculates SHA256
+from the bytes being copied in the same pass. Restore still checks the recorded
+hash before loading state, and save still syncs the file before publishing the
+index. Owner-only files, bounded lengths, no-follow checks, failure cleanup and
+conversation-based recovery are retained. Runtime/library identity hashing is
+unchanged. Preparation, probe and snapshot phase diagnostics make their cost
+visible without altering native prefill/decode rates.

@@ -76,6 +76,7 @@ struct LlamaServerProcess {
 }
 
 struct LlamaServerChatSession {
+    startup_seconds: f64,
     server: Arc<LlamaServerProcess>,
     persistence: Option<Arc<LlamaChatPersistence>>,
 }
@@ -332,8 +333,10 @@ impl GenerationBackend for LlamaServerBackend {
         if manifest.format != ModelFormat::Gguf {
             return Ok(None);
         }
+        let started = Instant::now();
         let (server, _, _) = self.cached_server(manifest, false)?;
         Ok(Some(Box::new(LlamaServerChatSession {
+            startup_seconds: started.elapsed().as_secs_f64(),
             server,
             persistence: None,
         })))
@@ -348,12 +351,15 @@ impl GenerationBackend for LlamaServerBackend {
         if manifest.format != ModelFormat::Gguf {
             return Ok(None);
         }
+        let started = Instant::now();
         let (server, _, _) = self.cached_server(manifest, false)?;
+        let startup_seconds = started.elapsed().as_secs_f64();
         let persistence =
             LlamaChatPersistence::open(&server, &self.store, manifest, cache_directory)?;
         Ok(Some(Box::new(LlamaServerChatSession {
             server,
             persistence: Some(Arc::new(persistence)),
+            startup_seconds,
         })))
     }
 
@@ -420,6 +426,20 @@ impl GenerationBackend for LlamaServerBackend {
 }
 
 impl ChatGenerationSession for LlamaServerChatSession {
+    fn preparation_diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = vec![format!(
+            "llama.cpp worker startup duration: {:.6}s",
+            self.startup_seconds
+        )];
+        if let Some(cache) = &self.persistence {
+            diagnostics.push(format!(
+                "llama.cpp cache capability probe duration: {:.6}s",
+                cache.probe_seconds
+            ));
+        }
+        diagnostics
+    }
+
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
         let total_started = Instant::now();
         self.server.print_debug(&request, true);
@@ -620,7 +640,9 @@ impl LlamaServerProcess {
             );
         }
         let started = Instant::now();
+        let restore_started = Instant::now();
         let cache_notice = persistence.map(|cache| cache.restore(self)).transpose()?;
+        let restore_seconds = restore_started.elapsed().as_secs_f64();
         let use_chat_endpoint = !request.messages.is_empty() || request_has_images(request);
         let (path, body) = if use_chat_endpoint {
             ("/v1/chat/completions", chat_completion_body(request))
@@ -704,7 +726,15 @@ impl LlamaServerProcess {
             );
         }
         if let Some(cache) = persistence {
+            completion.backend_diagnostics.push(format!(
+                "llama.cpp native KV restore duration: {restore_seconds:.6}s"
+            ));
+            let save_started = Instant::now();
             completion.backend_diagnostics.push(cache.save(self));
+            completion.backend_diagnostics.push(format!(
+                "llama.cpp native KV save duration: {:.6}s",
+                save_started.elapsed().as_secs_f64()
+            ));
         }
         Ok(completion)
     }

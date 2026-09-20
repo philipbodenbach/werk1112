@@ -5,6 +5,20 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Add `run --server URL` for text/vision/tool calls through an existing `serve`
+  worker, preserving client-side sessions and streaming via the shared OpenAI
+  transport. Report native timing/cache metadata over the API.
+- Include all text-backend preparation in CLI load/total timing and report
+  `run` latency through its first delta, plus llama.cpp startup, capability
+  probe, snapshot restore and save phases. Flush the first text delta immediately.
+- Hash llama.cpp chat snapshots during copying on save/restore, avoiding a
+  second full file read while retaining checksum and file-safety validation.
+
+- llama.cpp: validate terminal chat/run snapshot persistence with a token-prefix
+  continuation fallback for hybrid/recurrent models that cannot reuse identical
+  prompts after restore. Keep strict exact-replay checks for named runtime states
+  and require verified prefix hits after a fresh snapshot restore.
+
 - oMLX: use the same automatic device/model-dependent expert cache budget for CLI chat and Serve on supported DeepSeek V4 checkpoints. Preserve explicit small budgets and SSD offload; `0` selects native loading.
 - Report uncached prefill token counts/rates in CLI verbose output and native phase timings in Serve logs for comparable performance measurements.
 
