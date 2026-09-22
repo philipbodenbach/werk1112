@@ -24,8 +24,10 @@ pub(crate) struct ManagedChild(Arc<Mutex<Child>>);
 /// Register before preparing resources that must also be released if startup
 /// fails or a signal interrupts preparation. The owner must outlive its worker;
 /// normal destruction must reap that worker before dropping this token.
+#[cfg(any(target_os = "linux", all(test, unix)))]
 pub(crate) struct ManagedCleanup(Arc<Mutex<Option<CleanupCallback>>>);
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 impl ManagedCleanup {
     pub(crate) fn register(callback: CleanupCallback) -> std::io::Result<Self> {
         let mut registry = children().lock().unwrap_or_else(|e| e.into_inner());
@@ -51,6 +53,7 @@ fn run_cleanup(cleanup: &Mutex<Option<CleanupCallback>>) {
     }
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 impl Drop for ManagedCleanup {
     fn drop(&mut self) {
         run_cleanup(&self.0);
