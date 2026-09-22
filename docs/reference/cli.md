@@ -490,14 +490,60 @@ output is buffered; `--stream` streams text, and `--stream-granularity token|chu
 also enables streaming. `--no-history` (alias `--single-turn`) conflicts with
 persistence, as it does in `chat`.
 
-For local llama-server runs, `--warmup-tokens 0` disables native synthetic warmup
-when the runtime supports `--no-warmup`. Local llama.cpp `run`/`chat` never evaluate
+Werk-managed llama-server workers disable native synthetic warmup by default
+when the runtime exposes `--no-warmup`. This is shared by all models and CPU/GPU
+modes, including workers used by `run`, `chat` and `serve`. `--warmup-tokens 0`
+keeps it disabled; a positive value explicitly enables native warmup via
+`--warmup` when supported (the server uses a boolean, not an exact token count).
+Trailing `WERK_LLAMA_ARGS` retain native argument precedence. Verbose local
+session output reports the effective warmup setting; unsupported controls are
+reported as the runtime default. Local llama.cpp `run`/`chat` never evaluate
 a separate test prompt for session persistence. A new session runs the user
 request and saves its state. Existing snapshots are checked on restore, and
 successful real requests report observed reuse from backend cache counts.
 Verbose output distinguishes unverified restore from historical observed reuse.
 Worker loading still occurs on every local process start; cold file reads may
 remain expensive, including during the first real prefill.
+Runtime inspection avoids repeated help/version commands. Session library and
+snapshot file work runs after native startup, avoiding additional I/O during
+model loading. Verbose output separates runtime inspection, native readiness
+and final binary validation. Compatibility checks and native slot restore still
+complete before user inference.
+
+On Linux CUDA workers, `WERK_LLAMA_PREFETCH=auto` (the default) optionally
+prepares the explicitly CPU-placed MoE expert pages before native startup.
+It recognizes `--cpu-moe` and `--n-cpu-moe N`, inventories only the selected
+GGUF shard family, avoids rereading cached pages, and uses at most two bounded readers.
+It does not intentionally traverse dense weights or lazy PLE/ngram tables.
+Unsupported metadata/kernel support, ambiguous placement, explicit alternative
+load modes and insufficient host/container memory budgets retain native loading.
+Set `WERK_LLAMA_PREFETCH=off` to compare against native loading alone. This
+preparation does not change native arguments, expert placement, or KV-cache
+identity. Its time and checked/missing/prefaulted byte counts appear in verbose
+diagnostics and are included in preparation and total wall time. Read-only
+shared mappings retain the prepared page-table entries during the worker's
+lifetime, so cache-only trimming cannot immediately undo that preparation.
+This adds no weight copy or memory lock; memory pressure can still reclaim pages.
+The mappings are removed before file-cache release on normal or interrupted
+shutdown. Verbose first requests log the prepared worker PID and startup
+diagnostics before entering native inference.
+
+On WSL, `WERK_MODEL_CACHE_RELEASE=auto` (the default) requests release of the
+loaded model files' clean OS cache pages when their local model owner or worker
+is destroyed. This applies to all model families, after `run`, after leaving
+`chat`, and when `serve` stops or unloads its worker. Owned subprocesses are
+stopped and reaped first, including CLI interruption. An active chat/server
+worker retains its model; this is not an idle timer between requests.
+
+This file-scoped operation does not delete model files, chat history or saved
+KV snapshots, and does not restart WSL or clear the system-wide cache. It can
+make the next standalone run slower because model weights need reading again.
+Set `WERK_MODEL_CACHE_RELEASE=off` to retain those pages, or `on` to request the
+same release on other Linux hosts. Other operating systems keep their native
+cache behavior. Release is advisory: diagnostics report the file ranges for
+which advice was accepted, not measured bytes returned to the host. Concurrent
+Werk readers with an acquired lease protect their files; unavailable leases
+disable scoped cleanup for that owner. Remote servers are externally managed.
 
 To reuse a worker across separate text/vision/tool `run` processes, start the
 existing server once and point the client at it:

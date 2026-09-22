@@ -2,10 +2,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
     env, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
     sync::{Arc, Mutex},
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -656,7 +658,7 @@ impl OnnxRuntimeBackend {
 
     fn generate_with_runner(
         &self,
-        _manifest: &ModelManifest,
+        manifest: &ModelManifest,
         request: GenerateRequest,
         total_started: Instant,
         runner: &Path,
@@ -671,7 +673,13 @@ impl OnnxRuntimeBackend {
             eprintln!("ONNX model: {}", model_path.display());
         }
         let started = Instant::now();
-        let output = Command::new(runner)
+        // The child is reaped inside owned_runner_output before this guard can
+        // advise pages belonging to its selected model/artifact.
+        let _cache_release = super::model_file_cache::CacheReleaseGuard::prepare_paths(
+            onnx_cache_paths_or_empty(&self.store, manifest, model_path),
+        );
+        let mut command = Command::new(runner);
+        command
             .arg("--model")
             .arg(model_path)
             .arg("--prompt")
@@ -684,8 +692,8 @@ impl OnnxRuntimeBackend {
                 OnnxRuntimeMode::Rocm => "rocm",
                 OnnxRuntimeMode::Cpu => "cpu",
             })
-            .arg("--json")
-            .output()
+            .arg("--json");
+        let output = owned_runner_output(&mut command)
             .with_context(|| format!("failed to run ONNX Runtime runner {}", runner.display()))?;
         if !output.status.success() {
             bail!(
@@ -797,6 +805,11 @@ impl OnnxRuntimeBackend {
         model_dir: &Path,
         client: &CompanionClient,
     ) -> Result<GenerateResponse> {
+        // Client clones share the resident transport. It retains these leases
+        // until the worker actually exits, including between serve requests.
+        let client = client
+            .clone()
+            .with_model_cache_paths(onnx_cache_paths_or_empty(&self.store, manifest, model_dir));
         let model_dir = model_dir
             .to_str()
             .context("ONNX GenAI model directory is not valid UTF-8")?;
@@ -1358,6 +1371,135 @@ fn runner_name() -> &'static str {
     }
 }
 
+/// Capture the existing runner protocol while retaining ownership during
+/// interruption. Pipe readers run concurrently; polling never holds the child
+/// mutex across a blocking wait, so signal cleanup can kill and reap it.
+fn owned_runner_output(command: &mut Command) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = super::llama_process_lifecycle::ManagedChild::spawn(command)?;
+    let (mut stdout, mut stderr) = {
+        let mut process = child.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            process
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("runner stdout unavailable"))?,
+            process
+                .stderr
+                .take()
+                .ok_or_else(|| io::Error::other("runner stderr unavailable"))?,
+        )
+    };
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let status = loop {
+        let status = child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .try_wait()?;
+        if let Some(status) = status {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("runner stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("runner stderr reader panicked"))??;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn onnx_cache_paths_or_empty(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    selected: &Path,
+) -> Vec<PathBuf> {
+    match onnx_cache_paths(store, manifest, selected) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("[werk] ONNX model file cache release unavailable: {error:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// Generated ONNX artifacts and GenAI layouts can own external tensor data
+/// absent from the source manifest. Enumerate only the selected directory,
+/// never the parent of a single selected file or the global artifact store.
+fn onnx_cache_paths(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    selected: &Path,
+) -> Result<Vec<PathBuf>> {
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_DEPTH: usize = 16;
+    if selected.is_file() {
+        let mut paths = if manifest.format == ModelFormat::Onnx {
+            manifest
+                .files
+                .iter()
+                .map(|file| store.absolute_model_file(manifest, &file.path))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        paths.push(selected.to_path_buf());
+        paths.sort();
+        paths.dedup();
+        anyhow::ensure!(paths.len() <= MAX_ENTRIES, "too many ONNX model assets");
+        return Ok(paths);
+    }
+    anyhow::ensure!(selected.is_dir(), "selected ONNX model path is unavailable");
+    let mut pending = vec![(selected.to_path_buf(), 0)];
+    let mut paths = Vec::new();
+    let mut entries = 0;
+    while let Some((directory, depth)) = pending.pop() {
+        for entry in
+            fs::read_dir(&directory).context("cannot enumerate selected ONNX model directory")?
+        {
+            let entry = entry?;
+            entries += 1;
+            anyhow::ensure!(
+                entries <= MAX_ENTRIES,
+                "too many ONNX model directory entries"
+            );
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                anyhow::ensure!(
+                    depth < MAX_DEPTH,
+                    "ONNX model directory nesting is too deep"
+                );
+                pending.push((path, depth + 1));
+            } else if kind.is_file() || (kind.is_symlink() && path.is_file()) {
+                // File symlinks are common in HF snapshots. The shared lease
+                // layer opens, validates, and deduplicates the actual inode.
+                paths.push(path);
+            } else {
+                // Never follow directory symlinks into unrelated model trees.
+                bail!("unsupported entry in selected ONNX model directory");
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 fn command_output_detail(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1504,6 +1646,108 @@ for raw in sys.stdin:
 
     fn python_for_test() -> Option<PathBuf> {
         find_in_path("python3").or_else(|| find_in_path("python"))
+    }
+
+    #[test]
+    fn cache_inventory_tracks_selected_artifact_and_external_tensor_data_only() {
+        let tmp = test_dir("cache-artifact");
+        let selected = tmp.join("selected");
+        fs::create_dir_all(selected.join("decoder")).unwrap();
+        fs::write(selected.join("decoder/model.onnx"), b"model").unwrap();
+        fs::write(selected.join("decoder/model.onnx.data"), b"weights").unwrap();
+        fs::write(tmp.join("another-model.onnx"), b"unrelated").unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = manifest_with_model_path("test", None);
+        let paths = onnx_cache_paths(&store, &manifest, &selected).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                selected.join("decoder/model.onnx"),
+                selected.join("decoder/model.onnx.data")
+            ]
+        );
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn cache_inventory_does_not_scan_parent_of_selected_single_onnx_file() {
+        let tmp = test_dir("cache-single");
+        let store = ModelStore::resolve(Some(tmp.clone())).unwrap();
+        let mut manifest = manifest_with_model_path("test", Some("files/model.onnx"));
+        let selected = store.absolute_model_file(&manifest, "files/model.onnx");
+        fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        fs::write(&selected, b"model").unwrap();
+        let data = selected.with_file_name("model.onnx.data");
+        fs::write(&data, b"weights").unwrap();
+        fs::write(
+            selected.with_file_name("unregistered-model.onnx"),
+            b"unrelated",
+        )
+        .unwrap();
+        manifest.files.push(ModelFile {
+            path: "files/model.onnx.data".to_string(),
+            size: 7,
+            checksum: String::new(),
+        });
+        assert_eq!(
+            onnx_cache_paths(&store, &manifest, &selected).unwrap(),
+            vec![selected, data]
+        );
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn cache_inventory_bounds_selected_directory_depth() {
+        let tmp = test_dir("cache-depth");
+        let mut deepest = tmp.join("selected");
+        for _ in 0..17 {
+            deepest.push("nested");
+        }
+        fs::create_dir_all(&deepest).unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = manifest_with_model_path("test", None);
+        assert!(onnx_cache_paths(&store, &manifest, &tmp.join("selected")).is_err());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_inventory_rejects_directory_symlinks() {
+        let tmp = test_dir("cache-symlink");
+        fs::create_dir_all(tmp.join("selected")).unwrap();
+        fs::create_dir_all(tmp.join("unrelated")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("unrelated"), tmp.join("selected/link")).unwrap();
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = manifest_with_model_path("test", None);
+        assert!(onnx_cache_paths(&store, &manifest, &tmp.join("selected")).is_err());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn owned_runner_captures_both_large_pipes_and_reaps_failed_worker() {
+        let Some(python) = python_for_test() else {
+            return;
+        };
+        let mut command = Command::new(python);
+        command.args(["-c", "import os,sys; print(os.getpid()); sys.stdout.write('x'*131072); sys.stderr.write('e'*131072); sys.exit(7)"]);
+        let output = owned_runner_output(&mut command).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stderr, vec![b'e'; 131072]);
+        let newline = output
+            .stdout
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap();
+        assert_eq!(&output.stdout[newline + 1..], vec![b'x'; 131072]);
+        #[cfg(unix)]
+        {
+            let pid: i32 = std::str::from_utf8(&output.stdout[..newline])
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
     }
 
     #[test]

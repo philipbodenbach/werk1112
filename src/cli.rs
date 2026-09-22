@@ -337,7 +337,7 @@ pub struct LlamaRuntimeArgs {
         long,
         global = true,
         env = "WERK_LLAMA_WARMUP_TOKENS",
-        help = "Synthetic tokens decoded when creating a llama.cpp context; 0 disables prewarm"
+        help = "Synthetic warmup tokens; 0 disables prewarm. llama-server defaults to off and treats positive values as enabling native warmup"
     )]
     pub warmup_tokens: Option<usize>,
 
@@ -1474,7 +1474,11 @@ pub enum HuggingFaceAuthCommands {
 }
 
 pub async fn run_from_env() -> Result<()> {
-    run(Cli::parse()).await
+    let cli = Cli::parse();
+    let shutdown = crate::backend::llama_process_lifecycle::install_shutdown_handler()?;
+    let result = run(cli).await;
+    shutdown.abort();
+    result
 }
 
 pub async fn run(cli: Cli) -> Result<()> {

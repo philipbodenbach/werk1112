@@ -2151,37 +2151,104 @@ fn random_private_id(prefix: &str, random_bytes: usize) -> Result<String> {
     Ok(value)
 }
 
-pub(super) fn probe_llama_process_identity(
-    executable: &Path,
-    args: &[String],
-) -> Result<LlamaProcessIdentity> {
-    Ok(LlamaProcessIdentity {
-        executable: probe_llama_executable_identity(executable)?,
-        args_sha256: sha256_json_value(args)?,
-    })
+// Per-start inspection only: never reuse identities across executable changes.
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    unix_identity: (u64, u64, i64, i64),
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(path)?;
+        anyhow::ensure!(metadata.is_file(), "runtime file is not regular");
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            unix_identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ),
+        })
+    }
+}
+
+pub(super) struct LlamaExecutableInspection {
+    pub(super) help: String,
+    identity: LlamaExecutableIdentity,
+    stamp: FileStamp,
+}
+
+impl LlamaExecutableInspection {
+    pub(super) fn process_identity(&self, args: &[String]) -> Result<LlamaProcessIdentity> {
+        Ok(LlamaProcessIdentity {
+            executable: self.identity.clone(),
+            args_sha256: sha256_json_value(args)?,
+        })
+    }
+
+    pub(super) fn verify_unchanged(&self, executable: &Path) -> Result<()> {
+        anyhow::ensure!(
+            FileStamp::read(executable)? == self.stamp,
+            "llama-server changed during startup"
+        );
+        let hash = sha256_regular_file(executable, 4 * 1024 * 1024 * 1024)?;
+        anyhow::ensure!(
+            hash == self.identity.binary_sha256 && FileStamp::read(executable)? == self.stamp,
+            "llama-server changed during startup"
+        );
+        Ok(())
+    }
 }
 
 fn probe_llama_executable_identity(executable: &Path) -> Result<LlamaExecutableIdentity> {
-    let metadata = fs::metadata(executable)
-        .with_context(|| "failed to inspect the llama-server executable".to_string())?;
-    if !metadata.is_file() {
-        bail!("llama-server executable is not a regular file");
-    }
-    let binary_sha256 = sha256_regular_file(executable, 4 * 1024 * 1024 * 1024)?;
-    let help = bounded_command_output(executable, "--help", 2 * 1024 * 1024)?;
-    let version = bounded_command_output(executable, "--version", 64 * 1024)?;
+    Ok(inspect_llama_executable(executable)?.identity)
+}
+
+pub(super) fn inspect_llama_executable(executable: &Path) -> Result<LlamaExecutableInspection> {
+    let stamp = FileStamp::read(executable)?;
+    // Three bounded independent jobs; the hash runs on this thread. Join all
+    // children before returning even when an individual inspection fails.
+    let (binary_sha256, help, version) = std::thread::scope(|scope| {
+        let help = scope.spawn(|| bounded_command_output(executable, "--help", 2 * 1024 * 1024));
+        let version = scope.spawn(|| bounded_command_output(executable, "--version", 64 * 1024));
+        let hash = sha256_regular_file(executable, 4 * 1024 * 1024 * 1024);
+        let help = help
+            .join()
+            .map_err(|_| anyhow!("llama-server help inspection panicked"));
+        let version = version
+            .join()
+            .map_err(|_| anyhow!("llama-server version inspection panicked"));
+        Ok::<_, anyhow::Error>((hash?, help??, version??))
+    })?;
+    anyhow::ensure!(
+        FileStamp::read(executable)? == stamp,
+        "llama-server changed during inspection"
+    );
     let version = version
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .ok_or_else(|| anyhow!("llama-server --version returned no version"))?;
-    if version.len() > 512 || version.chars().any(char::is_control) {
-        bail!("llama-server returned an invalid version string");
-    }
-    Ok(LlamaExecutableIdentity {
-        version: version.to_string(),
-        binary_sha256,
-        help_sha256: sha256_bytes(help.as_bytes()),
+    anyhow::ensure!(
+        version.len() <= 512 && !version.chars().any(char::is_control),
+        "llama-server returned an invalid version string"
+    );
+    Ok(LlamaExecutableInspection {
+        identity: LlamaExecutableIdentity {
+            version: version.to_string(),
+            binary_sha256,
+            help_sha256: sha256_bytes(help.as_bytes()),
+        },
+        help,
+        stamp,
     })
 }
 
@@ -2651,6 +2718,28 @@ mod tests {
                 fs::remove_dir_all(root).unwrap();
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_inspection_queries_once_and_rejects_executable_changes() {
+        let root = test_root("executable-inspection");
+        let executable = root.join("llama-server");
+        let calls = root.join("calls");
+        fs::write(&executable, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n--help) echo '--slots --slot-save-path --parallel' ;;\n--version) echo 'test-version' ;;\nesac\n",
+            calls.display()
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let inspection = inspect_llama_executable(&executable).unwrap();
+        assert!(super::super::supported_args_from_help(&inspection.help).slots);
+        inspection.verify_unchanged(&executable).unwrap();
+        let calls = fs::read_to_string(&calls).unwrap();
+        assert_eq!(calls.lines().filter(|line| *line == "--help").count(), 1);
+        assert_eq!(calls.lines().filter(|line| *line == "--version").count(), 1);
+        fs::write(&executable, "#!/bin/sh\necho replacement\n").unwrap();
+        assert!(inspection.verify_unchanged(&executable).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3458,17 +3547,20 @@ mod tests {
 
     fn test_process(url: String, snapshot_dir: PathBuf) -> LlamaServerProcess {
         let executable = std::env::current_exe().unwrap();
-        let child = Command::new(&executable)
-            .arg(TEST_PROCESS_CHILD_NAME)
-            .arg("--exact")
-            .env(TEST_PROCESS_CHILD_ENV, "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = crate::backend::llama_process_lifecycle::ManagedChild::spawn(
+            Command::new(&executable)
+                .arg(TEST_PROCESS_CHILD_NAME)
+                .arg("--exact")
+                .env(TEST_PROCESS_CHILD_ENV, "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
         LlamaServerProcess {
-            child: Mutex::new(child),
+            #[cfg(target_os = "linux")]
+            _model_file_cache: None,
+            child,
             executable,
             discovery_source: "test".to_string(),
             args: Vec::new(),
@@ -3482,6 +3574,8 @@ mod tests {
             log_tail: Arc::new(Mutex::new(VecDeque::new())),
             log_readers: Mutex::new(Vec::new()),
             state_gate: Mutex::new(()),
+            startup_diagnostics: Vec::new(),
+            startup_diagnostics_reported: std::sync::OnceLock::new(),
             state_runtime: LlamaProcessStateRuntime {
                 generation_id: Some("test-process-generation".to_string()),
                 snapshot_dir: Some(snapshot_dir),

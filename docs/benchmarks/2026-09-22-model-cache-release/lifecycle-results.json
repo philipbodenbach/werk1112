@@ -1,0 +1,209 @@
+[
+  {
+    "label": "run-1",
+    "exit": 0,
+    "wall_seconds": 89.9972007329925,
+    "before": {
+      "linux": {
+        "MemFree": 98488549376,
+        "MemAvailable": 100990423040,
+        "Cached": 3173912576,
+        "SwapFree": 24726614016,
+        "AnonPages": 2530709504,
+        "SReclaimable": 176844800
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "after": {
+      "linux": {
+        "MemFree": 97972199424,
+        "MemAvailable": 100991385600,
+        "Cached": 3688611840,
+        "SwapFree": 24726630400,
+        "AnonPages": 2532843520,
+        "SReclaimable": 181686272
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "children_seen": [
+      610688,
+      610587,
+      610589
+    ],
+    "children_after_exit": [],
+    "weights_unchanged": true,
+    "release": [
+      "[werk] model file cache release requested: 110.97 GiB across 1 file(s); 0 shared, 0 changed, 0 failed (advisory)"
+    ]
+  },
+  {
+    "label": "run-2",
+    "exit": 0,
+    "wall_seconds": 85.9232621989795,
+    "before": {
+      "linux": {
+        "MemFree": 97942687744,
+        "MemAvailable": 100961869824,
+        "Cached": 3688620032,
+        "SwapFree": 24726630400,
+        "AnonPages": 2537639936,
+        "SReclaimable": 181661696
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "after": {
+      "linux": {
+        "MemFree": 97825677312,
+        "MemAvailable": 100846362624,
+        "Cached": 3689586688,
+        "SwapFree": 24726642688,
+        "AnonPages": 2533326848,
+        "SReclaimable": 181977088
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "children_seen": [
+      610988
+    ],
+    "children_after_exit": [],
+    "weights_unchanged": true,
+    "release": [
+      "[werk] model file cache release requested: 110.97 GiB across 1 file(s); 0 shared, 0 changed, 0 failed (advisory)"
+    ]
+  },
+  {
+    "label": "run-3",
+    "exit": 0,
+    "wall_seconds": 87.81375942600425,
+    "before": {
+      "linux": {
+        "MemFree": 97825005568,
+        "MemAvailable": 100845686784,
+        "Cached": 3689586688,
+        "SwapFree": 24726642688,
+        "AnonPages": 2536706048,
+        "SReclaimable": 181968896
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "after": {
+      "linux": {
+        "MemFree": 97833947136,
+        "MemAvailable": 100855926784,
+        "Cached": 3690422272,
+        "SwapFree": 24726646784,
+        "AnonPages": 2532462592,
+        "SReclaimable": 182247424
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "children_seen": [
+      611286
+    ],
+    "children_after_exit": [],
+    "weights_unchanged": true,
+    "release": [
+      "[werk] model file cache release requested: 110.97 GiB across 1 file(s); 0 shared, 0 changed, 0 failed (advisory)"
+    ]
+  },
+  {
+    "label": "chat-exit",
+    "exit": 0,
+    "wall_seconds": 83.73285904503427,
+    "before": {
+      "linux": {
+        "MemFree": 97805254656,
+        "MemAvailable": 100827226112,
+        "Cached": 3690422272,
+        "SwapFree": 24726646784,
+        "AnonPages": 2537127936,
+        "SReclaimable": 182226944
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "after": {
+      "linux": {
+        "MemFree": 97624068096,
+        "MemAvailable": 100766449664,
+        "Cached": 3809345536,
+        "SwapFree": 24726646784,
+        "AnonPages": 2544300032,
+        "SReclaimable": 184979456
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "children_seen": [
+      611576
+    ],
+    "children_after_exit": [],
+    "weights_unchanged": true,
+    "release": [
+      "[werk] model file cache release requested: 110.97 GiB across 1 file(s); 0 shared, 0 changed, 0 failed (advisory)"
+    ]
+  },
+  {
+    "label": "serve-stop",
+    "exit": 130,
+    "wall_seconds": 85.37467321497388,
+    "before": {
+      "linux": {
+        "MemFree": 97640706048,
+        "MemAvailable": 100783194112,
+        "Cached": 3809411072,
+        "SwapFree": 24726650880,
+        "AnonPages": 2537295872,
+        "SReclaimable": 185004032
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "after": {
+      "linux": {
+        "MemFree": 97698201600,
+        "MemAvailable": 100844732416,
+        "Cached": 3812446208,
+        "SwapFree": 24726654976,
+        "AnonPages": 2529665024,
+        "SReclaimable": 185810944
+      },
+      "windows": {
+        "error": ""
+      },
+      "weight_resident_bytes": 0
+    },
+    "children_seen": [
+      611918
+    ],
+    "children_after_exit": [],
+    "weights_unchanged": true,
+    "release": [
+      "[werk] model file cache release requested: 110.97 GiB across 1 file(s); 0 shared, 0 changed, 0 failed (advisory)"
+    ]
+  }
+]

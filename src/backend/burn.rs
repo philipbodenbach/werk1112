@@ -85,6 +85,8 @@ struct BurnPreparedModel {
     prompt_smoke: String,
     #[cfg(feature = "burn-runtime")]
     runtime: burn_phi3::BurnPhi3Runtime,
+    // Keep this after runtime so weight resources are released before advice.
+    _cache_release: Option<super::model_file_cache::CacheReleaseGuard>,
 }
 
 impl BurnBackend {
@@ -317,6 +319,9 @@ impl BurnBackend {
     fn prepare_model(&self, manifest: &ModelManifest) -> Result<BurnPreparedModel> {
         Self::probe(&self.store, manifest, self.mode).map_err(|err| anyhow!("{err}"))?;
 
+        let cache_release =
+            super::model_file_cache::CacheReleaseGuard::prepare_manifest(&self.store, manifest);
+        // Native loading is not cancellable; do not block signal cleanup on it.
         let tokenizer = load_tokenizer(&self.store, manifest)?;
         let prompt_smoke = prompt_smoke(manifest, &tokenizer)?;
         #[cfg(feature = "burn-runtime")]
@@ -331,6 +336,7 @@ impl BurnBackend {
             prompt_smoke,
             #[cfg(feature = "burn-runtime")]
             runtime,
+            _cache_release: cache_release,
         })
     }
 

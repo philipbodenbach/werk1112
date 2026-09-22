@@ -558,7 +558,23 @@ pub enum LlamaCppMode {
 pub struct LlamaCppBackend {
     store: ModelStore,
     mode: LlamaCppMode,
-    models: Arc<Mutex<HashMap<String, Arc<LlamaModel>>>>,
+    models: Arc<Mutex<HashMap<String, Arc<CachedLlamaCppModel>>>>,
+}
+
+#[cfg(feature = "llama-cpp")]
+struct CachedLlamaCppModel {
+    model: LlamaModel,
+    // Sessions retain this owner; native weights must drop before file advice.
+    _cache_release: Option<super::model_file_cache::CacheReleaseGuard>,
+}
+
+#[cfg(feature = "llama-cpp")]
+impl std::ops::Deref for CachedLlamaCppModel {
+    type Target = LlamaModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.model
+    }
 }
 
 #[cfg(feature = "llama-cpp")]
@@ -568,8 +584,10 @@ struct LlamaCppChatSession {
 
 #[cfg(feature = "llama-cpp")]
 struct LlamaCppChatState {
-    model: Arc<LlamaModel>,
+    // A session retains its own native model reference, so it must drop before
+    // the final lease-bearing model owner.
     session: LlamaSession,
+    model: Arc<CachedLlamaCppModel>,
     params: SessionParams,
 }
 
@@ -1058,7 +1076,7 @@ impl LlamaCppBackend {
         Ok(format!("in-process llama.cpp {}", mode.display_name()))
     }
 
-    fn cached_model(&self, manifest: &ModelManifest) -> Result<(Arc<LlamaModel>, f64)> {
+    fn cached_model(&self, manifest: &ModelManifest) -> Result<(Arc<CachedLlamaCppModel>, f64)> {
         if manifest.format != ModelFormat::Gguf {
             bail!(
                 "llama.cpp {} backend supports GGUF models only",
@@ -1093,6 +1111,9 @@ impl LlamaCppBackend {
             self.mode.display_name()
         );
         let started = Instant::now();
+        let cache_release =
+            super::model_file_cache::CacheReleaseGuard::prepare_manifest(&self.store, manifest);
+        // Native loading is not cancellable; do not block signal cleanup on it.
         let model = LlamaModel::load_from_file(&absolute_model_path, self.model_params())
             .map_err(|err| anyhow!("failed to load GGUF with llama.cpp: {err}"))?;
         let load_seconds = started.elapsed().as_secs_f64();
@@ -1103,7 +1124,10 @@ impl LlamaCppBackend {
             load_seconds
         );
 
-        let model = Arc::new(model);
+        let model = Arc::new(CachedLlamaCppModel {
+            model,
+            _cache_release: cache_release,
+        });
         self.models
             .lock()
             .map_err(|_| anyhow!("llama.cpp model cache mutex poisoned"))?
@@ -1757,6 +1781,8 @@ impl TransformersCompatBackend {
         let started = Instant::now();
         let response = self
             .client
+            .clone()
+            .with_model_cache(&self.store, manifest)
             .request("execute", &worker_request)
             .context("Transformers compatibility resident worker failed")?;
         let mut text = response

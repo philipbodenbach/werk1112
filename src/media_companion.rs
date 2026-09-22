@@ -1,3 +1,9 @@
+#[cfg(target_os = "linux")]
+use crate::backend::model_file_cache::CacheReleaseGuard;
+use crate::{
+    backend::llama_process_lifecycle::ManagedChild,
+    model_store::{ModelManifest, ModelStore},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -8,7 +14,7 @@ use std::{
     fmt,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
+    process::{ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex, TryLockError,
         atomic::{AtomicU64, Ordering},
@@ -212,12 +218,15 @@ enum ResidentNegotiation {
 }
 
 struct ResidentProcess {
-    child: Child,
+    child: ManagedChild,
     stdin: Option<ChildStdin>,
     responses: Receiver<ResidentReaderEvent>,
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
+    // Declared after the child so even error/unwind destruction reaps first.
+    #[cfg(target_os = "linux")]
+    model_caches: BTreeMap<Vec<PathBuf>, CacheReleaseGuard>,
 }
 
 impl ResidentProcess {
@@ -230,17 +239,22 @@ impl ResidentProcess {
 
     fn terminate(&mut self) -> Option<ExitStatus> {
         self.stdin.take();
-        let status = match self.child.try_wait() {
-            Ok(Some(status)) => Some(status),
-            Ok(None) => {
-                let _ = self.child.kill();
-                self.child.wait().ok()
-            }
-            Err(_) => {
-                let _ = self.child.kill();
-                self.child.wait().ok()
+        let status = {
+            let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
+            match child.try_wait() {
+                Ok(Some(status)) => Some(status),
+                Ok(None) => {
+                    let _ = child.kill();
+                    child.wait().ok()
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    child.wait().ok()
+                }
             }
         };
+        #[cfg(target_os = "linux")]
+        self.model_caches.clear();
         // Do not join pipe readers here: a grandchild spawned by a media
         // encoder may still own an inherited pipe after Python was killed.
         // Dropping the handles detaches the readers and keeps timeout cleanup
@@ -314,6 +328,7 @@ impl ResidentTransport {
         request: &Value,
         started: Instant,
         timeout: Duration,
+        model_cache_paths: &[PathBuf],
     ) -> Result<ResidentRequestOutcome> {
         let mut state = loop {
             match self.state.try_lock() {
@@ -353,6 +368,8 @@ impl ResidentTransport {
         let process_exited = match state.process.as_mut() {
             Some(process) => process
                 .child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
                 .try_wait()
                 .context("failed to inspect media companion resident worker")?
                 .is_some(),
@@ -364,6 +381,21 @@ impl ResidentTransport {
         if state.process.is_none() {
             state.process = Some(spawn_resident_process(&self.launcher)?);
         }
+        // Paths come only from the caller's manifest/artifact selection, never
+        // from arbitrary request metadata or a recursive directory scan.
+        #[cfg(target_os = "linux")]
+        if operation == "execute" && !model_cache_paths.is_empty() {
+            let process = state.process.as_mut().expect("worker just initialized");
+            if !process.model_caches.contains_key(model_cache_paths)
+                && let Some(guard) = CacheReleaseGuard::prepare_paths(model_cache_paths.to_vec())
+            {
+                process
+                    .model_caches
+                    .insert(model_cache_paths.to_vec(), guard);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = model_cache_paths;
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             bail!(
@@ -417,24 +449,28 @@ fn spawn_resident_process(launcher: &CompanionLauncher) -> Result<ResidentProces
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().with_context(|| {
+    let child = ManagedChild::spawn(&mut command).with_context(|| {
         format!(
             "failed to start media companion resident worker using {}",
             launcher.display()
         )
     })?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("failed to capture media companion resident stdout")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("failed to capture media companion resident stderr")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("failed to open media companion resident stdin")?;
+    let (stdout, stderr, mut stdin) = {
+        let mut process = child.lock().unwrap_or_else(|error| error.into_inner());
+        let stdout = process
+            .stdout
+            .take()
+            .context("failed to capture media companion resident stdout")?;
+        let stderr = process
+            .stderr
+            .take()
+            .context("failed to capture media companion resident stderr")?;
+        let stdin = process
+            .stdin
+            .take()
+            .context("failed to open media companion resident stdin")?;
+        (stdout, stderr, stdin)
+    };
 
     let (response_sender, responses) = mpsc::channel();
     let stdout_reader = thread::spawn(move || {
@@ -500,6 +536,8 @@ fn spawn_resident_process(launcher: &CompanionLauncher) -> Result<ResidentProces
                 stdout_reader: Some(stdout_reader),
                 stderr_reader: Some(stderr_reader),
                 stderr_tail,
+                #[cfg(target_os = "linux")]
+                model_caches: BTreeMap::new(),
             };
             let _ = process.terminate();
             return Err(error).context("failed to send embedded Python worker to resident process");
@@ -513,6 +551,8 @@ fn spawn_resident_process(launcher: &CompanionLauncher) -> Result<ResidentProces
         stdout_reader: Some(stdout_reader),
         stderr_reader: Some(stderr_reader),
         stderr_tail,
+        #[cfg(target_os = "linux")]
+        model_caches: BTreeMap::new(),
     })
 }
 
@@ -707,6 +747,7 @@ pub struct CompanionClient {
     request_timeout: Duration,
     execute_timeout: Duration,
     resident: Option<Arc<ResidentTransport>>,
+    model_cache_paths: Vec<PathBuf>,
 }
 
 impl CompanionClient {
@@ -721,6 +762,7 @@ impl CompanionClient {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             execute_timeout: DEFAULT_EXECUTE_TIMEOUT,
             resident: None,
+            model_cache_paths: Vec::new(),
         })
     }
 
@@ -758,6 +800,7 @@ impl CompanionClient {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             execute_timeout: DEFAULT_EXECUTE_TIMEOUT,
             resident: None,
+            model_cache_paths: Vec::new(),
         })
     }
 
@@ -780,6 +823,7 @@ impl CompanionClient {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             execute_timeout: DEFAULT_EXECUTE_TIMEOUT,
             resident: None,
+            model_cache_paths: Vec::new(),
         }
     }
 
@@ -801,6 +845,7 @@ impl CompanionClient {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             execute_timeout: DEFAULT_EXECUTE_TIMEOUT,
             resident: None,
+            model_cache_paths: Vec::new(),
         }
     }
 
@@ -822,6 +867,27 @@ impl CompanionClient {
     /// serialized execute call.
     pub fn without_resident_worker(mut self) -> Self {
         self.resident = None;
+        self
+    }
+
+    /// Scope cache ownership to files selected by an installed model manifest.
+    /// Clones can select different models while sharing a resident transport;
+    /// that transport retains each guard until its actual worker terminates.
+    pub(crate) fn with_model_cache(self, store: &ModelStore, manifest: &ModelManifest) -> Self {
+        self.with_model_cache_paths(
+            manifest
+                .files
+                .iter()
+                .map(|entry| store.absolute_model_file(manifest, &entry.path))
+                .collect(),
+        )
+    }
+
+    /// Use exact caller-selected artifact files; directories are not scanned.
+    pub(crate) fn with_model_cache_paths(mut self, mut paths: Vec<PathBuf>) -> Self {
+        paths.sort();
+        paths.dedup();
+        self.model_cache_paths = paths;
         self
     }
 
@@ -1019,7 +1085,13 @@ impl CompanionClient {
         let started = Instant::now();
 
         if let Some(resident) = &self.resident {
-            match resident.request(operation, request, started, timeout)? {
+            match resident.request(
+                operation,
+                request,
+                started,
+                timeout,
+                &self.model_cache_paths,
+            )? {
                 ResidentRequestOutcome::Response(value) => {
                     return parse_companion_response(operation, value);
                 }
@@ -1060,27 +1132,35 @@ impl CompanionClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().with_context(|| {
+        // Declared before the child: every return path reaps the worker before
+        // releasing file-cache leases, including legacy one-shot fallback.
+        #[cfg(target_os = "linux")]
+        let _model_cache = (operation == "execute")
+            .then(|| CacheReleaseGuard::prepare_paths(self.model_cache_paths.clone()))
+            .flatten();
+        let child = ManagedChild::spawn(&mut command).with_context(|| {
             format!(
                 "failed to start media companion for '{operation}' using {}",
                 self.launcher.display()
             )
         })?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .context("failed to capture media companion stdout")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("failed to capture media companion stderr")?;
+        let (stdout, stderr, stdin) = {
+            let mut process = child.lock().unwrap_or_else(|error| error.into_inner());
+            let stdout = process
+                .stdout
+                .take()
+                .context("failed to capture media companion stdout")?;
+            let stderr = process
+                .stderr
+                .take()
+                .context("failed to capture media companion stderr")?;
+            (stdout, stderr, process.stdin.take())
+        };
         let stdout_reader = read_pipe(stdout);
         let stderr_reader = read_pipe(stderr);
 
-        let write_result = child
-            .stdin
-            .take()
+        let write_result = stdin
             .context("failed to open media companion stdin")
             .and_then(|mut stdin| {
                 stdin
@@ -1091,8 +1171,11 @@ impl CompanionClient {
                     .context("failed to flush media companion request")
             });
         if let Err(err) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
+            {
+                let mut process = child.lock().unwrap_or_else(|error| error.into_inner());
+                let _ = process.kill();
+                let _ = process.wait();
+            }
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(err);
@@ -1100,8 +1183,11 @@ impl CompanionClient {
 
         let status = loop {
             if started.elapsed() >= timeout {
-                let _ = child.kill();
-                let status = child.wait().ok();
+                let status = {
+                    let mut process = child.lock().unwrap_or_else(|error| error.into_inner());
+                    let _ = process.kill();
+                    process.wait().ok()
+                };
                 let stdout = join_pipe(stdout_reader);
                 let stderr = join_pipe(stderr_reader);
                 bail!(
@@ -1115,6 +1201,8 @@ impl CompanionClient {
                 );
             }
             if let Some(status) = child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
                 .try_wait()
                 .context("failed while waiting for media companion")?
             {
@@ -1755,7 +1843,13 @@ else:
     fn resident_process_id(client: &CompanionClient) -> Option<u32> {
         let resident = client.resident.as_ref()?;
         let mut state = resident.state.lock().ok()?;
-        state.process.as_mut().map(|process| process.child.id())
+        state.process.as_mut().map(|process| {
+            process
+                .child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .id()
+        })
     }
 
     #[test]
@@ -1866,6 +1960,245 @@ else:
         assert_eq!(first_process, second_process);
         assert_eq!(first["sequence"], 1);
         assert_eq!(second["sequence"], 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resident_model_leases_follow_worker_clones_timeouts_and_restarts() {
+        fn exclusively_available(path: &Path) -> bool {
+            let file = fs::File::open(path).unwrap();
+            fs2::FileExt::try_lock_exclusive(&file).is_ok()
+        }
+        fn guards(client: &CompanionClient) -> usize {
+            client
+                .resident
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .process
+                .as_ref()
+                .unwrap()
+                .model_caches
+                .len()
+        }
+        let Some((directory, client)) = resident_mock_client(Duration::from_secs(3)) else {
+            return;
+        };
+        let first = directory.0.join("first.safetensors");
+        let second = directory.0.join("second.onnx");
+        fs::write(&first, b"first model fixture").unwrap();
+        fs::write(&second, b"second model fixture").unwrap();
+        let first_client = client
+            .clone()
+            .with_model_cache_paths(vec![first.clone(), first.clone()]);
+        let second_client = client.clone().with_model_cache_paths(vec![second.clone()]);
+        first_client.execute(&json!({})).unwrap();
+        first_client.execute(&json!({})).unwrap();
+        assert_eq!(
+            guards(&client),
+            1,
+            "repeated requests must not accumulate guards"
+        );
+        second_client.execute(&json!({})).unwrap();
+        assert_eq!(guards(&client), 2);
+        assert!(!exclusively_available(&first));
+        assert!(!exclusively_available(&second));
+        drop(second_client);
+        assert!(
+            !exclusively_available(&second),
+            "another clone still owns the worker"
+        );
+
+        let error = first_client
+            .clone()
+            .with_timeout(Duration::from_millis(100))
+            .execute(&json!({"sleep": 2}))
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(resident_process_id(&client).is_none());
+        assert!(exclusively_available(&first));
+        assert!(exclusively_available(&second));
+
+        first_client.execute(&json!({})).unwrap();
+        assert_eq!(
+            guards(&client),
+            1,
+            "restart must acquire a new lifetime lease"
+        );
+        let pid = resident_process_id(&client).unwrap();
+        drop(client);
+        drop(first_client);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(exclusively_available(&first));
+        assert_eq!(fs::read(first).unwrap(), b"first model fixture");
+        assert_eq!(fs::read(second).unwrap(), b"second model fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_shot_model_lease_is_released_before_request_returns() {
+        let Some((directory, client)) = mock_client(Duration::from_secs(3)) else {
+            return;
+        };
+        let path = directory.0.join("one-shot.safetensors");
+        fs::write(&path, b"one-shot fixture").unwrap();
+        let client = client.with_model_cache_paths(vec![path.clone()]);
+        for _ in 0..2 {
+            let executing = client.clone();
+            let worker = thread::spawn(move || executing.execute(&json!({"sleep": 0.2})));
+            let started = Instant::now();
+            loop {
+                let file = fs::File::open(&path).unwrap();
+                if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+                    break;
+                }
+                drop(file);
+                assert!(
+                    !worker.is_finished() && started.elapsed() < Duration::from_secs(2),
+                    "one-shot inference must hold a shared model lease"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            worker.join().unwrap().unwrap();
+            let file = fs::File::open(&path).unwrap();
+            fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        }
+        assert_eq!(fs::read(path).unwrap(), b"one-shot fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_interruption_fixture() {
+        let Some(ready) = env::var_os("WERK_TEST_COMPANION_READY") else {
+            return;
+        };
+        let ready = PathBuf::from(ready);
+        let python = python_program_names()
+            .iter()
+            .find_map(|name| find_in_path(name))
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _listener =
+                crate::backend::llama_process_lifecycle::install_shutdown_handler().unwrap();
+            let cleanup_ready = ready.clone();
+            let _cleanup = crate::backend::llama_process_lifecycle::ManagedCleanup::register(
+                Box::new(move || {
+                    let pid = fs::read_to_string(&cleanup_ready)
+                        .unwrap()
+                        .parse::<i32>()
+                        .unwrap();
+                    let gone = unsafe { libc::kill(pid, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                    fs::write(
+                        cleanup_ready.with_extension("cleanup"),
+                        if gone { "reaped" } else { "running" },
+                    )
+                    .unwrap();
+                }),
+            )
+            .unwrap();
+            let client = CompanionClient::from_embedded_python(
+                python,
+                r#"
+import json, os, sys, time
+if sys.argv[-1] == "serve":
+    json.loads(sys.stdin.readline())
+else:
+    json.load(sys.stdin)
+with open(os.environ["WERK_TEST_COMPANION_READY"], "w") as handle:
+    handle.write(str(os.getpid()))
+time.sleep(60)
+"#,
+                "interruption fixture",
+            )
+            .with_timeout(Duration::from_secs(60));
+            let client = if env::var("WERK_TEST_COMPANION_MODE").as_deref() == Ok("resident") {
+                client.with_resident_worker()
+            } else {
+                client
+            };
+            let _ = client.execute(&json!({}));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interruption_reaps_resident_and_one_shot_companions_before_cleanup() {
+        if !python_program_names()
+            .iter()
+            .any(|name| find_in_path(name).is_some())
+        {
+            return;
+        }
+        for mode in ["resident", "one-shot"] {
+            let directory = TestDirectory::new(mode);
+            let ready = directory.0.join("child-ready");
+            let mut parent = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "media_companion::tests::companion_interruption_fixture",
+                ])
+                .env("WERK_TEST_COMPANION_READY", &ready)
+                .env("WERK_TEST_COMPANION_MODE", mode)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let pid = loop {
+                if let Some(pid) = fs::read_to_string(&ready)
+                    .ok()
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
+                    break pid;
+                }
+                if started.elapsed() > Duration::from_secs(10) {
+                    let _ = parent.kill();
+                    let _ = parent.wait();
+                    panic!("{mode} interruption fixture did not start");
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(unsafe { libc::kill(parent.id() as i32, libc::SIGINT) }, 0);
+            let status = loop {
+                if let Some(status) = parent.try_wait().unwrap() {
+                    break status;
+                }
+                if started.elapsed() > Duration::from_secs(15) {
+                    let _ = parent.kill();
+                    let _ = parent.wait();
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    panic!("{mode} interruption fixture did not stop");
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let gone = unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if !gone {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            assert_eq!(status.code(), Some(130));
+            assert!(gone, "{mode} child must be reaped");
+            assert_eq!(
+                fs::read_to_string(ready.with_extension("cleanup")).unwrap(),
+                "reaped"
+            );
+        }
     }
 
     #[test]
@@ -2168,6 +2501,7 @@ else:
             request_timeout: Duration::from_secs(15),
             execute_timeout: Duration::from_secs(5),
             resident: None,
+            model_cache_paths: Vec::new(),
         };
         let health = client.health().unwrap();
         assert_eq!(health.protocol_version, PROTOCOL_VERSION);
@@ -2193,6 +2527,7 @@ else:
             request_timeout: Duration::from_secs(15),
             execute_timeout: Duration::from_secs(5),
             resident: None,
+            model_cache_paths: Vec::new(),
         }
         .with_resident_worker();
 

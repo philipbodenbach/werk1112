@@ -1,0 +1,18 @@
+{
+  "head": "fbce8768b22bdb1067603e31947fd402d20336dd",
+  "candidate_sha256": "c63f43230e26264dee44e9514be15e9a9acad8af4ecc9ab81943c1048da7dc14",
+  "native_revision": "ec928150501c2572fec05cb949061672bb424914",
+  "raw_directory": "/tmp/werk-prefetch-validation",
+  "native_args_match": true,
+  "build": "cargo build --locked --offline --release --no-default-features --features release-linux",
+  "initial_candidate_note": "Before final live-budget/file-identity/NUMA hardening and scalar-I32 metadata inventory extension; DeepSeek prefetch unavailable in this initial comparison.",
+  "final_candidate_sha256": "f92d9f1cb35599e436769f4352fd6b3608a47cd0c93fa36e080c97fe9b19ebe0",
+  "final_source_sha256": {
+    "src/backend/llama_server/model_prefetch.rs": "b82b3cad473b0c2c10bd652503209f036206a21d45bc81edb60368f5a7c65a25",
+    "src/backend/llama_server/model_prefetch_policy.rs": "9a1e825cbe67bc41589af9ab5c635e6ee773855d645bfb8b8897e6d92fe920ff",
+    "src/backend/llama_server/model_prefetch_linux.rs": "a0e54570da2d135b370539c0cce1e06e792328fc2bee78c471de8a67e742e8ce"
+  },
+  "final_tests": "80 passed",
+  "final_native_args_match_initial": true,
+  "final_validation_note": "Final DeepSeek resumed the initial auto fixture (76 prompt/65 cached); Qwen restored the same frozen 905/883/77-token fixture. All three prefetch operations and completions succeeded. No owned children survived."
+}

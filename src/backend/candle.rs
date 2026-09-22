@@ -95,12 +95,19 @@ impl CandleBackend {
             manifest.architecture.as_deref().unwrap_or("unknown")
         );
         let started = Instant::now();
+        let cache_release =
+            super::model_file_cache::CacheReleaseGuard::prepare_manifest(&self.store, manifest);
+        // Native loading is not cancellable; do not block signal cleanup on it.
         let tokenizer = load_tokenizer(&self.store, manifest)?;
         let model = load_candle_model(&self.store, manifest, &self.device)?;
         let load_seconds = started.elapsed().as_secs_f64();
         eprintln!("Loaded model '{}' in {:.2}s", manifest.id, load_seconds);
 
-        let cached = Arc::new(Mutex::new(CachedModel { tokenizer, model }));
+        let cached = Arc::new(Mutex::new(CachedModel {
+            tokenizer,
+            model,
+            _cache_release: cache_release,
+        }));
         self.cache
             .lock()
             .map_err(|_| anyhow!("model cache mutex poisoned"))?
@@ -463,6 +470,9 @@ fn generate_with_loaded_model(
 struct CachedModel {
     tokenizer: Tokenizer,
     model: CandleModel,
+    // Rust drops fields in declaration order: release weights before advising
+    // their file pages, and keep the lease while any model user retains its Arc.
+    _cache_release: Option<super::model_file_cache::CacheReleaseGuard>,
 }
 
 #[derive(Default)]

@@ -5,6 +5,44 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Retain the existing Linux CUDA CPU-expert prefault mappings for the active
+  worker lifetime, including initially cached pages. This prevents cache-only
+  reclamation from undoing preparation before the first serve request. Pages
+  remain reclaimable under memory pressure; no locking or weight copy is added.
+  Normal and interrupted cleanup unmap them before the existing file-cache
+  release. Verbose first requests now report the prepared worker's diagnostics.
+
+- Release file-backed model cache after local model/worker teardown on WSL,
+  shared by `run`, `chat` and `serve` across model families. Retain per-file
+  leases while a model is active; reap owned workers before issuing scoped
+  Linux file advice. Keep weights, histories and persisted KV files intact;
+  `WERK_MODEL_CACHE_RELEASE=off` opts into retaining the OS cache, and `on`
+  enables advisory release on other Linux hosts.
+
+- Prepare missing CPU MoE expert pages before Linux CUDA llama-server startup
+  through the existing backend. Reuse GGUF shard metadata, preserve native
+  arguments/KV identity, avoid rereading resident pages and skip nonexpert pages,
+  and bound preparation
+  by host/container memory, file identity, two readers and a work deadline.
+  Unsupported or overridden configurations retain native loading;
+  `WERK_LLAMA_PREFETCH=off` disables the optional step for comparison.
+
+- Stop and reap owned llama-server workers before the CLI exits on Ctrl+C,
+  SIGTERM or SIGHUP (Ctrl+C/Ctrl+Break on Windows), including interruption during
+  synchronous model loading. Register children atomically with shutdown and
+  retain normal drop cleanup; unrelated servers are never targeted.
+
+- Default native warmup off in the shared llama-server argument builder for all
+  models and CPU/GPU modes. Preserve explicit warmup opt-in and native argument
+  overrides; report the effective setting in local session diagnostics. This
+  removes the need for model-specific `--warmup-tokens 0` test commands.
+
+- Reuse a single help/version inspection per llama.cpp start and run independent
+  inspection jobs before spawning the model worker. Keep post-start binary
+  validation and phase timings. Following a reported first-call regression,
+  remove speculative library/snapshot I/O during native model loading; perform
+  that work after readiness and on the actual restore path.
+
 - Remove synthetic cache-probe inference from local llama.cpp `run`/`chat` startup.
   New sessions execute the user request directly; existing snapshots keep full
   integrity/restore checks. Record observed restored reuse only from a completed

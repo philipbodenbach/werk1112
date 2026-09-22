@@ -2,6 +2,9 @@ mod burn;
 mod candle;
 mod external;
 mod llama_fast;
+pub(crate) mod llama_process_lifecycle;
+#[cfg_attr(not(target_os = "linux"), path = "model_file_cache_stub.rs")]
+pub(crate) mod model_file_cache;
 mod llama_server;
 mod omlx;
 mod onnxruntime;
