@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "status": "completed_comparison",
+  "comparison_checks": {
+    "werk_arguments_match_except_binary_store_port": true,
+    "native_arguments_match_except_model_state_paths_and_port": true,
+    "inference_environment_matches": true,
+    "request_json_matches": true,
+    "both_begin_with_zero_resident_model_bytes": true,
+    "both_wait_at_least_330_seconds_before_first_request": true,
+    "linux_memory_total_matches": true,
+    "native_runtime_path_matches": true,
+    "both_first_requests_have_zero_cached_prompt_tokens": true,
+    "first_request_usage_matches": true,
+    "all_four_answers_match": true
+  },
+  "all_comparison_checks_pass": true,
+  "normalization_note": "The deliberate executable change is identified by binary hash. Ports, isolated store/state paths and absolute weight paths are normalized; all argument values and order otherwise must match.",
+  "runs": {
+    "baseline": {
+      "werk_binary_sha256": "b80605866f0aadedb6481dc8732f2bf97d5401aab8bc7b4f1101e40b2faebd35",
+      "initial_model_file_resident_bytes": 0,
+      "startup_to_api_ready_seconds": 78.66581436799606,
+      "idle_before_first_request_seconds": 330.00340508599766,
+      "ready_model_file_resident_bytes": 83635294208,
+      "ready_native_model_rss_bytes": 4642304000,
+      "ready_werk_model_rss_bytes": 0,
+      "before_first_model_file_resident_bytes": 3677270016,
+      "before_first_native_model_rss_bytes": 3677270016,
+      "before_first_werk_model_rss_bytes": 0,
+      "startup_plus_first_request_reported_total_seconds_excluding_idle": 185.97379286699606,
+      "first_request": {
+        "http_wall_seconds": 108.66992023104103,
+        "timings": {
+          "cached_prompt_tokens": 0,
+          "decode_seconds": 23.260704,
+          "first_token_seconds": 84.046882318,
+          "load_seconds": 0.0,
+          "prompt_seconds": 84.039239,
+          "total_seconds": 107.307978499,
+          "warmup_seconds": 0.0
+        },
+        "usage": {
+          "completion_tokens": 78,
+          "prompt_tokens": 20,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 98
+        },
+        "answer_sha256": "98a4f8c74d8688cd69491f00b7fb619c1c30a4c2814d2947ec27b409b72801dc",
+        "native_deltas": {
+          "read_bytes": 59811942400,
+          "major_faults": 62596,
+          "minor_faults": 795506
+        },
+        "decode_output_tokens_per_second": 3.3532948959756332
+      },
+      "immediate_repeat": {
+        "http_wall_seconds": 6.511754270992242,
+        "timings": {
+          "cached_prompt_tokens": 16,
+          "decode_seconds": 5.869502000000001,
+          "first_token_seconds": 0.63800507,
+          "load_seconds": 0.0,
+          "prompt_seconds": 0.62989,
+          "total_seconds": 6.507653374,
+          "warmup_seconds": 0.0
+        },
+        "usage": {
+          "completion_tokens": 78,
+          "prompt_tokens": 20,
+          "prompt_tokens_details": {
+            "cached_tokens": 16
+          },
+          "total_tokens": 98
+        },
+        "answer_sha256": "98a4f8c74d8688cd69491f00b7fb619c1c30a4c2814d2947ec27b409b72801dc",
+        "native_deltas": {
+          "read_bytes": 0,
+          "major_faults": 0,
+          "minor_faults": 28873
+        },
+        "decode_output_tokens_per_second": 13.28903201668557
+      },
+      "cleanup": {
+        "werk_exit_code": 130,
+        "surviving_owned_process_count": 0,
+        "final_model_file_resident_bytes": 0,
+        "weight_inode_size_mtime_unchanged": true
+      }
+    },
+    "retained": {
+      "werk_binary_sha256": "263e61868a94e5cc07a236abcdbc46e4c8fb225d34329c0c067e3b9f5a627b3f",
+      "initial_model_file_resident_bytes": 0,
+      "startup_to_api_ready_seconds": 76.06571243103826,
+      "idle_before_first_request_seconds": 330.3750769039616,
+      "ready_model_file_resident_bytes": 83635294208,
+      "ready_native_model_rss_bytes": 4580110336,
+      "ready_werk_model_rss_bytes": 62809071616,
+      "before_first_model_file_resident_bytes": 83635294208,
+      "before_first_native_model_rss_bytes": 4580061184,
+      "before_first_werk_model_rss_bytes": 62787608576,
+      "startup_plus_first_request_reported_total_seconds_excluding_idle": 87.09200108003826,
+      "first_request": {
+        "http_wall_seconds": 11.36525402002735,
+        "timings": {
+          "cached_prompt_tokens": 0,
+          "decode_seconds": 8.614467000000001,
+          "first_token_seconds": 2.411680547,
+          "load_seconds": 0.0,
+          "prompt_seconds": 2.404212,
+          "total_seconds": 11.026288649,
+          "warmup_seconds": 0.0
+        },
+        "usage": {
+          "completion_tokens": 78,
+          "prompt_tokens": 20,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 98
+        },
+        "answer_sha256": "98a4f8c74d8688cd69491f00b7fb619c1c30a4c2814d2947ec27b409b72801dc",
+        "native_deltas": {
+          "read_bytes": 112148480,
+          "major_faults": 1614,
+          "minor_faults": 468408
+        },
+        "decode_output_tokens_per_second": 9.054535817480058
+      },
+      "immediate_repeat": {
+        "http_wall_seconds": 6.3587701880023815,
+        "timings": {
+          "cached_prompt_tokens": 16,
+          "decode_seconds": 5.700134,
+          "first_token_seconds": 0.655847815,
+          "load_seconds": 0.0,
+          "prompt_seconds": 0.651971,
+          "total_seconds": 6.355834688,
+          "warmup_seconds": 0.0
+        },
+        "usage": {
+          "completion_tokens": 78,
+          "prompt_tokens": 20,
+          "prompt_tokens_details": {
+            "cached_tokens": 16
+          },
+          "total_tokens": 98
+        },
+        "answer_sha256": "98a4f8c74d8688cd69491f00b7fb619c1c30a4c2814d2947ec27b409b72801dc",
+        "native_deltas": {
+          "read_bytes": 0,
+          "major_faults": 0,
+          "minor_faults": 28872
+        },
+        "decode_output_tokens_per_second": 13.683888834894056
+      },
+      "cleanup": {
+        "werk_exit_code": 130,
+        "surviving_owned_process_count": 0,
+        "final_model_file_resident_bytes": 0,
+        "weight_inode_size_mtime_unchanged": true
+      }
+    }
+  },
+  "first_request_timing_differences": {
+    "first_token_seconds": {
+      "baseline_minus_retained_seconds": 81.635201771,
+      "baseline_divided_by_retained": 34.849923395762254
+    },
+    "total_seconds": {
+      "baseline_minus_retained_seconds": 96.28168985,
+      "baseline_divided_by_retained": 9.73201245812951
+    },
+    "decode_seconds": {
+      "baseline_minus_retained_seconds": 14.646237,
+      "baseline_divided_by_retained": 2.7001907372795086
+    }
+  },
+  "limitations": [
+    "One completed run per binary on one model and machine.",
+    "Non-streaming HTTP wall time is separate from backend-reported first-token time.",
+    "Immediate repeat may reuse KV tokens; first requests are compared using recorded cached-token counts.",
+    "Native read_bytes counts process storage reads; file residency is measured separately.",
+    "All 33 ready/idle retained-run samples contain the same 83,635,294,208 resident model bytes. No comparable idle cache-loss event was observed in this run.",
+    "The initiating host/kernel reclaim mechanism in the baseline was not traced. This pair of runs cannot prove the candidate experienced and resisted the same external reclaim event.",
+    "Small-file kernel regression tests separately exercise populated mapping retention against file-scoped POSIX_FADV_DONTNEED while the mapping lives, followed by release after its owner is dropped. This does not guarantee residency under arbitrary memory pressure."
+  ],
+  "mechanism_regression_tests": {
+    "source": "../../../src/backend/llama_server/model_prefetch_linux.rs",
+    "tests": [
+      "retains_pte_mappings_for_already_resident_pages_without_counting_new_io",
+      "retains_prepared_pages_until_drop_without_mutating_the_file"
+    ],
+    "operation": "File-scoped POSIX_FADV_DONTNEED on small temporary fixtures; no global cache clearing or WSL restart.",
+    "scope": "Validates the mapping-lifetime mechanism separately from the actual-model performance comparison."
+  }
+}

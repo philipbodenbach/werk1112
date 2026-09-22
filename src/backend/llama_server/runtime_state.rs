@@ -1293,6 +1293,7 @@ fn protocol_resource_exhausted(message: impl Into<String>) -> ProtocolError {
 #[derive(Debug, Clone, Copy)]
 struct LlamaSlotStatus {
     prompt_tokens: u64,
+    prompt_tokens_reported: bool,
     prompt_tokens_cache: u64,
     is_processing: bool,
 }
@@ -1309,6 +1310,18 @@ struct LlamaDecoded {
 }
 
 fn functional_probe_llama_state(server: &LlamaServerProcess) -> Result<()> {
+    functional_probe_llama_state_inner(server, false)
+}
+
+#[cfg(test)]
+fn functional_probe_llama_chat_state(server: &LlamaServerProcess) -> Result<()> {
+    functional_probe_llama_state_inner(server, true)
+}
+
+fn functional_probe_llama_state_inner(
+    server: &LlamaServerProcess,
+    allow_continuation: bool,
+) -> Result<()> {
     let probe_input = PrefillInput::Text {
         text: STATE_CAPABILITY_PROBE_PROMPT.to_string(),
     };
@@ -1322,12 +1335,40 @@ fn functional_probe_llama_state(server: &LlamaServerProcess) -> Result<()> {
         let snapshot = save_llama_slot(server, &probe_name, prompt_tokens)?;
         erase_llama_slot(server, Some(prompt_tokens))?;
         restore_llama_slot(server, &probe_name, prompt_tokens, snapshot.bytes)?;
+        // Chat needs continuation, not rewind. Prove it directly before doing
+        // an expensive full replay on hybrid/recurrent models. Older servers
+        // without a usable tokenizer retain the exact-replay path below.
+        if allow_continuation
+            && let Ok(mut tokens) =
+                tokenize_llama_probe(server, STATE_CAPABILITY_PROBE_PROMPT, true)
+            && tokens.len() as u64 == prompt_tokens
+            && let Ok(suffix) = tokenize_llama_probe(
+                server,
+                " Continue this private cache probe with new tokens.",
+                false,
+            )
+        {
+            tokens.extend(suffix);
+            let (path, mut body) = llama_state_request_body(&probe_input, Some(0), None);
+            body["prompt"] = serde_json::to_value(tokens)?;
+            let (total, cached) = run_llama_prefill_body_with_cache(server, path, &body)?;
+            if total <= prompt_tokens || cached < prompt_tokens || cached >= total {
+                bail!(
+                    "llama.cpp capability probe did not prove restored continuation reuse: cached {cached}/{total}"
+                );
+            }
+            erase_llama_slot(server, Some(total))?;
+            return Ok(());
+        }
         let (replay_tokens, cached_tokens) = run_llama_prefill_with_cache(server, &probe_input)?;
         if replay_tokens != prompt_tokens {
             bail!("llama.cpp capability probe replay changed tokenization");
         }
         let status = llama_slot_status(server)?;
-        if status.is_processing || cached_tokens < prompt_tokens.saturating_sub(1) {
+        if status.is_processing {
+            bail!("llama.cpp capability probe left a busy slot");
+        }
+        if cached_tokens < prompt_tokens.saturating_sub(1) {
             bail!("llama.cpp capability probe did not prove restored cache reuse");
         }
         erase_llama_slot(server, Some(prompt_tokens))?;
@@ -1336,6 +1377,30 @@ fn functional_probe_llama_state(server: &LlamaServerProcess) -> Result<()> {
     erase_slot_best_effort(server);
     remove_private_snapshot(server, &probe_name);
     result
+}
+
+fn tokenize_llama_probe(
+    server: &LlamaServerProcess,
+    text: &str,
+    add_special: bool,
+) -> Result<Vec<u32>> {
+    let response = control_json_request(
+        &server.url,
+        "/tokenize",
+        "POST",
+        Some(&json!({"content": text, "add_special": add_special, "parse_special": true})),
+    )?;
+    let tokens: Vec<u32> = serde_json::from_value(
+        response
+            .get("tokens")
+            .cloned()
+            .context("llama.cpp probe tokenizer returned no tokens")?,
+    )
+    .context("llama.cpp probe tokenizer returned invalid token IDs")?;
+    if tokens.is_empty() || tokens.len() > 4096 || tokens.iter().any(|id| *id > i32::MAX as u32) {
+        bail!("llama.cpp probe tokenizer returned invalid tokens");
+    }
+    Ok(tokens)
 }
 
 fn run_llama_prefill(server: &LlamaServerProcess, input: &PrefillInput) -> Result<u64> {
@@ -1347,7 +1412,15 @@ fn run_llama_prefill_with_cache(
     input: &PrefillInput,
 ) -> Result<(u64, u64)> {
     let (path, body) = llama_state_request_body(input, Some(0), None);
-    let response = control_json_request(&server.url, path, "POST", Some(&body))?;
+    run_llama_prefill_body_with_cache(server, path, &body)
+}
+
+fn run_llama_prefill_body_with_cache(
+    server: &LlamaServerProcess,
+    path: &str,
+    body: &Value,
+) -> Result<(u64, u64)> {
+    let response = control_json_request(&server.url, path, "POST", Some(body))?;
     if !response.is_object() {
         bail!("llama.cpp prefill returned an invalid response");
     }
@@ -1496,10 +1569,12 @@ fn llama_slot_status(server: &LlamaServerProcess) -> Result<LlamaSlotStatus> {
         .find(|slot| slot.get("id").and_then(Value::as_u64) == Some(u64::from(STATE_SLOT_ID)))
         .ok_or_else(|| anyhow!("llama.cpp explicit state slot is missing"))?;
     Ok(LlamaSlotStatus {
-        prompt_tokens: slot
-            .get("n_prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        prompt_tokens: if slot.get("n_prompt_tokens").is_some() {
+            required_u64(slot, "n_prompt_tokens")?
+        } else {
+            0
+        },
+        prompt_tokens_reported: slot.get("n_prompt_tokens").is_some(),
         prompt_tokens_cache: slot
             .get("n_prompt_tokens_cache")
             .and_then(Value::as_u64)
@@ -1555,7 +1630,11 @@ fn restore_llama_slot(
         bail!("llama.cpp slot restore response failed validation");
     }
     let slot = llama_slot_status(server)?;
-    if slot.is_processing || slot.prompt_tokens != expected_tokens {
+    // Fresh upstream slots omit n_prompt_tokens until a generation task has
+    // run, even after successful restore. The action's exact n_restored/n_read
+    // above remain mandatory; if /slots reports a count it must also match.
+    if slot.is_processing || (slot.prompt_tokens_reported && slot.prompt_tokens != expected_tokens)
+    {
         bail!("llama.cpp restored slot status failed validation");
     }
     Ok(())
@@ -1925,10 +2004,24 @@ fn copy_bounded_snapshot(source: &Path, target: &Path, expected_bytes: u64) -> R
 }
 
 fn copy_bounded_snapshot_file(
-    mut source_file: fs::File,
+    source_file: fs::File,
     target: &Path,
     expected_bytes: u64,
 ) -> Result<u64> {
+    copy_snapshot_file(source_file, target, expected_bytes, false).map(|v| v.0)
+}
+
+fn copy_snapshot_with_sha256(source: &Path, target: &Path, expected_bytes: u64) -> Result<String> {
+    let (file, _) = open_bounded_regular_file(source, Some(expected_bytes))?;
+    copy_snapshot_file(file, target, expected_bytes, true).map(|v| v.1)
+}
+
+fn copy_snapshot_file(
+    mut source_file: fs::File,
+    target: &Path,
+    expected_bytes: u64,
+    hash: bool,
+) -> Result<(u64, String)> {
     let source_metadata = source_file.metadata()?;
     if !source_metadata.is_file()
         || source_metadata.len() != expected_bytes
@@ -1943,6 +2036,7 @@ fn copy_bounded_snapshot_file(
     options.mode(0o600).custom_flags(libc::O_CLOEXEC);
     let mut target_file = options.open(target)?;
     let result = (|| {
+        let mut hasher = Sha256::new();
         let mut copied = 0u64;
         let mut buffer = [0u8; 1024 * 1024];
         loop {
@@ -1955,13 +2049,16 @@ fn copy_bounded_snapshot_file(
                 bail!("runtime-state snapshot changed while it was copied");
             }
             target_file.write_all(&buffer[..read])?;
+            if hash {
+                hasher.update(&buffer[..read]);
+            }
         }
         if copied != expected_bytes {
             bail!("runtime-state snapshot changed while it was copied");
         }
         target_file.flush()?;
         target_file.sync_all()?;
-        Ok(copied)
+        Ok((copied, format!("sha256:{:x}", hasher.finalize())))
     })();
     if result.is_err() {
         let _ = fs::remove_file(target);
@@ -2054,37 +2151,104 @@ fn random_private_id(prefix: &str, random_bytes: usize) -> Result<String> {
     Ok(value)
 }
 
-pub(super) fn probe_llama_process_identity(
-    executable: &Path,
-    args: &[String],
-) -> Result<LlamaProcessIdentity> {
-    Ok(LlamaProcessIdentity {
-        executable: probe_llama_executable_identity(executable)?,
-        args_sha256: sha256_json_value(args)?,
-    })
+// Per-start inspection only: never reuse identities across executable changes.
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    unix_identity: (u64, u64, i64, i64),
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(path)?;
+        anyhow::ensure!(metadata.is_file(), "runtime file is not regular");
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            unix_identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ),
+        })
+    }
+}
+
+pub(super) struct LlamaExecutableInspection {
+    pub(super) help: String,
+    identity: LlamaExecutableIdentity,
+    stamp: FileStamp,
+}
+
+impl LlamaExecutableInspection {
+    pub(super) fn process_identity(&self, args: &[String]) -> Result<LlamaProcessIdentity> {
+        Ok(LlamaProcessIdentity {
+            executable: self.identity.clone(),
+            args_sha256: sha256_json_value(args)?,
+        })
+    }
+
+    pub(super) fn verify_unchanged(&self, executable: &Path) -> Result<()> {
+        anyhow::ensure!(
+            FileStamp::read(executable)? == self.stamp,
+            "llama-server changed during startup"
+        );
+        let hash = sha256_regular_file(executable, 4 * 1024 * 1024 * 1024)?;
+        anyhow::ensure!(
+            hash == self.identity.binary_sha256 && FileStamp::read(executable)? == self.stamp,
+            "llama-server changed during startup"
+        );
+        Ok(())
+    }
 }
 
 fn probe_llama_executable_identity(executable: &Path) -> Result<LlamaExecutableIdentity> {
-    let metadata = fs::metadata(executable)
-        .with_context(|| "failed to inspect the llama-server executable".to_string())?;
-    if !metadata.is_file() {
-        bail!("llama-server executable is not a regular file");
-    }
-    let binary_sha256 = sha256_regular_file(executable, 4 * 1024 * 1024 * 1024)?;
-    let help = bounded_command_output(executable, "--help", 2 * 1024 * 1024)?;
-    let version = bounded_command_output(executable, "--version", 64 * 1024)?;
+    Ok(inspect_llama_executable(executable)?.identity)
+}
+
+pub(super) fn inspect_llama_executable(executable: &Path) -> Result<LlamaExecutableInspection> {
+    let stamp = FileStamp::read(executable)?;
+    // Three bounded independent jobs; the hash runs on this thread. Join all
+    // children before returning even when an individual inspection fails.
+    let (binary_sha256, help, version) = std::thread::scope(|scope| {
+        let help = scope.spawn(|| bounded_command_output(executable, "--help", 2 * 1024 * 1024));
+        let version = scope.spawn(|| bounded_command_output(executable, "--version", 64 * 1024));
+        let hash = sha256_regular_file(executable, 4 * 1024 * 1024 * 1024);
+        let help = help
+            .join()
+            .map_err(|_| anyhow!("llama-server help inspection panicked"));
+        let version = version
+            .join()
+            .map_err(|_| anyhow!("llama-server version inspection panicked"));
+        Ok::<_, anyhow::Error>((hash?, help??, version??))
+    })?;
+    anyhow::ensure!(
+        FileStamp::read(executable)? == stamp,
+        "llama-server changed during inspection"
+    );
     let version = version
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .ok_or_else(|| anyhow!("llama-server --version returned no version"))?;
-    if version.len() > 512 || version.chars().any(char::is_control) {
-        bail!("llama-server returned an invalid version string");
-    }
-    Ok(LlamaExecutableIdentity {
-        version: version.to_string(),
-        binary_sha256,
-        help_sha256: sha256_bytes(help.as_bytes()),
+    anyhow::ensure!(
+        version.len() <= 512 && !version.chars().any(char::is_control),
+        "llama-server returned an invalid version string"
+    );
+    Ok(LlamaExecutableInspection {
+        identity: LlamaExecutableIdentity {
+            version: version.to_string(),
+            binary_sha256,
+            help_sha256: sha256_bytes(help.as_bytes()),
+        },
+        help,
+        stamp,
     })
 }
 
@@ -2391,6 +2555,27 @@ mod tests {
         join.join().unwrap();
     }
 
+    #[test]
+    fn snapshot_copy_hashes_exact_bytes_and_preserves_existing_targets() {
+        let root = test_root("snapshot-copy-hash");
+        let source = root.join("source.bin");
+        let target = root.join("target.bin");
+        // Cross the copy buffer boundary, including an incomplete final chunk.
+        let bytes = vec![0x5a; 1024 * 1024 + 17];
+        fs::write(&source, &bytes).unwrap();
+        assert_eq!(
+            copy_snapshot_with_sha256(&source, &target, bytes.len() as u64).unwrap(),
+            sha256_bytes(&bytes)
+        );
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        assert!(copy_snapshot_with_sha256(&source, &target, bytes.len() as u64).is_err());
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        let invalid = root.join("invalid.bin");
+        assert!(copy_snapshot_with_sha256(&source, &invalid, bytes.len() as u64 + 1).is_err());
+        assert!(!invalid.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_snapshot_copy_is_owner_only_and_never_follows_symlinks() {
@@ -2497,6 +2682,67 @@ mod tests {
     }
 
     #[test]
+    fn chat_probe_accepts_continuation_without_weakening_named_state_probe() {
+        for reuse in [
+            FakeReuse::Exact,
+            FakeReuse::ContinuationOnly,
+            FakeReuse::BrokenRestore,
+            FakeReuse::WrongSlotCount,
+        ] {
+            for chat in [false, true] {
+                let root = test_root("probe-reuse-modes");
+                let snapshots = root.join("snapshots");
+                ensure_real_directory(&snapshots, true).unwrap();
+                let fake = spawn_fake_state_server_with_reuse(snapshots.clone(), false, reuse);
+                let process = test_process(fake.url.clone(), snapshots.clone());
+                let result = if chat {
+                    functional_probe_llama_chat_state(&process)
+                } else {
+                    functional_probe_llama_state(&process)
+                };
+                let requests = fake.finish();
+                let should_pass =
+                    reuse == FakeReuse::Exact || (chat && reuse == FakeReuse::ContinuationOnly);
+                assert_eq!(result.is_ok(), should_pass, "chat={chat}: {result:?}");
+                if chat && reuse != FakeReuse::Exact {
+                    assert_eq!(
+                        requests
+                            .iter()
+                            .filter(|r| r.as_str() == "POST /slots/0?action=restore")
+                            .count(),
+                        1
+                    );
+                }
+                assert!(fs::read_dir(&snapshots).unwrap().next().is_none());
+                drop(process);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_inspection_queries_once_and_rejects_executable_changes() {
+        let root = test_root("executable-inspection");
+        let executable = root.join("llama-server");
+        let calls = root.join("calls");
+        fs::write(&executable, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n--help) echo '--slots --slot-save-path --parallel' ;;\n--version) echo 'test-version' ;;\nesac\n",
+            calls.display()
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let inspection = inspect_llama_executable(&executable).unwrap();
+        assert!(super::super::supported_args_from_help(&inspection.help).slots);
+        inspection.verify_unchanged(&executable).unwrap();
+        let calls = fs::read_to_string(&calls).unwrap();
+        assert_eq!(calls.lines().filter(|line| *line == "--help").count(), 1);
+        assert_eq!(calls.lines().filter(|line| *line == "--version").count(), 1);
+        fs::write(&executable, "#!/bin/sh\necho replacement\n").unwrap();
+        assert!(inspection.verify_unchanged(&executable).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn chat_snapshot_survives_process_replacement_and_rejects_corruption() {
         let root = test_root("chat-restart");
         let store = ModelStore::resolve(Some(root.clone())).unwrap();
@@ -2504,12 +2750,17 @@ mod tests {
         for iteration in 0..3 {
             let snapshots = root.join(format!("snapshots-{iteration}"));
             ensure_real_directory(&snapshots, true).unwrap();
-            let fake = spawn_fake_state_server(snapshots.clone(), false);
+            let fake = spawn_fake_state_server_with_reuse(
+                snapshots.clone(),
+                false,
+                FakeReuse::ContinuationOnly,
+            );
             let process = test_process(fake.url.clone(), snapshots);
             let cache = LlamaChatPersistence::open(&process, &store, &test_manifest(), &cache_root)
                 .unwrap();
+            assert_eq!(cache.reuse_previously_observed, iteration == 2);
             if iteration == 0 {
-                assert!(cache.restore(&process).unwrap().contains("cold session"));
+                assert!(cache.restore(&process).unwrap().0.contains("cold session"));
                 run_llama_prefill(
                     &process,
                     &PrefillInput::Text {
@@ -2523,9 +2774,19 @@ mod tests {
                     cache
                         .restore(&process)
                         .unwrap()
+                        .0
                         .contains("restored: 7 tokens")
                 );
-                assert_eq!(llama_slot_status(&process).unwrap().prompt_tokens, 7);
+                let status = llama_slot_status(&process).unwrap();
+                assert!(!status.prompt_tokens_reported);
+                // A completed real request with a restored hit establishes
+                // historical evidence; a successful restore alone does not.
+                assert!(
+                    cache
+                        .observe_reuse(Some(7), 10, Some(7))
+                        .unwrap()
+                        .contains("reuse observed")
+                );
                 // Corrupt the durable bytes without changing their length.
                 let namespace = fs::read_dir(&cache_root)
                     .unwrap()
@@ -2543,14 +2804,127 @@ mod tests {
                     cache
                         .restore(&process)
                         .unwrap()
+                        .0
                         .contains("checksum mismatch")
                 );
                 assert_eq!(llama_slot_status(&process).unwrap().prompt_tokens, 0);
+                let namespace = fs::read_dir(&cache_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                assert!(!namespace.join("capability.json").exists());
             }
             drop(process);
-            fake.finish();
+            let requests = fake.finish();
+            if iteration > 0 {
+                assert!(!requests.iter().any(|r| r == "POST /completion"));
+            }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_requests_validate_restore_without_synthetic_inference() {
+        for reuse in [
+            FakeReuse::Exact,
+            FakeReuse::BrokenRestore,
+            FakeReuse::IncompleteStream,
+        ] {
+            let root = test_root("chat-real-request-reuse");
+            let store = ModelStore::resolve(Some(root.clone())).unwrap();
+            let cache_root = root.join("chat-cache");
+            for iteration in 0..2 {
+                let snapshots = root.join(format!("snapshots-{iteration}"));
+                ensure_real_directory(&snapshots, true).unwrap();
+                let fake = spawn_fake_state_server_with_reuse(
+                    snapshots.clone(),
+                    false,
+                    if iteration == 0 {
+                        FakeReuse::Exact
+                    } else {
+                        reuse
+                    },
+                );
+                let process = test_process(fake.url.clone(), snapshots);
+                let cache =
+                    LlamaChatPersistence::open(&process, &store, &test_manifest(), &cache_root)
+                        .unwrap();
+                assert!(!cache.reuse_previously_observed);
+                let request = crate::backend::GenerateRequest {
+                    prompt: "real user prompt".into(),
+                    messages: vec![],
+                    image_urls: vec![],
+                    max_tokens: 8,
+                    temperature: None,
+                    top_p: None,
+                    stop: vec![],
+                    seed: None,
+                    stream_granularity: crate::backend::StreamGranularity::Token,
+                    verbose: false,
+                    debug: false,
+                    tool_config: None,
+                };
+                let result = process.complete_with_cache(&request, None, Some(&cache));
+                let incomplete = iteration == 1 && reuse == FakeReuse::IncompleteStream;
+                assert_eq!(result.is_err(), incomplete);
+                let namespace = fs::read_dir(&cache_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let observed = iteration == 1 && reuse == FakeReuse::Exact;
+                assert_eq!(namespace.join("capability.json").exists(), observed);
+                if iteration == 1 && reuse == FakeReuse::BrokenRestore {
+                    assert!(
+                        result
+                            .unwrap()
+                            .backend_diagnostics
+                            .iter()
+                            .any(|s| s.contains("reuse not observed"))
+                    );
+                    // A later live hit must not disguise ineffective disk reuse.
+                    let live = process
+                        .complete_with_cache(&request, None, Some(&cache))
+                        .unwrap();
+                    assert_eq!(live.cached_prompt_tokens, Some(6));
+                    assert!(!namespace.join("capability.json").exists());
+                }
+                drop(process);
+                let requests = fake.finish();
+                let completions = if iteration == 1 && reuse == FakeReuse::BrokenRestore {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    requests.iter().filter(|r| *r == "POST /completion").count(),
+                    completions
+                );
+                assert!(
+                    !requests
+                        .iter()
+                        .any(|r| r == "POST /tokenize" || r == "POST /slots/0?action=erase")
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| *r == "POST /slots/0?action=restore")
+                        .count(),
+                    iteration
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| *r == "POST /slots/0?action=save")
+                        .count(),
+                    if incomplete { 0 } else { completions }
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -2937,7 +3311,24 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FakeReuse {
+        Exact,
+        ContinuationOnly,
+        BrokenRestore,
+        WrongSlotCount,
+        IncompleteStream,
+    }
+
     fn spawn_fake_state_server(snapshot_dir: PathBuf, corrupt_save: bool) -> FakeStateServer {
+        spawn_fake_state_server_with_reuse(snapshot_dir, corrupt_save, FakeReuse::Exact)
+    }
+
+    fn spawn_fake_state_server_with_reuse(
+        snapshot_dir: PathBuf,
+        corrupt_save: bool,
+        reuse: FakeReuse,
+    ) -> FakeStateServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2946,7 +3337,8 @@ mod tests {
             let started = Instant::now();
             let mut requests = Vec::new();
             let mut slot_tokens = 0u64;
-            let mut cache_tokens = 0u64;
+            let mut restored = false;
+            let mut had_generation = false;
             loop {
                 if stop_rx.try_recv().is_ok() {
                     return Ok(requests);
@@ -2965,36 +3357,83 @@ mod tests {
                 let (method, target, body) =
                     read_fake_request(&mut stream).map_err(|error| error.to_string())?;
                 requests.push(format!("{method} {target}"));
+                if method == "POST" && target == "/completion" && body["stream"] == true {
+                    if body["prompt"] != "real user prompt" {
+                        return Err("unexpected synthetic inference before user request".into());
+                    }
+                    let cached =
+                        if slot_tokens == 7 && (!restored || reuse != FakeReuse::BrokenRestore) {
+                            6
+                        } else {
+                            0
+                        };
+                    had_generation = true;
+                    restored = false;
+                    slot_tokens = 7;
+                    let event = json!({
+                        "content": "answer", "stop": reuse != FakeReuse::IncompleteStream,
+                        "tokens_predicted": 1, "tokens_evaluated": 7,
+                        "timings": {"cache_n": cached},
+                    });
+                    let response = format!("data: {event}\n\n");
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response)
+                        .map_err(|error| error.to_string())?;
+                    continue;
+                }
                 let snapshot_bytes = b"fake-slot-state";
                 let response = match (method.as_str(), target.as_str()) {
                     ("POST", "/slots/0?action=erase") => {
                         let erased = slot_tokens;
                         slot_tokens = 0;
-                        cache_tokens = 0;
                         json!({"id_slot": 0, "n_erased": erased})
                     }
+                    ("POST", "/tokenize") => {
+                        let original = body.get("content").and_then(Value::as_str)
+                            == Some(STATE_CAPABILITY_PROBE_PROMPT);
+                        if body.get("add_special").and_then(Value::as_bool) != Some(original) {
+                            return Err(
+                                "probe tokenization must add special tokens only to the prefix"
+                                    .into(),
+                            );
+                        }
+                        json!({"tokens": if original { vec![1,2,3,4,5,6,7] } else { vec![8,9,10] }})
+                    }
                     ("POST", "/completion") => {
-                        if body.get("prompt").and_then(Value::as_str)
-                            != Some(STATE_CAPABILITY_PROBE_PROMPT)
+                        had_generation = true;
+                        let continued =
+                            body.get("prompt") == Some(&json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
+                        if (!continued
+                            && body.get("prompt").and_then(Value::as_str)
+                                != Some(STATE_CAPABILITY_PROBE_PROMPT))
                             || body.get("n_predict").and_then(Value::as_u64) != Some(0)
                             || body.get("id_slot").and_then(Value::as_u64) != Some(0)
                             || body.get("cache_prompt").and_then(Value::as_bool) != Some(true)
                         {
                             return Err("probe request was not exact".to_string());
                         }
-                        if slot_tokens == 7 {
-                            cache_tokens = 7;
-                        }
-                        slot_tokens = 7;
+                        let cache_tokens = if slot_tokens == 7
+                            && (!restored
+                                || reuse == FakeReuse::Exact
+                                || (reuse == FakeReuse::ContinuationOnly && continued))
+                        {
+                            7
+                        } else {
+                            0
+                        };
+                        // After replay this is a freshly computed live cache,
+                        // even when the preceding disk restore was ineffective.
+                        restored = false;
+                        slot_tokens = if continued { 10 } else { 7 };
                         json!({"id_slot": 0, "content": "", "tokens_predicted": 0,
                             "timings": {"cache_n": cache_tokens}})
                     }
-                    ("GET", "/slots") => json!([{
-                        "id": 0,
-                        "n_prompt_tokens": slot_tokens,
-                        "n_prompt_tokens_cache": 0,
-                        "is_processing": false,
-                    }]),
+                    ("GET", "/slots") => {
+                        if had_generation {
+                            json!([{"id":0, "n_prompt_tokens":if restored && reuse == FakeReuse::WrongSlotCount { slot_tokens + 1 } else { slot_tokens }, "n_prompt_tokens_cache":0, "is_processing":false}])
+                        } else {
+                            json!([{"id":0, "is_processing":false}])
+                        }
+                    }
                     ("POST", "/slots/0?action=save") => {
                         let filename = fake_filename(&body)?;
                         fs::write(snapshot_dir.join(filename), snapshot_bytes)
@@ -3010,8 +3449,8 @@ mod tests {
                         let filename = fake_filename(&body)?;
                         let bytes = fs::read(snapshot_dir.join(filename))
                             .map_err(|error| error.to_string())?;
+                        restored = true;
                         slot_tokens = 7;
-                        cache_tokens = 7;
                         json!({
                             "id_slot": 0,
                             "filename": filename,
@@ -3108,17 +3547,20 @@ mod tests {
 
     fn test_process(url: String, snapshot_dir: PathBuf) -> LlamaServerProcess {
         let executable = std::env::current_exe().unwrap();
-        let child = Command::new(&executable)
-            .arg(TEST_PROCESS_CHILD_NAME)
-            .arg("--exact")
-            .env(TEST_PROCESS_CHILD_ENV, "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = crate::backend::llama_process_lifecycle::ManagedChild::spawn(
+            Command::new(&executable)
+                .arg(TEST_PROCESS_CHILD_NAME)
+                .arg("--exact")
+                .env(TEST_PROCESS_CHILD_ENV, "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
         LlamaServerProcess {
-            child: Mutex::new(child),
+            #[cfg(target_os = "linux")]
+            _model_file_cache: None,
+            child,
             executable,
             discovery_source: "test".to_string(),
             args: Vec::new(),
@@ -3130,7 +3572,10 @@ mod tests {
             pid: std::process::id(),
             mode: LlamaCppMode::Cpu,
             log_tail: Arc::new(Mutex::new(VecDeque::new())),
+            log_readers: Mutex::new(Vec::new()),
             state_gate: Mutex::new(()),
+            startup_diagnostics: Vec::new(),
+            startup_diagnostics_reported: std::sync::OnceLock::new(),
             state_runtime: LlamaProcessStateRuntime {
                 generation_id: Some("test-process-generation".to_string()),
                 snapshot_dir: Some(snapshot_dir),
@@ -3207,7 +3652,7 @@ mod tests {
         }
     }
 
-    fn test_root(name: &str) -> PathBuf {
+    pub(super) fn test_root(name: &str) -> PathBuf {
         let suffix = random_private_id("", 12).unwrap();
         let root = std::env::temp_dir().join(format!("werk-llama-state-{name}-{suffix}"));
         fs::create_dir(&root).unwrap();

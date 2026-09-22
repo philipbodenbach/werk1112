@@ -1,0 +1,348 @@
+[
+  {
+    "label": "off-deepseek",
+    "version": "off",
+    "model": "deepseek-v4-flash-q2-k-s",
+    "exit": 0,
+    "wall_seconds": 108.49398614300299,
+    "children_after_exit": [],
+    "completion": {
+      "backend_diagnostics": [
+        "history messages: 1",
+        "chat template source: model",
+        "chat template: model",
+        "chat template applied by werk: no",
+        "history enabled: yes",
+        "llama.cpp worker startup duration: 96.561869s",
+        "llama.cpp runtime inspection duration: 1.041978s",
+        "llama.cpp CPU expert prefetch: disabled",
+        "llama.cpp native readiness duration: 95.510686s",
+        "llama.cpp final identity validation duration: 0.001407s",
+        "llama.cpp cache file preparation: deferred until native startup completes",
+        "llama.cpp native warmup: disabled",
+        "llama.cpp cache capability probe: skipped; reuse checked on actual requests",
+        "llama.cpp cache restore verification: unverified; awaiting actual restored request",
+        "preparation duration: 97.207947s (included in load/total)",
+        "run elapsed through completion: 107.441364s",
+        "run first token including preparation: 99.630077s",
+        "llama.cpp request endpoint: /v1/chat/completions",
+        "chat template applied by backend/model: yes",
+        "llama.cpp native KV persistence: cold session; restore reuse unverified",
+        "llama.cpp native KV restore duration: 0.000020s",
+        "llama.cpp native KV snapshot saved: 65 tokens",
+        "llama.cpp native KV save duration: 0.202741s"
+      ],
+      "finish_reason": "stop",
+      "message": {
+        "content": "Rust ownership means each value has exactly one variable as its \"owner\" at any time. When the owner goes out of scope, the value is automatically freed from memory. Ownership can be temporarily borrowed or permanently transferred to another variable, but never duplicated without explicit cloning.",
+        "role": "assistant"
+      },
+      "model": "deepseek-v4-flash-q2-k-s",
+      "timings": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 7.608225999999999,
+        "first_token_seconds": 1.9007389049999999,
+        "load_seconds": 97.207946679,
+        "prompt_seconds": 1.8945940000000001,
+        "total_seconds": 106.919878323,
+        "warmup_seconds": 0.0
+      },
+      "type": "completion",
+      "usage": {
+        "completion_tokens": 55,
+        "prompt_tokens": 11,
+        "total_tokens": 66
+      }
+    },
+    "answer_sha256": "3526c952723e6924f0a14b24a670cb99799c57f2a42cd70516d7cc9d27e77521"
+  },
+  {
+    "label": "off-qwen-switch",
+    "version": "off",
+    "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+    "exit": 0,
+    "wall_seconds": 243.04045242801658,
+    "children_after_exit": [],
+    "completion": {
+      "backend_diagnostics": [
+        "history messages: 19",
+        "chat template source: model",
+        "chat template: model",
+        "chat template applied by werk: no",
+        "history enabled: yes",
+        "llama.cpp worker startup duration: 62.751967s",
+        "llama.cpp runtime inspection duration: 0.402372s",
+        "llama.cpp CPU expert prefetch: disabled",
+        "llama.cpp native readiness duration: 62.348204s",
+        "llama.cpp final identity validation duration: 0.000348s",
+        "llama.cpp cache file preparation: deferred until native startup completes",
+        "llama.cpp native warmup: disabled",
+        "llama.cpp cache capability probe: skipped; reuse checked on actual requests",
+        "llama.cpp cache restore verification: unverified; awaiting actual restored request",
+        "preparation duration: 63.426333s (included in load/total)",
+        "run elapsed through completion: 240.850765s",
+        "run first token including preparation: 179.435869s",
+        "llama.cpp request endpoint: /v1/chat/completions",
+        "chat template applied by backend/model: yes",
+        "llama.cpp native KV snapshot restored: 883 tokens; actual prefix reuse reported by backend usage",
+        "llama.cpp native KV restored reuse observed: 883/905 prompt tokens",
+        "llama.cpp native KV restore duration: 1.264593s",
+        "llama.cpp native KV snapshot saved: 981 tokens",
+        "llama.cpp native KV save duration: 2.728042s"
+      ],
+      "finish_reason": "stop",
+      "message": {
+        "content": "Rust ownership is a compile-time system that ensures memory safety by assigning each value a single owner responsible for its memory management. When the owner goes out of scope, the value is automatically dropped, and ownership can be transferred through moves or shared via references to prevent data races. This approach eliminates the need for a garbage collector while guaranteeing that no dangling pointers or concurrent mutations occur.",
+        "role": "assistant"
+      },
+      "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+      "timings": {
+        "cached_prompt_tokens": 883,
+        "decode_seconds": 58.678487000000004,
+        "first_token_seconds": 115.496599062,
+        "load_seconds": 63.426332892,
+        "prompt_seconds": 114.214781,
+        "total_seconds": 240.337786668,
+        "warmup_seconds": 0.0
+      },
+      "type": "completion",
+      "usage": {
+        "completion_tokens": 77,
+        "prompt_tokens": 905,
+        "total_tokens": 982
+      }
+    },
+    "answer_sha256": "10f6918a7f26fe96ad9dd018a1e6255908aaf67f7e333e995b11450c59c195e2"
+  },
+  {
+    "label": "off-qwen-repeat",
+    "version": "off",
+    "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+    "exit": 0,
+    "wall_seconds": 51.10009451300721,
+    "children_after_exit": [],
+    "completion": {
+      "backend_diagnostics": [
+        "history messages: 19",
+        "chat template source: model",
+        "chat template: model",
+        "chat template applied by werk: no",
+        "history enabled: yes",
+        "llama.cpp worker startup duration: 19.605081s",
+        "llama.cpp runtime inspection duration: 0.290862s",
+        "llama.cpp CPU expert prefetch: disabled",
+        "llama.cpp native readiness duration: 19.312397s",
+        "llama.cpp final identity validation duration: 0.000557s",
+        "llama.cpp cache file preparation: deferred until native startup completes",
+        "llama.cpp native warmup: disabled",
+        "llama.cpp cache capability probe: skipped; reuse checked on actual requests",
+        "llama.cpp cache restore verification: unverified; awaiting actual restored request",
+        "preparation duration: 20.240093s (included in load/total)",
+        "run elapsed through completion: 49.342399s",
+        "run first token including preparation: 39.412322s",
+        "llama.cpp request endpoint: /v1/chat/completions",
+        "chat template applied by backend/model: yes",
+        "llama.cpp native KV snapshot restored: 883 tokens; actual prefix reuse reported by backend usage",
+        "llama.cpp native KV restored reuse observed: 883/905 prompt tokens",
+        "llama.cpp native KV restore duration: 1.336157s",
+        "llama.cpp native KV snapshot saved: 981 tokens",
+        "llama.cpp native KV save duration: 1.476689s"
+      ],
+      "finish_reason": "stop",
+      "message": {
+        "content": "Rust ownership is a compile-time system that ensures memory safety by assigning each value a single owner responsible for its memory management. When the owner goes out of scope, the value is automatically dropped, and ownership can be transferred through moves or shared via references to prevent data races. This approach eliminates the need for a garbage collector while guaranteeing that no dangling pointers or concurrent mutations occur.",
+        "role": "assistant"
+      },
+      "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+      "timings": {
+        "cached_prompt_tokens": 883,
+        "decode_seconds": 8.432334,
+        "first_token_seconds": 18.685747768,
+        "load_seconds": 20.240092523,
+        "prompt_seconds": 17.330654,
+        "total_seconds": 48.855892347,
+        "warmup_seconds": 0.0
+      },
+      "type": "completion",
+      "usage": {
+        "completion_tokens": 77,
+        "prompt_tokens": 905,
+        "total_tokens": 982
+      }
+    },
+    "answer_sha256": "10f6918a7f26fe96ad9dd018a1e6255908aaf67f7e333e995b11450c59c195e2"
+  },
+  {
+    "label": "auto-deepseek",
+    "version": "auto",
+    "model": "deepseek-v4-flash-q2-k-s",
+    "exit": 0,
+    "wall_seconds": 232.27334026200697,
+    "children_after_exit": [],
+    "completion": {
+      "backend_diagnostics": [
+        "history messages: 1",
+        "chat template source: model",
+        "chat template: model",
+        "chat template applied by werk: no",
+        "history enabled: yes",
+        "llama.cpp worker startup duration: 69.053387s",
+        "llama.cpp runtime inspection duration: 0.327594s",
+        "llama.cpp CPU expert prefetch: unavailable; native loading continues (GGUF metadata is unsupported or invalid for expert inventory); 0.077291s",
+        "llama.cpp native readiness duration: 68.645626s",
+        "llama.cpp final identity validation duration: 0.000795s",
+        "llama.cpp cache file preparation: deferred until native startup completes",
+        "llama.cpp native warmup: disabled",
+        "llama.cpp cache capability probe: skipped; reuse checked on actual requests",
+        "llama.cpp cache restore verification: unverified; awaiting actual restored request",
+        "preparation duration: 69.685398s (included in load/total)",
+        "run elapsed through completion: 230.155940s",
+        "run first token including preparation: 150.080921s",
+        "llama.cpp request endpoint: /v1/chat/completions",
+        "chat template applied by backend/model: yes",
+        "llama.cpp native KV persistence: cold session; restore reuse unverified",
+        "llama.cpp native KV restore duration: 0.000052s",
+        "llama.cpp native KV snapshot saved: 65 tokens",
+        "llama.cpp native KV save duration: 0.177058s"
+      ],
+      "finish_reason": "stop",
+      "message": {
+        "content": "Rust ownership means each value has exactly one variable as its \"owner\" at any time. When the owner goes out of scope, the value is automatically freed from memory. Ownership can be temporarily borrowed or permanently transferred to another variable, but never duplicated without explicit cloning.",
+        "role": "assistant"
+      },
+      "model": "deepseek-v4-flash-q2-k-s",
+      "timings": {
+        "cached_prompt_tokens": 0,
+        "decode_seconds": 79.89323900000001,
+        "first_token_seconds": 79.929972813,
+        "load_seconds": 69.685397956,
+        "prompt_seconds": 79.918655,
+        "total_seconds": 229.690312682,
+        "warmup_seconds": 0.0
+      },
+      "type": "completion",
+      "usage": {
+        "completion_tokens": 55,
+        "prompt_tokens": 11,
+        "total_tokens": 66
+      }
+    },
+    "answer_sha256": "3526c952723e6924f0a14b24a670cb99799c57f2a42cd70516d7cc9d27e77521"
+  },
+  {
+    "label": "auto-qwen-switch",
+    "version": "auto",
+    "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+    "exit": 0,
+    "wall_seconds": 85.71206714701839,
+    "children_after_exit": [],
+    "completion": {
+      "backend_diagnostics": [
+        "history messages: 19",
+        "chat template source: model",
+        "chat template: model",
+        "chat template applied by werk: no",
+        "history enabled: yes",
+        "llama.cpp worker startup duration: 53.019924s",
+        "llama.cpp runtime inspection duration: 0.442854s",
+        "llama.cpp CPU expert prefetch: checked 58.50 GiB; missing 47.02 GiB; prefaulted 47.02 GiB in 32.507728s; 32.651402s",
+        "llama.cpp native readiness duration: 19.923993s",
+        "llama.cpp final identity validation duration: 0.000472s",
+        "llama.cpp cache file preparation: deferred until native startup completes",
+        "llama.cpp native warmup: disabled",
+        "llama.cpp cache capability probe: skipped; reuse checked on actual requests",
+        "llama.cpp cache restore verification: unverified; awaiting actual restored request",
+        "preparation duration: 53.631308s (included in load/total)",
+        "run elapsed through completion: 83.561987s",
+        "run first token including preparation: 67.673440s",
+        "llama.cpp request endpoint: /v1/chat/completions",
+        "chat template applied by backend/model: yes",
+        "llama.cpp native KV snapshot restored: 883 tokens; actual prefix reuse reported by backend usage",
+        "llama.cpp native KV restored reuse observed: 883/905 prompt tokens",
+        "llama.cpp native KV restore duration: 1.470298s",
+        "llama.cpp native KV snapshot saved: 981 tokens",
+        "llama.cpp native KV save duration: 1.445904s"
+      ],
+      "finish_reason": "stop",
+      "message": {
+        "content": "Rust ownership is a compile-time system that ensures memory safety by assigning each value a single owner responsible for its memory management. When the owner goes out of scope, the value is automatically dropped, and ownership can be transferred through moves or shared via references to prevent data races. This approach eliminates the need for a garbage collector while guaranteeing that no dangling pointers or concurrent mutations occur.",
+        "role": "assistant"
+      },
+      "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+      "timings": {
+        "cached_prompt_tokens": 883,
+        "decode_seconds": 14.434036,
+        "first_token_seconds": 13.563341171,
+        "load_seconds": 53.631308373,
+        "prompt_seconds": 12.075474,
+        "total_seconds": 83.083219979,
+        "warmup_seconds": 0.0
+      },
+      "type": "completion",
+      "usage": {
+        "completion_tokens": 77,
+        "prompt_tokens": 905,
+        "total_tokens": 982
+      }
+    },
+    "answer_sha256": "10f6918a7f26fe96ad9dd018a1e6255908aaf67f7e333e995b11450c59c195e2"
+  },
+  {
+    "label": "auto-qwen-repeat",
+    "version": "auto",
+    "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+    "exit": 0,
+    "wall_seconds": 40.251710380020086,
+    "children_after_exit": [],
+    "completion": {
+      "backend_diagnostics": [
+        "history messages: 19",
+        "chat template source: model",
+        "chat template: model",
+        "chat template applied by werk: no",
+        "history enabled: yes",
+        "llama.cpp worker startup duration: 23.626499s",
+        "llama.cpp runtime inspection duration: 0.369838s",
+        "llama.cpp CPU expert prefetch: checked 58.50 GiB; missing 0.13 GiB; prefaulted 0.13 GiB in 2.191745s; 2.312457s",
+        "llama.cpp native readiness duration: 20.942852s",
+        "llama.cpp final identity validation duration: 0.000329s",
+        "llama.cpp cache file preparation: deferred until native startup completes",
+        "llama.cpp native warmup: disabled",
+        "llama.cpp cache capability probe: skipped; reuse checked on actual requests",
+        "llama.cpp cache restore verification: unverified; awaiting actual restored request",
+        "preparation duration: 24.226089s (included in load/total)",
+        "run elapsed through completion: 38.310506s",
+        "run first token including preparation: 29.434164s",
+        "llama.cpp request endpoint: /v1/chat/completions",
+        "chat template applied by backend/model: yes",
+        "llama.cpp native KV snapshot restored: 883 tokens; actual prefix reuse reported by backend usage",
+        "llama.cpp native KV restored reuse observed: 883/905 prompt tokens",
+        "llama.cpp native KV restore duration: 1.364650s",
+        "llama.cpp native KV snapshot saved: 981 tokens",
+        "llama.cpp native KV save duration: 1.277550s"
+      ],
+      "finish_reason": "stop",
+      "message": {
+        "content": "Rust ownership is a compile-time system that ensures memory safety by assigning each value a single owner responsible for its memory management. When the owner goes out of scope, the value is automatically dropped, and ownership can be transferred through moves or shared via references to prevent data races. This approach eliminates the need for a garbage collector while guaranteeing that no dangling pointers or concurrent mutations occur.",
+        "role": "assistant"
+      },
+      "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+      "timings": {
+        "cached_prompt_tokens": 883,
+        "decode_seconds": 7.58873,
+        "first_token_seconds": 4.734815585,
+        "load_seconds": 24.22608874,
+        "prompt_seconds": 3.340364,
+        "total_seconds": 37.837219658,
+        "warmup_seconds": 0.0
+      },
+      "type": "completion",
+      "usage": {
+        "completion_tokens": 77,
+        "prompt_tokens": 905,
+        "total_tokens": 982
+      }
+    },
+    "answer_sha256": "10f6918a7f26fe96ad9dd018a1e6255908aaf67f7e333e995b11450c59c195e2"
+  }
+]

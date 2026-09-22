@@ -2,12 +2,16 @@ mod burn;
 mod candle;
 mod external;
 mod llama_fast;
+pub(crate) mod llama_process_lifecycle;
+#[cfg_attr(not(target_os = "linux"), path = "model_file_cache_stub.rs")]
+pub(crate) mod model_file_cache;
 mod llama_server;
 mod omlx;
 mod onnxruntime;
 mod openai_transport;
 mod qwen_tts;
 mod vllm;
+pub(crate) mod werk_server_client;
 
 use anyhow::Result;
 use std::pin::Pin;
@@ -1182,7 +1186,8 @@ pub struct GeneratedAssistantMessage {
     pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GenerationTimings {
     /// Total prompt tokens already present in a verified native prefix cache.
     pub cached_prompt_tokens: Option<usize>,
@@ -1243,6 +1248,9 @@ pub type GenerateStream =
     Pin<Box<dyn Stream<Item = Result<GenerateStreamEvent, String>> + Send + 'static>>;
 
 pub trait ChatGenerationSession: Send + Sync {
+    fn preparation_diagnostics(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse>;
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream;
 }

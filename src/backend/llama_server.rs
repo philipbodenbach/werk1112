@@ -6,7 +6,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
@@ -15,12 +15,20 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 mod cuda_offload;
+#[cfg(target_os = "linux")]
+mod model_prefetch;
+#[cfg(target_os = "linux")]
+mod model_prefetch_linux;
+#[cfg(target_os = "linux")]
+mod model_prefetch_policy;
+#[cfg(target_os = "linux")]
+use super::model_file_cache;
 mod runtime_state;
 
 use runtime_state::{
     LlamaChatPersistence, LlamaProcessStateRuntime, LlamaRuntimeStateAdapter,
-    cleanup_llama_snapshot_dir, llama_state_args_are_effective, prepare_llama_state_snapshot_dir,
-    probe_llama_process_identity,
+    cleanup_llama_snapshot_dir, inspect_llama_executable, llama_state_args_are_effective,
+    prepare_llama_state_snapshot_dir,
 };
 
 use super::{
@@ -59,7 +67,10 @@ pub struct LlamaServerBackend {
 }
 
 struct LlamaServerProcess {
-    child: Mutex<Child>,
+    child: super::llama_process_lifecycle::ManagedChild,
+    // Fields drop in declaration order, after Drop has reaped the native worker.
+    #[cfg(target_os = "linux")]
+    _model_file_cache: Option<model_file_cache::CacheReleaseGuard>,
     executable: PathBuf,
     discovery_source: String,
     args: Vec<String>,
@@ -71,11 +82,15 @@ struct LlamaServerProcess {
     pid: u32,
     mode: LlamaCppMode,
     log_tail: Arc<Mutex<VecDeque<String>>>,
+    log_readers: Mutex<Vec<thread::JoinHandle<()>>>,
     state_gate: Mutex<()>,
     state_runtime: LlamaProcessStateRuntime,
+    startup_diagnostics: Vec<String>,
+    startup_diagnostics_reported: OnceLock<()>,
 }
 
 struct LlamaServerChatSession {
+    startup_seconds: f64,
     server: Arc<LlamaServerProcess>,
     persistence: Option<Arc<LlamaChatPersistence>>,
 }
@@ -116,7 +131,20 @@ struct ServerCompletion {
     saw_reasoning_content: bool,
 }
 
+#[derive(Debug)]
+struct LlamaStartupError(anyhow::Error);
+impl std::fmt::Display for LlamaStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for LlamaStartupError {}
+
 impl LlamaServerBackend {
+    pub(crate) fn is_startup_error(error: &anyhow::Error) -> bool {
+        error.is::<LlamaStartupError>()
+    }
+
     pub fn new(
         store: ModelStore,
         mode: LlamaCppMode,
@@ -332,8 +360,10 @@ impl GenerationBackend for LlamaServerBackend {
         if manifest.format != ModelFormat::Gguf {
             return Ok(None);
         }
+        let started = Instant::now();
         let (server, _, _) = self.cached_server(manifest, false)?;
         Ok(Some(Box::new(LlamaServerChatSession {
+            startup_seconds: started.elapsed().as_secs_f64(),
             server,
             persistence: None,
         })))
@@ -348,12 +378,17 @@ impl GenerationBackend for LlamaServerBackend {
         if manifest.format != ModelFormat::Gguf {
             return Ok(None);
         }
-        let (server, _, _) = self.cached_server(manifest, false)?;
+        let started = Instant::now();
+        let (server, _, _) = self
+            .cached_server(manifest, false)
+            .map_err(|error| anyhow::Error::new(LlamaStartupError(error)))?;
+        let startup_seconds = started.elapsed().as_secs_f64();
         let persistence =
             LlamaChatPersistence::open(&server, &self.store, manifest, cache_directory)?;
         Ok(Some(Box::new(LlamaServerChatSession {
             server,
             persistence: Some(Arc::new(persistence)),
+            startup_seconds,
         })))
     }
 
@@ -420,6 +455,33 @@ impl GenerationBackend for LlamaServerBackend {
 }
 
 impl ChatGenerationSession for LlamaServerChatSession {
+    fn preparation_diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = vec![format!(
+            "llama.cpp worker startup duration: {:.6}s",
+            self.startup_seconds
+        )];
+        diagnostics.extend(self.server.startup_diagnostics.iter().cloned());
+        diagnostics.push(format!(
+            "llama.cpp native warmup: {}",
+            native_warmup_setting(&self.server.args)
+        ));
+        if let Some(cache) = &self.persistence {
+            diagnostics.push(
+                "llama.cpp cache capability probe: skipped; reuse checked on actual requests"
+                    .into(),
+            );
+            diagnostics.push(format!(
+                "llama.cpp cache restore verification: {}",
+                if cache.reuse_previously_observed {
+                    "reuse previously observed for this identity; current hit not guaranteed"
+                } else {
+                    "unverified; awaiting actual restored request"
+                }
+            ));
+        }
+        diagnostics
+    }
+
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
         let total_started = Instant::now();
         self.server.print_debug(&request, true);
@@ -494,7 +556,13 @@ impl LlamaServerProcess {
             .context("llama-server discovery had no executable path")?;
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
-        let supported = supported_args(&executable);
+        let inspection_started = Instant::now();
+        let inspection = inspect_llama_executable(&executable).ok();
+        let supported = inspection
+            .as_ref()
+            .map(|value| supported_args_from_help(&value.help))
+            .unwrap_or_else(|| supported_args(&executable));
+        let inspection_seconds = inspection_started.elapsed().as_secs_f64();
         if let Some(projector_path) = projector_path
             && !supported.mmproj
         {
@@ -526,10 +594,26 @@ impl LlamaServerProcess {
                 port,
             );
         let preflight_identity = state_args_effective
-            .then(|| probe_llama_process_identity(&executable, &args).ok())
+            .then(|| {
+                inspection
+                    .as_ref()
+                    .and_then(|value| value.process_identity(&args).ok())
+            })
             .flatten();
 
         eprintln!("Using llama.cpp server {} backend", display_name(mode));
+        #[cfg(target_os = "linux")]
+        let model_file_cache =
+            model_file_cache::CacheReleaseGuard::prepare(model_path, projector_path, &args);
+        #[cfg(target_os = "linux")]
+        let prefetch_diagnostic = match model_file_cache.as_ref() {
+            Some(cache) => cache.with_retained_preparation(|cancelled| {
+                model_prefetch_policy::prepare(mode, model_path, &args, &supported, cancelled)
+            }),
+            None => Some(
+                "llama.cpp CPU expert prefetch: skipped; model lifetime lease unavailable".into(),
+            ),
+        };
         let mut command = Command::new(&executable);
         command.args(&args);
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
@@ -538,7 +622,8 @@ impl LlamaServerProcess {
         } else {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let mut child = match command.spawn() {
+        let spawn_started = Instant::now();
+        let child = match super::llama_process_lifecycle::ManagedChild::spawn(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 if let Some(snapshot_dir) = snapshot_dir.as_deref() {
@@ -549,17 +634,22 @@ impl LlamaServerProcess {
                 });
             }
         };
+        let mut child_process = child.lock().unwrap_or_else(|e| e.into_inner());
+        let mut log_readers = Vec::new();
         if !env_true("WERK_LLAMA_LOG") {
-            if let Some(stdout) = child.stdout.take() {
-                spawn_log_tail_reader("stdout", stdout, log_tail.clone());
+            if let Some(stdout) = child_process.stdout.take() {
+                log_readers.push(spawn_log_tail_reader("stdout", stdout, log_tail.clone()));
             }
-            if let Some(stderr) = child.stderr.take() {
-                spawn_log_tail_reader("stderr", stderr, log_tail.clone());
+            if let Some(stderr) = child_process.stderr.take() {
+                log_readers.push(spawn_log_tail_reader("stderr", stderr, log_tail.clone()));
             }
         }
-        let pid = child.id();
+        let pid = child_process.id();
+        drop(child_process);
         let mut process = Self {
-            child: Mutex::new(child),
+            child,
+            #[cfg(target_os = "linux")]
+            _model_file_cache: model_file_cache,
             executable,
             discovery_source: discovery.source,
             args,
@@ -571,6 +661,7 @@ impl LlamaServerProcess {
             pid,
             mode,
             log_tail,
+            log_readers: Mutex::new(log_readers),
             state_gate: Mutex::new(()),
             state_runtime: LlamaProcessStateRuntime {
                 generation_id,
@@ -578,20 +669,39 @@ impl LlamaServerProcess {
                 identity: None,
                 configured: false,
             },
+            startup_diagnostics: vec![format!(
+                "llama.cpp runtime inspection duration: {inspection_seconds:.6}s"
+            )],
+            startup_diagnostics_reported: OnceLock::new(),
         };
-        if let Err(error) = process.wait_until_ready() {
+        #[cfg(target_os = "linux")]
+        if let Some(diagnostic) = prefetch_diagnostic {
+            process.startup_diagnostics.push(diagnostic);
+        }
+        // Do not compete with native model loading for disk/cache bandwidth.
+        // Session library hashing and snapshot reads begin only after startup.
+        let ready = process.wait_until_ready();
+        let ready_seconds = spawn_started.elapsed().as_secs_f64();
+        if let Err(error) = ready {
             if let Some(snapshot_dir) = process.state_runtime.snapshot_dir.as_deref() {
                 cleanup_llama_snapshot_dir(snapshot_dir);
             }
             return Err(error);
         }
-        let postflight_identity = state_args_effective
-            .then(|| probe_llama_process_identity(&process.executable, &process.args).ok())
-            .flatten();
-        if preflight_identity.is_some() && preflight_identity == postflight_identity {
-            process.state_runtime.identity = postflight_identity;
+        let final_started = Instant::now();
+        let unchanged = inspection
+            .as_ref()
+            .is_some_and(|value| value.verify_unchanged(&process.executable).is_ok());
+        if unchanged && preflight_identity.is_some() {
+            process.state_runtime.identity = preflight_identity;
             process.state_runtime.configured = true;
         }
+        let final_seconds = final_started.elapsed().as_secs_f64();
+        process.startup_diagnostics.extend([
+            format!("llama.cpp native readiness duration: {ready_seconds:.6}s"),
+            format!("llama.cpp final identity validation duration: {final_seconds:.6}s"),
+            "llama.cpp cache file preparation: deferred until native startup completes".into(),
+        ]);
         Ok(process)
     }
 
@@ -619,8 +729,20 @@ impl LlamaServerProcess {
                 self.model_id
             );
         }
+        // Serve prepares a worker before any request exists. Report that
+        // preparation once when verbose output is requested, before entering
+        // native inference, so a slow first request also has useful evidence.
+        if request.verbose && self.startup_diagnostics_reported.set(()).is_ok() {
+            eprintln!("[werk llama.cpp] prepared worker PID: {}", self.pid);
+            for diagnostic in &self.startup_diagnostics {
+                eprintln!("[werk llama.cpp] {diagnostic}");
+            }
+        }
         let started = Instant::now();
+        let restore_started = Instant::now();
         let cache_notice = persistence.map(|cache| cache.restore(self)).transpose()?;
+        let restored_tokens = cache_notice.as_ref().and_then(|(_, tokens)| *tokens);
+        let restore_seconds = restore_started.elapsed().as_secs_f64();
         let use_chat_endpoint = !request.messages.is_empty() || request_has_images(request);
         let (path, body) = if use_chat_endpoint {
             ("/v1/chat/completions", chat_completion_body(request))
@@ -642,7 +764,7 @@ impl LlamaServerProcess {
         };
         let mut sse = SseAccumulator::default();
         let mut finished = false;
-        if let Some(notice) = cache_notice {
+        if let Some((notice, _)) = cache_notice {
             completion.backend_diagnostics.push(notice);
         }
 
@@ -693,6 +815,8 @@ impl LlamaServerProcess {
                 "llama-server stream ended before a completion marker; native snapshot not saved"
             );
         }
+        // Estimated display metrics must never become restore evidence.
+        let reported_prompt_tokens = completion.prompt_tokens;
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
         if use_chat_endpoint
             && completion.text.trim().is_empty()
@@ -704,7 +828,22 @@ impl LlamaServerProcess {
             );
         }
         if let Some(cache) = persistence {
+            if let Some(observation) = cache.observe_reuse(
+                restored_tokens,
+                reported_prompt_tokens,
+                completion.cached_prompt_tokens,
+            ) {
+                completion.backend_diagnostics.push(observation);
+            }
+            completion.backend_diagnostics.push(format!(
+                "llama.cpp native KV restore duration: {restore_seconds:.6}s"
+            ));
+            let save_started = Instant::now();
             completion.backend_diagnostics.push(cache.save(self));
+            completion.backend_diagnostics.push(format!(
+                "llama.cpp native KV save duration: {:.6}s",
+                save_started.elapsed().as_secs_f64()
+            ));
         }
         Ok(completion)
     }
@@ -713,6 +852,7 @@ impl LlamaServerProcess {
         let started = Instant::now();
         loop {
             if let Some(status) = self.try_wait_status()? {
+                self.drain_exit_logs();
                 bail!(
                     "llama-server exited before becoming healthy ({status}){}",
                     self.formatted_log_tail()
@@ -745,6 +885,22 @@ impl LlamaServerProcess {
             .lock()
             .map_err(|_| anyhow!("llama-server child mutex poisoned"))?;
         Ok(child.try_wait()?)
+    }
+
+    fn drain_exit_logs(&self) {
+        if let Ok(mut readers) = self.log_readers.lock() {
+            let started = Instant::now();
+            while readers.iter().any(|reader| !reader.is_finished())
+                && started.elapsed() < Duration::from_millis(200)
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            for reader in readers.drain(..) {
+                if reader.is_finished() {
+                    let _ = reader.join();
+                }
+            }
+        }
     }
 
     fn formatted_log_tail(&self) -> String {
@@ -940,8 +1096,19 @@ fn llama_server_args_with_state(
     if supported.perf {
         args.push("--perf".to_string());
     }
-    if supported.log_disable && !env_true("WERK_LLAMA_LOG") {
-        args.push("--log-disable".to_string());
+    // Keep native logging enabled: pipes already keep normal output quiet,
+    // while the bounded tail explains startup failures.
+    // A fresh local worker should process the actual request, not a synthetic
+    // warmup. This is a shared policy for every model and execution mode.
+    if runtime_options.warmup_tokens.unwrap_or(0) == 0 && supported.no_warmup {
+        args.push("--no-warmup".to_string());
+    } else if runtime_options
+        .warmup_tokens
+        .is_some_and(|tokens| tokens > 0)
+        && supported.warmup
+    {
+        // llama-server controls warmup as a boolean, not a token count.
+        args.push("--warmup".to_string());
     }
     if non_thinking {
         if supported.reasoning {
@@ -973,6 +1140,17 @@ fn llama_server_args_with_state(
 
 fn llama_server_non_thinking(manifest: &ModelManifest) -> bool {
     manifest_text_matches(manifest, "qwen3")
+}
+
+fn native_warmup_setting(args: &[String]) -> &'static str {
+    args.iter()
+        .rev()
+        .find_map(|arg| match arg.as_str() {
+            "--no-warmup" => Some("disabled"),
+            "--warmup" => Some("enabled (explicit request)"),
+            _ => None,
+        })
+        .unwrap_or("runtime default; no explicit control applied")
 }
 
 fn completion_body(request: &GenerateRequest) -> Value {
@@ -1509,10 +1687,15 @@ fn header_contains(headers: &[(String, String)], name: &str, needle: &str) -> bo
 
 #[derive(Default)]
 struct SupportedArgs {
+    #[cfg(target_os = "linux")]
+    cpu_moe: bool,
+    #[cfg(target_os = "linux")]
+    n_cpu_moe: bool,
     flash_attn: bool,
     kv_offload: bool,
     perf: bool,
-    log_disable: bool,
+    no_warmup: bool,
+    warmup: bool,
     reasoning: bool,
     chat_template_kwargs: bool,
     mmproj: bool,
@@ -1528,16 +1711,28 @@ fn supported_args(executable: &PathBuf) -> SupportedArgs {
     let Ok(output) = Command::new(executable).arg("--help").output() else {
         return SupportedArgs::default();
     };
+    if !output.status.success() {
+        return SupportedArgs::default();
+    }
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    supported_args_from_help(&text)
+}
+
+fn supported_args_from_help(text: &str) -> SupportedArgs {
     SupportedArgs {
+        #[cfg(target_os = "linux")]
+        cpu_moe: help_has_exact_option(text, "--cpu-moe"),
+        #[cfg(target_os = "linux")]
+        n_cpu_moe: help_has_exact_option(text, "--n-cpu-moe"),
         flash_attn: text.contains("--flash-attn") || text.contains("-fa,"),
         kv_offload: text.contains("--kv-offload") || text.contains("-kvo,"),
         perf: text.contains("--perf"),
-        log_disable: text.contains("--log-disable"),
+        no_warmup: help_has_exact_option(&text, "--no-warmup"),
+        warmup: help_has_exact_option(&text, "--warmup"),
         reasoning: text.contains("--reasoning ") || text.contains("-rea,"),
         chat_template_kwargs: text.contains("--chat-template-kwargs"),
         mmproj: text.split_whitespace().any(|argument| {
@@ -1549,7 +1744,7 @@ fn supported_args(executable: &PathBuf) -> SupportedArgs {
         parallel: help_has_exact_option(&text, "--parallel"),
         cache_ram: help_has_exact_option(&text, "--cache-ram"),
         cache_idle_slots: help_has_exact_option(&text, "--cache-idle-slots"),
-        help_succeeded: output.status.success(),
+        help_succeeded: true,
     }
 }
 
@@ -2692,7 +2887,11 @@ fn command_check(command: &str, args: &[&str], detail: &str) -> BackendDoctorChe
     }
 }
 
-fn spawn_log_tail_reader<R>(label: &'static str, reader: R, tail: Arc<Mutex<VecDeque<String>>>)
+fn spawn_log_tail_reader<R>(
+    label: &'static str,
+    reader: R,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
@@ -2706,7 +2905,7 @@ where
                 tail.push_back(format!("{label}: {line}"));
             }
         }
-    });
+    })
 }
 
 fn cuda_init_failed(text: &str) -> bool {
@@ -3759,6 +3958,104 @@ Agent 3
     }
 
     #[test]
+    fn native_warmup_defaults_off_across_models_and_modes_with_explicit_opt_in() {
+        for mode in [
+            LlamaCppMode::Cpu,
+            LlamaCppMode::Cuda,
+            LlamaCppMode::Rocm,
+            LlamaCppMode::Vulkan,
+            LlamaCppMode::Metal,
+        ] {
+            for model in ["qwen.gguf", "deepseek.gguf", "other.gguf"] {
+                for requested in [None, Some(0), Some(1), Some(8)] {
+                    let args = llama_server_args(
+                        mode,
+                        Path::new(model),
+                        None,
+                        12345,
+                        &LlamaRuntimeOptions {
+                            warmup_tokens: requested,
+                            ..Default::default()
+                        },
+                        &SupportedArgs {
+                            no_warmup: true,
+                            warmup: true,
+                            ..Default::default()
+                        },
+                        false,
+                    );
+                    let enabled = requested.is_some_and(|tokens| tokens > 0);
+                    assert_eq!(args.iter().any(|arg| arg == "--warmup"), enabled);
+                    assert_eq!(args.iter().any(|arg| arg == "--no-warmup"), !enabled);
+                    assert_eq!(
+                        native_warmup_setting(&args),
+                        if enabled {
+                            "enabled (explicit request)"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                }
+            }
+        }
+        // Old native runtimes must not receive unsupported switches.
+        for requested in [None, Some(0), Some(1)] {
+            let args = llama_server_args(
+                LlamaCppMode::Cpu,
+                Path::new("old-runtime.gguf"),
+                None,
+                12345,
+                &LlamaRuntimeOptions {
+                    warmup_tokens: requested,
+                    ..Default::default()
+                },
+                &SupportedArgs::default(),
+                false,
+            );
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == "--warmup" || arg == "--no-warmup")
+            );
+        }
+        // Explicit trailing native arguments retain their usual precedence.
+        let mut args = vec!["--no-warmup".to_string()];
+        args.extend(split_args("--warmup --reasoning off"));
+        assert_eq!(native_warmup_setting(&args), "enabled (explicit request)");
+        args.push("--no-warmup".into());
+        assert_eq!(native_warmup_setting(&args), "disabled");
+    }
+
+    #[test]
+    fn server_warmup_can_be_disabled_without_suppressing_failure_logs() {
+        let args = llama_server_args(
+            LlamaCppMode::Cuda,
+            Path::new("/tmp/model.gguf"),
+            None,
+            12345,
+            &LlamaRuntimeOptions {
+                warmup_tokens: Some(0),
+                ..Default::default()
+            },
+            &SupportedArgs {
+                no_warmup: true,
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(args.iter().any(|arg| arg == "--no-warmup"));
+        assert!(!args.iter().any(|arg| arg == "--log-disable"));
+        let error = anyhow::Error::new(LlamaStartupError(anyhow!(
+            "unknown model architecture: glm5next"
+        )));
+        assert!(LlamaServerBackend::is_startup_error(&error));
+        assert!(error.to_string().contains("glm5next"));
+        assert!(!LlamaServerBackend::is_startup_error(&anyhow!(
+            "snapshot unsupported"
+        )));
+    }
+
+    #[test]
     fn server_args_pass_flash_attention_value_before_kv_offload() {
         let args = llama_server_args(
             LlamaCppMode::Cuda,
@@ -3770,7 +4067,7 @@ Agent 3
                 flash_attn: true,
                 kv_offload: true,
                 perf: true,
-                log_disable: true,
+                no_warmup: true,
                 ..SupportedArgs::default()
             },
             false,
@@ -3794,7 +4091,7 @@ Agent 3
                 flash_attn: true,
                 kv_offload: true,
                 perf: false,
-                log_disable: false,
+                no_warmup: false,
                 ..SupportedArgs::default()
             },
             false,

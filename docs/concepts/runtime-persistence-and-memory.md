@@ -97,13 +97,15 @@ resident weights were restored; terminal startup reports native cache support
 separately. The [terminal chat options](../reference/cli.md#persistent-terminal-chat)
 do not alter the named state capability matrix above.
 
-On the existing Unix llama.cpp route, persistent terminal text chats additionally
-use private native slot snapshots after the live save/erase/restore/replay probe
-passes. The latest snapshot for each compatible runtime namespace can survive
-restart; response usage, not the existence of a file or conversation, determines
-reported prefix hits. Newer llama.cpp releases reset idle-slot timing counters,
-so the probe reads the completed response's cache count before falling back to
-the legacy slot counter. Named runtime-control states remain process-bound.
+On the existing Unix llama.cpp route, persistent terminal text chats and local
+`run` use private native slot snapshots without a synthetic inference probe.
+With no snapshot, the user request runs directly and its completed state is
+saved. A later process checks compatibility, file integrity and native restore
+acknowledgements before using the snapshot. Only backend-reported prefix hits
+on the first real request after that restore establish observed disk reuse.
+Missing usage, zero hits and later live-slot hits do not establish that evidence.
+This is opportunistic chat caching, not a general state capability guarantee;
+named runtime-control states retain their exact-replay functional probe.
 
 Local storage cleanup is available through `werk cache list` and
 `werk cache purge <CACHE-ID>` or `werk cache purge --all`. The inventory
@@ -440,3 +442,201 @@ the value is not exposed as a `STRING` or JSON output. See the
 
 CLI examples are in the [runtime-control CLI section](../reference/cli.md#runtime-control),
 and the transport contract is in the [Werk Protocol 1.0 reference](../reference/werk-protocol-v1.md).
+
+### Reusing a worker from `run`
+
+`run --server http://127.0.0.1:11434` sends text/vision/tool requests through the
+existing `serve` API while keeping the portable session archive on the client.
+The running backend retains its live prefix cache, avoiding worker startup
+and disk-snapshot restore for each invocation. Server restarts
+and competing prompts can invalidate that live prefix; this frontend does not
+claim cross-restart native KV persistence. Worker placement/thread settings
+belong to `serve`, while sampling and session selection belong to `run`.
+
+For local llama.cpp sessions, durable snapshot copying now calculates SHA256
+from the bytes being copied in the same pass. Restore still checks the recorded
+hash before loading state, and save still syncs the file before publishing the
+index. Owner-only files, bounded lengths, no-follow checks, failure cleanup and
+conversation-based recovery are retained. Runtime/library identity hashing is
+unchanged. Preparation, probe and snapshot phase diagnostics make their cost
+visible without altering native prefill/decode rates.
+
+### Local llama.cpp startup and lazy restore validation
+
+Local `run` starts a new worker each time. Native KV snapshots preserve prefix
+state, not loaded model weights. Cold weight reads, CUDA initialization and
+native warmup can therefore dominate even with a valid saved snapshot.
+
+The general rule for local llama.cpp `run`/`chat` is: no snapshot means no restore
+work, and opening a session never evaluates a synthetic test prompt. Existing
+snapshots are verified and restored on the first real request. A complete,
+successful response with a positive, consistent backend cache count records
+observed restored reuse; a zero count is a cache miss, not proof of broken
+restore. Missing or inconsistent usage stays unverified. Subsequent live-slot
+hits cannot prove disk restore, and incomplete/error streams cannot establish
+reuse or publish a new snapshot. Named Werk Protocol state operations retain
+their explicit functional capability tests.
+
+A small `capability.json` receipt records historical observed reuse beside the
+session's snapshot. It is informational and does not bypass snapshot validation
+or claim any future hit. It requires the same model files, runtime binary and
+libraries, environment, effective arguments and receipt schema. Missing,
+malformed, oversized or old synthetic-probe receipts leave reuse unverified;
+they never trigger inference. Purging the session removes the receipt too.
+
+Fresh llama.cpp slots can omit prompt counters before their first generation.
+Restore still requires exact acknowledged token/byte counts and an idle slot;
+a reported slot counter must match. Restore failure invalidates the receipt,
+clears the slot and rebuilds from the conversation. Snapshot checksum, file-size
+and private-path checks remain mandatory.
+
+Verbose output reports `cache capability probe: skipped; reuse checked on actual
+requests`, distinguishes historical evidence from unverified state, and reports
+`native KV restored reuse observed` only after actual restored hits. These rules
+apply across supported llama.cpp models and CPU/GPU modes, not only Qwen/CUDA.
+
+Native synthetic warmup defaults to off for every model and mode using the
+Werk-managed llama-server path, including `run`, `chat` and `serve`. The shared
+argument builder emits `--no-warmup` when supported. Explicit zero has the same
+meaning; positive `--warmup-tokens` enables the native boolean `--warmup` when
+supported rather than promising that exact token count. Trailing native
+arguments may explicitly override either setting. Old runtimes without these
+controls retain their defaults, which the diagnostics report honestly.
+
+This avoids a synthetic model run before the actual request, but does not avoid
+weight loading, CUDA initialization or page faults during real prefill. It is
+not a claim that cold loading is fixed. Snapshot namespaces still include the
+effective launch arguments. A session that previously used implicit native
+warmup can therefore need one full conversation prefill after this default
+changes; sessions already using `--warmup-tokens 0` keep the same launch arguments.
+No snapshot compatibility checks are bypassed or synthetic cache probes added.
+
+The CLI stops and reaps its own llama-server children before exiting on Ctrl+C,
+SIGTERM or SIGHUP on Unix, or Ctrl+C/Ctrl+Break on Windows. This also covers
+interruptions during blocking model loading, before a chat session exists.
+Normal completion still releases the worker through ownership cleanup. The
+registry holds weak references and does not keep workers alive between CLI
+invocations; unrelated Werk/server processes are not killed. Forced termination
+such as SIGKILL is outside this signal-handler guarantee. Persisted conversation
+and KV files are not deleted, and an interrupted response does not promise a
+new snapshot. The model file-cache lifecycle below handles clean file pages
+that can otherwise outlive the worker in the operating-system cache.
+
+Startup errors now contain captured native logs. For example, the installed
+`ec928150501c` CUDA runtime rejects GLM-5.3-Flash with
+`unknown model architecture: 'glm5next'`. That is architecture support, not a
+KV-cache failure or an MoE-placement setting; Werk does not retry it as a
+nonpersistent request.
+
+### Local startup inspection and file I/O ordering
+
+The local llama.cpp startup path inspects help and version once per successful
+executable inspection, in parallel with binary hashing. All of these jobs finish
+before spawning the model worker. Supported argument parsing uses that same help
+text. File identity is checked around inspection; after native readiness the
+executable is checked again, including its full hash. Invalid inspection disables
+native persistence rather than trusting an unknown runtime.
+
+Session library hashing starts after native readiness. Snapshot copying and
+checksum validation happen on the actual restore path before inference. The
+previous experiment overlapped this file work with native startup; it was
+withdrawn after a reported first-call regression. Warm development-build
+comparisons did not establish its effect on cold release starts. This ordering
+avoids additional Werk library/snapshot I/O competing with the native loader.
+
+Snapshot checksums, exact restore acknowledgements, the slot mutex and
+observed-reuse rules remain intact. No synthetic cache probe is reintroduced.
+Snapshot save remains after generation and durable before command exit.
+
+Verbose diagnostics distinguish runtime inspection, native readiness and final
+binary validation, and state that cache file preparation is deferred until
+native startup completes. The existing preparation and restore timings include
+their respective subsequent library and snapshot work. First-token wall time
+remains the relevant end-to-end measure; a first-call speedup has not yet been
+established for this change.
+
+### CPU expert page preparation
+
+Linux CUDA workers can prepare the current model's explicitly CPU-placed MoE
+expert pages before spawning llama-server. This uses the existing backend path
+and upstream runtime; it adds no daemon or alternative inference integration.
+`WERK_LLAMA_PREFETCH=auto` enables the bounded preparation when it can establish
+a positive CPU-expert subset from `--cpu-moe` or `--n-cpu-moe N`. `off` disables
+it for comparison. Conflicting tensor overrides, NUMA controls, alternative
+loading modes or unsupported GGUF metadata make this optional step abstain.
+
+The inventory reuses the existing GGUF metadata reader and split-file resolver,
+with a bounded tensor-directory reader that also recognizes scalar I32 routing
+tables without interpreting their payloads. Only
+complete OS pages within selected expert tensor ranges are considered; shared
+boundary pages, dense tensors and PLE/ngram tensors remain for native loading.
+The Linux helper checks residency with `mincore`, then establishes readable
+page-table entries using `MADV_POPULATE_READ`. Already cached pages do not need
+another disk read, but still need these entries: an unpopulated mapping alone
+does not protect file cache against cache-only reclamation. Read-only shared
+mappings for the selected pages remain owned by the worker lifecycle guard.
+They share the existing file cache with llama-server rather than copying weights.
+Kernel readahead can independently fetch adjacent pages. The helper does not
+change llama-server's own mapping policy or lock pages in RAM.
+
+Preparation checks host and container memory budgets, preserves original shard
+identity, and runs at most two workers with 32-MiB chunks. All workers join
+before native startup. A deadline is checked between chunks; an individual
+kernel I/O syscall cannot be forcibly interrupted by that deadline. Errors or
+memory pressure stop the optional preparation, drop its mappings and leave
+native loading available. Retention requires a successfully acquired model
+lifetime lease. Shutdown cancels preparation, joins its workers and removes
+retained mappings before attempting the existing file-cache release, including
+the CLI signal path.
+No previous-model file advice or global cache eviction is performed.
+
+This warms Linux's file cache. It is separate from KV persistence and does not
+implement dynamic expert swapping or adaptive VRAM residency. Native arguments,
+CPU/GPU placement and snapshot compatibility remain unchanged. Verbose output
+reports the preparation duration, checked/missing/prefaulted bytes and retained
+mapping size. A verbose first request also logs the prepared worker PID and
+startup diagnostics before inference. Mapped pages resist cache-only trimming,
+but normal memory pressure and targeted reclaim can still remove them; this is
+not a residency guarantee. Comparisons must include Werk's preparation
+I/O and first-token wall time, not just the child process's load/read counters.
+
+### Model file-cache release on WSL
+
+The shared Linux model lifecycle retains read-only descriptors and shared
+advisory file leases for the exact model assets selected by the backend. It is
+independent of model family, MoE placement and prefix/KV persistence. llama-server
+uses the selected GGUF shards and projector; local model owners and companion
+workers use their resolved manifest or artifact inventory, including externally
+bound files. Remote endpoints have no locally owned weight cache to release.
+
+`WERK_MODEL_CACHE_RELEASE=auto` enables release on WSL; `on` enables it on other
+Linux hosts and `off` retains normal OS caching. On normal teardown, native
+weights or the owned worker are destroyed first, then the guard attempts a
+nonblocking exclusive file lease and `POSIX_FADV_DONTNEED` on unchanged files.
+Another successfully leased Werk reader prevents that file's cleanup. Lease
+acquisition is bounded and optional; if it fails, inference can proceed without
+the coordination/release guarantee. Other applications do not participate in
+these advisory leases.
+
+`run`, `chat` and `serve` use these same owners. An active chat or server can
+retain loaded models between requests; release occurs at unload or shutdown,
+not after every response. CLI signal cleanup first terminates/reaps registered
+native and companion subprocesses. During CPU expert preparation it cancels
+further chunks and waits for in-flight work and mappings to finish before file
+advice. In-process backends release through normal model destruction; forced
+process termination, including the CLI signal-exit path, cannot guarantee that
+their mappings have been removed before advisory cleanup. SIGKILL bypasses
+cleanup entirely. Subprocess ownership covers the directly launched worker;
+independently surviving descendants are not part of this release guarantee.
+Companion inventories remain leased until their resident worker ends, including
+models that its Python implementation may have internally unloaded earlier.
+
+The operation neither deletes files nor swaps live tensors to SSD. Clean model
+pages already have their backing weight files; the kernel may discard them and
+read them again later. Mapped, dirty or locked pages can remain. Accepted advice
+is not a freed-byte measurement or a guarantee of immediate Windows reclamation.
+No global cache flush, WSL restart, root sysctl or extra service is used. Disk KV
+snapshots and conversations are preserved; a subsequent standalone run may have
+to reload model weights even when its prompt snapshot is reusable.
+The verbose completion timing ends before final owner destruction; use total
+command wall time when measuring the cost of shutdown and cache advice.

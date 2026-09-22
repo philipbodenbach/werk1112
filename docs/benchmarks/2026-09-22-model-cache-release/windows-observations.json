@@ -1,0 +1,20 @@
+{
+  "during_validation": {
+    "ProcessName": "vmmemWSL",
+    "Id": 67336,
+    "WorkingSet64": 87073189888,
+    "PrivateMemorySize64": 94662463488
+  },
+  "after_all_commands": {
+    "ProcessName": "vmmemWSL",
+    "Id": 67336,
+    "WorkingSet64": 39987392512,
+    "PrivateMemorySize64": 87548395520
+  },
+  "later_after_all_commands": {
+    "ProcessName": "vmmemWSL",
+    "Id": 67336,
+    "WorkingSet64": 9566896128,
+    "PrivateMemorySize64": 10679373824
+  }
+}

@@ -53,6 +53,8 @@ mod imp {
         vocab: usize,
         eos: llama_token,
         eot: llama_token,
+        // Drop frees the native model before Rust drops this lease.
+        _cache_release: Option<crate::backend::model_file_cache::CacheReleaseGuard>,
     }
 
     struct LlamaFastContext {
@@ -240,7 +242,14 @@ mod imp {
             let started = Instant::now();
             let stderr_guard = NativeStderrGuard::silence_if_needed();
             ensure_llama_backend();
-            let model = LlamaFastModel::load(&absolute_model_path, &params)?;
+            let cache_release =
+                crate::backend::model_file_cache::CacheReleaseGuard::prepare_manifest(
+                    &self.store,
+                    manifest,
+                );
+            // Native loading is not cancellable; do not gate signal cleanup.
+            let mut model = LlamaFastModel::load(&absolute_model_path, &params)?;
+            model._cache_release = cache_release;
             drop(stderr_guard);
             let load_seconds = started.elapsed().as_secs_f64();
             eprintln!(
@@ -412,6 +421,7 @@ mod imp {
                 vocab: vocab as usize,
                 eos: unsafe { llama_token_eos(ptr) },
                 eot: unsafe { llama_token_eot(ptr) },
+                _cache_release: None,
             })
         }
 

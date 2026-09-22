@@ -490,6 +490,119 @@ output is buffered; `--stream` streams text, and `--stream-granularity token|chu
 also enables streaming. `--no-history` (alias `--single-turn`) conflicts with
 persistence, as it does in `chat`.
 
+Werk-managed llama-server workers disable native synthetic warmup by default
+when the runtime exposes `--no-warmup`. This is shared by all models and CPU/GPU
+modes, including workers used by `run`, `chat` and `serve`. `--warmup-tokens 0`
+keeps it disabled; a positive value explicitly enables native warmup via
+`--warmup` when supported (the server uses a boolean, not an exact token count).
+Trailing `WERK_LLAMA_ARGS` retain native argument precedence. Verbose local
+session output reports the effective warmup setting; unsupported controls are
+reported as the runtime default. Local llama.cpp `run`/`chat` never evaluate
+a separate test prompt for session persistence. A new session runs the user
+request and saves its state. Existing snapshots are checked on restore, and
+successful real requests report observed reuse from backend cache counts.
+Verbose output distinguishes unverified restore from historical observed reuse.
+Worker loading still occurs on every local process start; cold file reads may
+remain expensive, including during the first real prefill.
+Runtime inspection avoids repeated help/version commands. Session library and
+snapshot file work runs after native startup, avoiding additional I/O during
+model loading. Verbose output separates runtime inspection, native readiness
+and final binary validation. Compatibility checks and native slot restore still
+complete before user inference.
+
+On Linux CUDA workers, `WERK_LLAMA_PREFETCH=auto` (the default) optionally
+prepares the explicitly CPU-placed MoE expert pages before native startup.
+It recognizes `--cpu-moe` and `--n-cpu-moe N`, inventories only the selected
+GGUF shard family, avoids rereading cached pages, and uses at most two bounded readers.
+It does not intentionally traverse dense weights or lazy PLE/ngram tables.
+Unsupported metadata/kernel support, ambiguous placement, explicit alternative
+load modes and insufficient host/container memory budgets retain native loading.
+Set `WERK_LLAMA_PREFETCH=off` to compare against native loading alone. This
+preparation does not change native arguments, expert placement, or KV-cache
+identity. Its time and checked/missing/prefaulted byte counts appear in verbose
+diagnostics and are included in preparation and total wall time. Read-only
+shared mappings retain the prepared page-table entries during the worker's
+lifetime, so cache-only trimming cannot immediately undo that preparation.
+This adds no weight copy or memory lock; memory pressure can still reclaim pages.
+The mappings are removed before file-cache release on normal or interrupted
+shutdown. Verbose first requests log the prepared worker PID and startup
+diagnostics before entering native inference.
+
+On WSL, `WERK_MODEL_CACHE_RELEASE=auto` (the default) requests release of the
+loaded model files' clean OS cache pages when their local model owner or worker
+is destroyed. This applies to all model families, after `run`, after leaving
+`chat`, and when `serve` stops or unloads its worker. Owned subprocesses are
+stopped and reaped first, including CLI interruption. An active chat/server
+worker retains its model; this is not an idle timer between requests.
+
+This file-scoped operation does not delete model files, chat history or saved
+KV snapshots, and does not restart WSL or clear the system-wide cache. It can
+make the next standalone run slower because model weights need reading again.
+Set `WERK_MODEL_CACHE_RELEASE=off` to retain those pages, or `on` to request the
+same release on other Linux hosts. Other operating systems keep their native
+cache behavior. Release is advisory: diagnostics report the file ranges for
+which advice was accepted, not measured bytes returned to the host. Concurrent
+Werk readers with an acquired lease protect their files; unavailable leases
+disable scoped cleanup for that owner. Remote servers are externally managed.
+
+To reuse a worker across separate text/vision/tool `run` processes, start the
+existing server once and point the client at it:
+
+```bash
+# Terminal 1: worker settings belong to serve.
+WERK_LLAMA_ARGS='--n-cpu-moe 38 --reasoning off' \
+werk --backend cuda --threads 24 --threads-batch 24 --ctx-size 4096 \
+  serve --model vumpt/Qwen3.8-Flash-Next-GGUF --persistence \
+  --host 127.0.0.1 --port 11434 --allow-unauthenticated
+
+# Terminal 2: reuse the running worker; each invocation exits normally.
+werk run vumpt/Qwen3.8-Flash-Next-GGUF "Explain Rust ownership briefly." \
+  --server http://127.0.0.1:11434 --session qwen-test --persistence \
+  --stream --verbose --max-tokens 128
+```
+
+This Qwen example uses 38 CPU expert layers out of the installed GGUF's 48
+blocks. It retains the measured 24-thread configuration; it is not a claim of
+optimal settings for every machine or quantization. `--n-cpu-moe` is static CPU
+expert placement, not an adaptive expert cache.
+
+`--server` uses the existing `/v1/chat/completions` API, including images, tools,
+sampling and request-scoped `werk.omlx` controls. It starts no local worker and
+never silently falls back to local inference. The model must be registered in
+both client and server stores under the same ID. `--model-home` on the client
+selects its model metadata and conversation archive; it does not redirect the
+server store. CLI `--image` files are read on the client and sent as data URLs.
+Paths inside JSON requests refer to the server filesystem; use data URLs for
+separate hosts. Media `run` requests continue to use the local media
+service; combining them with `--server` is rejected.
+
+Set backend/device/context/thread options and `WERK_LLAMA_ARGS` on the server.
+Worker CLI options on a remote `run` are rejected. For authenticated servers,
+provide `--api-key` or `WERK_API_KEY` to the client. The example explicitly binds
+an unauthenticated development server to loopback; HTTP URLs require host and
+port. There is no automatic server discovery or background daemon.
+
+Sessions still save the transcript locally. Prefix reuse now depends on the
+server's live cache: restarting the server or another request replacing that
+prefix may require prefill again. This route does not upload or restore local
+KV snapshots. Local `run` without `--server` retains native disk snapshots where
+supported. Neither transcript persistence nor live cache hits imply persistent
+MoE expert residency.
+
+Verbose text diagnostics now include `preparation duration` (worker preparation
+and optional capability probe), plus llama.cpp worker startup, cache probe,
+restore and save durations. Preparation is included once in `load duration`
+and `total duration`. `first token` continues to measure the generation request;
+`run first token including preparation` measures from entry to `run` until the
+first nonempty text/tool delta arrives. With `--stream`, the first text delta is
+flushed immediately. `run elapsed through completion` also includes snapshot
+saving; final transcript publication and process exit follow it. Interactive
+chat waiting for input is excluded. Native prefill/decode rates are unchanged.
+CLI JSON completions also include `timings` and `backend_diagnostics`; the HTTP
+API includes native values under `werk.timings` and `werk.backend_diagnostics`.
+An available native cache count appears as `usage.prompt_tokens_details.cached_tokens`;
+unknown counts remain absent.
+
 For structured conversations and tool calls, pass the existing OpenAI chat
 request schema. `--request -` reads JSON from stdin:
 
@@ -612,8 +725,8 @@ arguments still win. This cache remains vLLM-owned and does not survive its
 process restart. Exiting `run` or `chat` still stops its owned backend workers.
 
 The existing llama.cpp route also saves native slot snapshots for persistent
-text chats on Unix when the running server passes the save/erase/restore/replay
-probe. It restores a compatible snapshot on the next process start and reports
+text chats on Unix when the server exposes the required private slot operations.
+It restores a compatible snapshot on the next process start and reports
 actual prefix hits as `prompt cached count` in `--verbose` output. Snapshots are
 namespaced by model files, runtime executable/libraries, native environment and
 effective arguments; incompatible or corrupt snapshots are rebuilt from the

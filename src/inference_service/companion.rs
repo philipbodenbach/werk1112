@@ -516,7 +516,8 @@ impl MediaInferenceBackend for CompanionMediaBackend {
                     .clone()
                     .with_execute_timeout(Duration::from_secs(seconds))
             })
-            .unwrap_or(client);
+            .unwrap_or(client)
+            .with_model_cache(store, manifest);
         let model_path = companion_model_path(store, manifest);
         let mut parameters = companion_execution_parameters(request, runtime);
         if let Some(accelerator) = companion_runtime_accelerator(runtime) {

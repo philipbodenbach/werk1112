@@ -5,6 +5,69 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Retain the existing Linux CUDA CPU-expert prefault mappings for the active
+  worker lifetime, including initially cached pages. This prevents cache-only
+  reclamation from undoing preparation before the first serve request. Pages
+  remain reclaimable under memory pressure; no locking or weight copy is added.
+  Normal and interrupted cleanup unmap them before the existing file-cache
+  release. Verbose first requests now report the prepared worker's diagnostics.
+
+- Release file-backed model cache after local model/worker teardown on WSL,
+  shared by `run`, `chat` and `serve` across model families. Retain per-file
+  leases while a model is active; reap owned workers before issuing scoped
+  Linux file advice. Keep weights, histories and persisted KV files intact;
+  `WERK_MODEL_CACHE_RELEASE=off` opts into retaining the OS cache, and `on`
+  enables advisory release on other Linux hosts.
+
+- Prepare missing CPU MoE expert pages before Linux CUDA llama-server startup
+  through the existing backend. Reuse GGUF shard metadata, preserve native
+  arguments/KV identity, avoid rereading resident pages and skip nonexpert pages,
+  and bound preparation
+  by host/container memory, file identity, two readers and a work deadline.
+  Unsupported or overridden configurations retain native loading;
+  `WERK_LLAMA_PREFETCH=off` disables the optional step for comparison.
+
+- Stop and reap owned llama-server workers before the CLI exits on Ctrl+C,
+  SIGTERM or SIGHUP (Ctrl+C/Ctrl+Break on Windows), including interruption during
+  synchronous model loading. Register children atomically with shutdown and
+  retain normal drop cleanup; unrelated servers are never targeted.
+
+- Default native warmup off in the shared llama-server argument builder for all
+  models and CPU/GPU modes. Preserve explicit warmup opt-in and native argument
+  overrides; report the effective setting in local session diagnostics. This
+  removes the need for model-specific `--warmup-tokens 0` test commands.
+
+- Reuse a single help/version inspection per llama.cpp start and run independent
+  inspection jobs before spawning the model worker. Keep post-start binary
+  validation and phase timings. Following a reported first-call regression,
+  remove speculative library/snapshot I/O during native model loading; perform
+  that work after readiness and on the actual restore path.
+
+- Remove synthetic cache-probe inference from local llama.cpp `run`/`chat` startup.
+  New sessions execute the user request directly; existing snapshots keep full
+  integrity/restore checks. Record observed restored reuse only from a completed
+  real request with consistent positive cache usage. Cold/live-only hits and
+  incomplete responses cannot establish disk reuse; named state probes remain.
+- Accept missing prompt counters on a fresh idle llama.cpp slot after an exact
+  restore acknowledgement, preserving checks for incorrect or malformed counters.
+- Forward `--warmup-tokens 0` to llama-server's `--no-warmup` when supported.
+- Keep native startup logs captured and include them in errors; a failed
+  llama-server startup no longer triggers a second attempt as a KV fallback.
+
+- Add `run --server URL` for text/vision/tool calls through an existing `serve`
+  worker, preserving client-side sessions and streaming via the shared OpenAI
+  transport. Report native timing/cache metadata over the API.
+- Include all text-backend preparation in CLI load/total timing and report
+  `run` latency through its first delta, plus llama.cpp startup, capability
+  probe, snapshot restore and save phases. Flush the first text delta immediately.
+- Hash llama.cpp chat snapshots during copying on save/restore, avoiding a
+  second full file read while retaining checksum and file-safety validation.
+
+- llama.cpp: validate terminal chat/run snapshot persistence with a token-prefix
+  continuation fallback for hybrid/recurrent models that cannot reuse identical
+  prompts after restore. Keep strict exact-replay checks for named runtime states
+  and require verified prefix hits after a fresh snapshot restore.
+
 - oMLX: use the same automatic device/model-dependent expert cache budget for CLI chat and Serve on supported DeepSeek V4 checkpoints. Preserve explicit small budgets and SSD offload; `0` selects native loading.
 - Report uncached prefill token counts/rates in CLI verbose output and native phase timings in Serve logs for comparable performance measurements.
 

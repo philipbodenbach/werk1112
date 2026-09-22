@@ -1,0 +1,209 @@
+{
+  "model": "vumpt/Qwen3.8-Flash-Next-GGUF",
+  "architecture": "qwen4exp",
+  "quantization": "Q4_K_M",
+  "llama_cpp_revision": "ec928150501c2572fec05cb949061672bb424914",
+  "settings": {
+    "backend": "CUDA",
+    "cpu_moe_layers": 38,
+    "threads": 24,
+    "threads_batch": 24,
+    "ctx_size": 4096,
+    "temperature": 0,
+    "seed": 17
+  },
+  "restore_and_restart": {
+    "cold_prefill": {
+      "content": "\n\n",
+      "tokens_evaluated": 15,
+      "tokens_predicted": 1,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 15,
+        "prompt_ms": 49160.944,
+        "prompt_per_token_ms": 3277.396266666667,
+        "prompt_per_second": 0.3051202596923281,
+        "predicted_n": 1,
+        "predicted_ms": 0.001,
+        "predicted_per_token_ms": 0.0,
+        "predicted_per_second": 0.0
+      }
+    },
+    "saved": {
+      "n_saved": 15,
+      "n_written": 118455412,
+      "timings": {
+        "save_ms": 180.357
+      }
+    },
+    "restore_exact": {
+      "n_restored": 15,
+      "n_read": 118455412,
+      "timings": {
+        "restore_ms": 47.289
+      }
+    },
+    "exact_replay": {
+      "content": "\n\n",
+      "tokens_evaluated": 15,
+      "tokens_predicted": 1,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 15,
+        "prompt_ms": 890.792,
+        "prompt_per_token_ms": 59.38613333333333,
+        "prompt_per_second": 16.83894781273294,
+        "predicted_n": 1,
+        "predicted_ms": 0.001,
+        "predicted_per_token_ms": 0.0,
+        "predicted_per_second": 0.0
+      }
+    },
+    "restore_continuation": {
+      "n_restored": 15,
+      "n_read": 118455412,
+      "timings": {
+        "restore_ms": 45.314
+      }
+    },
+    "continuation": {
+      "content": "\n\n",
+      "tokens_evaluated": 24,
+      "tokens_predicted": 1,
+      "timings": {
+        "cache_n": 15,
+        "prompt_n": 9,
+        "prompt_ms": 5104.541,
+        "prompt_per_token_ms": 567.1712222222222,
+        "prompt_per_second": 1.7631359998871592,
+        "predicted_n": 1,
+        "predicted_ms": 0.001,
+        "predicted_per_token_ms": 0.0,
+        "predicted_per_second": 0.0
+      }
+    },
+    "restart_restore": {
+      "n_restored": 15,
+      "n_read": 118455412,
+      "timings": {
+        "restore_ms": 63.574
+      }
+    },
+    "restart_warm_decode": {
+      "content": "\n\nn\n\n<think>\nThe user",
+      "tokens_evaluated": 24,
+      "tokens_predicted": 8,
+      "timings": {
+        "cache_n": 15,
+        "prompt_n": 9,
+        "prompt_ms": 1761.608,
+        "prompt_per_token_ms": 195.73422222222223,
+        "prompt_per_second": 5.10896862412069,
+        "predicted_n": 8,
+        "predicted_ms": 4201.504,
+        "predicted_per_token_ms": 600.2148571428571,
+        "predicted_per_second": 1.666070054913669
+      }
+    },
+    "fresh_reference_decode": {
+      "content": "\n\nparameter\n\n<think>\nThe user",
+      "tokens_evaluated": 24,
+      "tokens_predicted": 8,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 24,
+        "prompt_ms": 2114.421,
+        "prompt_per_token_ms": 88.10087499999999,
+        "prompt_per_second": 11.350625064734034,
+        "predicted_n": 8,
+        "predicted_ms": 1392.596,
+        "predicted_per_token_ms": 198.9422857142857,
+        "predicted_per_second": 5.026583445593697
+      }
+    },
+    "same_output": false
+  },
+  "same_batching_control": {
+    "prefix": {
+      "content": "\n\n",
+      "tokens_evaluated": 15,
+      "tokens_predicted": 1,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 15,
+        "prompt_ms": 49486.958,
+        "prompt_per_token_ms": 3299.1305333333335,
+        "prompt_per_second": 0.3031101649044583,
+        "predicted_n": 1,
+        "predicted_ms": 0.001,
+        "predicted_per_token_ms": 0.0,
+        "predicted_per_second": 0.0
+      }
+    },
+    "saved": {
+      "n_saved": 15,
+      "n_written": 118455412,
+      "timings": {
+        "save_ms": 198.865
+      }
+    },
+    "live_split_decode": {
+      "content": "\n\nn\n\n<think>\nThe user",
+      "tokens_evaluated": 24,
+      "tokens_predicted": 8,
+      "timings": {
+        "cache_n": 15,
+        "prompt_n": 9,
+        "prompt_ms": 5524.672,
+        "prompt_per_token_ms": 613.8524444444444,
+        "prompt_per_second": 1.629055987396175,
+        "predicted_n": 8,
+        "predicted_ms": 3469.061,
+        "predicted_per_token_ms": 495.5801428571429,
+        "predicted_per_second": 2.017837103469786
+      }
+    },
+    "restored": {
+      "n_restored": 15,
+      "n_read": 118455412,
+      "timings": {
+        "restore_ms": 56.062
+      }
+    },
+    "restored_split_decode": {
+      "content": "\n\nn\n\n<think>\nThe user",
+      "tokens_evaluated": 24,
+      "tokens_predicted": 8,
+      "timings": {
+        "cache_n": 15,
+        "prompt_n": 9,
+        "prompt_ms": 1100.356,
+        "prompt_per_token_ms": 122.26177777777778,
+        "prompt_per_second": 8.179171104624322,
+        "predicted_n": 8,
+        "predicted_ms": 1054.132,
+        "predicted_per_token_ms": 150.59028571428573,
+        "predicted_per_second": 6.640534582006807
+      }
+    },
+    "fresh_split_decode": {
+      "content": "\n\nn\n\n<think>\nThe user",
+      "tokens_evaluated": 24,
+      "tokens_predicted": 8,
+      "timings": {
+        "cache_n": 15,
+        "prompt_n": 9,
+        "prompt_ms": 890.383,
+        "prompt_per_token_ms": 98.93144444444445,
+        "prompt_per_second": 10.108009699196863,
+        "predicted_n": 8,
+        "predicted_ms": 775.307,
+        "predicted_per_token_ms": 110.75814285714286,
+        "predicted_per_second": 9.028681541634475
+      }
+    },
+    "restore_matches_live": true,
+    "restore_matches_fresh_split": true
+  },
+  "interpretation": "The identical-prompt probe reports zero cache reuse. Token-ID continuation reuses all 15 saved prefix tokens, including across restart. Restored output matches live-cache and freshly computed split-prefill output. Whole-prompt prefill produced different output, so it is not an equivalent numerical baseline in this run. Timings include cold pages and are not a controlled performance benchmark."
+}

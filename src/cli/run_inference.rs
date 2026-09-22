@@ -10,6 +10,15 @@ use crate::{
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct RunOptions {
+    #[arg(long, value_name = "URL", conflicts_with_all = ["backend", "device", "threads", "threads_batch", "ctx_size", "batch_size", "ubatch_size", "gpu_layers", "main_gpu", "kv_cache_type", "flash_attn", "kv_offload", "warmup_tokens", "chat_template"], help = "Send text/vision/tool requests to an existing werk serve (http://HOST:PORT); configure the worker on serve")]
+    pub server: Option<String>,
+    #[arg(
+        long,
+        env = "WERK_API_KEY",
+        hide_env_values = true,
+        help = "Bearer key for --server"
+    )]
+    pub api_key: Option<String>,
     #[arg(long, value_name = "PATH", conflicts_with_all = ["prompt", "images"], help = "Read an OpenAI chat request or canonical media InferenceRequest from JSON; - reads stdin")]
     pub request: Option<PathBuf>,
     #[arg(long, value_parser = parse_inference_task, help = "Inference task; inferred when the model has an unambiguous default")]
@@ -57,6 +66,8 @@ pub struct RunOptions {
 }
 
 pub(super) struct RunTurn {
+    pub started: Instant,
+    pub server: bool,
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
     pub json: bool,
@@ -146,6 +157,24 @@ fn apply_media_parameters(request: &mut InferenceRequest, values: &[String]) -> 
     Ok(())
 }
 
+fn validate_server_worker_options(
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    options: &LlamaRuntimeOptions,
+) -> Result<()> {
+    anyhow::ensure!(
+        matches!(backend, BackendArg::Auto)
+            && device.is_none()
+            && serde_json::to_value(options)?
+                .as_object()
+                .context("invalid runtime options")?
+                .values()
+                .all(Value::is_null),
+        "--server uses an existing worker: set backend, device and llama.cpp runtime options on werk serve, not run (including WERK_LLAMA_* runtime settings)"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     model_home: Option<PathBuf>,
@@ -166,6 +195,10 @@ pub(super) async fn execute(
     options: RunOptions,
     persistence_args: ChatPersistenceArgs,
 ) -> Result<()> {
+    let started = Instant::now();
+    if options.server.is_some() {
+        validate_server_worker_options(backend_override, device_override, &llama_options)?;
+    }
     let store = ModelStore::resolve(model_home)?;
     let manifest = store.get(&model)?;
     let mut raw = options.request.as_deref().map(read_request).transpose()?;
@@ -197,6 +230,10 @@ pub(super) async fn execute(
         task,
         InferenceTask::TextGeneration | InferenceTask::ImageUnderstanding
     ) {
+        anyhow::ensure!(
+            options.server.is_none(),
+            "--server currently supports text, vision and tool conversations; media uses the local run route"
+        );
         anyhow::ensure!(
             !persistence_args.is_enabled(),
             "conversation persistence applies to text/vision and tool conversations; media uses the existing output store"
@@ -337,25 +374,37 @@ pub(super) async fn execute(
     } else {
         backend_choice
     };
-    let selected_route = routed_backend_for_request_with_tools(
-        &store,
-        route_choice,
-        &manifest,
-        has_images,
-        requires_tools,
-        selection_options,
-    )?;
-    let selected_backend = selected_route.choice;
-    selected_route.report();
-    print_routing_debug(
-        &store,
-        backend_override,
-        &manifest,
-        has_images,
-        &selected_route,
-        debug,
-    );
-    let mut backend = selected_route.build(store, llama_options.clone(), selection_options)?;
+    let (selected_backend, mut backend): (_, Arc<dyn GenerationBackend>) =
+        if let Some(url) = &options.server {
+            (
+                BackendChoice::Auto,
+                Arc::new(crate::backend::werk_server_client::WerkServerClient::new(
+                    url,
+                    options.api_key.clone(),
+                )?),
+            )
+        } else {
+            let selected_route = routed_backend_for_request_with_tools(
+                &store,
+                route_choice,
+                &manifest,
+                has_images,
+                requires_tools,
+                selection_options,
+            )?;
+            let selected_backend = selected_route.choice;
+            selected_route.report();
+            print_routing_debug(
+                &store,
+                backend_override,
+                &manifest,
+                has_images,
+                &selected_route,
+                debug,
+            );
+            let backend = selected_route.build(store, llama_options.clone(), selection_options)?;
+            (selected_backend, backend)
+        };
     if let Some(runtime) = runtime_options {
         backend = backend.with_chat_options(&manifest, runtime)?;
     }
@@ -372,7 +421,11 @@ pub(super) async fn execute(
         tool_choice: request.tool_choice,
         parallel_tool_calls: request.parallel_tool_calls,
     });
-    let context_size = chat_context_size(selected_backend, &manifest, llama_options.ctx_size);
+    let context_size = if options.server.is_some() {
+        None
+    } else {
+        chat_context_size(selected_backend, &manifest, llama_options.ctx_size)
+    };
     chat_loop(
         backend,
         manifest,
@@ -394,6 +447,8 @@ pub(super) async fn execute(
         terminal_spinner_enabled(debug) && !options.json,
         persistence,
         Some(RunTurn {
+            started,
+            server: options.server.is_some(),
             messages: request.messages,
             stream,
             json: options.json,
@@ -462,6 +517,42 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    #[test]
+    fn server_run_parser_accepts_remote_and_rejects_worker_settings() {
+        assert!(
+            Cli::try_parse_from([
+                "werk",
+                "run",
+                "qwen",
+                "Hi",
+                "--server",
+                "http://127.0.0.1:11434",
+                "--persistence",
+                "--stream"
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_server_worker_options(BackendArg::Auto, None, &LlamaRuntimeOptions::default())
+                .is_ok()
+        );
+        assert!(
+            validate_server_worker_options(BackendArg::Cuda, None, &LlamaRuntimeOptions::default())
+                .is_err()
+        );
+        assert!(
+            validate_server_worker_options(
+                BackendArg::Auto,
+                None,
+                &LlamaRuntimeOptions {
+                    threads: Some(24),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
     fn fixture() -> (ModelStore, ModelManifest) {
         let home = std::env::temp_dir().join(format!(
             "werk-run-{}-{}",
@@ -505,6 +596,8 @@ mod tests {
 
     fn turn(messages: Vec<ChatMessage>) -> RunTurn {
         RunTurn {
+            started: Instant::now(),
+            server: false,
             messages,
             stream: false,
             json: true,
@@ -601,6 +694,60 @@ mod tests {
             Some(run),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn server_run_preserves_messages_and_skips_local_snapshot_preparation() {
+        let (store, manifest) = fixture();
+        let state = Arc::new(Recording::default());
+        *state.events.lock().unwrap() = vec![
+            Ok(GenerateStreamEvent::TextChunk("OK".into())),
+            done("stop"),
+        ];
+        let input = vec![
+            text_message("system", "Keep this system message"),
+            text_message("user", "Hello"),
+        ];
+        let mut run = turn(input.clone());
+        run.server = true;
+        run.stop.clear();
+        chat_loop(
+            Arc::new(MockBackend {
+                state: state.clone(),
+                native: true,
+            }),
+            manifest.clone(),
+            BackendChoice::Auto,
+            None,
+            128,
+            None,
+            None,
+            None,
+            true,
+            None,
+            Vec::new(),
+            StreamGranularity::Token,
+            false,
+            false,
+            false,
+            persistence().open(&store, &manifest.id).unwrap(),
+            Some(run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *state.calls.lock().unwrap(),
+            vec!["prepare", "backend_generate"]
+        );
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(
+            serde_json::to_value(&requests[0].messages).unwrap(),
+            serde_json::to_value(input).unwrap()
+        );
+        assert!(requests[0].stop.is_empty());
+        let (_, messages) = persistence().open(&store, &manifest.id).unwrap().unwrap();
+        assert_eq!(messages.len(), 3);
+        fs::remove_dir_all(store.home()).unwrap();
     }
 
     #[tokio::test]

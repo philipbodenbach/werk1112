@@ -485,7 +485,15 @@ async fn complete_chat_response(
                 log_generation_phases(response.prompt_tokens, response.timings);
                 log_backend_diagnostics(&response.backend_diagnostics);
             }
-            Json(to_chat_completion(model, response)).into_response()
+            let metadata = json!({"timings": response.timings, "backend_diagnostics": response.backend_diagnostics});
+            let cached = response.timings.cached_prompt_tokens;
+            let mut body = serde_json::to_value(to_chat_completion(model, response))
+                .expect("serializable completion");
+            body["werk"] = metadata;
+            if let Some(cached) = cached {
+                body["usage"]["prompt_tokens_details"] = json!({"cached_tokens": cached});
+            }
+            Json(body).into_response()
         }
         Err(err) => {
             eprintln!("[werk serve] complete model={model} -> error: {err}");
@@ -573,12 +581,16 @@ fn stream_chat_response(
                     backend_diagnostics,
                 }) => {
                     if include_usage {
-                        *body_usage.lock().expect("stream usage mutex poisoned") = Some(json!({
+                        let mut usage = json!({
                             "id": body_id, "object": "chat.completion.chunk", "created": created,
                             "model": body_model, "choices": [],
                             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                                       "total_tokens": prompt_tokens.saturating_add(completion_tokens)}
-                        }));
+                        });
+                        if let Some(cached) = timings.cached_prompt_tokens {
+                            usage["usage"]["prompt_tokens_details"] = json!({"cached_tokens": cached});
+                        }
+                        *body_usage.lock().expect("stream usage mutex poisoned") = Some(usage);
                     }
                     if verbose {
                         eprintln!(
@@ -599,6 +611,7 @@ fn stream_chat_response(
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": body_model,
+                        "werk": {"timings": timings, "backend_diagnostics": backend_diagnostics},
                         "choices": [{
                             "index": 0,
                             "delta": {},

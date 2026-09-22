@@ -10,7 +10,7 @@ use std::{
     io::{BufRead, BufReader, Read},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -98,7 +98,9 @@ impl VllmAccelerator {
 }
 
 struct VllmProcess {
-    child: Option<Mutex<Child>>,
+    child: Option<super::llama_process_lifecycle::ManagedChild>,
+    // Owned native process drops/reaps before its model file leases are released.
+    _cache_release: Option<super::model_file_cache::CacheReleaseGuard>,
     command_label: String,
     discovery_source: String,
     args: Vec<String>,
@@ -240,6 +242,7 @@ impl VllmBackend {
         let model_dir = store.model_dir(&model_name);
         let server = VllmProcess {
             child: None,
+            _cache_release: None,
             command_label: "mock remote vLLM OpenAI server".to_string(),
             discovery_source: "test HTTP server".to_string(),
             args: Vec::new(),
@@ -656,6 +659,7 @@ impl VllmProcess {
             )?;
             let process = Self {
                 child: None,
+                _cache_release: None,
                 command_label: "remote vLLM OpenAI server".to_string(),
                 discovery_source: discovery.source,
                 args: Vec::new(),
@@ -696,23 +700,30 @@ impl VllmProcess {
         } else {
             child_command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let mut child = child_command.spawn().with_context(|| {
-            format!(
-                "failed to start vLLM server using {}",
-                launch.program.display()
-            )
-        })?;
-        if !env_true("WERK_VLLM_LOG") {
-            if let Some(stdout) = child.stdout.take() {
-                spawn_log_tail_reader("stdout", stdout, log_tail.clone());
+        let cache_release =
+            super::model_file_cache::CacheReleaseGuard::prepare_manifest(store, manifest);
+        let child = super::llama_process_lifecycle::ManagedChild::spawn(&mut child_command)
+            .with_context(|| {
+                format!(
+                    "failed to start vLLM server using {}",
+                    launch.program.display()
+                )
+            })?;
+        let pid = {
+            let mut process = child.lock().unwrap_or_else(|error| error.into_inner());
+            if !env_true("WERK_VLLM_LOG") {
+                if let Some(stdout) = process.stdout.take() {
+                    spawn_log_tail_reader("stdout", stdout, log_tail.clone());
+                }
+                if let Some(stderr) = process.stderr.take() {
+                    spawn_log_tail_reader("stderr", stderr, log_tail.clone());
+                }
             }
-            if let Some(stderr) = child.stderr.take() {
-                spawn_log_tail_reader("stderr", stderr, log_tail.clone());
-            }
-        }
-        let pid = child.id();
+            process.id()
+        };
         let process = Self {
-            child: Some(Mutex::new(child)),
+            child: Some(child),
+            _cache_release: cache_release,
             command_label: command.display(),
             discovery_source: discovery.source,
             args: launch.args,
@@ -919,17 +930,6 @@ impl VllmProcess {
         eprintln!("reused existing server: {reused}");
         if self.is_nemotron {
             print_nemotron_reasoning_parser_guidance(&self.args);
-        }
-    }
-}
-
-impl Drop for VllmProcess {
-    fn drop(&mut self) {
-        if let Some(child) = &self.child
-            && let Ok(mut child) = child.lock()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
         }
     }
 }
@@ -2787,6 +2787,42 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_vllm_worker_is_reaped_after_last_process_owner_drops() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 60"]);
+        let child = super::super::llama_process_lifecycle::ManagedChild::spawn(&mut command)
+            .expect("spawn owned test worker");
+        let pid = child.lock().unwrap().id();
+        let server = Arc::new(VllmProcess {
+            child: Some(child),
+            _cache_release: None,
+            command_label: "test worker".to_string(),
+            discovery_source: "test".to_string(),
+            args: Vec::new(),
+            model_dir: PathBuf::new(),
+            model_name: "test".to_string(),
+            model_name_source: "test",
+            is_nemotron: false,
+            url: String::new(),
+            pid: Some(pid),
+            log_tail: Arc::default(),
+            accelerator: VllmAccelerator::Cuda,
+            runtime_version: "test".to_string(),
+            runtime_instance_id: "test".to_string(),
+        });
+        let session_owner = Arc::clone(&server);
+        drop(server);
+        assert!(session_owner.try_wait_status().unwrap().is_none());
+        drop(session_owner);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 
     #[test]
     fn chat_completion_body_uses_openai_messages() {

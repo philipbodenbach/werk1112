@@ -1,0 +1,29 @@
+{
+  "time": 1790012347.4897099,
+  "models": {
+    "vumpt-Qwen3.8-Flash-Next-GGUF": {
+      "other": {
+        "GiB": 19.679,
+        "resident_GiB": 19.373
+      },
+      "lazy_PLE": {
+        "GiB": 32.783,
+        "resident_GiB": 0.0
+      },
+      "cpu_experts_38": {
+        "GiB": 58.496,
+        "resident_GiB": 14.354
+      }
+    },
+    "deepseek-v4-flash-q2-k-s": {
+      "other": {
+        "GiB": 17.004,
+        "resident_GiB": 0.187
+      },
+      "cpu_experts_38": {
+        "GiB": 74.812,
+        "resident_GiB": 58.086
+      }
+    }
+  }
+}

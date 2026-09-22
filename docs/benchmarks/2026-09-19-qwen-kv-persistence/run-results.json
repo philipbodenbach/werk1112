@@ -1,0 +1,16 @@
+[
+  {
+    "run": 0,
+    "exit": 0,
+    "wall_seconds": 150.028454350002,
+    "stdout": "{\"finish_reason\":\"stop\",\"message\":{\"content\":\"OK\",\"role\":\"assistant\"},\"model\":\"qwen-cache-test\",\"type\":\"completion\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":23,\"total_tokens\":25}}\n",
+    "stderr": "[werk run] persistence enabled: 0 saved messages\n[werk run] conversation: /tmp/werk-qwen-cache-e2e/chat-sessions/7a7eb2e79dd18917cb9854e6f9038e5e6de05356ca051f9ed73392fb963d156b.json\nUsing llama.cpp server CUDA backend\n[werk run] native KV cache enabled; reuse depends on the prompt and backend\n\nbackend:              llama.cpp server CUDA\ntotal duration:       16.072739s\nload duration:        0us\nprompt total count:   23 token(s)\nprompt cached count:  0 token(s)\nprompt eval count:    23 token(s)\nprompt eval duration: 4.902051s\nprompt eval rate:     4.69 tokens/s\neval count:           2 token(s)\neval duration:        403.571ms\nfirst token:          4.909194s\neval rate:            4.96 tokens/s\nfinish reason:        stop\n\nbackend stats:\n  history messages: 1\n  chat template source: model\n  chat template: model\n  chat template applied by werk: no\n  history enabled: yes\n  llama.cpp request endpoint: /v1/chat/completions\n  chat template applied by backend/model: yes\n  llama.cpp native KV persistence: cold session\n  llama.cpp native KV snapshot saved: 24 tokens\n"
+  },
+  {
+    "run": 1,
+    "exit": 0,
+    "wall_seconds": 49.419227701000636,
+    "stdout": "{\"finish_reason\":\"stop\",\"message\":{\"content\":\"37\",\"role\":\"assistant\"},\"model\":\"qwen-cache-test\",\"type\":\"completion\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":53,\"total_tokens\":56}}\n",
+    "stderr": "[werk run] persistence enabled: 2 saved messages restored\n[werk run] conversation: /tmp/werk-qwen-cache-e2e/chat-sessions/7a7eb2e79dd18917cb9854e6f9038e5e6de05356ca051f9ed73392fb963d156b.json\nUsing llama.cpp server CUDA backend\n[werk run] native KV cache enabled; reuse depends on the prompt and backend\n\nbackend:              llama.cpp server CUDA\ntotal duration:       24.991321s\nload duration:        0us\nprompt total count:   53 token(s)\nprompt cached count:  24 token(s)\nprompt eval count:    29 token(s)\nprompt eval duration: 3.931463s\nprompt eval rate:     7.38 tokens/s\neval count:           3 token(s)\neval duration:        483.513ms\nfirst token:          14.122578s\neval rate:            6.20 tokens/s\nfinish reason:        stop\n\nbackend stats:\n  history messages: 3\n  chat template source: model\n  chat template: model\n  chat template applied by werk: no\n  history enabled: yes\n  llama.cpp request endpoint: /v1/chat/completions\n  chat template applied by backend/model: yes\n  llama.cpp native KV snapshot restored: 24 tokens; actual prefix reuse reported by backend usage\n  llama.cpp native KV snapshot saved: 55 tokens\n"
+  }
+]
