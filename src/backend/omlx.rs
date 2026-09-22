@@ -1666,7 +1666,9 @@ impl OmlxProcess {
             process.expert_offload =
                 status.get("experts_offloaded").and_then(Value::as_bool) == Some(true);
         }
-        if invocation.server_prefix_cache {
+        // Persistent CLI sessions verify their own cache after startup. The
+        // server-only directory is intentionally absent for those sessions.
+        if invocation.server_prefix_cache && invocation.persistence_dir.is_none() {
             let active = if server_cache_directory.is_some() {
                 process
                     .json_request(

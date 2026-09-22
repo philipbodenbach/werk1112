@@ -29,6 +29,7 @@ _DTYPES = {"U32": 4, "I32": 4, "F32": 4, "F16": 2, "BF16": 2,
            "I64": 8, "U64": 8, "I16": 2, "U16": 2, "I8": 1, "U8": 1, "BOOL": 1}
 _WORKSPACE_BYTES = 1024 * 1024 * 1024
 _ALLOCATOR_CACHE_BYTES = 64 * 1024 * 1024
+_ADMISSION_HEADROOM_BYTES = 64 * 1024 * 1024
 _EXPERT_GROUP_SIZE = 8
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _MANAGER = None
@@ -873,7 +874,13 @@ class _ExpertMemoryGuard:
                 return
             resident, _ = self.cache_totals()
             non_expert = max(0, current - resident)
-            available = min(caps) - non_expert - int(peak) - _WORKSPACE_BYTES
+            # Native preflight re-samples process usage after this executor
+            # callback. Filling the predicted cap exactly makes even a small
+            # intervening allocation reject a feasible prompt. Leave a bounded
+            # margin outside current()'s workspace reservation; adding it to
+            # both calculations would cancel it and leave no real headroom.
+            available = (min(caps) - non_expert - int(peak) - _WORKSPACE_BYTES
+                         - _ADMISSION_HEADROOM_BYTES)
             resize_auxiliary = getattr(self.manager, "resize_auxiliary_cache", None)
             if resize_auxiliary is not None:
                 available -= resize_auxiliary(available)
@@ -885,6 +892,7 @@ class _ExpertMemoryGuard:
                 "non_weight_bytes": non_expert,
                 "predicted_peak_bytes": int(peak),
                 "ceiling_bytes": min(caps),
+                "headroom_bytes": _ADMISSION_HEADROOM_BYTES,
                 "effective_expert_bytes": self.manager.effective_cache_bytes,
             }
             setattr(self.manager, "last_" + phase + "_admission", admission)
