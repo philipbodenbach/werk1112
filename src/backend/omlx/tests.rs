@@ -1,6 +1,73 @@
 use super::*;
 
 #[test]
+fn text_worker_helpers_bootstrap_without_model_directory_imports() {
+    let python = absolute_program(PathBuf::from("python3")).unwrap();
+    for architecture in [
+        None,
+        Some("deepseek_v4"),
+        Some("qwen4_exp"),
+        Some("glm5_next"),
+    ] {
+        let source = "import json\nprint(json.dumps({name: name in sys.modules for name in ('_werk_omlx_decode', '_werk_omlx_glm_profile')}))\n";
+        let output = Command::new(&python)
+            .args([
+                "-I",
+                "-c",
+                &text_worker_script_source(source, architecture),
+                "/unused",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let modules: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            modules["_werk_omlx_decode"],
+            matches!(architecture, Some("qwen4_exp" | "glm5_next"))
+        );
+        assert_eq!(
+            modules["_werk_omlx_glm_profile"],
+            architecture == Some("glm5_next")
+        );
+        if !matches!(architecture, Some("qwen4_exp" | "glm5_next")) {
+            assert_eq!(
+                text_worker_script_source(source, architecture),
+                worker_script_source(source)
+            );
+        }
+    }
+}
+
+#[test]
+fn glm_profile_diagnostics_are_opt_in_bounded_and_allowlisted() {
+    assert!(glm_profile_diagnostics(&json!({})).is_none());
+    assert!(
+        glm_profile_diagnostics(&json!({"glm_layer_profile":{"enabled":false,"layers":[]}}))
+            .is_none()
+    );
+    let row = json!({"layer":3,"calls":2,"failures":0,"cache_hits":9,"cache_misses":7,
+        "cache_evictions":1,"disk_bytes_read":1024,"wall_seconds":0.1,
+        "forward_seconds":0.09,"routing_seconds":0.01,"disk_read_seconds":0.05,
+        "api_key":"never print this"});
+    let status = json!({"glm_layer_profile":{"enabled":true,"layers":[row.clone()]}});
+    let line = glm_profile_diagnostics(&status).unwrap();
+    assert!(line.contains("worker cumulative") && line.contains("\"layer\":3"));
+    assert!(!line.contains("api_key") && !line.contains("never print this"));
+    assert!(
+        glm_profile_diagnostics(
+            &json!({"glm_layer_profile":{"enabled":true,"layers":vec![row;1025]}})
+        )
+        .is_none()
+    );
+    let mut invalid = status;
+    invalid["glm_layer_profile"]["layers"][0]["wall_seconds"] = json!(-1);
+    assert!(glm_profile_diagnostics(&invalid).is_none());
+}
+#[test]
 fn expert_cache_defaults_to_native_with_explicit_auto_small_and_large_overrides() {
     assert_eq!(expert_cache_bytes(None).unwrap(), None);
     assert_eq!(expert_cache_bytes(Some("auto".into())).unwrap(), Some(0));

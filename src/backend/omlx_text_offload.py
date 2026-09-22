@@ -10,6 +10,7 @@ import copy
 import importlib
 import importlib.metadata
 import inspect
+import os
 from pathlib import Path
 import weakref
 
@@ -25,6 +26,36 @@ except ImportError:  # Direct repository tests.
 
 ARCHITECTURES = {"qwen4_exp", "glm5_next"}
 _MANAGER = None
+
+
+def expert_decode_factory(architecture):
+    """Choose once at load time; unrelated backends keep their original path."""
+    mode = os.environ.get("WERK_OMLX_TEXT_DECODE", "direct")
+    if mode not in ("legacy", "direct"):
+        raise ValueError("WERK_OMLX_TEXT_DECODE must be legacy or direct")
+    if architecture not in ARCHITECTURES or mode == "legacy":
+        return streamed_experts
+    try:
+        from _werk_omlx_decode import streamed_decode_experts
+    except ImportError:
+        from omlx_decode import streamed_decode_experts
+    return streamed_decode_experts
+
+
+def profiled_experts(module, layer, manager, profile):
+    import mlx.nn as nn
+
+    class ProfiledExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.module = module
+            self.activation = module.activation
+
+        def __call__(self, x, indices, scores=None, weighted_sum=False):
+            with manager._lock, profile.measure(layer, manager):
+                return self.module(x, indices, scores, weighted_sum)
+
+    return ProfiledExperts()
 
 
 def configure_glm_thinking(tokenizer, architecture):
@@ -361,6 +392,8 @@ class TextExpertManager(ExpertManager):
 
     def status(self):
         result = super().status()
+        if getattr(self, "glm_profile", None) is not None:
+            result["glm_layer_profile"] = self.glm_profile.snapshot()
         result["ngram_cache"] = self.ngram_cache.snapshot()
         result["ngram_requested_rows"] = self.access.ple_requested_rows
         result["ngram_unique_rows"] = self.access.ple_unique_rows
@@ -520,11 +553,14 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
                 # an ordinary None attribute. A dictionary None is invisible
                 # to MLX attribute lookup and breaks native GLM sanitize.
                 setattr(root, attribute, None)
+        factory = expert_decode_factory(current.architecture) if cp.experts_enabled else None
         for layer in sorted(cp.expert_bytes) if cp.experts_enabled else ():
             block = root.language_model.model.layers[layer]
             mlp = block.mlp
             activation = mlp.switch_mlp.activation
-            mlp.switch_mlp = streamed_experts(manager.access, layer, activation, _WORKSPACE_BYTES)
+            mlp.switch_mlp = factory(manager.access, layer, activation, _WORKSPACE_BYTES)
+            if getattr(manager, "glm_profile", None) is not None:
+                mlp.switch_mlp = profiled_experts(mlp.switch_mlp, layer, manager, manager.glm_profile)
             if hasattr(block, "compile_ffn"):
                 # Python routing and bounded disk I/O cannot be traced into an
                 # MLX compiled graph. The arithmetic itself stays native.
@@ -618,6 +654,16 @@ def install(path, expert_bytes, ngram_bytes=None):
     if tuple(inspect.signature(original_size).parameters) != ("self", "entry", "runtime_settings", "base_size"):
         raise ValueError("unsupported oMLX memory admission contract")
     manager = TextExpertManager(checkpoint)
+    if checkpoint.inventory.architecture == "glm5_next":
+        profile = os.environ.get("WERK_OMLX_GLM_PROFILE", "0")
+        if profile not in ("0", "1"):
+            raise ValueError("WERK_OMLX_GLM_PROFILE must be 0 or 1")
+        if profile == "1":
+            try:
+                from _werk_omlx_glm_profile import GlmLayerProfile
+            except ImportError:
+                from omlx_glm_profile import GlmLayerProfile
+            manager.glm_profile = GlmLayerProfile(enabled=True, max_layers=len(checkpoint.expert_bytes))
     guard = _ExpertMemoryGuard(manager, Scheduler, BatchedEngine)
 
     def matches(value):

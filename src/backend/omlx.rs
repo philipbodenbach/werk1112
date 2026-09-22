@@ -45,6 +45,8 @@ const PERSISTENCE: &str = include_str!("omlx_persistence.py");
 const OFFLOAD: &str = include_str!("omlx_offload.py");
 const OFFLOAD_RUNTIME: &str = include_str!("omlx_offload_runtime.py");
 const TEXT_OFFLOAD: &str = include_str!("omlx_text_offload.py");
+const TEXT_DECODE: &str = include_str!("omlx_decode.py");
+const GLM_PROFILE: &str = include_str!("omlx_glm_profile.py");
 mod experts;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(900);
@@ -82,6 +84,21 @@ fn worker_script_source(source: &str) -> String {
     }
     script.push_str(source);
     console_script_source(&script)
+}
+
+fn text_worker_script_source(source: &str, architecture: Option<&str>) -> String {
+    if !matches!(architecture, Some("glm5_next" | "qwen4_exp")) {
+        return worker_script_source(source);
+    }
+    let mut script = String::new();
+    for (name, helper) in [("_werk_omlx_decode", TEXT_DECODE)].into_iter().chain(
+        (architecture == Some("glm5_next")).then_some(("_werk_omlx_glm_profile", GLM_PROFILE)),
+    ) {
+        let literal = serde_json::to_string(helper).expect("Python source is serializable");
+        script.push_str(&format!("_werk_helper = types.ModuleType('{name}')\nsys.modules['{name}'] = _werk_helper\nexec({literal}, _werk_helper.__dict__)\n"));
+    }
+    script.push_str(source);
+    worker_script_source(&script)
 }
 
 #[derive(Clone)]
@@ -1220,6 +1237,51 @@ fn expert_interval_diagnostics(before: &Value, after: &Value) -> Option<String> 
     ))
 }
 
+fn glm_profile_diagnostics(status: &Value) -> Option<String> {
+    let profile = status.get("glm_layer_profile")?;
+    if !profile.get("enabled")?.as_bool()? {
+        return None;
+    }
+    let layers = profile.get("layers")?.as_array()?;
+    if layers.len() > 1024 {
+        return None;
+    }
+    let rows: Option<Vec<Value>> = layers
+        .iter()
+        .map(|layer| {
+            let mut row = serde_json::Map::new();
+            row.insert("layer".into(), json!(layer.get("layer")?.as_u64()?));
+            for name in [
+                "calls",
+                "failures",
+                "cache_hits",
+                "cache_misses",
+                "cache_evictions",
+                "disk_bytes_read",
+            ] {
+                row.insert(name.into(), json!(layer.get(name)?.as_u64()?));
+            }
+            for name in [
+                "wall_seconds",
+                "forward_seconds",
+                "routing_seconds",
+                "disk_read_seconds",
+            ] {
+                let seconds = layer.get(name)?.as_f64()?;
+                if !seconds.is_finite() || seconds < 0.0 {
+                    return None;
+                }
+                row.insert(name.into(), json!(seconds));
+            }
+            Some(Value::Object(row))
+        })
+        .collect();
+    Some(format!(
+        "oMLX GLM layer profile (worker cumulative; overlapping timings; reads include OS file cache): {}",
+        json!(rows?)
+    ))
+}
+
 fn omlx_chat_completion_body(
     model_name: &str,
     request: &GenerateRequest,
@@ -1485,9 +1547,15 @@ impl OmlxProcess {
             .persistence_dir
             .as_ref()
             .or(server_cache_directory.as_ref());
+        let architecture = report
+            .runtime
+            .get("expert_offload")
+            .and_then(|offload| offload.get("architecture"))
+            .and_then(Value::as_str);
+        let worker_source = text_worker_script_source(SUPERVISOR, architecture);
         let mut command = invocation.python_command();
         command
-            .args(["-c", &worker_script_source(SUPERVISOR)])
+            .args(["-c", &worker_source])
             .arg(
                 invocation
                     .launcher
@@ -1953,9 +2021,13 @@ impl OmlxProcess {
         if let Some(before) = expert_before
             && let Ok(after) =
                 self.json_request("GET", "/werk/experts/status", None, Duration::from_secs(2))
-            && let Some(diagnostic) = expert_interval_diagnostics(&before, &after)
         {
-            backend_diagnostics.push(diagnostic);
+            if let Some(diagnostic) = expert_interval_diagnostics(&before, &after) {
+                backend_diagnostics.push(diagnostic);
+            }
+            if let Some(diagnostic) = glm_profile_diagnostics(&after) {
+                backend_diagnostics.push(diagnostic);
+            }
         }
         let assistant_message = completion.assistant_message();
         Ok(GenerateResponse {

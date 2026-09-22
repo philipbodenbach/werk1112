@@ -1,11 +1,12 @@
 """Installed native model vs offloaded model, including recurrent follow-up tokens."""
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import socket
 import subprocess
 import sys
@@ -14,6 +15,163 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import omlx_text_offload as adapter
+
+
+class ExpertDecodeSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.decode = ModuleType("_werk_omlx_decode")
+        self.decode.streamed_decode_experts = lambda *args: None
+        self.modules = patch.dict(sys.modules, {self.decode.__name__: self.decode})
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+
+    def test_explicit_direct_and_legacy_selection_preserves_other_architectures(self):
+        for mode in ("direct", "legacy"):
+            with self.subTest(mode=mode), patch.dict(
+                    os.environ, {"WERK_OMLX_TEXT_DECODE": mode}, clear=True):
+                expected = (self.decode.streamed_decode_experts if mode == "direct"
+                            else adapter.streamed_experts)
+                for architecture in ("glm5_next", "qwen4_exp"):
+                    self.assertIs(adapter.expert_decode_factory(architecture), expected)
+                for architecture in ("deepseek_v4", "unrecognized", None):
+                    self.assertIs(adapter.expert_decode_factory(architecture),
+                                  adapter.streamed_experts)
+
+    def test_defaults_use_direct_and_invalid_mode_fails_before_loading(self):
+        with patch.dict(os.environ, {}, clear=True):
+            for architecture in ("glm5_next", "qwen4_exp"):
+                self.assertIs(adapter.expert_decode_factory(architecture),
+                              self.decode.streamed_decode_experts)
+        for mode in ("", "auto", "DIRECT", "0"):
+            with self.subTest(mode=mode), patch.dict(
+                    os.environ, {"WERK_OMLX_TEXT_DECODE": mode}, clear=True):
+                with self.assertRaisesRegex(ValueError, "WERK_OMLX_TEXT_DECODE"):
+                    adapter.expert_decode_factory("glm5_next")
+
+
+class GlmProfileIntegrationTests(unittest.TestCase):
+    @contextmanager
+    def runtime(self, architecture, profile_value=None):
+        """Use real header-only checkpoint/manager setup with no GPU runtime."""
+        from test_omlx_offload import write_fixture
+
+        class EnginePool:
+            def _entry_runtime_resident_size(self, entry, runtime_settings, base_size=None):
+                return base_size
+
+        modules = {name: ModuleType(name) for name in (
+            "omlx", "omlx.utils", "omlx.utils.model_loading", "omlx.model_discovery",
+            "omlx.engine_pool", "omlx.scheduler", "omlx.engine", "omlx.engine.batched")}
+        loading = modules["omlx.utils.model_loading"]
+        loading.lm_load_compat = lambda *_args, **_kwargs: None
+        discovery = modules["omlx.model_discovery"]
+        discovery.detect_model_type = lambda _path: "native"
+        modules["omlx"].model_discovery = discovery
+        modules["omlx.utils"].model_loading = loading
+        modules["omlx.engine_pool"].EnginePool = EnginePool
+        modules["omlx.scheduler"].Scheduler = type("Scheduler", (), {})
+        modules["omlx.engine.batched"].BatchedEngine = type("BatchedEngine", (), {})
+        environment = {} if profile_value is None else {"WERK_OMLX_GLM_PROFILE": profile_value}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            write_fixture(path, architecture)
+            with (patch.dict(sys.modules, modules),
+                  patch.dict(os.environ, environment, clear=True),
+                  patch.object(adapter, "_MANAGER", None),
+                  patch.object(adapter, "native_classes"),
+                  patch.object(adapter.TextCheckpoint, "configure_auto"),
+                  patch.object(adapter, "_ExpertMemoryGuard") as guard):
+                yield SimpleNamespace(path=path, loading=loading, guard=guard,
+                                      original_load=loading.lm_load_compat)
+
+    def test_profiling_is_absent_by_default_and_qwen_ignores_glm_flag(self):
+        for architecture, value in (("glm5_next", None), ("glm5_next", "0"),
+                                    ("qwen4_exp", None), ("qwen4_exp", "1"),
+                                    ("qwen4_exp", "invalid")):
+            with self.subTest(architecture=architecture, value=value):
+                with self.runtime(architecture, value) as runtime:
+                    manager = adapter.install(runtime.path, 1024**2)
+                    self.assertFalse(hasattr(manager, "glm_profile"))
+                    self.assertNotIn("glm_layer_profile", manager.status())
+                    runtime.guard.return_value.install.assert_called_once()
+
+    def test_opt_in_profile_is_bounded_by_checkpoint_layers_and_exposed_in_status(self):
+        with self.runtime("glm5_next", "1") as runtime:
+            manager = adapter.install(runtime.path, 1024**2)
+            profile = manager.glm_profile
+            layer = next(iter(manager.checkpoint.expert_bytes))
+            with manager._lock, profile.measure(layer, manager):
+                manager.hits += 3
+                manager.reader.logical_bytes += 4096
+            with manager._lock, profile.measure(layer + 1, manager):
+                manager.hits += 4
+            status = manager.status()
+            result = status["glm_layer_profile"]
+            self.assertTrue(result["enabled"])
+            self.assertEqual(result["max_layers"], len(manager.checkpoint.expert_bytes))
+            self.assertEqual(len(result["layers"]), 1)
+            self.assertEqual(result["ignored_calls"], 1)
+            self.assertEqual(result["totals"]["cache_hits"], 3)
+            self.assertEqual(result["totals"]["disk_bytes_read"], 4096)
+            self.assertEqual(status["cache_hits"], 7)
+            json.dumps(result, allow_nan=False)
+
+    def test_invalid_profile_setting_does_not_install_loader_or_guard(self):
+        for value in ("", "true", "2"):
+            with self.subTest(value=value), self.runtime("glm5_next", value) as runtime:
+                with self.assertRaisesRegex(ValueError, "WERK_OMLX_GLM_PROFILE"):
+                    adapter.install(runtime.path, 1024**2)
+                self.assertIs(runtime.loading.lm_load_compat, runtime.original_load)
+                runtime.guard.assert_not_called()
+                self.assertIsNone(adapter._MANAGER)
+
+    def test_profile_wrapper_preserves_arguments_result_and_failure(self):
+        class TrackingLock:
+            held = False
+
+            def __enter__(self):
+                self.held = True
+
+            def __exit__(self, *_args):
+                self.held = False
+
+        with self.runtime("glm5_next", "1") as runtime:
+            manager = adapter.install(runtime.path, 1024**2)
+            manager._lock = TrackingLock()
+            layer = next(iter(manager.checkpoint.expert_bytes))
+            result = object()
+            failure = RuntimeError("expert failed")
+            calls = []
+
+            class Experts:
+                activation = object()
+
+                def __call__(inner, *args):
+                    self.assertTrue(manager._lock.held)
+                    calls.append(args)
+                    manager.misses += 1
+                    if len(calls) == 2:
+                        raise failure
+                    return result
+
+            mlx = ModuleType("mlx")
+            mlx.nn = ModuleType("mlx.nn")
+            mlx.nn.Module = object
+            with patch.dict(sys.modules, {"mlx": mlx, "mlx.nn": mlx.nn}):
+                original = Experts()
+                wrapped = adapter.profiled_experts(original, layer, manager, manager.glm_profile)
+                self.assertIs(wrapped.activation, original.activation)
+                arguments = (object(), object(), object(), True)
+                self.assertIs(wrapped(*arguments), result)
+                with self.assertRaises(RuntimeError) as caught:
+                    wrapped(*arguments)
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(calls, [arguments, arguments])
+            self.assertFalse(manager._lock.held)
+            measured = manager.glm_profile.snapshot()["totals"]
+            self.assertEqual(measured["calls"], 2)
+            self.assertEqual(measured["failures"], 1)
+            self.assertEqual(measured["cache_misses"], 2)
 
 
 class GlmThinkingTemplateTests(unittest.TestCase):
@@ -182,6 +340,19 @@ def restart_prefix(test, model, model_path, state, tokens, directory):
     test.assertEqual(request.remaining_tokens, [21])
     test.assertEqual(request.cached_tokens, len(tokens))
     return request.prompt_cache
+
+
+def tiny_chat_template(architecture):
+    messages = "{% for message in messages %}{{ message['content'] }} {% endfor %}"
+    if architecture != "glm5_next":
+        return messages
+    # Match the installed GLM template's effort and assistant markers so the
+    # production no-thinking adaptation is exercised by native loader tests.
+    return ("{%- set effective_reasoning_effort = reasoning_effort | default('max') -%}"
+            "{%- if effective_reasoning_effort is not none -%}"
+            "<|system|>Reasoning Effort: {{ effective_reasoning_effort }}{%- endif -%}"
+            + messages +
+            "{% if add_generation_prompt %}<|assistant|>{{- '<think>' -}}{% endif %}")
 
 
 def tiny_config(architecture):
@@ -431,7 +602,8 @@ class NativeTextLoaderTests(unittest.TestCase):
                             cp.configure_auto()
                             self.assertFalse(cp.experts_enabled)
                         manager = adapter.TextExpertManager(cp)
-                        with patch("mlx_lm.utils.load_tokenizer", return_value=object()):
+                        tokenizer = SimpleNamespace(chat_template=tiny_chat_template(architecture))
+                        with patch("mlx_lm.utils.load_tokenizer", return_value=tokenizer):
                             model, _ = adapter.load_text_model(manager)
                         if architecture == "glm5_next":
                             attention = model.core.language_model.model.layers[0].self_attn
@@ -481,7 +653,8 @@ class NativeTextLoaderTests(unittest.TestCase):
 
         source = Path(__file__).resolve().parent
         bootstrap = "import sys, importlib\nsys.path.insert(0, " + repr(str(source)) + ")\n"
-        for name in ("omlx_experts", "omlx_offload", "omlx_offload_runtime", "omlx_text_offload", "omlx_persistence"):
+        for name in ("omlx_experts", "omlx_offload", "omlx_offload_runtime", "omlx_decode",
+                     "omlx_glm_profile", "omlx_text_offload", "omlx_persistence"):
             bootstrap += f"sys.modules['_werk_{name}'] = importlib.import_module('{name}')\n"
         bootstrap += "from omlx_supervisor import main\nmain()\n"
         launcher = Path(sys.executable).parent / "omlx"
@@ -508,10 +681,18 @@ class NativeTextLoaderTests(unittest.TestCase):
                 mx.save_safetensors(str(path / "model.safetensors"), dict(tree_flatten(model.parameters())))
                 del model
                 mx.clear_cache()
-                tokenizer = Tokenizer(models.WordLevel({"<eos>": 0, "<unk>": 1, **{f"word{i}": i for i in range(2, 128)}}, unk_token="<unk>"))
+                vocabulary = {"<eos>": 0, "<unk>": 1, **{f"word{i}": i for i in range(2, 128)}}
+                special_tokens = []
+                if architecture == "glm5_next":
+                    special_tokens = ["<think>", "</think>", "<|assistant|>", "<|system|>"]
+                    for index, token in enumerate(special_tokens, 124):
+                        vocabulary.pop(f"word{index}")
+                        vocabulary[token] = index
+                tokenizer = Tokenizer(models.WordLevel(vocabulary, unk_token="<unk>"))
                 tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-                fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token="<eos>", unk_token="<unk>")
-                fast.chat_template = "{% for message in messages %}{{ message['content'] }} {% endfor %}"
+                fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token="<eos>", unk_token="<unk>",
+                                              additional_special_tokens=special_tokens)
+                fast.chat_template = tiny_chat_template(architecture)
                 fast.save_pretrained(path)
                 with socket.socket() as sock:
                     sock.bind(("127.0.0.1", 0))
@@ -520,6 +701,11 @@ class NativeTextLoaderTests(unittest.TestCase):
                                    WERK_OMLX_PERSISTENCE_DIR=str(root / "prefix"), WERK_OMLX_PERSISTENCE_MODEL_DIR=str(path))
                 if architecture == "qwen4_exp": environment["WERK_OMLX_NGRAM_CACHE_BYTES"] = "1024"
                 else: environment.pop("WERK_OMLX_NGRAM_CACHE_BYTES", None)
+                profile_enabled = architecture == "glm5_next" and expert_mode != "0"
+                if profile_enabled:
+                    environment["WERK_OMLX_GLM_PROFILE"] = "1"
+                else:
+                    environment.pop("WERK_OMLX_GLM_PROFILE", None)
                 with (root / "worker.log").open("w+") as log:
                     child = subprocess.Popen([sys.executable, "-I", "-c", bootstrap, str(launcher), "serve",
                         "--model-dir", str(path), "--base-path", str(root / "worker"), "--host", "127.0.0.1",
@@ -554,6 +740,14 @@ class NativeTextLoaderTests(unittest.TestCase):
                             events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: {")]
                             self.assertTrue(any(event.get("choices") for event in events))
                             self.assertFalse(any("error" in event for event in events), events)
+                        status = request("/werk/experts/status")
+                        if profile_enabled:
+                            profile = status["glm_layer_profile"]
+                            self.assertTrue(profile["enabled"])
+                            self.assertTrue(profile["layers"])
+                            self.assertGreater(profile["totals"]["calls"], 0)
+                        else:
+                            self.assertNotIn("glm_layer_profile", status)
                         persistence = request("/werk/persistence/status")
                         self.assertTrue(persistence["active"], persistence)
                         self.assertGreater(persistence["stores"], 0, persistence)

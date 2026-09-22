@@ -1,0 +1,1021 @@
+{
+  "scope": "one real expert layer, warm bounded expert pools, BF16 single-token decode",
+  "limits": [
+    "not full-model tokens/s or model-quality evidence",
+    "no missing-expert I/O, prefill, attention, router, KV, or server overhead",
+    "fixed small route/input pool; not a production routing distribution",
+    "both implementations retain their own expert arrays during alternating samples"
+  ],
+  "created_utc": "2026-09-22T18:57:15.967373+00:00",
+  "command": [
+    "docs/benchmarks/2026-09-22-text-decode/compare_decode.py",
+    "/Users/philipbodenbach/.local/share/werk1112/models/pipenetwork-Qwen3.8-Flash-Next-MLX-mixed-4_8bit/files",
+    "--output",
+    "/private/tmp/qwen-decode-layer.json"
+  ],
+  "python": "3.11.16 (main, Aug 12 2026, 23:03:19) [Clang 21.0.0 (clang-2100.1.1.101)]",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "packages": {
+    "omlx": "0.6.4",
+    "mlx": "0.32.0",
+    "mlx-lm": "0.31.3",
+    "mlx-vlm": "0.6.3",
+    "numpy": "2.3.5"
+  },
+  "sources": [
+    {
+      "path": "/Users/philipbodenbach/Documents/werk1112/docs/benchmarks/2026-09-22-text-decode/compare_decode.py",
+      "sha256": "0a441afc4f0a036018e50b44cc2bfd10f72afd01d9161d4f336cbc3129af7d0d"
+    },
+    {
+      "path": "/Users/philipbodenbach/Documents/werk1112/src/backend/omlx_offload_runtime.py",
+      "sha256": "4109ad317c24896eec931ab49a11792f7d0ca6eb1678fdb5e11b5e2578f18610"
+    },
+    {
+      "path": "/Users/philipbodenbach/Documents/werk1112/src/backend/omlx_decode.py",
+      "sha256": "a1266eefd88837ad47a9ac84c7dafc91587b2da731056a979a878a9c680f3eb5"
+    },
+    {
+      "path": "/Users/philipbodenbach/Documents/werk1112/src/backend/omlx_text_offload.py",
+      "sha256": "a19ec3a8204581665aa472e5594cb8811f2828ee5be7eb7e29ffaa15bf5211c0"
+    },
+    {
+      "path": "/Users/philipbodenbach/Documents/werk1112/src/backend/omlx_experts.py",
+      "sha256": "5676095b6c4d68640bc1bd6e51e649468550bfaadc228f3069b156a0c15b0223"
+    },
+    {
+      "path": "/Users/philipbodenbach/Documents/werk1112/src/backend/omlx_offload.py",
+      "sha256": "4d35fb9eb9a65aabad33f084318bd726a5cad97ba72d41df28cd027fa41fad60"
+    },
+    {
+      "path": "/opt/homebrew/Cellar/omlx/0.6.4/libexec/lib/python3.11/site-packages/mlx_lm/models/switch_layers.py",
+      "sha256": "073a6a808d5c90bb699a2ecca0e559b06727ae96dbc1f0253e4c7e77e4ee1ef2"
+    }
+  ],
+  "model": "/Users/philipbodenbach/.local/share/werk1112/models/pipenetwork-Qwen3.8-Flash-Next-MLX-mixed-4_8bit/files",
+  "checkpoint_fingerprint": "d9141d93f1da6cddc17ea2231b0c4537852fc757155bb29f034af1fc4f136759",
+  "architecture": "qwen4_exp",
+  "layer": 0,
+  "hidden": 2560,
+  "intermediate": 640,
+  "top_k": 10,
+  "expert_pool": [
+    103,
+    142,
+    149,
+    170,
+    239,
+    287,
+    296,
+    314,
+    327,
+    351,
+    367,
+    371,
+    405,
+    431,
+    436,
+    443,
+    444,
+    489,
+    502,
+    508
+  ],
+  "pool_bytes_per_implementation": 55296000,
+  "cache_bytes_per_implementation": 268435456,
+  "activation": "mlx_lm.models.switch_layers.SwiGLU",
+  "activation_limit": null,
+  "input_dtype": "bfloat16",
+  "score_dtype": "mlx.core.bfloat16",
+  "reduction": "outside_expert_module",
+  "seed": 20260922,
+  "timed_routes": [
+    [
+      103,
+      142,
+      170,
+      314,
+      367,
+      405,
+      431,
+      436,
+      444,
+      489
+    ],
+    [
+      296,
+      431,
+      314,
+      327,
+      287,
+      367,
+      239,
+      103,
+      371,
+      436
+    ],
+    [
+      149,
+      170,
+      287,
+      296,
+      327,
+      351,
+      371,
+      431,
+      489,
+      502
+    ],
+    [
+      436,
+      489,
+      431,
+      367,
+      508,
+      170,
+      314,
+      405,
+      327,
+      443
+    ],
+    [
+      170,
+      314,
+      351,
+      367,
+      405,
+      431,
+      436,
+      443,
+      444,
+      489
+    ],
+    [
+      489,
+      367,
+      371,
+      170,
+      327,
+      502,
+      296,
+      314,
+      142,
+      287
+    ],
+    [
+      103,
+      142,
+      327,
+      351,
+      367,
+      405,
+      443,
+      444,
+      502,
+      508
+    ],
+    [
+      367,
+      508,
+      170,
+      142,
+      149,
+      489,
+      431,
+      351,
+      436,
+      296
+    ]
+  ],
+  "warmup": 12,
+  "iterations": 60,
+  "correctness": {
+    "comparisons": 70,
+    "array_equal": true,
+    "bitwise_equal": true,
+    "allclose_atol_0_rtol_0": true,
+    "max_absolute_error": 0.0
+  },
+  "stats": {
+    "legacy": {
+      "median_ms": 0.8229995,
+      "min_ms": 0.709667,
+      "p10_ms": 0.7610747,
+      "p90_ms": 0.9496708,
+      "max_ms": 1.119541
+    },
+    "candidate": {
+      "median_ms": 0.7774785,
+      "min_ms": 0.673375,
+      "p10_ms": 0.7062378,
+      "p90_ms": 0.8421833999999999,
+      "max_ms": 1.14125
+    }
+  },
+  "candidate_speedup": 1.058549529022346,
+  "paired_speedup_median": 1.0630751967187062,
+  "warm_logical_read_bytes": {
+    "legacy": 0,
+    "candidate": 0
+  },
+  "cache_after_pool_load": {
+    "legacy": {
+      "cache_hits": 0,
+      "cache_misses": 20,
+      "cache_evictions": 0,
+      "resident_cache_bytes": 55296000,
+      "effective_cache_budget_bytes": 268435456,
+      "logical_read_bytes": 55296000,
+      "read_calls": 180,
+      "output_evaluations": 0,
+      "forward_calls": 0
+    },
+    "candidate": {
+      "cache_hits": 0,
+      "cache_misses": 20,
+      "cache_evictions": 0,
+      "resident_cache_bytes": 55296000,
+      "effective_cache_budget_bytes": 268435456,
+      "logical_read_bytes": 55296000,
+      "read_calls": 180,
+      "output_evaluations": 0,
+      "forward_calls": 0
+    }
+  },
+  "cache_before_samples": {
+    "legacy": {
+      "cache_hits": 210,
+      "cache_misses": 20,
+      "cache_evictions": 0,
+      "resident_cache_bytes": 55296000,
+      "effective_cache_budget_bytes": 268435456,
+      "logical_read_bytes": 55296000,
+      "read_calls": 180,
+      "output_evaluations": 43,
+      "forward_calls": 22
+    },
+    "candidate": {
+      "cache_hits": 210,
+      "cache_misses": 20,
+      "cache_evictions": 0,
+      "resident_cache_bytes": 55296000,
+      "effective_cache_budget_bytes": 268435456,
+      "logical_read_bytes": 55296000,
+      "read_calls": 180,
+      "output_evaluations": 43,
+      "forward_calls": 22
+    }
+  },
+  "cache_after_samples": {
+    "legacy": {
+      "cache_hits": 810,
+      "cache_misses": 20,
+      "cache_evictions": 0,
+      "resident_cache_bytes": 55296000,
+      "effective_cache_budget_bytes": 268435456,
+      "logical_read_bytes": 55296000,
+      "read_calls": 180,
+      "output_evaluations": 163,
+      "forward_calls": 82
+    },
+    "candidate": {
+      "cache_hits": 810,
+      "cache_misses": 20,
+      "cache_evictions": 0,
+      "resident_cache_bytes": 55296000,
+      "effective_cache_budget_bytes": 268435456,
+      "logical_read_bytes": 55296000,
+      "read_calls": 180,
+      "output_evaluations": 163,
+      "forward_calls": 82
+    }
+  },
+  "samples_ms": {
+    "legacy": [
+      1.025334,
+      0.852125,
+      0.804792,
+      0.780458,
+      0.709667,
+      0.711375,
+      0.836583,
+      0.90525,
+      0.715167,
+      0.807417,
+      0.841584,
+      0.816542,
+      0.824291,
+      1.119541,
+      0.788,
+      0.907125,
+      0.831166,
+      1.001334,
+      0.821292,
+      0.893833,
+      0.815292,
+      0.889541,
+      0.798833,
+      0.853417,
+      0.827,
+      0.773333,
+      0.838041,
+      0.867292,
+      0.785041,
+      0.723125,
+      0.719666,
+      1.075875,
+      0.827958,
+      0.804209,
+      0.859375,
+      0.811834,
+      0.836292,
+      0.806417,
+      0.928708,
+      0.789208,
+      0.88525,
+      0.763583,
+      0.946125,
+      0.783584,
+      0.857625,
+      0.778917,
+      0.7815,
+      0.821708,
+      0.876083,
+      0.783125,
+      0.806959,
+      0.981583,
+      0.7385,
+      0.875542,
+      0.797625,
+      1.005833,
+      0.792375,
+      0.840375,
+      0.861416,
+      0.781666
+    ],
+    "candidate": [
+      0.7865,
+      0.729709,
+      0.881125,
+      0.802709,
+      0.673375,
+      0.689292,
+      0.785875,
+      0.82275,
+      0.700125,
+      0.683083,
+      1.14125,
+      0.825667,
+      0.864875,
+      0.794292,
+      0.776042,
+      0.797958,
+      0.733375,
+      0.824042,
+      0.777416,
+      0.780375,
+      0.761709,
+      0.814833,
+      0.7715,
+      0.804375,
+      0.699,
+      0.841625,
+      0.784667,
+      0.781417,
+      0.724708,
+      0.679,
+      0.706917,
+      0.777541,
+      0.837875,
+      0.742292,
+      0.886166,
+      0.764708,
+      0.847209,
+      0.776083,
+      0.739666,
+      0.802834,
+      0.758625,
+      0.782208,
+      0.736208,
+      0.743042,
+      0.791792,
+      0.787167,
+      0.742166,
+      0.76925,
+      0.786167,
+      0.756375,
+      0.721334,
+      0.774917,
+      0.769084,
+      0.746709,
+      0.815292,
+      0.793708,
+      0.7645,
+      0.797,
+      0.75075,
+      0.961
+    ]
+  },
+  "paired_samples": [
+    {
+      "iteration": 0,
+      "case": 0,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 1.025334,
+      "candidate_ms": 0.7865
+    },
+    {
+      "iteration": 1,
+      "case": 1,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.852125,
+      "candidate_ms": 0.729709
+    },
+    {
+      "iteration": 2,
+      "case": 2,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.804792,
+      "candidate_ms": 0.881125
+    },
+    {
+      "iteration": 3,
+      "case": 3,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.780458,
+      "candidate_ms": 0.802709
+    },
+    {
+      "iteration": 4,
+      "case": 4,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.709667,
+      "candidate_ms": 0.673375
+    },
+    {
+      "iteration": 5,
+      "case": 5,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.711375,
+      "candidate_ms": 0.689292
+    },
+    {
+      "iteration": 6,
+      "case": 6,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.836583,
+      "candidate_ms": 0.785875
+    },
+    {
+      "iteration": 7,
+      "case": 7,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.90525,
+      "candidate_ms": 0.82275
+    },
+    {
+      "iteration": 8,
+      "case": 0,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.715167,
+      "candidate_ms": 0.700125
+    },
+    {
+      "iteration": 9,
+      "case": 1,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.807417,
+      "candidate_ms": 0.683083
+    },
+    {
+      "iteration": 10,
+      "case": 2,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.841584,
+      "candidate_ms": 1.14125
+    },
+    {
+      "iteration": 11,
+      "case": 3,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.816542,
+      "candidate_ms": 0.825667
+    },
+    {
+      "iteration": 12,
+      "case": 4,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.824291,
+      "candidate_ms": 0.864875
+    },
+    {
+      "iteration": 13,
+      "case": 5,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 1.119541,
+      "candidate_ms": 0.794292
+    },
+    {
+      "iteration": 14,
+      "case": 6,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.788,
+      "candidate_ms": 0.776042
+    },
+    {
+      "iteration": 15,
+      "case": 7,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.907125,
+      "candidate_ms": 0.797958
+    },
+    {
+      "iteration": 16,
+      "case": 0,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.831166,
+      "candidate_ms": 0.733375
+    },
+    {
+      "iteration": 17,
+      "case": 1,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 1.001334,
+      "candidate_ms": 0.824042
+    },
+    {
+      "iteration": 18,
+      "case": 2,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.821292,
+      "candidate_ms": 0.777416
+    },
+    {
+      "iteration": 19,
+      "case": 3,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.893833,
+      "candidate_ms": 0.780375
+    },
+    {
+      "iteration": 20,
+      "case": 4,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.815292,
+      "candidate_ms": 0.761709
+    },
+    {
+      "iteration": 21,
+      "case": 5,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.889541,
+      "candidate_ms": 0.814833
+    },
+    {
+      "iteration": 22,
+      "case": 6,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.798833,
+      "candidate_ms": 0.7715
+    },
+    {
+      "iteration": 23,
+      "case": 7,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.853417,
+      "candidate_ms": 0.804375
+    },
+    {
+      "iteration": 24,
+      "case": 0,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.827,
+      "candidate_ms": 0.699
+    },
+    {
+      "iteration": 25,
+      "case": 1,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.773333,
+      "candidate_ms": 0.841625
+    },
+    {
+      "iteration": 26,
+      "case": 2,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.838041,
+      "candidate_ms": 0.784667
+    },
+    {
+      "iteration": 27,
+      "case": 3,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.867292,
+      "candidate_ms": 0.781417
+    },
+    {
+      "iteration": 28,
+      "case": 4,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.785041,
+      "candidate_ms": 0.724708
+    },
+    {
+      "iteration": 29,
+      "case": 5,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.723125,
+      "candidate_ms": 0.679
+    },
+    {
+      "iteration": 30,
+      "case": 6,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.719666,
+      "candidate_ms": 0.706917
+    },
+    {
+      "iteration": 31,
+      "case": 7,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 1.075875,
+      "candidate_ms": 0.777541
+    },
+    {
+      "iteration": 32,
+      "case": 0,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.827958,
+      "candidate_ms": 0.837875
+    },
+    {
+      "iteration": 33,
+      "case": 1,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.804209,
+      "candidate_ms": 0.742292
+    },
+    {
+      "iteration": 34,
+      "case": 2,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.859375,
+      "candidate_ms": 0.886166
+    },
+    {
+      "iteration": 35,
+      "case": 3,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.811834,
+      "candidate_ms": 0.764708
+    },
+    {
+      "iteration": 36,
+      "case": 4,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.836292,
+      "candidate_ms": 0.847209
+    },
+    {
+      "iteration": 37,
+      "case": 5,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.806417,
+      "candidate_ms": 0.776083
+    },
+    {
+      "iteration": 38,
+      "case": 6,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.928708,
+      "candidate_ms": 0.739666
+    },
+    {
+      "iteration": 39,
+      "case": 7,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.789208,
+      "candidate_ms": 0.802834
+    },
+    {
+      "iteration": 40,
+      "case": 0,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.88525,
+      "candidate_ms": 0.758625
+    },
+    {
+      "iteration": 41,
+      "case": 1,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.763583,
+      "candidate_ms": 0.782208
+    },
+    {
+      "iteration": 42,
+      "case": 2,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.946125,
+      "candidate_ms": 0.736208
+    },
+    {
+      "iteration": 43,
+      "case": 3,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.783584,
+      "candidate_ms": 0.743042
+    },
+    {
+      "iteration": 44,
+      "case": 4,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.857625,
+      "candidate_ms": 0.791792
+    },
+    {
+      "iteration": 45,
+      "case": 5,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.778917,
+      "candidate_ms": 0.787167
+    },
+    {
+      "iteration": 46,
+      "case": 6,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.7815,
+      "candidate_ms": 0.742166
+    },
+    {
+      "iteration": 47,
+      "case": 7,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.821708,
+      "candidate_ms": 0.76925
+    },
+    {
+      "iteration": 48,
+      "case": 0,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.876083,
+      "candidate_ms": 0.786167
+    },
+    {
+      "iteration": 49,
+      "case": 1,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.783125,
+      "candidate_ms": 0.756375
+    },
+    {
+      "iteration": 50,
+      "case": 2,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.806959,
+      "candidate_ms": 0.721334
+    },
+    {
+      "iteration": 51,
+      "case": 3,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.981583,
+      "candidate_ms": 0.774917
+    },
+    {
+      "iteration": 52,
+      "case": 4,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.7385,
+      "candidate_ms": 0.769084
+    },
+    {
+      "iteration": 53,
+      "case": 5,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.875542,
+      "candidate_ms": 0.746709
+    },
+    {
+      "iteration": 54,
+      "case": 6,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.797625,
+      "candidate_ms": 0.815292
+    },
+    {
+      "iteration": 55,
+      "case": 7,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 1.005833,
+      "candidate_ms": 0.793708
+    },
+    {
+      "iteration": 56,
+      "case": 0,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.792375,
+      "candidate_ms": 0.7645
+    },
+    {
+      "iteration": 57,
+      "case": 1,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.840375,
+      "candidate_ms": 0.797
+    },
+    {
+      "iteration": 58,
+      "case": 2,
+      "order": [
+        "candidate",
+        "legacy"
+      ],
+      "legacy_ms": 0.861416,
+      "candidate_ms": 0.75075
+    },
+    {
+      "iteration": 59,
+      "case": 3,
+      "order": [
+        "legacy",
+        "candidate"
+      ],
+      "legacy_ms": 0.781666,
+      "candidate_ms": 0.961
+    }
+  ]
+}
