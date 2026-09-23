@@ -10,14 +10,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.98"
-axum = "0.8.4"
+axum = { version = "0.8.4", features = ["multipart"] }
 base64 = "0.22.1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 crc32fast = "1.5.0"
 fs2 = "0.4.3"
 getrandom = "0.2.17"
 hmac = "0.12.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.142"
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+tempfile = "3"
 sha2 = "0.10.9"
 shell-words = "1.1.0"
 tokio = { version = "1.47.1", features = ["full"] }
@@ -34,6 +37,9 @@ candle-nn = { version = "=0.9.2", default-features = false }
 candle-transformers = { version = "=0.9.2", default-features = false }
 clap = { version = "4.5.28", features = ["derive", "env"] }
 console = "0.15.11"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 indicatif = "0.17.11"
 libc = "0.2"
 safetensors = "0.4.5"

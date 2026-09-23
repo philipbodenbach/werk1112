@@ -183,6 +183,7 @@ It sends no launch setting to remote vLLM.
 | GET | `/werk/v1/info` | none | Runtime info and limits |
 | GET | `/werk/v1/capabilities` | none | Capability array |
 | GET | `/werk/v1/memory` | none | Memory telemetry and accounting |
+| GET | `/werk/v1/observability` | none | Server-wide chat, worker and memory observations |
 | GET | `/werk/v1/states` | query filters | One page of runtime states |
 | POST | `/werk/v1/states/{id}/actions` | State action | Updated/projected state |
 | POST | `/werk/v1/states/prune` | Explicit selector | Match/removal summary |

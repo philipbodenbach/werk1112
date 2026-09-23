@@ -1,6 +1,73 @@
 use super::*;
 
 #[test]
+fn text_worker_helpers_bootstrap_without_model_directory_imports() {
+    let python = absolute_program(PathBuf::from("python3")).unwrap();
+    for architecture in [
+        None,
+        Some("deepseek_v4"),
+        Some("qwen4_exp"),
+        Some("glm5_next"),
+    ] {
+        let source = "import json\nprint(json.dumps({name: name in sys.modules for name in ('_werk_omlx_decode', '_werk_omlx_glm_profile')}))\n";
+        let output = Command::new(&python)
+            .args([
+                "-I",
+                "-c",
+                &text_worker_script_source(source, architecture),
+                "/unused",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let modules: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            modules["_werk_omlx_decode"],
+            matches!(architecture, Some("qwen4_exp" | "glm5_next"))
+        );
+        assert_eq!(
+            modules["_werk_omlx_glm_profile"],
+            architecture == Some("glm5_next")
+        );
+        if !matches!(architecture, Some("qwen4_exp" | "glm5_next")) {
+            assert_eq!(
+                text_worker_script_source(source, architecture),
+                worker_script_source(source)
+            );
+        }
+    }
+}
+
+#[test]
+fn glm_profile_diagnostics_are_opt_in_bounded_and_allowlisted() {
+    assert!(glm_profile_diagnostics(&json!({})).is_none());
+    assert!(
+        glm_profile_diagnostics(&json!({"glm_layer_profile":{"enabled":false,"layers":[]}}))
+            .is_none()
+    );
+    let row = json!({"layer":3,"calls":2,"failures":0,"cache_hits":9,"cache_misses":7,
+        "cache_evictions":1,"disk_bytes_read":1024,"wall_seconds":0.1,
+        "forward_seconds":0.09,"routing_seconds":0.01,"disk_read_seconds":0.05,
+        "api_key":"never print this"});
+    let status = json!({"glm_layer_profile":{"enabled":true,"layers":[row.clone()]}});
+    let line = glm_profile_diagnostics(&status).unwrap();
+    assert!(line.contains("worker cumulative") && line.contains("\"layer\":3"));
+    assert!(!line.contains("api_key") && !line.contains("never print this"));
+    assert!(
+        glm_profile_diagnostics(
+            &json!({"glm_layer_profile":{"enabled":true,"layers":vec![row;1025]}})
+        )
+        .is_none()
+    );
+    let mut invalid = status;
+    invalid["glm_layer_profile"]["layers"][0]["wall_seconds"] = json!(-1);
+    assert!(glm_profile_diagnostics(&invalid).is_none());
+}
+#[test]
 fn expert_cache_defaults_to_native_with_explicit_auto_small_and_large_overrides() {
     assert_eq!(expert_cache_bytes(None).unwrap(), None);
     assert_eq!(expert_cache_bytes(Some("auto".into())).unwrap(), Some(0));
@@ -179,6 +246,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path=='/v1/models/physical%20%2F%20model/load':
             if settings.get('load_fail'): return self.reply({'error':'model exceeds available memory'},507)
             loaded=True; return self.reply({'status':'ok','model_id':'physical / model'})
+        if self.path=='/werk/tokenize':
+            (root/'tokenize.json').write_text(json.dumps(body))
+            return self.reply({'input_tokens':settings.get('token_count',37)})
         if self.path != '/v1/chat/completions': return self.reply({'error':'unknown path'},404)
         (root/'request.json').write_text(json.dumps(body)); (root/'chat_started').write_text('yes')
         if settings.get('stall_headers'): time.sleep(2)
@@ -887,6 +957,7 @@ fn chat_options(
     expert_cache_mb: Option<u64>,
 ) -> crate::openai::ChatRuntimeOptions {
     crate::openai::ChatRuntimeOptions {
+        documents: None,
         omlx: Some(crate::openai::OmlxChatOptions {
             reasoning_effort: None,
             thinking,
@@ -926,6 +997,32 @@ fn server_cache_fixture(settings: Value) -> (Fixture, OmlxBackend, ModelManifest
     invocation.expert_cache_bytes = None;
     let manifest = fixture_model_for_backend(&fixture);
     (fixture, backend, manifest)
+}
+
+#[test]
+#[cfg(unix)]
+fn native_count_reuses_worker_and_template_controls_without_generating() {
+    let (fixture, backend, manifest) = server_cache_fixture(json!({"version":"0.6.4"}));
+    backend.prepare(&manifest).unwrap();
+    let configured = backend
+        .with_chat_options(&manifest, &chat_options(Some(false), None))
+        .unwrap();
+    assert_eq!(configured.count_tokens(&manifest, request()).unwrap(), 37);
+    assert_eq!(configured.count_tokens(&manifest, request()).unwrap(), 37);
+    let model = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let sent: Value =
+        serde_json::from_slice(&fs::read(model.join("tokenize.json")).unwrap()).unwrap();
+    assert_eq!(sent["model"], "physical / model");
+    assert_eq!(sent["chat_template_kwargs"]["enable_thinking"], false);
+    assert!(!model.join("chat_started").exists());
+    assert_eq!(
+        fs::read_to_string(model.join("starts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(backend.servers.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1760,9 +1857,11 @@ fn auto_expert_cache_activates_only_for_probe_verified_models() {
 }
 
 #[test]
+#[cfg(unix)]
 fn auto_native_experts_require_verified_text_adapter_and_preserve_explicit_limits() {
     for (verified, budget, succeeds) in [(true, 0, true), (false, 0, false), (true, 1024, false)] {
-        let (fixture, mut backend, manifest) = server_cache_fixture(json!({"version":"0.6.4", "native_experts":true}));
+        let (fixture, mut backend, manifest) =
+            server_cache_fixture(json!({"version":"0.6.4", "native_experts":true}));
         backend.invocation.as_mut().unwrap().expert_cache_bytes = Some(budget);
         backend.test_probe.as_mut().unwrap().runtime["expert_offload"] = if verified {
             json!({"loader":"installed_native_text_port"})

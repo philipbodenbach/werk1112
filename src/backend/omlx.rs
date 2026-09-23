@@ -45,6 +45,8 @@ const PERSISTENCE: &str = include_str!("omlx_persistence.py");
 const OFFLOAD: &str = include_str!("omlx_offload.py");
 const OFFLOAD_RUNTIME: &str = include_str!("omlx_offload_runtime.py");
 const TEXT_OFFLOAD: &str = include_str!("omlx_text_offload.py");
+const TEXT_DECODE: &str = include_str!("omlx_decode.py");
+const GLM_PROFILE: &str = include_str!("omlx_glm_profile.py");
 mod experts;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(900);
@@ -84,6 +86,21 @@ fn worker_script_source(source: &str) -> String {
     console_script_source(&script)
 }
 
+fn text_worker_script_source(source: &str, architecture: Option<&str>) -> String {
+    if !matches!(architecture, Some("glm5_next" | "qwen4_exp")) {
+        return worker_script_source(source);
+    }
+    let mut script = String::new();
+    for (name, helper) in [("_werk_omlx_decode", TEXT_DECODE)].into_iter().chain(
+        (architecture == Some("glm5_next")).then_some(("_werk_omlx_glm_profile", GLM_PROFILE)),
+    ) {
+        let literal = serde_json::to_string(helper).expect("Python source is serializable");
+        script.push_str(&format!("_werk_helper = types.ModuleType('{name}')\nsys.modules['{name}'] = _werk_helper\nexec({literal}, _werk_helper.__dict__)\n"));
+    }
+    script.push_str(source);
+    worker_script_source(&script)
+}
+
 #[derive(Clone)]
 pub struct OmlxBackend {
     store: ModelStore,
@@ -97,6 +114,8 @@ pub struct OmlxBackend {
     #[cfg(test)]
     test_probe: Option<ProbeReport>,
 }
+
+mod telemetry;
 
 #[derive(Clone)]
 struct OmlxInvocation {
@@ -507,6 +526,75 @@ impl OmlxBackend {
 }
 
 impl GenerationBackend for OmlxBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        telemetry::sample(self)
+    }
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+        tx: Option<mpsc::Sender<Result<Value, String>>>,
+    ) -> Result<Value> {
+        super::openai_transport::validate_api_options(
+            &options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "top_k",
+                "reasoning_effort",
+            ],
+        )?;
+        reject_images(&request)?;
+        validate_tool_options(&request)?;
+        if request.requires_tool_calling() && !self.probe_tool_calling(manifest)? {
+            bail!("oMLX model does not have a verified native tool parser");
+        }
+        let (server, _) = self.cached_server(manifest)?;
+        let mut body = omlx_chat_completion_body(
+            &server.model_name,
+            &request,
+            tx.is_some(),
+            self.request_thinking.or(server.thinking),
+            self.request_reasoning_effort.or(server.reasoning_effort),
+        );
+        super::openai_transport::apply_api_options(
+            &mut body,
+            options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "top_k",
+                "reasoning_effort",
+            ],
+        )?;
+        super::openai_transport::generate_api(&server.url, Some(&server.api_key), body, tx)
+    }
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        reject_images(&request)?;
+        validate_tool_options(&request)?;
+        let (server, _) = self.cached_server(manifest)?;
+        let body = omlx_chat_completion_body(
+            &server.model_name,
+            &request,
+            false,
+            self.request_thinking.or(server.thinking),
+            self.request_reasoning_effort.or(server.reasoning_effort),
+        );
+        let value = server.json_request(
+            "POST",
+            "/werk/tokenize",
+            Some(&body),
+            Duration::from_secs(60),
+        )?;
+        value
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .context("oMLX tokenizer returned no valid input_tokens")
+    }
     fn with_chat_options(
         &self,
         manifest: &ModelManifest,
@@ -1220,6 +1308,51 @@ fn expert_interval_diagnostics(before: &Value, after: &Value) -> Option<String> 
     ))
 }
 
+fn glm_profile_diagnostics(status: &Value) -> Option<String> {
+    let profile = status.get("glm_layer_profile")?;
+    if !profile.get("enabled")?.as_bool()? {
+        return None;
+    }
+    let layers = profile.get("layers")?.as_array()?;
+    if layers.len() > 1024 {
+        return None;
+    }
+    let rows: Option<Vec<Value>> = layers
+        .iter()
+        .map(|layer| {
+            let mut row = serde_json::Map::new();
+            row.insert("layer".into(), json!(layer.get("layer")?.as_u64()?));
+            for name in [
+                "calls",
+                "failures",
+                "cache_hits",
+                "cache_misses",
+                "cache_evictions",
+                "disk_bytes_read",
+            ] {
+                row.insert(name.into(), json!(layer.get(name)?.as_u64()?));
+            }
+            for name in [
+                "wall_seconds",
+                "forward_seconds",
+                "routing_seconds",
+                "disk_read_seconds",
+            ] {
+                let seconds = layer.get(name)?.as_f64()?;
+                if !seconds.is_finite() || seconds < 0.0 {
+                    return None;
+                }
+                row.insert(name.into(), json!(seconds));
+            }
+            Some(Value::Object(row))
+        })
+        .collect();
+    Some(format!(
+        "oMLX GLM layer profile (worker cumulative; overlapping timings; reads include OS file cache): {}",
+        json!(rows?)
+    ))
+}
+
 fn omlx_chat_completion_body(
     model_name: &str,
     request: &GenerateRequest,
@@ -1485,9 +1618,15 @@ impl OmlxProcess {
             .persistence_dir
             .as_ref()
             .or(server_cache_directory.as_ref());
+        let architecture = report
+            .runtime
+            .get("expert_offload")
+            .and_then(|offload| offload.get("architecture"))
+            .and_then(Value::as_str);
+        let worker_source = text_worker_script_source(SUPERVISOR, architecture);
         let mut command = invocation.python_command();
         command
-            .args(["-c", &worker_script_source(SUPERVISOR)])
+            .args(["-c", &worker_source])
             .arg(
                 invocation
                     .launcher
@@ -1607,7 +1746,9 @@ impl OmlxProcess {
             }
             process.expert_offload = !native_experts;
             if native_experts {
-                eprintln!("oMLX experts: native resident execution (auto; weights fit available memory)");
+                eprintln!(
+                    "oMLX experts: native resident execution (auto; weights fit available memory)"
+                );
             } else {
                 eprintln!(
                     "oMLX expert cache: {} MiB ({}) upper budget; SSD offload active, native memory guard may reduce residency",
@@ -1666,7 +1807,9 @@ impl OmlxProcess {
             process.expert_offload =
                 status.get("experts_offloaded").and_then(Value::as_bool) == Some(true);
         }
-        if invocation.server_prefix_cache {
+        // Persistent CLI sessions verify their own cache after startup. The
+        // server-only directory is intentionally absent for those sessions.
+        if invocation.server_prefix_cache && invocation.persistence_dir.is_none() {
             let active = if server_cache_directory.is_some() {
                 process
                     .json_request(
@@ -1951,9 +2094,13 @@ impl OmlxProcess {
         if let Some(before) = expert_before
             && let Ok(after) =
                 self.json_request("GET", "/werk/experts/status", None, Duration::from_secs(2))
-            && let Some(diagnostic) = expert_interval_diagnostics(&before, &after)
         {
-            backend_diagnostics.push(diagnostic);
+            if let Some(diagnostic) = expert_interval_diagnostics(&before, &after) {
+                backend_diagnostics.push(diagnostic);
+            }
+            if let Some(diagnostic) = glm_profile_diagnostics(&after) {
+                backend_diagnostics.push(diagnostic);
+            }
         }
         let assistant_message = completion.assistant_message();
         Ok(GenerateResponse {

@@ -940,3 +940,25 @@ werk backend install TARGET
 The supported install targets, operating-system matrix and manual cleanup
 procedure are documented in [Backends](../backends.md). There is currently no
 managed `werk backend uninstall` command.
+
+## Live dashboard
+
+`werk top` opens the responsive terminal dashboard. It connects to
+`http://127.0.0.1:11434` by default; `--url` selects another server, and
+`WERK_API_KEY` or `--api-key` supplies its credential. Loopback targets also try
+Werk's standard local API-key file. The updated server exposes observability
+without an additional serve flag. Older running servers need a planned restart
+with the updated binary; opening the dashboard never restarts them.
+
+| Option | Meaning |
+| --- | --- |
+| `--interval-ms 2000` | Poll interval, 500–60000 ms |
+| `--once` | Print one snapshot and exit |
+| `--once --json` | Structured snapshot for scripts |
+| `--no-animation` | Disable decorative animation |
+| `--demo` | Simulated preview without a server connection |
+
+Keys: `q`/Escape/Ctrl-C quit; Space pauses the display; arrows select a request;
+Tab/Enter toggles details; `b` selects a native worker; `a` toggles animation. The dashboard is read-only.
+See [observability](../../utils/observability/README.md) for metrics, backend
+coverage, Prometheus setup and the importable Grafana dashboard.

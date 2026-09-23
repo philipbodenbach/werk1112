@@ -457,6 +457,65 @@ impl VllmBackend {
 }
 
 impl GenerationBackend for VllmBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+        tx: Option<mpsc::Sender<Result<Value, String>>>,
+    ) -> Result<Value> {
+        super::openai_transport::validate_api_options(
+            &options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "logit_bias",
+                "n",
+                "logprobs",
+                "top_logprobs",
+                "top_k",
+                "reasoning_effort",
+                "__werk_matched_stop",
+            ],
+        )?;
+        validate_vllm_image_request(manifest.architecture.as_deref(), &request)?;
+        let (server, _, _) = self.cached_server(manifest)?;
+        let mut body = chat_completion_body(&server.model_name, &request, tx.is_some());
+        super::openai_transport::apply_api_options(
+            &mut body,
+            options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "logit_bias",
+                "n",
+                "logprobs",
+                "top_logprobs",
+                "top_k",
+                "reasoning_effort",
+                "__werk_matched_stop",
+            ],
+        )?;
+        super::openai_transport::generate_api(&server.url, None, body, tx)
+    }
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        validate_vllm_image_request(manifest.architecture.as_deref(), &request)?;
+        let (server, _, _) = self.cached_server(manifest)?;
+        let chat = chat_completion_body(&server.model_name, &request, false);
+        let mut body = serde_json::json!({"model":server.model_name,"messages":chat["messages"],
+            "add_generation_prompt":true,"add_special_tokens":false});
+        if let Some(tools) = chat.get("tools") {
+            body["tools"] = tools.clone();
+        }
+        let result = super::openai_transport::tokenization_json(&server.url, "/tokenize", &body)?;
+        result
+            .get("count")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .context("vLLM tokenizer returned no valid count")
+    }
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         true
     }
@@ -2901,11 +2960,13 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
                     ContentPart {
+                        file: None,
                         kind: "text".to_string(),
                         text: Some("Compare these screenshots:".to_string()),
                         image_url: None,
                     },
                     ContentPart {
+                        file: None,
                         kind: "image_url".to_string(),
                         text: None,
                         image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
@@ -2914,11 +2975,13 @@ mod tests {
                         })),
                     },
                     ContentPart {
+                        file: None,
                         kind: "text".to_string(),
                         text: Some("against".to_string()),
                         image_url: None,
                     },
                     ContentPart {
+                        file: None,
                         kind: "input_image".to_string(),
                         text: None,
                         image_url: Some(ImageUrlSpec::Url(
@@ -2976,6 +3039,7 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![ContentPart {
+                    file: None,
                     kind: "image_url".to_string(),
                     text: None,
                     image_url: Some(ImageUrlSpec::Url("file:///tmp/private.png".to_string())),
@@ -3007,6 +3071,7 @@ mod tests {
         let multipart_message = ChatMessage {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![ContentPart {
+                file: None,
                 kind: "image_url".to_string(),
                 text: None,
                 image_url: Some(ImageUrlSpec::Url("image.png".to_string())),

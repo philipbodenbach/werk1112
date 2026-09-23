@@ -1,0 +1,291 @@
+# Anthropic Messages clients
+
+Werk serves an Anthropic-compatible **Messages subset** at `POST /v1/messages`
+and native token counting at `POST /v1/messages/count_tokens`
+alongside its existing OpenAI API, on the same port. Both adapters use the same
+model routing, sessions and backend workers. There is no loopback HTTP proxy or
+second model load. Use the actual installed Werk model ID, not a Claude alias.
+This does not claim full Anthropic API or Claude Code compatibility.
+
+## Start and call
+
+An existing `werk serve` needs no additional API flag. For a local console test:
+
+```bash
+env -u WERK_OMLX_REASONING_EFFORT \
+WERK_OMLX_EXPERT_CACHE_MB=22528 \
+WERK_OMLX_EXPERT_EXECUTION=grouped \
+WERK_OMLX_NGRAM_CACHE_MB=auto \
+WERK_OMLX_THINKING=0 \
+werk --backend omlx serve \
+  --model pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit \
+  --persistence --persistence-mode disk --persistence-reuse prefer \
+  --port 11434 --verbose --allow-unauthenticated
+```
+
+For GLM, stop the Qwen server first and run the same command with
+`--model Vontra/GLM-5.3-Flash-MLX-oQ2-MTP`. The unauthenticated option above is
+for a local test. With normal server authentication, supply the generated Werk
+key via `x-api-key` or `Authorization: Bearer <key>`.
+
+```bash
+curl -fsS -N http://127.0.0.1:11434/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model":"pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+    "max_tokens":96,
+    "temperature":0,
+    "stream":true,
+    "messages":[{"role":"user","content":"Explain what a token is in three sentences."}]
+  }'
+```
+
+Set `stream` to `false` for a normal JSON message. For a tool request:
+
+```bash
+curl -fsS http://127.0.0.1:11434/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model":"pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit",
+    "max_tokens":512,"temperature":0,
+    "tools":[{"name":"add","description":"Add two integers",
+      "input_schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}}],
+    "tool_choice":{"type":"auto"},
+    "messages":[{"role":"user","content":"Use add to calculate 2+3."}]
+  }'
+```
+
+The client executes the returned `tool_use`, appends the assistant content
+unchanged, and follows it with a user message containing
+`{"type":"tool_result","tool_use_id":"<returned-id>","content":"5"}`.
+Send the complete history and tool catalog again. Werk never executes client
+tools. Multiple calls require one result per ID in that immediately following
+user message. Check `stop_reason == "tool_use"` before executing a call;
+`max_tokens` is incomplete output, even if an SDK can parse part of its JSON.
+
+## Supported contract
+
+| Input | Behavior |
+| --- | --- |
+| `anthropic-version` | Required, exactly `2023-06-01` |
+| `anthropic-beta` | Only legacy `files-api-2025-04-14` accepted; unknown flags rejected |
+| `model`, `messages`, `max_tokens` | Required; nonempty model/history and positive token budget |
+| `system` | String or text-block array; separate from messages |
+| Message roles | `user`, `assistant` |
+| Content | String or text/image/document/tool-use/tool-result block array; source order is preserved |
+| Documents and file references | Shared text/PDF/Office processing on every text backend, including CUDA; see [Documents and files](documents.md) |
+| Images | Base64 JPEG/PNG/GIF/WebP or HTTP(S) URL; user messages and tool results; requires a vision-capable model/backend |
+| `metadata.user_id` | Optional string, at most 256 bytes; accepted without provider tracking or billing semantics |
+| `temperature`, `top_p` | Optional numbers in `[0, 1]` |
+| Tools | Custom tools with unique names, descriptions, object `input_schema` |
+| `tool_choice` | `auto`, `none`, `any`, named `tool`; capability constraints remain backend-dependent |
+| `disable_parallel_tool_use` | `true` forwards a constraint; absent/false leaves backend parallelism unconstrained |
+| `strict` | Passed to backend; never silently weakened |
+| `tool_result.is_error` | Text errors become `{"content":"…","is_error":true}`; image results retain their parts with a leading error marker |
+| `top_k` | Nonnegative integer; forwarded to compatible oMLX, vLLM and llama.cpp servers |
+| `output_config.format` | `json_schema` with `schema`; uses native structured output, never simulated by prompt instructions |
+| `stop_sequences` | Up to four nonempty strings; vLLM must report the actual matched sequence; oMLX/llama.cpp currently reject |
+| `werk` | Separate local options: `documents` processing and `omlx` runtime settings |
+| Unknown fields | Rejected; includes provider `thinking`, `cache_control`, server tools and audio/video blocks |
+
+oMLX currently supports `auto`/`none`; it rejects forced/named choices,
+`disable_parallel_tool_use: true` and `strict: true`. Other backends retain their
+own capabilities. Backend validation errors during an already-started stream
+arrive as an SSE `error` event. Tool calling cannot make a model/backend support
+tools when it lacks a native tool parser.
+
+Assistant text must precede its tool-use blocks. User tool results must precede
+any trailing user text. Unsupported interleaving, orphaned/duplicate IDs,
+missing results, nonobject tool arguments and malformed JSON are rejected.
+Requests exceeding a known context limit are rejected rather than trimming a
+tool cycle. Admission estimates text/tool schemas, arguments and results from
+their byte sizes, and images from the shared detail-based visual estimate;
+Base64 pixels are not counted as text. This is not exact tokenization. If model metadata provides
+no context ceiling, the backend's own context/memory guard is authoritative.
+
+Responses contain `id`, `type: message`, `role: assistant`, `model`, content,
+`stop_reason`, `stop_sequence` and usage. Stops map to `end_turn`,
+`max_tokens`, `tool_use`, or `stop_sequence` with a verified native matched string;
+otherwise `stop_sequence` is null. Invalid completed tool JSON yields HTTP 502 rather
+than fabricated arguments. Request validation is HTTP 400, authentication 401,
+missing models 404 and oversized bodies 413, with an Anthropic error envelope.
+Responses carry `request-id`; errors also include it in the body. The existing
+`WERK_API_BODY_LIMIT_BYTES` setting and API key checks apply to this endpoint.
+
+## Streaming and resource use
+
+Named SSE events are `message_start`, `content_block_start`,
+`content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`.
+There is no OpenAI `[DONE]` event. Text is forwarded as soon as it arrives.
+Tool arguments stream live as `input_json_delta` once the fragmented tool name
+is unambiguous within the supplied catalog. Ambiguous name prefixes remain
+buffered until resolved or completion. The adapter assigns stable, opaque
+`toolu_…` IDs; clients must return those IDs in the following tool results.
+Interleaved backend calls are serialized into consecutive content blocks.
+The retained tool data is bounded to 128 calls and 8 MiB of ID/name/argument
+bytes; exceeding either limit emits an error.
+
+There is no detached adapter task or unbounded queue. Dropping the response
+drops the backend stream; actual inference cancellation continues to follow the
+selected backend's existing implementation. A backend error or premature EOF
+emits `error`, with no successful `message_stop` afterward.
+
+`message_start.usage` has provisional zero counts. Actual input/output counts
+arrive in the final `message_delta`; the tested SDK accumulates both. Native
+cache hits are not presented as Anthropic cache billing or TTL promises.
+`--verbose` reports backend timing and cache diagnostics in the server log.
+
+## Native token counting
+
+`POST /v1/messages/count_tokens` accepts `model`, `messages`, `system`, `tools`
+and `tool_choice`, with the same authentication and version header as Messages.
+It returns `{"input_tokens": N}` from the selected backend's actual tokenizer.
+There is no generated completion, byte-count estimate or session append. Unlike
+completion admission, this endpoint does not trim or reject history based on
+Werk's context estimate; native runtime limits still apply.
+
+```bash
+curl -fsS http://127.0.0.1:11434/v1/messages/count_tokens \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit","messages":[{"role":"user","content":"What is a token?"}]}'
+```
+
+- oMLX uses the existing worker's text tokenizer, model template settings and
+  effective thinking controls. Tool schemas/history are included. Multimodal
+  engines and implicit server MCP tools are rejected because their counting
+  parity has not been established.
+- vLLM delegates to its native `/tokenize` chat endpoint, including tools.
+- llama.cpp applies its chat template and tokenizes the rendered prompt with
+  special tokens enabled, as in its completion path. This currently supports
+  text without tools or images.
+- Other backends return an unsupported-operation error rather than an estimate.
+
+Counting can load the selected model if its worker is not already running.
+Counts describe that local model/template, not Claude's tokenizer or billing.
+The HTTP contracts are tested with fixtures; numerical parity with each real
+model/runtime still requires the console acceptance tests.
+
+## SDK and model acceptance tests
+
+The official Python SDK **0.86.0** is tested against a local Rust mock-backend
+server for `messages.create`, `messages.stream`, `messages.count_tokens`,
+exact final usage and two successive client tool rounds with a 64-tool catalog. The ABBA script is
+also smoke-tested against that fixture. The same test now covers file upload,
+pagination, download, deletion and references with Anthropic 0.86.0 and OpenAI
+2.29.0. Install both SDKs in an isolated environment if needed:
+
+```bash
+python3 -m venv /tmp/werk-anthropic-sdk
+/tmp/werk-anthropic-sdk/bin/pip install -r tests/files-requirements.txt
+env WERK_TEST_ANTHROPIC_PYTHON=/tmp/werk-anthropic-sdk/bin/python \
+  cargo test --locked official_anthropic_sdk_text_stream_and_tool_loop --lib -- --ignored --nocapture
+```
+
+The SDK base URL is `http://127.0.0.1:11434` (without an extra `/v1`).
+Against the running Qwen server:
+
+```bash
+/tmp/werk-anthropic-sdk/bin/python tests/anthropic_sdk.py \
+  --model pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit
+/tmp/werk-anthropic-sdk/bin/python tests/anthropic_sdk.py \
+  --model pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit --catalog-size 64
+```
+
+After switching the server to GLM:
+
+```bash
+/tmp/werk-anthropic-sdk/bin/python tests/anthropic_sdk.py \
+  --model Vontra/GLM-5.3-Flash-MLX-oQ2-MTP
+/tmp/werk-anthropic-sdk/bin/python tests/anthropic_sdk.py \
+  --model Vontra/GLM-5.3-Flash-MLX-oQ2-MTP --catalog-size 64
+```
+
+For authenticated servers add `--api-key <werk-key>`. These tests execute only
+integer addition locally. They fail if the model skips the requested tools,
+returns incomplete arguments or fails to finish the cycle; this distinguishes
+model/tool-parser quality from successful transport with the mock fixture.
+
+## Performance acceptance
+
+Run with the same fixed model/cache budgets as above. Capture `--verbose`
+server stderr in a file, then run:
+
+```bash
+python3 utils/benchmarks/anthropic_api.py \
+  --model pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit \
+  --server-log /tmp/werk-qwen-serve.log > /tmp/werk-qwen-api-abba.jsonl
+```
+
+Repeat for GLM with its model ID and log file. This sends three ABBA rounds to
+one existing server, records first versus warm requests, TTFT, output counts,
+native decode rate/cache hits (when available), output hash and observed
+`omlx-server` PIDs. It neither starts nor stops a model. The process observation
+is by executable name; inspect the server log as well if that runtime uses a
+different name. Cache counts can be absent when the backend does not report them.
+
+For old/new OpenAI regression testing, preserve the old binary before installing
+the new build. Run servers sequentially with the same arguments and use
+`--order openai --rounds 4 --label old` or `--label new`. Repeat build order as
+old/new/new/old. Compare warm medians and native decode timing across repeats,
+not a single first request. A hash/token-count mismatch needs investigation
+before treating timings as equivalent work. No reproducible Qwen/GLM regression
+is acceptable. Real-model results and worker reuse still require these console
+tests; passing mock/SDK tests alone is not a hardware performance claim.
+
+Remaining gaps: matched stops on oMLX/llama.cpp, thinking/signatures,
+provider document citations, image-file references, prompt-cache controls,
+server-side tools, Batch APIs and full Claude Code compatibility. Files APIs
+implement the documented local subset; see [Documents and files](documents.md).
+This is not complete provider-spec coverage.
+Provider API semantics and Werk settings are separate: Werk does not synthesize
+Claude signatures, Anthropic cache TTLs or provider billing from local cache
+statistics. Unsupported fields fail explicitly. `max_tokens: 0` cache-warmup
+requests are not implemented.
+
+## Document and extended-output verification (2026-09-23)
+
+- API regression suite: 91 passed, two opt-in integration tests excluded.
+- oMLX adapter regression suite: 56 passed with simulated workers.
+- File storage: four tests passed, covering expiry/staging cleanup, quotas,
+  principal separation and symlink rejection.
+- Native transport: three tests passed, including actual matched-stop metadata
+  and separation of model-template terminators from client stop sequences.
+- Public-URL validation passed, including private/link-local and mapped IPv6
+  rejection. Visual admission preserves tool costs without counting Base64 as text.
+- Document worker: 11 tests passed, including PDF text/rendering, Office formats,
+  rejected XML entities and OCR subprocess handling. OCR uses mocked Tesseract.
+- Real generated PDF fixture: both APIs produce the same extracted prompt for
+  GGUF, SafeTensors and MLX model layouts using a capture backend.
+- Official SDKs: Anthropic 0.86.0 and OpenAI 2.29.0 file/reference contracts,
+  existing message/tool/count tests and ABBA fixture smoke test passed.
+- Apple Silicon release-profile build check passed. No installation or real
+  Qwen/GLM/DeepSeek/CUDA inference performed; no hardware performance claim.
+
+The full library suite has not been rerun for this extension. Historical
+unrelated baseline failures are recorded below.
+
+## Previous adapter verification (2026-09-23)
+
+- `cargo test --locked --offline api:: --lib`: 78 passed; the opt-in SDK test is
+  ignored in this ordinary run.
+- `WERK_TEST_ANTHROPIC_PYTHON=python3 cargo test --locked --offline
+  official_anthropic_sdk_text_stream_and_tool_loop --lib -- --ignored`: passed,
+  using official SDK 0.86.0, two tool rounds per mode, 64 tools and the ABBA harness.
+- `cargo check --locked --offline --no-default-features --features
+  release-macos-apple-silicon`: passed.
+- Native oMLX count/worker-reuse Rust test: passed; two counts use one worker
+  and never call the completion endpoint.
+- Python token-count, supervisor and expert-route tests: 30 passed.
+- Historical result for the initial adapter, before this extension: full library
+  suite, serial, 1009 passed, 5 failed, 1 ignored. All five failures
+  also reproduce in a clean copy of pre-change HEAD `ce1ab91`: two CLI fallback
+  diagnostic tests, two runtime-planner CUDA/ROCm selection tests and
+  `werk_protocol::client::tests::client_parses_envelope_and_sends_bearer_without_leaking_it`.
+  A parallel run additionally hit a persistence-expiry test that passes serially;
+  the baseline also showed an intermittent llama-server restore test failure.
+  The full suite was not rerun for the counting/vision/streaming extension;
+  the focused tests above cover the changes in this extension.
+- No installation or real Qwen/GLM inference was performed for this adapter.

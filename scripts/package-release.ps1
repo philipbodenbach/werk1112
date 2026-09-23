@@ -96,6 +96,11 @@ Copy-Item $BinaryPath (Join-Path $StagingDir "werk.exe") -Force
 Copy-Item (Join-Path $RepoRoot "README.md") (Join-Path $StagingDir "README.md") -Force
 Copy-Item (Join-Path $RepoRoot "LICENSE") (Join-Path $StagingDir "LICENSE") -Force
 
+New-Item (Join-Path $StagingDir "observability") -ItemType Directory -Force | Out-Null
+foreach ($asset in @("README.md", "prometheus.yml", "grafana-dashboard.json")) {
+    Copy-Item (Join-Path $RepoRoot "utils/observability/$asset") (Join-Path $StagingDir "observability/$asset") -Force
+}
+
 Remove-Item $Artifact -Force -ErrorAction Ignore
 Remove-Item "$Artifact.sha256" -Force -ErrorAction Ignore
 

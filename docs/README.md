@@ -1,5 +1,7 @@
 # Werk1112 documentation
 
+- [Live TUI, Prometheus and Grafana](../utils/observability/README.md)
+
 This directory is the versioned documentation source for Werk1112. It is
 reviewed with the code and describes the current repository state.
 

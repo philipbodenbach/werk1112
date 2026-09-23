@@ -71,8 +71,13 @@ tool-requiring request with HTTP 400 and code `unsupported_tool_calling`; they
 do not silently discard it. See the [chat request contract](../api.md#post-v1chatcompletions)
 for a complete curl request and continuation shape.
 
-Structured response formats, audio/video message content, log probabilities
-and stream usage summaries are not implemented by this endpoint.
+Documents and stored `file_id` references are expanded by a shared layer for
+every text backend, including CUDA. See [Documents and files](documents.md)
+for upload examples, PDF/Office dependencies, optional OCR and cleanup.
+Native structured response formats, multiple choices, penalties and log
+probabilities are supported by the adapters listed in the
+[chat field matrix](../api.md#post-v1chatcompletions). Streaming usage is requested
+with `stream_options.include_usage`. Audio/video chat content remains unsupported.
 
 The native n8n and ComfyUI Text nodes also expose oMLX thinking and expert-cache
 options through the `werk.omlx` request extension. Other compatible clients can
@@ -97,9 +102,8 @@ Increasing that expert budget does not enable prompt reuse. For a useful
 comparison with `werk chat --persistence`, compare cached prompt counts as well
 as prefill and decode times.
 
-Unknown OpenAI chat fields are currently ignored during deserialization. A
-request being accepted therefore does not prove that every supplied field was
-applied. Use only the fields listed in the
+Unknown OpenAI top-level chat fields are rejected. Unsupported native extended
+fields fail explicitly. Use the fields listed in the
 [chat request contract](../api.md#post-v1chatcompletions).
 
 ## Open WebUI: slow first answer with expert offload

@@ -1,7 +1,10 @@
+mod anthropic;
 mod automatic1111;
 mod chat;
 mod chat_options;
 mod cors;
+mod documents;
 mod media;
+mod observability;
 mod support;
 mod vllm_tools;

@@ -40,6 +40,42 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
         .map(|origin| origin.header_value())
         .collect::<Vec<_>>();
     let router = Router::new()
+        .route("/metrics", get(super::observability::metrics))
+        .route(
+            "/werk/v1/observability",
+            get(super::observability::snapshot),
+        )
+        .route(
+            "/v1/files",
+            get(super::files::list)
+                .post(super::files::upload)
+                .layer::<_, std::convert::Infallible>(axum::middleware::from_fn(
+                    super::files::response_headers,
+                ))
+                .layer(DefaultBodyLimit::max(
+                    (crate::file_store::MAX_FILE_BYTES + 1024 * 1024).min(body_limit_bytes),
+                )),
+        )
+        .route(
+            "/v1/files/{id}",
+            get(super::files::retrieve)
+                .delete(super::files::delete)
+                .layer(axum::middleware::from_fn(super::files::response_headers)),
+        )
+        .route(
+            "/v1/files/{id}/content",
+            get(super::files::content)
+                .layer(axum::middleware::from_fn(super::files::response_headers)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(super::anthropic::count_tokens_handler)
+                .layer(DefaultBodyLimit::max(body_limit_bytes)),
+        )
+        .route(
+            "/v1/messages",
+            post(super::anthropic::messages_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
+        )
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{id}", get(model_handler))
         .route(
@@ -113,6 +149,8 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
             header::ACCEPT,
             HeaderName::from_static(PROTOCOL_VERSION_HEADER),
             HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("anthropic-version"),
+            HeaderName::from_static("anthropic-beta"),
             HeaderName::from_static("openai-organization"),
             HeaderName::from_static("openai-project"),
             HeaderName::from_static("x-stainless-lang"),
@@ -128,6 +166,7 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
             HeaderName::from_static("x-stainless-async"),
         ])
         .expose_headers([
+            HeaderName::from_static("request-id"),
             HeaderName::from_static("x-werk-output-id"),
             HeaderName::from_static("x-werk-request-id"),
             HeaderName::from_static(PROTOCOL_VERSION_HEADER),

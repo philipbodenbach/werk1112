@@ -15,11 +15,13 @@ architecture-specific companion runtimes.
 
 ## Core capabilities
 
+- [live terminal dashboard and Prometheus/Grafana observability](utils/observability/README.md)
 - managed local and Hugging Face model store
 - explicit or automatic runtime and accelerator selection
 - typed chat, image, video and audio commands
 - workload estimation, parameter validation and provenance
-- an OpenAI-compatible subset plus Werk-native media and job APIs
+- OpenAI-compatible and Anthropic Messages API subsets with text, streaming and
+  client tool calling, plus Werk-native media and job APIs
 - optional ComfyUI nodes with native IMAGE, VIDEO and AUDIO values
 - optional [native n8n nodes (Beta)](utils/n8n/README.md),
   with manual installation, binary media and runtime operations
@@ -41,6 +43,20 @@ including when runtime routing changes. Without `--session`, the name is
 `default` for that model. Native KV reuse is separate and backend-dependent;
 conversation persistence works even when the backend must recompute the prompt.
 See the [CLI reference](docs/reference/cli.md#persistent-terminal-chat).
+
+Monitor a running server with a responsive dashboard in Werk's logo colors:
+
+~~~bash
+werk top
+werk top --demo
+werk top --once --json
+~~~
+
+`werk top` shows request activity, timing, memory and supported native cache/offload
+metrics. Both the server and client need the new observability build. Previewing
+with `--demo` uses simulated data and leaves running inference untouched. The same
+telemetry is available through authenticated `/metrics` for Prometheus and Grafana.
+See [setup, metric semantics and backend coverage](utils/observability/README.md).
 
 Inspect and clean up persisted caches:
 
@@ -250,11 +266,25 @@ OpenAI-compatible clients use:
 http://127.0.0.1:11434/v1
 ~~~
 
-Werk exposes an OpenAI-compatible chat subset, OpenAI-inspired media routes,
-Werk-native discovery/jobs/outputs and a small AUTOMATIC1111 compatibility
+Werk exposes OpenAI-compatible Chat Completions (`POST /v1/chat/completions`)
+and Anthropic-compatible Messages (`POST /v1/messages`) subsets on the same
+server, alongside OpenAI-inspired media routes, Werk-native discovery/jobs/outputs
+and a small AUTOMATIC1111 compatibility
 surface. A separate `/werk/v1` protocol provides versioned runtime capability,
 state and memory control without changing those existing routes. These classes
 are intentionally documented separately.
+
+Both chat APIs support documents and persistent file references through
+`/v1/files`. Text extraction is shared across all text backends, including CUDA,
+vLLM, llama.cpp and MLX/oMLX. PDF page images require a vision-capable runtime;
+local OCR is optional. See [Documents and files](docs/integrations/documents.md)
+for formats, dependencies, limits and examples.
+
+`POST /v1/messages` supports Anthropic-style text, images, documents, streaming and client
+tool cycles on the same server. `POST /v1/messages/count_tokens` provides native
+backend token counting where supported. Provider features and Werk runtime
+parameters remain separate; these endpoints do not imply full provider API coverage. See [Anthropic clients](docs/integrations/anthropic-clients.md)
+for SDK setup, protocol limits and Qwen/GLM test commands.
 
 ~~~bash
 curl -fsS http://127.0.0.1:11434/v1/models \
@@ -269,7 +299,7 @@ explicitly instead of ignoring them. See the
 [chat API contract](docs/api.md#post-v1chatcompletions) and
 [vLLM launch configuration](docs/backends.md#vllm-launch-arguments-and-tool-calling).
 
-See the [HTTP API reference and coverage matrix](docs/api.md) for all 33
+See the [HTTP API reference and coverage matrix](docs/api.md) for all 40
 method/path operations, exact request fields, task coverage, responses,
 authentication, limits, persistence and known gaps.
 

@@ -10,6 +10,7 @@ use std::{
 
 struct MockHttpResponse {
     content_type: &'static str,
+    warning: bool,
     body: String,
 }
 
@@ -17,6 +18,7 @@ impl MockHttpResponse {
     fn json(value: Value) -> Self {
         Self {
             content_type: "application/json",
+            warning: false,
             body: value.to_string(),
         }
     }
@@ -29,6 +31,7 @@ impl MockHttpResponse {
         body.push_str("data: [DONE]\n\n");
         Self {
             content_type: "text/event-stream",
+            warning: false,
             body,
         }
     }
@@ -42,6 +45,10 @@ struct MockVllmServer {
 
 impl MockVllmServer {
     fn start(responses: Vec<MockHttpResponse>) -> Self {
+        Self::start_at(responses, "/v1/chat/completions")
+    }
+
+    fn start_at(responses: Vec<MockHttpResponse>, path: &'static str) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -63,7 +70,7 @@ impl MockVllmServer {
                         Err(error) => panic!("mock vLLM accept failed: {error}"),
                     }
                 };
-                let request = read_json_request(&mut stream);
+                let request = read_json_request(&mut stream, path);
                 recorded.lock().unwrap().push(request);
                 write_response(&mut stream, response);
             }
@@ -81,17 +88,16 @@ impl MockVllmServer {
     }
 }
 
-fn read_json_request(stream: &mut TcpStream) -> Value {
+fn read_json_request(stream: &mut TcpStream, path: &str) -> Value {
+    // macOS may inherit O_NONBLOCK from the listening socket.
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).unwrap();
-    assert_eq!(
-        request_line.trim_end(),
-        "POST /v1/chat/completions HTTP/1.1"
-    );
+    assert_eq!(request_line.trim_end(), format!("POST {path} HTTP/1.1"));
     let mut content_length = None;
     loop {
         let mut line = String::new();
@@ -113,9 +119,14 @@ fn read_json_request(stream: &mut TcpStream) -> Value {
 
 fn write_response(stream: &mut TcpStream, response: MockHttpResponse) {
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
         response.content_type,
-        response.body.len()
+        response.body.len(),
+        if response.warning {
+            "Warning: 299 - grammar fallback\r\n"
+        } else {
+            ""
+        }
     );
     stream.write_all(headers.as_bytes()).unwrap();
     stream.write_all(response.body.as_bytes()).unwrap();
@@ -176,6 +187,254 @@ fn weather_tool() -> Value {
             }
         }
     })
+}
+
+#[tokio::test]
+async fn rich_openai_responses_preserve_multiple_choices_logprobs_and_schema_controls() {
+    let logprobs = json!({"content":[{"token":"hello","logprob":-0.1,"bytes":[104,101,108,108,111],"top_logprobs":[]}]});
+    let server = MockVllmServer::start(vec![MockHttpResponse::json(json!({
+        "id":"native-id","object":"chat.completion","created":1,"model":"Qwen-Test",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop","logprobs":logprobs},
+            {"index":1,"message":{"role":"assistant","content":"world"},"finish_reason":"stop","logprobs":logprobs}],
+        "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}))]);
+    let app = vllm_app(server.url.clone());
+    let response=post_json(&app,"/v1/chat/completions",json!({"model":"qwen-test","messages":[{"role":"user","content":"Hello"}],
+        "n":2,"logprobs":true,"top_logprobs":1,"frequency_penalty":0.2,"presence_penalty":0.1,"logit_bias":{"12":-5}}),None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["model"], "qwen-test");
+    assert_eq!(value["choices"].as_array().unwrap().len(), 2);
+    assert_eq!(value["choices"][1]["logprobs"], logprobs);
+    let sent = server.finish();
+    assert_eq!(sent[0]["n"], 2);
+    assert_eq!(sent[0]["logit_bias"]["12"], -5);
+}
+
+#[tokio::test]
+async fn extended_controls_fail_when_native_enforcement_or_metadata_is_missing() {
+    for (field, value, warning, expected) in [
+        (
+            "response_format",
+            json!({"type":"json_object"}),
+            true,
+            "could not enforce",
+        ),
+        (
+            "logprobs",
+            json!(true),
+            false,
+            "did not provide requested logprobs",
+        ),
+    ] {
+        let mut native = MockHttpResponse::json(
+            json!({"choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+        );
+        native.warning = warning;
+        let server = MockVllmServer::start(vec![native]);
+        let app = vllm_app(server.url.clone());
+        let mut request =
+            json!({"model":"qwen-test","messages":[{"role":"user","content":"hello"}]});
+        request[field] = value;
+        let response = post_json(&app, "/v1/chat/completions", request, None).await;
+        assert!(!response.status().is_success());
+        let text = String::from_utf8(
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains(expected), "{text}");
+        server.finish();
+    }
+}
+
+#[tokio::test]
+async fn anthropic_native_template_stop_is_not_a_client_stop_sequence() {
+    let server = MockVllmServer::start(vec![MockHttpResponse::json(
+        json!({"choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop","stop_reason":"<|im_end|>"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+    )]);
+    let app = vllm_app(server.url.clone());
+    let request = json!({"model":"qwen-test","max_tokens":32,"top_k":10,"messages":[{"role":"user","content":"hello"}]});
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["stop_reason"], "end_turn");
+    assert!(value["stop_sequence"].is_null());
+    server.finish();
+}
+
+#[tokio::test]
+async fn anthropic_schema_top_k_and_matched_stop_reach_native_backend() {
+    let server = MockVllmServer::start(vec![MockHttpResponse::json(
+        json!({"id":"native","model":"Qwen-Test",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"{\"ok\":true}"},"finish_reason":"stop","stop_reason":"END"}],
+        "usage":{"prompt_tokens":10,"completion_tokens":5}}),
+    )]);
+    let app = vllm_app(server.url.clone());
+    let body = json!({"model":"qwen-test","max_tokens":32,"top_k":20,"stop_sequences":["END"],
+        "output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}}},
+        "messages":[{"role":"user","content":"Reply in JSON"}]});
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["stop_reason"], "stop_sequence");
+    assert_eq!(value["stop_sequence"], "END");
+    assert_eq!(value["content"][0]["text"], "{\"ok\":true}");
+    let sent = server.finish();
+    assert_eq!(sent[0]["top_k"], 20);
+    assert_eq!(sent[0]["response_format"]["json_schema"]["strict"], true);
+    assert!(sent[0].get("__werk_matched_stop").is_none());
+}
+
+#[tokio::test]
+async fn rich_streams_keep_choice_indexes_usage_and_error_termination() {
+    for include_usage in [false, true] {
+        let server = MockVllmServer::start(vec![MockHttpResponse::sse(vec![
+            json!({"choices":[{"index":1,"delta":{"content":"second"},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{"content":"first"},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delta":{},"finish_reason":"length"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}),
+        ])]);
+        let app = vllm_app(server.url.clone());
+        let response=post_json(&app,"/v1/chat/completions",json!({"model":"qwen-test","messages":[{"role":"user","content":"hello"}],"n":2,"stream":true,"stream_options":{"include_usage":include_usage}}),None).await;
+        let text = String::from_utf8(
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("[DONE]"), "{text}");
+        assert_eq!(text.contains("prompt_tokens"), include_usage);
+        assert!(text.contains("\"index\":1"));
+        assert!(text.contains("\"index\":0"));
+        server.finish();
+    }
+    let server = MockVllmServer::start(vec![MockHttpResponse::sse(vec![
+        json!({"choices":[{"index":0,"delta":{"content":"unfinished"},"finish_reason":null}]}),
+    ])]);
+    let app = vllm_app(server.url.clone());
+    let response=post_json(&app,"/v1/chat/completions",json!({"model":"qwen-test","messages":[{"role":"user","content":"hello"}],"presence_penalty":0.1,"stream":true}),None).await;
+    let text = String::from_utf8(
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("error"));
+    assert!(!text.contains("[DONE]"));
+    server.finish();
+}
+
+#[tokio::test]
+async fn anthropic_rich_stream_reports_real_matched_stop_and_final_usage() {
+    let server = MockVllmServer::start(vec![MockHttpResponse::sse(vec![
+        json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop","stop_reason":"END"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}),
+    ])]);
+    let app = vllm_app(server.url.clone());
+    let request = json!({"model":"qwen-test","messages":[{"role":"user","content":"hello"}],"max_tokens":32,"stop_sequences":["END"],"stream":true});
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("\"stop_reason\":\"stop_sequence\""), "{text}");
+    assert!(text.contains("\"stop_sequence\":\"END\""));
+    assert!(text.contains("\"input_tokens\":12"));
+    assert!(text.contains("event: message_stop"));
+    assert!(!text.contains("event: error"));
+    server.finish();
+}
+
+#[tokio::test]
+async fn anthropic_count_uses_vllm_tokenizer_with_tool_history_and_physical_model() {
+    let server = MockVllmServer::start_at(
+        vec![MockHttpResponse::json(
+            json!({"count": 47, "tokens": [1, 2]}),
+        )],
+        "/tokenize",
+    );
+    let app = vllm_app(server.url.clone());
+    let body = json!({
+        "model":"qwen-test",
+        "system":"Use tools when needed.",
+        "tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{}}}],
+        "messages":[
+            {"role":"user","content":"Weather?"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"get_weather","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"21 C"}]}
+        ]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, json!({"input_tokens":47}));
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request["model"], "Qwen-Test");
+    assert_eq!(request["messages"][0]["role"], "system");
+    assert_eq!(request["messages"][2]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(request["messages"][3]["tool_call_id"], "call_1");
+    assert_eq!(request["tools"][0]["function"]["name"], "get_weather");
+    assert_eq!(request["add_generation_prompt"], true);
+    assert_eq!(request["add_special_tokens"], false);
+    assert!(request.get("max_tokens").is_none());
 }
 
 #[tokio::test]

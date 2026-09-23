@@ -303,8 +303,8 @@ class ExpertMemoryGuardTests(unittest.TestCase):
         self.scheduler.workspace = 10 * self.gib
         request = SimpleNamespace(num_prompt_tokens=10000, cached_tokens=50)
         self.assertIsNone(self.scheduler._preflight_memory_check(request))
-        # 32 GiB cap - 4 GiB base - 10 GiB transient - KV - 1 GiB reserve.
-        self.assertEqual(self.manager.effective_cache_bytes, 17 * self.gib - self.mib)
+        # Leave 64 MiB between the estimated peak and the native cap.
+        self.assertEqual(self.manager.effective_cache_bytes, 17 * self.gib - 65 * self.mib)
         self.assertEqual(self.manager.budget_reductions, 1)
         self.assertEqual(self.scheduler.check_calls, [request])
         self.scheduler.workspace = 64 * self.mib
@@ -312,12 +312,28 @@ class ExpertMemoryGuardTests(unittest.TestCase):
         self.assertEqual(self.manager.effective_cache_bytes, 24 * self.gib)
         self.assertTrue(self.scheduler._prefill_memory_guard)
 
+    def test_prefill_budget_tolerates_small_growth_before_native_recheck(self):
+        for growth_mib in (2, 32):
+            with self.subTest(growth_mib=growth_mib):
+                manager, scheduler, guard, _ = memory_guard_fixture(cache_bytes=40 * self.gib)
+                guard.prepare(scheduler, num_prompt_tokens=500)
+                # The HTTP guard re-samples process usage after the executor
+                # has sized the cache. Small intervening allocations must not
+                # make an otherwise feasible prompt exceed the native cap.
+                scheduler.base_bytes += growth_mib * self.mib
+                estimate = scheduler._admission_estimate(
+                    num_prompt_tokens=500, cached_tokens=0,
+                    current=scheduler._current_usage_bytes(refresh_mlx_active=False))
+                self.assertLessEqual(estimate.estimated, scheduler._prefill_abort_cap())
+                self.assertLess(manager.effective_cache_bytes, manager.checkpoint.cache_bytes)
+                self.assertTrue(scheduler._prefill_memory_guard)
+
     def test_adapter_transient_reserve_reclaims_capacity_before_chunk_sizing(self):
         self.scheduler.workspace = 4 * self.gib
         self.manager.prefill_transient_reserve = lambda tokens, peak: peak
         self.assertEqual(self.scheduler._adaptive_chunk_size(
             2048, request_id="large-tools", loop_label="external"), 2048)
-        self.assertEqual(self.manager.effective_cache_bytes, 19 * self.gib - 2 * self.mib)
+        self.assertEqual(self.manager.effective_cache_bytes, 19 * self.gib - 66 * self.mib)
         self.assertTrue(self.scheduler._prefill_memory_guard)
 
     def test_decode_recovers_prefill_budget_after_workspace_is_released(self):
@@ -576,6 +592,29 @@ class NativePrefillMemoryAccountingTests(unittest.TestCase):
         self.scheduler._raise_prefill_eviction_if_available = lambda **kwargs: None
         self.scheduler._format_rejection_message = lambda **kwargs: "unsafe native peak"
         self.guard = experts._ExpertMemoryGuard(self.manager, Scheduler, BatchedEngine)
+
+    def test_native_admission_accepts_small_post_budget_growth_but_rejects_real_pressure(self):
+        scheduler = self.scheduler
+        self.manager.checkpoint.cache_bytes = 40 * self.gib
+        self.manager.effective_cache_bytes = 40 * self.gib
+        scheduler._prefill_headroom_safety = 0.9
+        scheduler._admission_limit_bytes = lambda: 32 * self.gib
+        scheduler._prefill_abort_cap = lambda: 32 * self.gib
+        usage = [4 * self.gib]
+        self.guard.original_current = lambda _, **kwargs: usage[0]
+        scheduler._current_usage_bytes = lambda **kwargs: self.guard.current(scheduler, **kwargs)
+        self.guard.prepare(scheduler, num_prompt_tokens=500)
+        request = SimpleNamespace(num_prompt_tokens=500, cached_tokens=0, request_id="boundary")
+
+        # Native admission consumes a later process-footprint sample. This
+        # previously failed with even one extra byte when Auto filled the cap.
+        usage[0] += 2 * self.mib
+        self.assertIsNone(scheduler._preflight_memory_check(request))
+        usage[0] += 128 * self.mib
+        rejection = scheduler._preflight_memory_check(request)
+        self.assertIsNotNone(rejection)
+        self.assertGreater(rejection.estimated_bytes, rejection.limit_bytes)
+        self.assertTrue(scheduler._prefill_memory_guard)
 
     def test_actual_native_ewma_reproduces_second_turn_rejection_and_accepts_corrected_sample(self):
         scheduler = self.scheduler

@@ -12,6 +12,231 @@ use std::{
 use tokio::sync::mpsc;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+pub(super) fn apply_api_options(
+    body: &mut Value,
+    options: std::collections::BTreeMap<String, Value>,
+    allowed: &[&str],
+) -> Result<()> {
+    validate_api_options(&options, allowed)?;
+    for (key, value) in options {
+        body[key] = value;
+    }
+    Ok(())
+}
+pub(super) fn validate_api_options(
+    options: &std::collections::BTreeMap<String, Value>,
+    allowed: &[&str],
+) -> Result<()> {
+    for key in options.keys() {
+        if !allowed.contains(&key.as_str()) {
+            let name = if key == "__werk_matched_stop" {
+                "stop_sequences with matched-stop metadata"
+            } else {
+                key.as_str()
+            };
+            bail!("the selected runtime does not support {name}");
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn generate_api(
+    url: &str,
+    bearer: Option<&str>,
+    mut body: Value,
+    tx: Option<mpsc::Sender<Result<Value, String>>>,
+) -> Result<Value> {
+    let matched_stops = body.as_object_mut().unwrap().remove("__werk_matched_stop");
+    let mut watcher = None;
+    let cancel = if let Some(raw) = tx.clone() {
+        let (cancel, receiver) = mpsc::channel(1);
+        watcher = Some(SocketCancellation(
+            tokio::runtime::Handle::try_current()?.spawn(async move {
+                raw.closed().await;
+                drop(receiver);
+            }),
+        ));
+        Some(cancel)
+    } else {
+        None
+    };
+    let mut response = request_with_bearer_cancellable(
+        url,
+        "/v1/chat/completions",
+        "POST",
+        Some(&body),
+        None,
+        bearer,
+        cancel,
+    )?;
+    if response.status != 200 {
+        bail!("native chat API returned HTTP {}", response.status);
+    }
+    if body.get("response_format").is_some()
+        && response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("warning"))
+    {
+        bail!("native runtime could not enforce the requested structured output");
+    }
+    let result = if let Some(tx) = tx {
+        let mut accumulator = SseAccumulator::default();
+        let mut done = false;
+        stream_body(&mut response, |chunk| {
+            accumulator.push(chunk, |event| {
+                if event.trim() == "[DONE]" {
+                    done = true;
+                    return Ok(());
+                }
+                if done {
+                    bail!("native API emitted data after DONE");
+                }
+                let mut value: Value = serde_json::from_str(event)
+                    .context("native API returned invalid stream JSON")?;
+                if value.get("error").is_some() {
+                    bail!("native API stream error: {}", value["error"]);
+                }
+                validate_api_response(&value, &body, matched_stops.as_ref(), true)?;
+                normalize_matched_stop(&mut value, matched_stops.as_ref());
+                tx.blocking_send(Ok(value))
+                    .map_err(|_| anyhow!("stream receiver closed"))
+            })
+        })?;
+        if !done {
+            bail!("native API stream ended without DONE");
+        }
+        Value::Null
+    } else {
+        let mut bytes = Vec::new();
+        stream_body(&mut response, |chunk| {
+            if bytes.len() + chunk.len() > 16 * 1024 * 1024 {
+                bail!("native API response exceeds 16 MiB");
+            }
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        let mut value: Value =
+            serde_json::from_slice(&bytes).context("native API returned invalid JSON")?;
+        if value.get("error").is_some() {
+            bail!("native API error: {}", value["error"]);
+        }
+        validate_api_response(&value, &body, matched_stops.as_ref(), false)?;
+        normalize_matched_stop(&mut value, matched_stops.as_ref());
+        value
+    };
+    drop(watcher);
+    Ok(result)
+}
+
+fn validate_api_response(
+    value: &Value,
+    body: &Value,
+    matched: Option<&Value>,
+    stream: bool,
+) -> Result<()> {
+    let choices = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .context("native response is missing choices")?;
+    let n = body.get("n").and_then(Value::as_u64).unwrap_or(1);
+    if !stream {
+        let indices: std::collections::HashSet<_> =
+            choices.iter().filter_map(|c| c["index"].as_u64()).collect();
+        if choices.len() != n as usize || indices.len() != n as usize {
+            bail!("native API returned incomplete or duplicate choices");
+        }
+    }
+    for choice in choices {
+        ensure_choice_index(choice, n)?;
+        if !stream && (!choice["finish_reason"].is_string() || !choice["message"].is_object()) {
+            bail!("native API returned an incomplete completion");
+        }
+        if body.get("logprobs") == Some(&json!(true)) {
+            let content = if stream {
+                &choice["delta"]["content"]
+            } else {
+                &choice["message"]["content"]
+            };
+            if content.as_str().is_some_and(|s| !s.is_empty())
+                && !choice["logprobs"]["content"].is_array()
+            {
+                bail!("native runtime did not provide requested logprobs");
+            }
+        }
+        if let Some(stops) = matched
+            && choice["finish_reason"].is_string()
+        {
+            let actual = choice
+                .get("stop_reason")
+                .context("native runtime cannot report matched stop sequences")?;
+            if !actual.is_null() && !actual.is_string() && actual.as_u64().is_none() {
+                bail!("native runtime reported invalid stop metadata");
+            }
+            if let Some(stop) = actual.as_str() {
+                if choice["finish_reason"] != "stop" {
+                    bail!("native stop metadata disagrees with finish reason");
+                }
+                let requested = stops
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v.as_str() == Some(stop)));
+                let template = body["stop"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v.as_str() == Some(stop)));
+                if !requested && !template {
+                    bail!("native runtime reported an unexpected stop sequence");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn normalize_matched_stop(value: &mut Value, matched: Option<&Value>) {
+    let Some(stops) = matched.and_then(Value::as_array) else {
+        return;
+    };
+    if let Some(choices) = value["choices"].as_array_mut() {
+        for choice in choices {
+            if choice["stop_reason"].is_string() && !stops.contains(&choice["stop_reason"]) {
+                // Model-template terminators are end_turn, not client stop_sequences.
+                choice["stop_reason"] = Value::Null;
+            }
+        }
+    }
+}
+fn ensure_choice_index(choice: &Value, n: u64) -> Result<()> {
+    if !choice
+        .get("index")
+        .and_then(Value::as_u64)
+        .is_some_and(|i| i < n)
+    {
+        bail!("native response has an invalid choice index");
+    }
+    Ok(())
+}
+
+pub(super) fn tokenization_json(base_url: &str, path: &str, body: &Value) -> Result<Value> {
+    let mut response = request(
+        base_url,
+        path,
+        "POST",
+        Some(body),
+        Some(Duration::from_secs(60)),
+    )?;
+    if response.status != 200 {
+        bail!("native tokenizer returned HTTP {}", response.status);
+    }
+    let mut bytes = Vec::new();
+    stream_body(&mut response, |chunk| {
+        if bytes.len().saturating_add(chunk.len()) > 16 * 1024 * 1024 {
+            bail!("native tokenizer response exceeds 16 MiB");
+        }
+        bytes.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    serde_json::from_slice(&bytes).context("native tokenizer returned invalid JSON")
+}
+
 #[derive(Default)]
 pub(super) struct OpenAiCompletion {
     pub(super) text: String,
@@ -799,6 +1024,33 @@ pub(super) fn send_tool_call_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matched_stops_require_native_metadata_and_distinguish_template_terminators() {
+        let request = json!({"stop":["END","<|im_end|>"]});
+        let matched = json!(["END"]);
+        for (stop, valid, expected) in [
+            (json!("END"), true, json!("END")),
+            (json!("<|im_end|>"), true, Value::Null),
+            (Value::Null, true, Value::Null),
+            (json!(42), true, json!(42)),
+            (json!("unexpected"), false, Value::Null),
+            (json!({}), false, Value::Null),
+        ] {
+            let mut response = json!({"choices":[{"index":0,"message":{"content":"ok"},"finish_reason":"stop","stop_reason":stop}]});
+            assert_eq!(
+                validate_api_response(&response, &request, Some(&matched), false).is_ok(),
+                valid
+            );
+            if valid {
+                normalize_matched_stop(&mut response, Some(&matched));
+                assert_eq!(response["choices"][0]["stop_reason"], expected);
+            }
+        }
+        let response =
+            json!({"choices":[{"index":0,"message":{"content":"ok"},"finish_reason":"stop"}]});
+        assert!(validate_api_response(&response, &request, Some(&matched), false).is_err());
+    }
 
     #[test]
     fn mixed_line_delimiters_keep_earliest_sse_boundary() {

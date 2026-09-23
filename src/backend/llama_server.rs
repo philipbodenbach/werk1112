@@ -344,6 +344,86 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+        tx: Option<mpsc::Sender<Result<Value, String>>>,
+    ) -> Result<Value> {
+        super::openai_transport::validate_api_options(
+            &options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "logit_bias",
+                "n",
+                "logprobs",
+                "top_logprobs",
+                "top_k",
+            ],
+        )?;
+        if request.requires_tool_calling() {
+            bail!("llama.cpp adapter does not expose native tool calling");
+        }
+        let (server, _, _) = self.cached_server(manifest, !request.image_urls.is_empty())?;
+        let _guard = server
+            .state_gate
+            .lock()
+            .map_err(|_| anyhow!("llama-server state operation mutex poisoned"))?;
+        if request_has_images(&request) && server.projector_path.is_none() {
+            bail!("visual input requires a multimodal projector");
+        }
+        let mut body = chat_completion_body(&request);
+        body["stream"] = json!(tx.is_some());
+        if tx.is_none() {
+            body.as_object_mut().unwrap().remove("stream_options");
+        }
+        super::openai_transport::apply_api_options(
+            &mut body,
+            options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "logit_bias",
+                "n",
+                "logprobs",
+                "top_logprobs",
+                "top_k",
+            ],
+        )?;
+        super::openai_transport::generate_api(&server.url, None, body, tx)
+    }
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        if !request.image_urls.is_empty() || request.requires_tool_calling() {
+            bail!("native llama.cpp token counting currently requires text without tool calling");
+        }
+        let (server, _, _) = self.cached_server(manifest, false)?;
+        let rendered = super::openai_transport::tokenization_json(
+            &server.url,
+            "/apply-template",
+            &json!({"messages":llama_chat_messages(&request),"add_generation_prompt":true}),
+        )?;
+        let prompt = rendered
+            .get("prompt")
+            .and_then(Value::as_str)
+            .context("llama.cpp template endpoint returned no prompt")?;
+        let tokens = super::openai_transport::tokenization_json(
+            &server.url,
+            "/tokenize",
+            &json!({"content":prompt,"add_special":true,"parse_special":true}),
+        )?;
+        let tokens = tokens
+            .get("tokens")
+            .and_then(Value::as_array)
+            .context("llama.cpp tokenizer returned no token array")?;
+        if tokens.iter().any(|token| token.as_u64().is_none()) {
+            bail!("llama.cpp tokenizer returned invalid token IDs");
+        }
+        Ok(tokens.len())
+    }
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         Arc::new(LlamaRuntimeStateAdapter::new(self.clone()))
     }
@@ -3434,11 +3514,13 @@ Agent 3
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
                     ContentPart {
+                        file: None,
                         kind: "text".to_string(),
                         text: Some("Inspect this layout".to_string()),
                         image_url: None,
                     },
                     ContentPart {
+                        file: None,
                         kind: "image_url".to_string(),
                         text: None,
                         image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
@@ -3447,6 +3529,7 @@ Agent 3
                         })),
                     },
                     ContentPart {
+                        file: None,
                         kind: "input_image".to_string(),
                         text: None,
                         image_url: Some(ImageUrlSpec::Url(
