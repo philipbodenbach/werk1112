@@ -330,6 +330,11 @@ The compute-capability value follows NVIDIA's
 Build the Windows artifact on native Windows, not inside WSL. Use a Windows
 filesystem checkout such as `C:\dev\werk1112`, not a `\\wsl$` path.
 
+For Windows MSVC targets, `build.rs` reserves an 8 MiB main-thread stack for
+`werk.exe` in all build profiles. The full Clap command tree can exceed the
+default 1 MiB stack in debug builds, even for `werk top --help`. This also
+applies to backend-neutral builds and does not require a CI environment override.
+
 Prerequisites are:
 
 1. Rustup with the `stable-x86_64-pc-windows-msvc` toolchain;

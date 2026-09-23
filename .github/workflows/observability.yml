@@ -1,9 +1,9 @@
 name: Werk Observability
 on:
   push:
-    paths: ["src/**", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
+    paths: ["src/**", "build.rs", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
   pull_request:
-    paths: ["src/**", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
+    paths: ["src/**", "build.rs", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
   workflow_dispatch:
 permissions:
   contents: read
