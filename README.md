@@ -15,6 +15,7 @@ architecture-specific companion runtimes.
 
 ## Core capabilities
 
+- [live terminal dashboard and Prometheus/Grafana observability](utils/observability/README.md)
 - managed local and Hugging Face model store
 - explicit or automatic runtime and accelerator selection
 - typed chat, image, video and audio commands
@@ -42,6 +43,20 @@ including when runtime routing changes. Without `--session`, the name is
 `default` for that model. Native KV reuse is separate and backend-dependent;
 conversation persistence works even when the backend must recompute the prompt.
 See the [CLI reference](docs/reference/cli.md#persistent-terminal-chat).
+
+Monitor a running server with a responsive dashboard in Werk's logo colors:
+
+~~~bash
+werk top
+werk top --demo
+werk top --once --json
+~~~
+
+`werk top` shows request activity, timing, memory and supported native cache/offload
+metrics. Both the server and client need the new observability build. Previewing
+with `--demo` uses simulated data and leaves running inference untouched. The same
+telemetry is available through authenticated `/metrics` for Prometheus and Grafana.
+See [setup, metric semantics and backend coverage](utils/observability/README.md).
 
 Inspect and clean up persisted caches:
 

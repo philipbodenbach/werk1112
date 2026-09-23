@@ -115,6 +115,8 @@ pub struct OmlxBackend {
     test_probe: Option<ProbeReport>,
 }
 
+mod telemetry;
+
 #[derive(Clone)]
 struct OmlxInvocation {
     launcher: PathBuf,
@@ -524,6 +526,9 @@ impl OmlxBackend {
 }
 
 impl GenerationBackend for OmlxBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        telemetry::sample(self)
+    }
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -1741,7 +1746,9 @@ impl OmlxProcess {
             }
             process.expert_offload = !native_experts;
             if native_experts {
-                eprintln!("oMLX experts: native resident execution (auto; weights fit available memory)");
+                eprintln!(
+                    "oMLX experts: native resident execution (auto; weights fit available memory)"
+                );
             } else {
                 eprintln!(
                     "oMLX expert cache: {} MiB ({}) upper budget; SSD offload active, native memory guard may reduce residency",

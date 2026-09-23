@@ -5,6 +5,14 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Add `werk top`: a responsive Ratatui dashboard in the Werk logo palette with
+  animated status, bounded live charts, request selection and detail view.
+  Add authenticated `/werk/v1/observability` and Prometheus `/metrics`, shared
+  chat accounting across OpenAI/Anthropic and native oMLX cache/offload telemetry.
+  Ship Prometheus/Grafana assets in release bundles and add headless cross-platform
+  observability checks. Monitoring never changes running worker configuration.
+
+
 - Retain the existing Linux CUDA CPU-expert prefault mappings for the active
   worker lifetime, including initially cached pages. This prevents cache-only
   reclamation from undoing preparation before the first serve request. Pages

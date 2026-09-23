@@ -49,6 +49,7 @@ pub mod inference_service;
 pub mod media_cli;
 pub mod media_companion;
 pub mod model_store;
+pub mod observability;
 pub mod openai;
 pub mod runtime_control;
 pub mod runtime_planner;

@@ -196,16 +196,18 @@ package_target() {
     cp "$binary_path" "$staging_dir/$binary_name"
     cp "$REPO_ROOT/README.md" "$staging_dir/README.md"
     cp "$REPO_ROOT/LICENSE" "$staging_dir/LICENSE"
+    mkdir -p "$staging_dir/observability"
+    cp "$REPO_ROOT/utils/observability/README.md" "$REPO_ROOT/utils/observability/prometheus.yml" "$REPO_ROOT/utils/observability/grafana-dashboard.json" "$staging_dir/observability/"
     rm -f "$artifact" "$artifact.sha256"
 
     case "$platform" in
         windows)
             require_command zip
-            (cd "$staging_dir" && zip -q "$artifact" "$binary_name" README.md LICENSE)
+            (cd "$staging_dir" && zip -qr "$artifact" "$binary_name" README.md LICENSE observability)
             ;;
         linux|linux-strix-halo|linux-aarch64|macos)
             require_command tar
-            tar -czf "$artifact" -C "$staging_dir" "$binary_name" README.md LICENSE
+            tar -czf "$artifact" -C "$staging_dir" "$binary_name" README.md LICENSE observability
             ;;
     esac
 

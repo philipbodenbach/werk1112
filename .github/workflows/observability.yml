@@ -1,0 +1,31 @@
+name: Werk Observability
+on:
+  push:
+    paths: ["src/**", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
+  pull_request:
+    paths: ["src/**", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Headless telemetry, protocol and responsive TUI tests
+        run: cargo test-observability
+      - name: Validate Grafana and Prometheus assets
+        run: python utils/observability/validate.py
+      - name: Build the normal CLI
+        run: cargo build --locked --bin werk
+      - name: Check command integration
+        run: cargo run --locked -- top --help
+      - name: Exercise an isolated empty CPU server
+        run: python utils/observability/smoke.py

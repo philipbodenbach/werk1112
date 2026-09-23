@@ -297,7 +297,7 @@ async fn decode_handler(
     }
 }
 
-async fn request_context(
+pub(super) async fn request_context(
     state: &ApiState,
     headers: &HeaderMap,
 ) -> Result<(String, ControlContext), Response> {
@@ -390,7 +390,7 @@ fn new_request_id() -> String {
     format!("req_{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn success<T: Serialize>(request_id: String, data: T) -> Response {
+pub(super) fn success<T: Serialize>(request_id: String, data: T) -> Response {
     json_response(
         StatusCode::OK,
         request_id.clone(),

@@ -40,6 +40,11 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
         .map(|origin| origin.header_value())
         .collect::<Vec<_>>();
     let router = Router::new()
+        .route("/metrics", get(super::observability::metrics))
+        .route(
+            "/werk/v1/observability",
+            get(super::observability::snapshot),
+        )
         .route(
             "/v1/files",
             get(super::files::list)

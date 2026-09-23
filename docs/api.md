@@ -1223,3 +1223,17 @@ The API documentation roadmap is:
 Until then, clients should use capability/parameter discovery, tolerate the
 documented task-name forms and treat 202 as queued validation rather than
 execution success.
+
+## Observability
+
+`GET /werk/v1/observability` returns a Werk Protocol 1.0 envelope containing
+schema-versioned server-wide chat telemetry, bounded recent/active request rows,
+physical memory observations and available native worker metrics. It requires
+normal Werk authentication and `x-werk-protocol-version: 1.0`.
+
+`GET /metrics` exposes the same observations in Prometheus text format 0.0.4.
+It requires normal API-key authentication, without the Werk protocol header.
+Both endpoints share a two-second backend sampling cache and never load or
+reconfigure models. These operational endpoints expose model IDs and aggregate
+activity across server clients, but no prompts, generated content or credentials.
+See [metric semantics and coverage](../utils/observability/README.md).

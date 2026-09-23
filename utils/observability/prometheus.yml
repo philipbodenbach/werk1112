@@ -1,0 +1,14 @@
+# Run Prometheus on the Werk host. Change the target for a remote server.
+# Container localhost is the container itself; use your host's reachable address.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: werk
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: ./werk-api-key
+    static_configs:
+      - targets: ["127.0.0.1:11434"]

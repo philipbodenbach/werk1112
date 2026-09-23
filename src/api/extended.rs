@@ -164,16 +164,7 @@ pub(super) async fn openai(prepared: Prepared) -> Response {
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        match tokio::task::spawn_blocking(move || {
-            prepared.state.backend.generate_api(
-                &prepared.manifest,
-                prepared.request,
-                prepared.api_options,
-                None,
-            )
-        })
-        .await
-        {
+        match tokio::task::spawn_blocking(move || raw_generate(prepared)).await {
             Ok(Ok(mut value)) => {
                 if value["choices"].as_array().is_none_or(|c| c.len() != n) {
                     return api_error(
@@ -196,6 +187,12 @@ pub(super) async fn openai(prepared: Prepared) -> Response {
 }
 
 pub(super) fn raw_stream(prepared: Prepared) -> crate::backend::ApiGenerateStream {
+    let guard = prepared.state.telemetry.begin(&prepared.manifest.id);
+    let expected = prepared
+        .api_options
+        .get("n")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as usize;
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tokio::task::spawn_blocking(move || {
         if tx.is_closed() {
@@ -210,7 +207,25 @@ pub(super) fn raw_stream(prepared: Prepared) -> crate::backend::ApiGenerateStrea
             let _ = tx.blocking_send(Err(e.to_string()));
         }
     });
-    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    crate::observability::observe_raw_stream(
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        guard,
+        expected,
+    )
+}
+pub(super) fn raw_generate(prepared: Prepared) -> anyhow::Result<Value> {
+    let mut guard = prepared.state.telemetry.begin(&prepared.manifest.id);
+    let result = prepared.state.backend.generate_api(
+        &prepared.manifest,
+        prepared.request,
+        prepared.api_options,
+        None,
+    );
+    match &result {
+        Ok(value) => guard.raw_complete(value),
+        Err(_) => guard.error(),
+    }
+    result
 }
 struct OpenAiStream {
     source: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = (Event, bool, usize)> + Send>>,

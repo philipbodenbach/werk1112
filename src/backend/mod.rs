@@ -3,9 +3,9 @@ mod candle;
 mod external;
 mod llama_fast;
 pub(crate) mod llama_process_lifecycle;
+mod llama_server;
 #[cfg_attr(not(target_os = "linux"), path = "model_file_cache_stub.rs")]
 pub(crate) mod model_file_cache;
-mod llama_server;
 mod omlx;
 mod onnxruntime;
 mod openai_transport;
@@ -1259,6 +1259,10 @@ pub type ApiGenerateStream =
     std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<serde_json::Value, String>> + Send>>;
 
 pub trait GenerationBackend: Send + Sync {
+    /// Read only: sample already-running workers; never load or prepare models.
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        Vec::new()
+    }
     /// Rich chat responses retain choices, logprobs and structured output.
     /// Ordinary requests keep using the existing generation/session path.
     fn generate_api(

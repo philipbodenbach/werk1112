@@ -388,10 +388,24 @@ pub(super) async fn generate(
     request: GenerateRequest,
     explicit_runtime_options: bool,
 ) -> anyhow::Result<GenerateResponse> {
-    let session = select_session(&state, &manifest, &request, explicit_runtime_options)?;
-    tokio::task::spawn_blocking(move || match session {
-        Some(session) => session.generate(request),
-        None => state.backend.generate(&manifest, request),
+    let mut guard = state.telemetry.begin(&manifest.id);
+    let session = match select_session(&state, &manifest, &request, explicit_runtime_options) {
+        Ok(session) => session,
+        Err(error) => {
+            guard.error();
+            return Err(error);
+        }
+    };
+    tokio::task::spawn_blocking(move || {
+        let result = match session {
+            Some(session) => session.generate(request),
+            None => state.backend.generate(&manifest, request),
+        };
+        match &result {
+            Ok(response) => guard.complete(response),
+            Err(_) => guard.error(),
+        }
+        result
     })
     .await
     .map_err(|e| anyhow::anyhow!("generation task failed: {e}"))?
@@ -403,11 +417,13 @@ pub(super) fn generate_stream(
     request: GenerateRequest,
     explicit_runtime_options: bool,
 ) -> GenerateStream {
-    match select_session(state, &manifest, &request, explicit_runtime_options) {
+    let guard = state.telemetry.begin(&manifest.id);
+    let stream = match select_session(state, &manifest, &request, explicit_runtime_options) {
         Ok(Some(session)) => session.generate_stream(request),
         Ok(None) => state.backend.generate_stream(manifest, request),
         Err(e) => Box::pin(tokio_stream::iter(vec![Err(e.to_string())])),
-    }
+    };
+    crate::observability::observe_stream(stream, guard)
 }
 fn select_session(
     state: &ApiState,

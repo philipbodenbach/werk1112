@@ -12,6 +12,7 @@ mod extended;
 mod files;
 mod generation;
 mod media;
+mod observability;
 mod response;
 mod router;
 mod state;

@@ -85,6 +85,8 @@ pub type PromptOptionsResolver = Arc<
 
 #[derive(Clone)]
 pub struct ApiState {
+    pub(super) telemetry: Arc<crate::observability::Telemetry>,
+    pub(super) telemetry_cache: Arc<super::observability::SampleCache>,
     pub(super) store: Arc<ModelStore>,
     pub(super) backend: Arc<dyn GenerationBackend>,
     pub(super) files: crate::file_store::FileStore,
@@ -152,6 +154,8 @@ impl ApiState {
         let local_control = LocalWerkControl::new(store.clone(), runtime_adapter);
         let principal_deriver = local_control.principal_deriver();
         Self {
+            telemetry: Arc::new(crate::observability::Telemetry::default()),
+            telemetry_cache: Arc::new(super::observability::SampleCache::default()),
             files: crate::file_store::FileStore::new(store.home()),
             document_gate: Arc::new(Semaphore::new(2)),
             upload_gate: Arc::new(Semaphore::new(4)),

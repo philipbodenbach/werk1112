@@ -5,5 +5,6 @@ mod chat_options;
 mod cors;
 mod documents;
 mod media;
+mod observability;
 mod support;
 mod vllm_tools;

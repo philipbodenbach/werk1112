@@ -544,6 +544,9 @@ impl Drop for StateRouteReservation<'_> {
 }
 
 impl GenerationBackend for RuntimeRoutedGenerationBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        self.backend.telemetry()
+    }
     fn generate_api(
         &self,
         manifest: &ModelManifest,

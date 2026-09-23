@@ -1859,7 +1859,8 @@ fn auto_expert_cache_activates_only_for_probe_verified_models() {
 #[test]
 fn auto_native_experts_require_verified_text_adapter_and_preserve_explicit_limits() {
     for (verified, budget, succeeds) in [(true, 0, true), (false, 0, false), (true, 1024, false)] {
-        let (fixture, mut backend, manifest) = server_cache_fixture(json!({"version":"0.6.4", "native_experts":true}));
+        let (fixture, mut backend, manifest) =
+            server_cache_fixture(json!({"version":"0.6.4", "native_experts":true}));
         backend.invocation.as_mut().unwrap().expert_cache_bytes = Some(budget);
         backend.test_probe.as_mut().unwrap().runtime["expert_offload"] = if verified {
             json!({"loader":"installed_native_text_port"})

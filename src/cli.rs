@@ -3,6 +3,7 @@ mod media_diagnostics;
 mod model_list;
 mod run_inference;
 mod terminal_activity;
+mod top;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -112,8 +113,8 @@ const GIB: u64 = 1024 * 1024 * 1024;
 #[command(
     name = "werk",
     version,
-    about = "Headless local model server with an OpenAI-compatible API",
-    long_about = "Werk1112 imports local or Hugging Face models into a managed store, serves an OpenAI-compatible HTTP API, and stays UI-free for external clients such as Open WebUI, LM Studio, and agent tools."
+    about = "Local inference router, compatible APIs and live terminal monitoring",
+    long_about = "Werk1112 imports local or Hugging Face models, routes inference across installed runtimes, serves OpenAI-compatible and Anthropic Messages API subsets, and provides a live terminal dashboard with werk top."
 )]
 pub struct Cli {
     #[arg(
@@ -621,6 +622,8 @@ impl From<ServePersistenceReuseArg> for ReuseMode {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
+    #[command(about = "Live Werk dashboard with inference, memory and cache telemetry")]
+    Top(top::TopArgs),
     #[command(about = "Start the OpenAI-compatible HTTP server")]
     Serve {
         #[arg(long, default_value = "127.0.0.1", help = "Address to bind")]
@@ -2039,6 +2042,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Commands::Top(args) => tokio::task::spawn_blocking(move || top::run(args)).await?,
         Commands::Runtime {
             url,
             api_key,
@@ -4557,6 +4561,7 @@ fn should_print_startup_banner_for(
         | Commands::Auth { .. }
         | Commands::Temp { .. }
         | Commands::Cache { .. }
+        | Commands::Top(..)
         | Commands::Runtime { .. }
         | Commands::List { .. }
         | Commands::Parameters { .. }
@@ -4584,6 +4589,7 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
+        | Commands::Top(..)
         | Commands::Runtime { .. }
         | Commands::Cache { .. }
         | Commands::List { .. }
@@ -8873,6 +8879,24 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        let omlx = self
+            .omlx_backends
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        let mut samples: Vec<_> = backends.iter().flat_map(|b| b.telemetry()).collect();
+        samples.extend(omlx.iter().flat_map(|b| b.telemetry()));
+        let mut seen = std::collections::HashSet::new();
+        samples.retain(|s| seen.insert((s.backend.clone(), s.instance.clone())));
+        samples
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -9111,6 +9135,24 @@ impl GgufPreferredBackend {
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        let omlx = self
+            .omlx_backends
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        let mut samples: Vec<_> = backends.iter().flat_map(|b| b.telemetry()).collect();
+        samples.extend(omlx.iter().flat_map(|b| b.telemetry()));
+        let mut seen = std::collections::HashSet::new();
+        samples.retain(|s| seen.insert((s.backend.clone(), s.instance.clone())));
+        samples
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -9284,6 +9326,12 @@ impl MlxPreferredBackend {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        let mut samples = self.text_backend.telemetry();
+        samples.extend(self.vision_backend.telemetry());
+        samples
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -9473,6 +9521,15 @@ impl VllmPreferredBackend {
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        backends.iter().flat_map(|b| b.telemetry()).collect()
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -15317,12 +15374,16 @@ mod tests {
         let mut output = Vec::new();
         write_verbose_stats(&mut output, Some("oMLX"), 22, 4, "stop", first, &[]).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.lines().any(|line| {
-            line.starts_with("load duration:") && line.ends_with("3.25s")
-        }));
-        assert!(output.lines().any(|line| {
-            line.starts_with("total duration:") && line.ends_with("5s")
-        }));
+        assert!(
+            output
+                .lines()
+                .any(|line| { line.starts_with("load duration:") && line.ends_with("3.25s") })
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| { line.starts_with("total duration:") && line.ends_with("5s") })
+        );
     }
 
     #[test]

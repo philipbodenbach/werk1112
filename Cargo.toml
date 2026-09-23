@@ -37,6 +37,9 @@ candle-nn = { version = "=0.9.2", default-features = false }
 candle-transformers = { version = "=0.9.2", default-features = false }
 clap = { version = "4.5.28", features = ["derive", "env"] }
 console = "0.15.11"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 indicatif = "0.17.11"
 libc = "0.2"
 safetensors = "0.4.5"
