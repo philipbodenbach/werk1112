@@ -15,26 +15,15 @@ use std::{
 use tokio_stream::{StreamExt, once};
 
 use crate::{
-    backend::{
-        GenerateRequest, GenerateResponse, GenerateStreamEvent, GeneratedAssistantMessage,
-        StreamGranularity, ToolCallingConfig,
-    },
-    capabilities::InferenceTask,
+    backend::{GenerateRequest, GenerateResponse, GenerateStreamEvent, GeneratedAssistantMessage},
     model_store::{ModelManifest, unix_ts},
     openai::{
         AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ChatTemplateOptions, ChatTemplateSource, ModelListResponse, ModelObject, Usage,
-        generation_messages_for_prompt, image_urls_from_messages,
-        messages_to_prompt_for_model_with_template,
+        ModelListResponse, ModelObject, Usage,
     },
 };
 
-use super::{
-    response::{api_error, api_error_with_code},
-    state::ApiState,
-};
-
-const DEFAULT_LLAMA_CONTEXT_SIZE: usize = 4096;
+use super::{response::api_error, state::ApiState};
 
 pub(super) async fn models_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(response) = state.authorize(&headers) {
@@ -85,351 +74,40 @@ fn model_object(manifest: ModelManifest) -> ModelObject {
 }
 
 pub(super) async fn chat_completions_handler(
-    State(mut state): State<ApiState>,
+    State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(mut request): Json<ChatCompletionRequest>,
+    Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     if let Err(response) = state.authorize(&headers) {
         return response;
     }
-    if let Some(options) = &request.werk
-        && let Err(error) = options.validate()
+    let prepared = match super::generation::prepare(
+        state,
+        request,
+        super::generation::ContextPolicy::Trim,
+        "/v1/chat/completions",
+    )
+    .await
     {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            error.to_string(),
-            Some("werk.omlx".into()),
-        );
-    }
-    let model_id = match request.model.as_deref().or(state.default_model.as_deref()) {
-        Some(model) => model,
-        None => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "request must include model, or start the server with --model <id>".to_string(),
-                Some("model".to_string()),
-            );
-        }
+        Ok(prepared) => prepared,
+        Err(error) => return error.openai_response(),
     };
-
-    let manifest = match state.store.get(model_id) {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            eprintln!("[werk serve] POST /v1/chat/completions model={model_id} -> 404");
-            return api_error(
-                StatusCode::NOT_FOUND,
-                err.to_string(),
-                Some("model".to_string()),
-            );
-        }
-    };
-
-    if !manifest.metadata.tasks.is_empty()
-        && !manifest.supports_task(InferenceTask::TextGeneration)
-        && !manifest.supports_task(InferenceTask::ImageUnderstanding)
-    {
-        let message = if manifest.supports_task(InferenceTask::ImageGeneration) {
-            format!(
-                "model '{}' is an image-generation model and cannot be used with /v1/chat/completions; use /v1/images/generations instead",
-                manifest.id
-            )
-        } else {
-            format!(
-                "model '{}' does not declare text-generation or image-understanding and cannot be used with /v1/chat/completions",
-                manifest.id
-            )
-        };
-        return api_error(StatusCode::BAD_REQUEST, message, Some("model".to_string()));
-    }
-
-    let max_tokens = request.max_completion_tokens();
-    let context_size = effective_chat_context_size(state.chat_context_size, &manifest);
-    let removed_messages = if let Some(context_size) = context_size {
-        match trim_messages_to_context(&mut request.messages, context_size, max_tokens) {
-            Ok(removed) => removed,
-            Err(message) => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    message,
-                    Some("messages".to_string()),
-                );
-            }
-        }
-    } else {
-        0
-    };
-    if removed_messages > 0 {
-        eprintln!(
-            "[werk serve] chat context model={} removed_messages={} context_size={} max_tokens={}",
-            manifest.id,
-            removed_messages,
-            context_size.unwrap_or_default(),
-            max_tokens
-        );
-    }
-
-    let image_urls = image_urls_from_messages(&request.messages);
-    let runtime_options = request.werk.as_ref().filter(|options| !options.is_empty());
-    let explicit_runtime_options = runtime_options.is_some();
-    if let Some(options) = runtime_options {
-        if !image_urls.is_empty() {
-            return api_error_with_code(
-                StatusCode::BAD_REQUEST,
-                "werk.omlx options currently support text chat only".into(),
-                Some("werk.omlx".into()),
-                Some("unsupported_chat_options".into()),
-            );
-        }
-        let backend = state.backend.clone();
-        let selected_model = manifest.clone();
-        let options = options.clone();
-        // Compatibility probing may invoke Python. Keep it off the async
-        // executor, and never modify the process environment for a request.
-        match tokio::task::spawn_blocking(move || {
-            backend.with_chat_options(&selected_model, &options)
-        })
-        .await
-        {
-            Ok(Ok(backend)) => state.backend = backend,
-            result => {
-                let message = match result {
-                    Ok(Err(error)) => format!("{error:#}"),
-                    Err(error) => format!("chat runtime configuration failed: {error}"),
-                    Ok(Ok(_)) => unreachable!(),
-                };
-                return api_error_with_code(
-                    StatusCode::BAD_REQUEST,
-                    message,
-                    Some("werk.omlx".into()),
-                    Some("unsupported_chat_options".into()),
-                );
-            }
-        }
-    }
-    let requires_tool_calling = request.requires_tool_calling();
-    if requires_tool_calling
-        && !state
-            .backend
-            .supports_tool_calling(&manifest, !image_urls.is_empty())
-    {
-        return api_error_with_code(
-            StatusCode::BAD_REQUEST,
-            "the configured backend does not support OpenAI tool calling; use --backend vllm or --backend omlx with a compatible model and native tool parser"
-                .to_string(),
-            Some(tool_calling_parameter(&request).to_string()),
-            Some("unsupported_tool_calling".to_string()),
-        );
-    }
-    let stream = request.stream.unwrap_or(false);
-    if state.verbose {
-        let tools = request.tools.as_deref().unwrap_or_default();
-        // Clients can attach a large tool catalog to a single short message.
-        // Report its size without logging schemas, prompts or credentials.
-        let tool_schema_bytes = if tools.is_empty() {
-            0
-        } else {
-            serde_json::to_vec(tools)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default()
-        };
-        state.log_verbose(format!(
-            "[werk serve] POST /v1/chat/completions model={} stream={} messages={} images={} max_tokens={} tools={} tool_schema_bytes={}",
-            manifest.id,
-            yes_no(stream),
-            request.messages.len(),
-            image_urls.len(),
-            max_tokens,
-            tools.len(),
-            tool_schema_bytes,
-        ));
-    }
-    let prompt_options = match if explicit_runtime_options {
-        // These options select the native oMLX text route. A resolver for the
-        // server's default route must not template or redirect this request.
-        Ok(ChatTemplateOptions {
-            default_source: ChatTemplateSource::Model,
-            model_template_preferred: true,
-            override_name: Some("model"),
-        })
-    } else {
-        state.prompt_options(&manifest, !image_urls.is_empty())
-    } {
-        Ok(options) => options,
-        Err(err) => {
-            eprintln!(
-                "[werk serve] POST /v1/chat/completions model={} -> routing error: {err}",
-                manifest.id
-            );
-            return api_error(StatusCode::BAD_REQUEST, err.to_string(), None);
-        }
-    };
-    let prompt =
-        messages_to_prompt_for_model_with_template(&manifest, &request.messages, prompt_options);
-    let generation_messages = if requires_tool_calling {
-        request.messages.clone()
-    } else {
-        generation_messages_for_prompt(&prompt, request.messages.clone())
-    };
-    let mut stop = prompt.stop;
-    stop.extend(request.stop_strings());
-    let tool_config = (request.tools.is_some()
-        || request.tool_choice.is_some()
-        || request.parallel_tool_calls.is_some())
-    .then_some(ToolCallingConfig {
-        tools: request.tools,
-        tool_choice: request.tool_choice,
-        parallel_tool_calls: request.parallel_tool_calls,
-    });
-
-    let generate_request = GenerateRequest {
-        prompt: prompt.prompt,
-        messages: generation_messages,
-        image_urls,
-        max_tokens,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        stop,
-        seed: request.seed,
-        stream_granularity: StreamGranularity::Chunk,
-        verbose: state.verbose,
-        debug: false,
-        tool_config,
-    };
-
-    if stream {
-        let include_usage = request
-            .stream_options
-            .as_ref()
-            .is_some_and(|options| options.include_usage);
+    if prepared.stream {
         stream_chat_response(
-            state,
-            manifest,
-            generate_request,
-            explicit_runtime_options,
-            include_usage,
+            prepared.state,
+            prepared.manifest,
+            prepared.request,
+            prepared.explicit_runtime_options,
+            prepared.include_usage,
         )
     } else {
-        complete_chat_response(state, manifest, generate_request, explicit_runtime_options).await
-    }
-}
-
-fn tool_calling_parameter(request: &ChatCompletionRequest) -> &'static str {
-    if request.tools.is_some() {
-        "tools"
-    } else if request.tool_choice.is_some() {
-        "tool_choice"
-    } else if request.parallel_tool_calls.is_some() {
-        "parallel_tool_calls"
-    } else {
-        "messages"
-    }
-}
-
-fn effective_chat_context_size(configured: usize, manifest: &ModelManifest) -> Option<usize> {
-    if manifest.format != crate::model_store::ModelFormat::Gguf {
-        return None;
-    }
-    if configured != 0 {
-        return Some(configured);
-    }
-    manifest
-        .metadata
-        .parameter_constraints
-        .get("max_position_embeddings")
-        .or_else(|| {
-            manifest
-                .metadata
-                .parameter_constraints
-                .get("model_max_length")
-        })
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .or(Some(DEFAULT_LLAMA_CONTEXT_SIZE))
-}
-
-fn trim_messages_to_context(
-    messages: &mut Vec<crate::openai::ChatMessage>,
-    context_size: usize,
-    max_tokens: usize,
-) -> Result<usize, String> {
-    const SAFETY_TOKENS: usize = 64;
-    let reserved = max_tokens
-        .checked_add(SAFETY_TOKENS)
-        .ok_or_else(|| "chat response token reserve overflowed".to_string())?;
-    if reserved >= context_size {
-        return Err(format!(
-            "response budget ({max_tokens} tokens) leaves no prompt space in the {context_size}-token context; reduce max_tokens or increase the server --ctx-size"
-        ));
-    }
-    let prompt_budget = context_size - reserved;
-    let mut removed = 0;
-
-    while estimate_message_tokens(messages) > prompt_budget {
-        let Some(start) = messages
-            .iter()
-            .position(|message| !message.role.eq_ignore_ascii_case("system"))
-        else {
-            return Err(format!(
-                "system prompt is too large for the {context_size}-token context"
-            ));
-        };
-        if start + 1 >= messages.len() {
-            return Err(format!(
-                "current message is too large for the {context_size}-token context after reserving {max_tokens} response tokens"
-            ));
-        }
-        let remove_count = if messages
-            .get(start + 1)
-            .is_some_and(|message| message.role.eq_ignore_ascii_case("assistant"))
-        {
-            2
-        } else {
-            1
-        };
-        messages.drain(start..start + remove_count);
-        removed += remove_count;
-    }
-    Ok(removed)
-}
-
-fn estimate_message_tokens(messages: &[crate::openai::ChatMessage]) -> usize {
-    messages
-        .iter()
-        .map(|message| {
-            message
-                .content
-                .as_ref()
-                .map(estimate_content_tokens)
-                .unwrap_or_default()
-                .saturating_add(16)
-        })
-        .sum::<usize>()
-        + 16
-}
-
-fn estimate_content_tokens(content: &crate::openai::MessageContent) -> usize {
-    use crate::openai::{ImageUrlSpec, MessageContent};
-
-    match content {
-        MessageContent::Text(text) => text.len().div_ceil(3),
-        MessageContent::Parts(parts) => parts.iter().fold(0usize, |tokens, part| {
-            let part_tokens = match part.kind.as_str() {
-                "text" => part.text.as_deref().unwrap_or_default().len().div_ceil(3),
-                "image_url" | "input_image" => {
-                    let detail = part.image_url.as_ref().and_then(|image| match image {
-                        ImageUrlSpec::Object(image) => image.detail.as_deref(),
-                        ImageUrlSpec::Url(_) => None,
-                    });
-                    match detail {
-                        Some("low") => 256,
-                        Some("high") => 2048,
-                        _ => 1024,
-                    }
-                }
-                _ => 0,
-            };
-            tokens.saturating_add(part_tokens)
-        }),
+        complete_chat_response(
+            prepared.state,
+            prepared.manifest,
+            prepared.request,
+            prepared.explicit_runtime_options,
+        )
+        .await
     }
 }
 
@@ -439,35 +117,11 @@ async fn complete_chat_response(
     generate_request: GenerateRequest,
     explicit_runtime_options: bool,
 ) -> Response {
-    let backend = state.backend.clone();
     let verbose = state.verbose;
     let model = manifest.id.clone();
-    // Session selection currently happens before the request reaches AutoBackend and therefore
-    // cannot account for modality. Image requests use the request-aware backend path directly;
-    // persistent backends still retain their model/server and may reuse their own prefix cache.
-    let has_images = !generate_request.image_urls.is_empty();
-    let requires_tool_calling = generate_request.requires_tool_calling();
-    let chat_session = match if has_images || requires_tool_calling || explicit_runtime_options {
-        Ok(None)
-    } else {
-        state.chat_session(&manifest, generate_request.seed)
-    } {
-        Ok(session) => session,
-        Err(err) => {
-            eprintln!("[werk serve] complete model={model} -> session error: {err}");
-            return api_error(StatusCode::BAD_REQUEST, err.to_string(), None);
-        }
-    };
-    let result = tokio::task::spawn_blocking(move || {
-        if let Some(session) = chat_session.as_ref() {
-            session.generate(generate_request)
-        } else {
-            backend.generate(&manifest, generate_request)
-        }
-    })
-    .await
-    .map_err(|err| anyhow::anyhow!("generation task failed: {err}"))
-    .and_then(|inner| inner);
+    let result =
+        super::generation::generate(state, manifest, generate_request, explicit_runtime_options)
+            .await;
 
     match result {
         Ok(response) => {
@@ -536,17 +190,12 @@ fn stream_chat_response(
     let body_model = model.clone();
     let body_model_for_log = model.clone();
     let verbose = state.verbose;
-    let has_images = !generate_request.image_urls.is_empty();
-    let requires_tool_calling = generate_request.requires_tool_calling();
-    let body_stream = match if has_images || requires_tool_calling || explicit_runtime_options {
-        Ok(None)
-    } else {
-        state.chat_session(&manifest, generate_request.seed)
-    } {
-        Ok(Some(session)) => session.generate_stream(generate_request),
-        Ok(None) => state.backend.generate_stream(manifest, generate_request),
-        Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
-    };
+    let body_stream = super::generation::generate_stream(
+        &state,
+        manifest,
+        generate_request,
+        explicit_runtime_options,
+    );
     let final_usage = Arc::new(Mutex::new(None));
     let body_usage = final_usage.clone();
     let body = body_stream.map(move |event| {
@@ -651,10 +300,6 @@ fn stream_chat_response(
         .into_response()
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
-}
-
 fn format_duration(seconds: f64) -> String {
     let seconds = seconds.max(0.0);
     if seconds >= 1.0 {
@@ -735,34 +380,5 @@ fn to_chat_completion(model: String, response: GenerateResponse) -> ChatCompleti
             completion_tokens: response.completion_tokens,
             total_tokens: response.prompt_tokens + response.completion_tokens,
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openai::{ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
-
-    #[test]
-    fn multimodal_context_estimate_accounts_for_image_detail() {
-        let low = MessageContent::Parts(vec![ContentPart {
-            kind: "image_url".to_string(),
-            text: None,
-            image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
-                url: "data:image/png;base64,AAAA".to_string(),
-                detail: Some("low".to_string()),
-            })),
-        }]);
-        let high = MessageContent::Parts(vec![ContentPart {
-            kind: "input_image".to_string(),
-            text: None,
-            image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
-                url: "data:image/png;base64,AAAA".to_string(),
-                detail: Some("high".to_string()),
-            })),
-        }]);
-
-        assert_eq!(estimate_content_tokens(&low), 256);
-        assert_eq!(estimate_content_tokens(&high), 2048);
     }
 }

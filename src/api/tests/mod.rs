@@ -1,3 +1,4 @@
+mod anthropic;
 mod automatic1111;
 mod chat;
 mod chat_options;

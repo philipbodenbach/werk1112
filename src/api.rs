@@ -3,9 +3,11 @@
 //! State, routing, chat, media handling, responses, and tests live in focused
 //! submodules while the historical public API remains available here.
 
+mod anthropic;
 mod automatic1111;
 mod chat;
 mod cors;
+mod generation;
 mod media;
 mod response;
 mod router;

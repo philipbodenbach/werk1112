@@ -19,7 +19,8 @@ architecture-specific companion runtimes.
 - explicit or automatic runtime and accelerator selection
 - typed chat, image, video and audio commands
 - workload estimation, parameter validation and provenance
-- an OpenAI-compatible subset plus Werk-native media and job APIs
+- OpenAI-compatible and Anthropic Messages API subsets with text, streaming and
+  client tool calling, plus Werk-native media and job APIs
 - optional ComfyUI nodes with native IMAGE, VIDEO and AUDIO values
 - optional [native n8n nodes (Beta)](utils/n8n/README.md),
   with manual installation, binary media and runtime operations
@@ -250,11 +251,17 @@ OpenAI-compatible clients use:
 http://127.0.0.1:11434/v1
 ~~~
 
-Werk exposes an OpenAI-compatible chat subset, OpenAI-inspired media routes,
-Werk-native discovery/jobs/outputs and a small AUTOMATIC1111 compatibility
+Werk exposes OpenAI-compatible Chat Completions (`POST /v1/chat/completions`)
+and Anthropic-compatible Messages (`POST /v1/messages`) subsets on the same
+server, alongside OpenAI-inspired media routes, Werk-native discovery/jobs/outputs
+and a small AUTOMATIC1111 compatibility
 surface. A separate `/werk/v1` protocol provides versioned runtime capability,
 state and memory control without changing those existing routes. These classes
 are intentionally documented separately.
+
+`POST /v1/messages` also supports Anthropic-style text, streaming and client tool
+cycles on the same server. See [Anthropic clients](docs/integrations/anthropic-clients.md)
+for SDK setup, protocol limits and Qwen/GLM test commands.
 
 ~~~bash
 curl -fsS http://127.0.0.1:11434/v1/models \

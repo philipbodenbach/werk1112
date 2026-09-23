@@ -34,6 +34,7 @@ compile_error!(
 #[cfg(all(feature = "release-macos-apple-silicon", not(feature = "metal")))]
 compile_error!("macOS Apple Silicon release artifacts must compile Candle Metal support.");
 
+pub mod anthropic;
 pub mod api;
 pub mod api_keys;
 pub mod backend;

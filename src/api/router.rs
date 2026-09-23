@@ -40,6 +40,10 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
         .map(|origin| origin.header_value())
         .collect::<Vec<_>>();
     let router = Router::new()
+        .route(
+            "/v1/messages",
+            post(super::anthropic::messages_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
+        )
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{id}", get(model_handler))
         .route(
@@ -113,6 +117,8 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
             header::ACCEPT,
             HeaderName::from_static(PROTOCOL_VERSION_HEADER),
             HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("anthropic-version"),
+            HeaderName::from_static("anthropic-beta"),
             HeaderName::from_static("openai-organization"),
             HeaderName::from_static("openai-project"),
             HeaderName::from_static("x-stainless-lang"),
@@ -128,6 +134,7 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
             HeaderName::from_static("x-stainless-async"),
         ])
         .expose_headers([
+            HeaderName::from_static("request-id"),
             HeaderName::from_static("x-werk-output-id"),
             HeaderName::from_static("x-werk-request-id"),
             HeaderName::from_static(PROTOCOL_VERSION_HEADER),

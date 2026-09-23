@@ -1,6 +1,6 @@
 # HTTP API reference and coverage
 
-Werk1112 exposes an OpenAI-compatible subset together with Werk-native media,
+Werk1112 exposes OpenAI-compatible and Anthropic Messages subsets together with Werk-native media,
 discovery, output and job contracts. It also provides small compatibility
 surfaces for ComfyUI's hosted OpenAI nodes and AUTOMATIC1111 clients.
 
@@ -15,8 +15,8 @@ of truth.
 
 Current surface:
 
-- 31 unique paths
-- 33 method/path operations
+- 32 unique paths
+- 34 method/path operations
 - JSON requests except raw output downloads
 - server-sent events only for chat streaming
 - persisted asynchronous jobs for video, generated audio and the native job API
@@ -52,6 +52,7 @@ with <code>--allow-unauthenticated</code>.
 | Class | Meaning |
 | --- | --- |
 | OpenAI-compatible subset | Common OpenAI request and response shapes are implemented, but only documented fields are supported. |
+| Anthropic Messages subset | Text, streaming and client tool cycles; documented backend and protocol limits apply. |
 | OpenAI-inspired | The path or general purpose resembles OpenAI, but Werk adds or changes request/response behavior. |
 | Werk-native | The route exposes Werk tasks, routing, estimates, plans, jobs or outputs directly. |
 | Werk Protocol 1.0 | Versioned runtime-control envelope with typed capability, state, memory and prefill/decode semantics. |
@@ -67,6 +68,7 @@ Do not infer compatibility with an entire upstream API from the path prefix.
 | OpenAI-compatible | GET | <code>/v1/models</code> | Installed model list |
 | OpenAI-compatible | GET | <code>/v1/models/{id}</code> | One model summary |
 | OpenAI-compatible subset | POST | <code>/v1/chat/completions</code> | JSON completion or SSE stream |
+| Anthropic Messages subset | POST | <code>/v1/messages</code> | JSON message or named SSE events, including client tool calling |
 | OpenAI-compatible extended | POST | <code>/v1/images/generations</code> | Synchronous Base64 or persisted Werk URL |
 | Werk JSON | POST | <code>/v1/images/edits</code> | Synchronous JSON image edit/inpaint |
 | Comfy alias | POST | <code>/proxy/openai/images/generations</code> | Same handler as image generation |
@@ -143,8 +145,10 @@ Authentication properties:
 
 CORS is disabled when no browser origins are configured. When enabled, Werk
 allows only the configured exact origins, methods GET/POST/DELETE, content and
-authentication headers, and the OpenAI SDK request headers registered by the
-router. The <code>x-werk-output-id</code> response header is exposed.
+authentication headers, the OpenAI SDK request headers, and
+<code>anthropic-version</code>/<code>anthropic-beta</code> registered by the
+router. Response exposure includes <code>x-werk-output-id</code> and the
+Anthropic <code>request-id</code>.
 
 ## Request body limits
 
@@ -152,6 +156,7 @@ The following JSON routes default to 128 MiB and can be configured up to
 512 MiB with <code>WERK_API_BODY_LIMIT_BYTES</code>:
 
 - <code>POST /v1/chat/completions</code>
+- <code>POST /v1/messages</code>
 - <code>POST /v1/jobs</code>
 - <code>POST /v1/audio/transcriptions</code>
 - <code>POST /v1/audio/translations</code>
@@ -373,6 +378,13 @@ It intentionally does not return the full Werk manifest. Use
 Returns the same summary shape for one installed ID, or 404.
 
 ## Chat completions
+
+### POST /v1/messages
+
+Anthropic-compatible text, named SSE streaming and complete client-side tool
+cycles share the existing model/backend path. Require `anthropic-version:
+2023-06-01` and the usual Werk API key. See [Anthropic clients](integrations/anthropic-clients.md)
+for the field matrix, SDK/Curl examples, errors, streaming limits and model tests.
 
 ### POST /v1/chat/completions
 
