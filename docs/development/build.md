@@ -208,13 +208,18 @@ testing.
 Linux artifact requires a working CUDA build environment even though the final
 Werk router can later use CPU or external runtimes.
 
-The repository supplies these non-forced defaults in `.cargo/config.toml`:
+The `build-linux` alias supplies non-forced compiler defaults in
+`.cargo/config.toml`; compute capability is a shared non-forced default:
 
 ~~~text
 CUDA_COMPUTE_CAP=86
 CC_x86_64_unknown_linux_gnu=gcc-10
 CXX_x86_64_unknown_linux_gnu=g++-10
 ~~~
+
+Ordinary builds and tests (including `cargo test-observability`) use the system
+compiler unless explicitly overridden. The GCC/G++ 10 defaults apply only to
+`cargo build-linux`.
 
 An existing shell value wins. Compute capability `86` targets Ampere cards
 such as an RTX 3090; set the value appropriate for the binary you intend to
@@ -457,7 +462,8 @@ Do not delete the global Cargo registry as a routine build fix.
 
 ### `gcc-10` or `g++-10` is not found
 
-Install those compilers or override the repository defaults for the target:
+For `cargo build-linux`, install those compilers or override the release alias
+defaults for the target:
 
 ~~~bash
 export CC_x86_64_unknown_linux_gnu=gcc
