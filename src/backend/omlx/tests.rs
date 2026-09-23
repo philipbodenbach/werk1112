@@ -1857,6 +1857,7 @@ fn auto_expert_cache_activates_only_for_probe_verified_models() {
 }
 
 #[test]
+#[cfg(unix)]
 fn auto_native_experts_require_verified_text_adapter_and_preserve_explicit_limits() {
     for (verified, budget, succeeds) in [(true, 0, true), (false, 0, false), (true, 1024, false)] {
         let (fixture, mut backend, manifest) =
