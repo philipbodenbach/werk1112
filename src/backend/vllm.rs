@@ -457,6 +457,22 @@ impl VllmBackend {
 }
 
 impl GenerationBackend for VllmBackend {
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        validate_vllm_image_request(manifest.architecture.as_deref(), &request)?;
+        let (server, _, _) = self.cached_server(manifest)?;
+        let chat = chat_completion_body(&server.model_name, &request, false);
+        let mut body = serde_json::json!({"model":server.model_name,"messages":chat["messages"],
+            "add_generation_prompt":true,"add_special_tokens":false});
+        if let Some(tools) = chat.get("tools") {
+            body["tools"] = tools.clone();
+        }
+        let result = super::openai_transport::tokenization_json(&server.url, "/tokenize", &body)?;
+        result
+            .get("count")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .context("vLLM tokenizer returned no valid count")
+    }
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         true
     }

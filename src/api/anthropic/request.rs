@@ -2,6 +2,7 @@ use crate::{
     anthropic::{self as wire, Block, Content},
     openai::*,
 };
+use base64::Engine;
 use std::collections::HashSet;
 
 pub(super) fn valid_name(name: &str) -> bool {
@@ -14,6 +15,17 @@ pub(super) fn valid_name(name: &str) -> bool {
 pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletionRequest, String> {
     if request.model.trim().is_empty() || request.max_tokens == 0 || request.messages.is_empty() {
         return Err("model, nonempty messages and positive max_tokens are required".into());
+    }
+    if request.messages.len() > 100_000 {
+        return Err("messages may contain at most 100000 entries".into());
+    }
+    if request
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .is_some_and(|id| id.len() > 256)
+    {
+        return Err("metadata.user_id must not exceed 256 bytes".into());
     }
     if request
         .temperature
@@ -131,7 +143,7 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
         if blocks.is_empty() {
             return Err("message content must not be empty".into());
         }
-        let mut text = Vec::new();
+        let mut parts = Vec::new();
         let mut calls = Vec::new();
         let mut had_results = false;
         for block in blocks {
@@ -143,7 +155,15 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
                     if !pending.is_empty() {
                         return Err("all pending tool_result blocks must precede user text".into());
                     }
-                    text.push(value);
+                    parts.push(text_part(value));
+                }
+                Block::Image { source } => {
+                    if message.role != "user" || !pending.is_empty() {
+                        return Err(
+                            "images require a user message after all pending tool results".into(),
+                        );
+                    }
+                    parts.push(image_part(source)?);
                 }
                 Block::ToolUse { id, name, input } => {
                     if message.role != "assistant"
@@ -174,18 +194,12 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
                     content,
                     is_error,
                 } => {
-                    if message.role != "user" || !text.is_empty() || !pending.remove(&tool_use_id) {
+                    if message.role != "user" || !parts.is_empty() || !pending.remove(&tool_use_id)
+                    {
                         return Err("tool_result must precede text and match a pending tool_use exactly once".into());
                     }
-                    let content = content
-                        .map(wire::TextContent::into_text)
-                        .unwrap_or_default();
-                    let content = if is_error {
-                        serde_json::json!({"is_error": true, "content": content}).to_string()
-                    } else {
-                        content
-                    };
-                    let mut result = text_message("tool", content);
+                    let mut result = text_message("tool", String::new());
+                    result.content = Some(tool_result_content(content, is_error)?);
                     result.tool_call_id = Some(tool_use_id);
                     messages.push(result);
                     had_results = true;
@@ -196,11 +210,13 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
             return Err("user message is missing a tool_result for a pending tool_use".into());
         }
         pending.extend(calls.iter().map(|call| call.id.clone()));
-        if !text.is_empty() || !calls.is_empty() || !had_results {
-            let mut translated = text_message(&message.role, text.join("\n"));
-            if text.is_empty() {
-                translated.content = None;
-            }
+        if !parts.is_empty() || !calls.is_empty() || !had_results {
+            let mut translated = text_message(&message.role, String::new());
+            translated.content = if parts.is_empty() {
+                None
+            } else {
+                Some(parts_content(parts))
+            };
             if !calls.is_empty() {
                 translated.tool_calls = Some(calls);
             }
@@ -228,6 +244,94 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
         tool_choice,
         parallel_tool_calls,
         werk: None,
+    })
+}
+
+fn text_part(text: String) -> ContentPart {
+    ContentPart {
+        kind: "text".into(),
+        text: Some(text),
+        image_url: None,
+    }
+}
+
+fn image_part(source: wire::ImageSource) -> Result<ContentPart, String> {
+    let url = match source {
+        wire::ImageSource::Base64 { media_type, data } => {
+            if !matches!(
+                media_type.as_str(),
+                "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+            ) {
+                return Err(
+                    "image media_type must be image/jpeg, image/png, image/gif or image/webp"
+                        .into(),
+                );
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&data)
+                .map_err(|_| "image source contains invalid base64")?;
+            if decoded.is_empty() {
+                return Err("image source must not be empty".into());
+            }
+            format!("data:{media_type};base64,{data}")
+        }
+        wire::ImageSource::Url { url } => {
+            let uri = url
+                .parse::<axum::http::Uri>()
+                .map_err(|_| "image URL must be a valid HTTP(S) URL")?;
+            if !matches!(uri.scheme_str(), Some("https" | "http"))
+                || uri.host().is_none_or(str::is_empty)
+            {
+                return Err("image URL must use http or https and include a host".into());
+            }
+            url
+        }
+    };
+    Ok(ContentPart {
+        kind: "image_url".into(),
+        text: None,
+        image_url: Some(ImageUrlSpec::Url(url)),
+    })
+}
+
+fn parts_content(parts: Vec<ContentPart>) -> MessageContent {
+    if parts.iter().all(|part| part.kind == "text") {
+        MessageContent::Text(
+            parts
+                .into_iter()
+                .filter_map(|part| part.text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    } else {
+        MessageContent::Parts(parts)
+    }
+}
+
+fn tool_result_content(
+    content: Option<wire::ToolResultContent>,
+    is_error: bool,
+) -> Result<MessageContent, String> {
+    let parts = match content {
+        None => vec![text_part(String::new())],
+        Some(wire::ToolResultContent::Text(text)) => vec![text_part(text)],
+        Some(wire::ToolResultContent::Blocks(blocks)) => blocks
+            .into_iter()
+            .map(|block| match block {
+                wire::ToolResultBlock::Text { text } => Ok(text_part(text)),
+                wire::ToolResultBlock::Image { source } => image_part(source),
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    };
+    Ok(match (parts_content(parts), is_error) {
+        (MessageContent::Text(text), true) => {
+            MessageContent::Text(serde_json::json!({"is_error":true,"content":text}).to_string())
+        }
+        (MessageContent::Parts(mut parts), true) => {
+            parts.insert(0, text_part("{\"is_error\":true}".into()));
+            MessageContent::Parts(parts)
+        }
+        (content, false) => content,
     })
 }
 

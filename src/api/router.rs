@@ -41,6 +41,11 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
         .collect::<Vec<_>>();
     let router = Router::new()
         .route(
+            "/v1/messages/count_tokens",
+            post(super::anthropic::count_tokens_handler)
+                .layer(DefaultBodyLimit::max(body_limit_bytes)),
+        )
+        .route(
             "/v1/messages",
             post(super::anthropic::messages_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
         )

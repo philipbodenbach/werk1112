@@ -524,6 +524,29 @@ impl OmlxBackend {
 }
 
 impl GenerationBackend for OmlxBackend {
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        reject_images(&request)?;
+        validate_tool_options(&request)?;
+        let (server, _) = self.cached_server(manifest)?;
+        let body = omlx_chat_completion_body(
+            &server.model_name,
+            &request,
+            false,
+            self.request_thinking.or(server.thinking),
+            self.request_reasoning_effort.or(server.reasoning_effort),
+        );
+        let value = server.json_request(
+            "POST",
+            "/werk/tokenize",
+            Some(&body),
+            Duration::from_secs(60),
+        )?;
+        value
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .context("oMLX tokenizer returned no valid input_tokens")
+    }
     fn with_chat_options(
         &self,
         manifest: &ModelManifest,

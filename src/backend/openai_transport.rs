@@ -12,6 +12,28 @@ use std::{
 use tokio::sync::mpsc;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+pub(super) fn tokenization_json(base_url: &str, path: &str, body: &Value) -> Result<Value> {
+    let mut response = request(
+        base_url,
+        path,
+        "POST",
+        Some(body),
+        Some(Duration::from_secs(60)),
+    )?;
+    if response.status != 200 {
+        bail!("native tokenizer returned HTTP {}", response.status);
+    }
+    let mut bytes = Vec::new();
+    stream_body(&mut response, |chunk| {
+        if bytes.len().saturating_add(chunk.len()) > 16 * 1024 * 1024 {
+            bail!("native tokenizer response exceeds 16 MiB");
+        }
+        bytes.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    serde_json::from_slice(&bytes).context("native tokenizer returned invalid JSON")
+}
+
 #[derive(Default)]
 pub(super) struct OpenAiCompletion {
     pub(super) text: String,

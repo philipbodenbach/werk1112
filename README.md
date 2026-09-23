@@ -259,8 +259,10 @@ surface. A separate `/werk/v1` protocol provides versioned runtime capability,
 state and memory control without changing those existing routes. These classes
 are intentionally documented separately.
 
-`POST /v1/messages` also supports Anthropic-style text, streaming and client tool
-cycles on the same server. See [Anthropic clients](docs/integrations/anthropic-clients.md)
+`POST /v1/messages` supports Anthropic-style text, images, streaming and client
+tool cycles on the same server. `POST /v1/messages/count_tokens` provides native
+backend token counting where supported. Provider features and Werk runtime
+parameters remain separate; these endpoints do not imply full provider API coverage. See [Anthropic clients](docs/integrations/anthropic-clients.md)
 for SDK setup, protocol limits and Qwen/GLM test commands.
 
 ~~~bash

@@ -15,8 +15,8 @@ of truth.
 
 Current surface:
 
-- 32 unique paths
-- 34 method/path operations
+- 33 unique paths
+- 35 method/path operations
 - JSON requests except raw output downloads
 - server-sent events only for chat streaming
 - persisted asynchronous jobs for video, generated audio and the native job API
@@ -52,7 +52,7 @@ with <code>--allow-unauthenticated</code>.
 | Class | Meaning |
 | --- | --- |
 | OpenAI-compatible subset | Common OpenAI request and response shapes are implemented, but only documented fields are supported. |
-| Anthropic Messages subset | Text, streaming and client tool cycles; documented backend and protocol limits apply. |
+| Anthropic Messages subset | Text/images, streaming, client tool cycles and native token counting; documented backend and protocol limits apply. |
 | OpenAI-inspired | The path or general purpose resembles OpenAI, but Werk adds or changes request/response behavior. |
 | Werk-native | The route exposes Werk tasks, routing, estimates, plans, jobs or outputs directly. |
 | Werk Protocol 1.0 | Versioned runtime-control envelope with typed capability, state, memory and prefill/decode semantics. |
@@ -69,6 +69,7 @@ Do not infer compatibility with an entire upstream API from the path prefix.
 | OpenAI-compatible | GET | <code>/v1/models/{id}</code> | One model summary |
 | OpenAI-compatible subset | POST | <code>/v1/chat/completions</code> | JSON completion or SSE stream |
 | Anthropic Messages subset | POST | <code>/v1/messages</code> | JSON message or named SSE events, including client tool calling |
+| Anthropic Messages subset | POST | <code>/v1/messages/count_tokens</code> | Backend-native input token count |
 | OpenAI-compatible extended | POST | <code>/v1/images/generations</code> | Synchronous Base64 or persisted Werk URL |
 | Werk JSON | POST | <code>/v1/images/edits</code> | Synchronous JSON image edit/inpaint |
 | Comfy alias | POST | <code>/proxy/openai/images/generations</code> | Same handler as image generation |
@@ -157,6 +158,7 @@ The following JSON routes default to 128 MiB and can be configured up to
 
 - <code>POST /v1/chat/completions</code>
 - <code>POST /v1/messages</code>
+- <code>POST /v1/messages/count_tokens</code>
 - <code>POST /v1/jobs</code>
 - <code>POST /v1/audio/transcriptions</code>
 - <code>POST /v1/audio/translations</code>
@@ -381,10 +383,19 @@ Returns the same summary shape for one installed ID, or 404.
 
 ### POST /v1/messages
 
-Anthropic-compatible text, named SSE streaming and complete client-side tool
+Anthropic-compatible text/images, named SSE streaming and complete client-side tool
 cycles share the existing model/backend path. Require `anthropic-version:
 2023-06-01` and the usual Werk API key. See [Anthropic clients](integrations/anthropic-clients.md)
 for the field matrix, SDK/Curl examples, errors, streaming limits and model tests.
+
+### POST /v1/messages/count_tokens
+
+Uses the selected backend tokenizer and chat template for `model`, `messages`,
+optional `system`, `tools` and `tool_choice`. Returns `{"input_tokens": N}`
+without generating a completion or appending session history. The same
+Anthropic authentication/version headers apply. Backend/media restrictions
+are listed in [Anthropic clients](integrations/anthropic-clients.md#native-token-counting);
+unsupported counters return an error rather than a guessed count.
 
 ### POST /v1/chat/completions
 

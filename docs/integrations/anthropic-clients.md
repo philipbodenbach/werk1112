@@ -1,6 +1,7 @@
 # Anthropic Messages clients
 
 Werk serves an Anthropic-compatible **Messages subset** at `POST /v1/messages`
+and native token counting at `POST /v1/messages/count_tokens`
 alongside its existing OpenAI API, on the same port. Both adapters use the same
 model routing, sessions and backend workers. There is no loopback HTTP proxy or
 second model load. Use the actual installed Werk model ID, not a Claude alias.
@@ -73,15 +74,17 @@ user message. Check `stop_reason == "tool_use"` before executing a call;
 | `model`, `messages`, `max_tokens` | Required; nonempty model/history and positive token budget |
 | `system` | String or text-block array; separate from messages |
 | Message roles | `user`, `assistant` |
-| Content | String or text/tool-use/tool-result block array; adjacent text blocks join with a newline |
+| Content | String or text/image/tool-use/tool-result block array; text-only blocks join with a newline; mixed text/image order is preserved |
+| Images | Base64 JPEG/PNG/GIF/WebP or HTTP(S) URL; user messages and tool results; requires a vision-capable model/backend |
+| `metadata.user_id` | Optional string, at most 256 bytes; accepted without provider tracking or billing semantics |
 | `temperature`, `top_p` | Optional numbers in `[0, 1]` |
 | Tools | Custom tools with unique names, descriptions, object `input_schema` |
 | `tool_choice` | `auto`, `none`, `any`, named `tool`; capability constraints remain backend-dependent |
 | `disable_parallel_tool_use` | `true` forwards a constraint; absent/false leaves backend parallelism unconstrained |
 | `strict` | Passed to backend; never silently weakened |
-| `tool_result.is_error` | Error content becomes the JSON string `{"content":"…","is_error":true}` in the backend tool message |
+| `tool_result.is_error` | Text errors become `{"content":"…","is_error":true}`; image results retain their parts with a leading error marker |
 | `stop_sequences` | Absent/empty accepted; nonempty rejected until matched-stop metadata exists |
-| Unknown fields | Rejected; includes `metadata`, `top_k`, `thinking`, `cache_control`, server tools and media blocks |
+| Unknown fields | Rejected; includes `top_k`, `thinking`, `cache_control`, server tools and document/audio/video blocks |
 
 oMLX currently supports `auto`/`none`; it rejects forced/named choices,
 `disable_parallel_tool_use: true` and `strict: true`. Other backends retain their
@@ -110,11 +113,13 @@ Responses carry `request-id`; errors also include it in the body. The existing
 Named SSE events are `message_start`, `content_block_start`,
 `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`.
 There is no OpenAI `[DONE]` event. Text is forwarded as soon as it arrives.
-Tool headers may arrive fragmented from a backend, without a header-complete
-marker. Tool output is therefore buffered until backend completion and emitted
-as `tool_use` blocks with `input_json_delta`. This first version does **not**
-provide live partial tool-argument delivery. The buffer is bounded to 128 calls
-and 8 MiB of tool ID/name/argument bytes; exceeding either limit emits an error.
+Tool arguments stream live as `input_json_delta` once the fragmented tool name
+is unambiguous within the supplied catalog. Ambiguous name prefixes remain
+buffered until resolved or completion. The adapter assigns stable, opaque
+`toolu_…` IDs; clients must return those IDs in the following tool results.
+Interleaved backend calls are serialized into consecutive content blocks.
+The retained tool data is bounded to 128 calls and 8 MiB of ID/name/argument
+bytes; exceeding either limit emits an error.
 
 There is no detached adapter task or unbounded queue. Dropping the response
 drops the backend stream; actual inference cancellation continues to follow the
@@ -126,11 +131,42 @@ arrive in the final `message_delta`; the tested SDK accumulates both. Native
 cache hits are not presented as Anthropic cache billing or TTL promises.
 `--verbose` reports backend timing and cache diagnostics in the server log.
 
+## Native token counting
+
+`POST /v1/messages/count_tokens` accepts `model`, `messages`, `system`, `tools`
+and `tool_choice`, with the same authentication and version header as Messages.
+It returns `{"input_tokens": N}` from the selected backend's actual tokenizer.
+There is no generated completion, byte-count estimate or session append. Unlike
+completion admission, this endpoint does not trim or reject history based on
+Werk's context estimate; native runtime limits still apply.
+
+```bash
+curl -fsS http://127.0.0.1:11434/v1/messages/count_tokens \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit","messages":[{"role":"user","content":"What is a token?"}]}'
+```
+
+- oMLX uses the existing worker's text tokenizer, model template settings and
+  effective thinking controls. Tool schemas/history are included. Multimodal
+  engines and implicit server MCP tools are rejected because their counting
+  parity has not been established.
+- vLLM delegates to its native `/tokenize` chat endpoint, including tools.
+- llama.cpp applies its chat template and tokenizes the rendered prompt with
+  special tokens enabled, as in its completion path. This currently supports
+  text without tools or images.
+- Other backends return an unsupported-operation error rather than an estimate.
+
+Counting can load the selected model if its worker is not already running.
+Counts describe that local model/template, not Claude's tokenizer or billing.
+The HTTP contracts are tested with fixtures; numerical parity with each real
+model/runtime still requires the console acceptance tests.
+
 ## SDK and model acceptance tests
 
 The official Python SDK **0.86.0** is tested against a local Rust mock-backend
-server for `messages.create`, `messages.stream`, exact final usage and complete
-two successive client tool rounds with a 64-tool catalog. The ABBA script is
+server for `messages.create`, `messages.stream`, `messages.count_tokens`,
+exact final usage and two successive client tool rounds with a 64-tool catalog. The ABBA script is
 also smoke-tested against that fixture. Install the SDK in an isolated environment if needed:
 
 ```bash
@@ -191,23 +227,33 @@ before treating timings as equivalent work. No reproducible Qwen/GLM regression
 is acceptable. Real-model results and worker reuse still require these console
 tests; passing mock/SDK tests alone is not a hardware performance claim.
 
-Deferred: `/v1/messages/count_tokens`, thinking, vision/documents, prompt-cache
-controls, server-side tools, Batch/Files APIs and full Claude Code compatibility.
+Remaining gaps: nonempty `stop_sequences`, `top_k`, thinking/signatures,
+documents, prompt-cache controls, server-side tools, Batch/Files APIs and full
+Claude Code compatibility. This is not complete provider-spec coverage.
+Provider API semantics and Werk settings are separate: Werk does not synthesize
+Claude signatures, Anthropic cache TTLs or provider billing from local cache
+statistics. Unsupported fields fail explicitly. `max_tokens: 0` cache-warmup
+requests are not implemented.
 
 ## Verification record (2026-09-23)
 
-- `cargo test --locked --offline api:: --lib`: 73 passed; the opt-in SDK test is
+- `cargo test --locked --offline api:: --lib`: 78 passed; the opt-in SDK test is
   ignored in this ordinary run.
 - `WERK_TEST_ANTHROPIC_PYTHON=python3 cargo test --locked --offline
   official_anthropic_sdk_text_stream_and_tool_loop --lib -- --ignored`: passed,
   using official SDK 0.86.0, two tool rounds per mode, 64 tools and the ABBA harness.
 - `cargo check --locked --offline --no-default-features --features
   release-macos-apple-silicon`: passed.
-- Full library suite, serial: 1009 passed, 5 failed, 1 ignored. All five failures
+- Native oMLX count/worker-reuse Rust test: passed; two counts use one worker
+  and never call the completion endpoint.
+- Python token-count, supervisor and expert-route tests: 30 passed.
+- Historical result for the initial adapter, before this extension: full library
+  suite, serial, 1009 passed, 5 failed, 1 ignored. All five failures
   also reproduce in a clean copy of pre-change HEAD `ce1ab91`: two CLI fallback
   diagnostic tests, two runtime-planner CUDA/ROCm selection tests and
   `werk_protocol::client::tests::client_parses_envelope_and_sends_bearer_without_leaking_it`.
   A parallel run additionally hit a persistence-expiry test that passes serially;
   the baseline also showed an intermittent llama-server restore test failure.
-  These unrelated modules were not changed by this implementation.
+  The full suite was not rerun for the counting/vision/streaming extension;
+  the focused tests above cover the changes in this extension.
 - No installation or real Qwen/GLM inference was performed for this adapter.

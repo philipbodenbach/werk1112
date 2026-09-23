@@ -246,6 +246,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path=='/v1/models/physical%20%2F%20model/load':
             if settings.get('load_fail'): return self.reply({'error':'model exceeds available memory'},507)
             loaded=True; return self.reply({'status':'ok','model_id':'physical / model'})
+        if self.path=='/werk/tokenize':
+            (root/'tokenize.json').write_text(json.dumps(body))
+            return self.reply({'input_tokens':settings.get('token_count',37)})
         if self.path != '/v1/chat/completions': return self.reply({'error':'unknown path'},404)
         (root/'request.json').write_text(json.dumps(body)); (root/'chat_started').write_text('yes')
         if settings.get('stall_headers'): time.sleep(2)
@@ -993,6 +996,32 @@ fn server_cache_fixture(settings: Value) -> (Fixture, OmlxBackend, ModelManifest
     invocation.expert_cache_bytes = None;
     let manifest = fixture_model_for_backend(&fixture);
     (fixture, backend, manifest)
+}
+
+#[test]
+#[cfg(unix)]
+fn native_count_reuses_worker_and_template_controls_without_generating() {
+    let (fixture, backend, manifest) = server_cache_fixture(json!({"version":"0.6.4"}));
+    backend.prepare(&manifest).unwrap();
+    let configured = backend
+        .with_chat_options(&manifest, &chat_options(Some(false), None))
+        .unwrap();
+    assert_eq!(configured.count_tokens(&manifest, request()).unwrap(), 37);
+    assert_eq!(configured.count_tokens(&manifest, request()).unwrap(), 37);
+    let model = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let sent: Value =
+        serde_json::from_slice(&fs::read(model.join("tokenize.json")).unwrap()).unwrap();
+    assert_eq!(sent["model"], "physical / model");
+    assert_eq!(sent["chat_template_kwargs"]["enable_thinking"], false);
+    assert!(!model.join("chat_started").exists());
+    assert_eq!(
+        fs::read_to_string(model.join("starts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(backend.servers.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

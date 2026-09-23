@@ -8871,6 +8871,15 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .count_tokens(manifest, request)
+    }
+
     fn with_chat_options(
         &self,
         manifest: &ModelManifest,
@@ -9085,6 +9094,15 @@ impl GgufPreferredBackend {
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .count_tokens(manifest, request)
+    }
+
     fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
         self.backend_for_capabilities(manifest, has_images, true)
             .is_ok_and(|backend| backend.supports_tool_calling(manifest, has_images))
@@ -9234,6 +9252,11 @@ impl MlxPreferredBackend {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .count_tokens(manifest, request)
+    }
+
     fn runtime_control_adapter_for(
         &self,
         manifest: &ModelManifest,
@@ -9407,6 +9430,11 @@ impl VllmPreferredBackend {
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .count_tokens(manifest, request)
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         // This router contains only vLLM-family adapters. Report protocol
         // capability independently of runtime readiness so malformed launch

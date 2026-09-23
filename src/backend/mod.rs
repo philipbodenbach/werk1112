@@ -1256,6 +1256,11 @@ pub trait ChatGenerationSession: Send + Sync {
 }
 
 pub trait GenerationBackend: Send + Sync {
+    /// Count a fully templated prompt using the selected runtime's tokenizer.
+    /// Never implement this by generating a token or estimating from bytes.
+    fn count_tokens(&self, _manifest: &ModelManifest, _request: GenerateRequest) -> Result<usize> {
+        anyhow::bail!("the selected backend does not expose native chat token counting")
+    }
     /// Applies explicit API runtime controls without changing process-wide
     /// environment or silently routing them to an unrelated backend.
     fn with_chat_options(

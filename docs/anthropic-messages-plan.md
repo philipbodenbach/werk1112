@@ -5,10 +5,11 @@ offizieller Python-SDK-Test vorhanden. Reale Qwen-/GLM-Abnahme und
 Performance-Vergleiche erfolgen durch den Nutzer in seiner Konsole.
 Bedienung, Grenzen und Testbefehle: [Anthropic-Clients](integrations/anthropic-clients.md).
 
-Implementierungsentscheidung: Text streamt sofort. Tool-Blöcke werden begrenzt
-bis zum Backend-Abschluss gepuffert, da der interne Vertrag keinen Abschluss
-fragmentierter IDs/Namen signalisiert. Erst dann folgen stabile Tool-Header und
-`input_json_delta`; Live-Streaming partieller Tool-Argumente bleibt offen.
+Implementierungsentscheidung: Text streamt sofort. Tool-Argumente streamen,
+sobald der Name im übergebenen Katalog eindeutig ist. Mehrdeutige Namen und
+interleavte Aufrufe werden begrenzt gepuffert; eigene stabile Antwort-IDs
+entkoppeln die Ausgabe von fragmentierten Backend-IDs. Der Client gibt diese
+Antwort-IDs im folgenden Tool-Ergebnis zurück.
 
 Ziel ist ein zusätzlicher `POST /v1/messages`-Endpunkt auf demselben
 `werk serve`-Listener. Text, Streaming und vollständige Zyklen mit vom Client
@@ -195,7 +196,9 @@ Ausgabemodi funktioniert, die vorhandenen OpenAI-Tests bestehen, beide APIs
 denselben geladenen Worker wiederverwenden, Abbrüche keine Request-Ressourcen
 zurücklassen und keine reproduzierbare Performance-Regression vorliegt.
 
-`/v1/messages/count_tokens`, Thinking, Vision und Anthropic-Cache-Steuerung
-folgen als getrennte Erweiterungen mit eigener Backend-Unterstützung und
-Kompatibilitätsprüfung. Keine vollständige Anthropic- oder Claude-Code-Parität
+Erweiterungsstand 2026-09-23: `/v1/messages/count_tokens` mit nativer
+Backend-Tokenisierung, Bildblöcke und Live-Tool-Argumente sind implementiert.
+Die Backend-Grenzen und Tests stehen in `integrations/anthropic-clients.md`.
+Thinking-Signaturen und Anthropic-Cache-Steuerung werden nicht durch lokale
+Werk-Parameter nachgebildet. Weitere Anbieterfunktionen bleiben separat. Keine vollständige Anthropic- oder Claude-Code-Parität
 allein aufgrund des neuen Messages-Endpunkts behaupten.

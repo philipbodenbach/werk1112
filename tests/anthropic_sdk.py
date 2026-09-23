@@ -24,6 +24,12 @@ def main():
     assert 1 <= args.catalog_size <= 256
     client = anthropic.Anthropic(base_url=args.base_url, api_key=args.api_key,
                                  max_retries=0, timeout=600)
+    count = client.messages.count_tokens(model=args.model,
+        messages=[{"role":"user","content":"Say hello in one sentence."}])
+    assert count.input_tokens > 0
+    if args.fixture:
+        assert count.input_tokens == 23
+    print(json.dumps({"count_tokens":count.input_tokens}))
     schema = {"type": "object", "properties": {"a": {"type": "integer"},
               "b": {"type": "integer"}}, "required": ["a", "b"]}
     tools = [{"name": "add", "description": "Add two integers. Use this for addition.",

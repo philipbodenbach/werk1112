@@ -73,6 +73,10 @@ fn turn_suffix(request: &GenerateRequest) -> String {
     }
 }
 impl GenerationBackend for Fixture {
+    fn count_tokens(&self, _: &ModelManifest, request: GenerateRequest) -> anyhow::Result<usize> {
+        self.requests.lock().unwrap().push(request);
+        Ok(23)
+    }
     fn supports_tool_calling(&self, _: &ModelManifest, _: bool) -> bool {
         self.support_tools
     }
@@ -322,15 +326,27 @@ async fn interleaved_tool_fragments_produce_stable_sequential_blocks() {
         .filter(|v| v["type"] == "content_block_start")
         .collect();
     assert_eq!(starts.len(), 3);
-    assert_eq!(
-        starts[1]["content_block"],
-        json!({"type":"tool_use","id":"call_one","name":"add","input":{}})
+    assert!(
+        starts[1]["content_block"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("toolu_")
     );
+    assert_eq!(starts[1]["content_block"]["name"], "add");
     assert_eq!(starts[2]["index"], 2);
-    let arguments: Vec<Value> = events
+    let mut fragments = BTreeMap::<usize, String>::new();
+    for event in events
         .iter()
         .filter(|v| v["delta"]["type"] == "input_json_delta")
-        .map(|v| serde_json::from_str(v["delta"]["partial_json"].as_str().unwrap()).unwrap())
+    {
+        fragments
+            .entry(event["index"].as_u64().unwrap() as usize)
+            .or_default()
+            .push_str(event["delta"]["partial_json"].as_str().unwrap());
+    }
+    let arguments: Vec<Value> = fragments
+        .values()
+        .map(|s| serde_json::from_str(s).unwrap())
         .collect();
     assert_eq!(arguments, vec![json!({"a":2,"b":3}), json!({"a":5,"b":6})]);
     assert_eq!(events[events.len() - 2]["delta"]["stop_reason"], "tool_use");
@@ -340,6 +356,18 @@ async fn interleaved_tool_fragments_produce_stable_sequential_blocks() {
 async fn validation_rejects_unsupported_fields_and_invalid_histories_before_generation() {
     let backend = Arc::new(Fixture::tools());
     let app = router(state(backend.clone()));
+    for source in [
+        json!({"type":"url","url":"http://"}),
+        json!({"type":"url","url":"file:///tmp/image.png"}),
+        json!({"type":"url","url":"https://host/\r\ninjected"}),
+        json!({"type":"base64","media_type":"image/png","data":"!invalid!"}),
+        json!({"type":"base64","media_type":"image/png","data":""}),
+        json!({"type":"base64","media_type":"text/plain","data":"AQID"}),
+    ] {
+        let mut req = request();
+        req["messages"] = json!([{"role":"user","content":[{"type":"image","source":source}]}]);
+        assert_eq!(post(&app, req).await.status(), StatusCode::BAD_REQUEST);
+    }
     let invalid = vec![
         ("max_tokens", json!(0)),
         ("model", json!("")),
@@ -348,7 +376,7 @@ async fn validation_rejects_unsupported_fields_and_invalid_histories_before_gene
         ("top_p", json!(-0.1)),
         ("stop_sequences", json!(["END"])),
         ("thinking", json!({"type":"enabled","budget_tokens":100})),
-        ("metadata", json!({"user_id":"x"})),
+        ("metadata", json!({"user_id":"x".repeat(257)})),
         (
             "system",
             json!([{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]),
@@ -801,5 +829,132 @@ async fn official_anthropic_sdk_text_stream_and_tool_loop() {
         rows[..4]
             .iter()
             .all(|v| v["text_sha256"] == rows[0]["text_sha256"])
+    );
+}
+
+#[tokio::test]
+async fn vision_and_tool_result_images_keep_content_order_and_use_modality_aware_route() {
+    let backend = Arc::new(Fixture::tools());
+    let base = state(backend.clone());
+    let app = router(ApiState::new_with_default_model_and_prompt_options(
+        base.store.as_ref().clone(),
+        backend.clone(),
+        None,
+        Some(Arc::new(|_, _, _| {
+            Ok(ChatTemplateOptions {
+                default_source: ChatTemplateSource::Model,
+                model_template_preferred: true,
+                override_name: Some("model"),
+            })
+        })),
+    ));
+    let mut req = request();
+    req["metadata"] = json!({"user_id":"client-42"});
+    req["messages"] = json!([{"role":"user","content":[
+        {"type":"text","text":"Before"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQID"}},
+        {"type":"text","text":"After"},
+        {"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}
+    ]}]);
+    assert_eq!(post(&app, req.clone()).await.status(), StatusCode::OK);
+    let captured = backend.requests.lock().unwrap()[0].clone();
+    assert_eq!(
+        captured.image_urls,
+        [
+            "data:image/png;base64,AQID",
+            "https://example.test/image.png"
+        ]
+    );
+    let parts = serde_json::to_value(&captured.messages[0].content).unwrap();
+    assert_eq!(parts[0]["text"], "Before");
+    assert_eq!(parts[2]["text"], "After");
+    assert_eq!(backend.sessions.load(Ordering::SeqCst), 0);
+    req["messages"] = json!([
+        {"role":"assistant","content":[{"type":"tool_use","id":"image_call","name":"add","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"image_call","is_error":true,
+            "content":[{"type":"text","text":"Here"},{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}]}
+    ]);
+    assert_eq!(post(&app, req).await.status(), StatusCode::OK);
+    let captured = backend.requests.lock().unwrap()[1].clone();
+    assert_eq!(captured.messages[1].role, "tool");
+    let parts = serde_json::to_value(&captured.messages[1].content).unwrap();
+    assert_eq!(parts[0]["text"], "{\"is_error\":true}");
+    assert_eq!(parts[1]["text"], "Here");
+    assert_eq!(parts[2]["type"], "image_url");
+}
+
+#[tokio::test]
+async fn count_endpoint_uses_native_counter_without_generation_or_context_trimming() {
+    let backend = Arc::new(Fixture::tools());
+    let state = state(backend.clone()).with_chat_context_size(Some(32));
+    let mut manifest = dummy_manifest();
+    manifest.format = ModelFormat::Gguf;
+    fs::write(
+        state
+            .store
+            .model_dir("mock")
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let app = router(state);
+    let req = json!({"model":"mock","system":"Be brief.","tools":tools(),"messages":[{"role":"user","content":"hello".repeat(500)}]});
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("request-id"));
+    assert_eq!(response_json(response).await, json!({"input_tokens":23}));
+    let captured = backend.requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].messages.len(), 2);
+    assert_eq!(
+        captured[0]
+            .tool_config
+            .as_ref()
+            .unwrap()
+            .tools
+            .as_ref()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(backend.sessions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn count_without_native_support_fails_instead_of_estimating() {
+    let app = router(state(Arc::new(MockBackend)));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(
+                    json!({"model":"mock","messages":[{"role":"user","content":"hi"}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value = response_json(response).await;
+    assert!(value.get("input_tokens").is_none());
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("native chat token counting")
     );
 }

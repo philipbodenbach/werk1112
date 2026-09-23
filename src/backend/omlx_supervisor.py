@@ -1,7 +1,7 @@
 """Run a validated oMLX console script while its Werk parent holds stdin open.
 
-Rust starts this interpreter as a new process-group leader. No MLX code is
-imported here; the selected launcher retains its original argv and import path.
+Rust starts this interpreter as a new process-group leader. Private routes are
+registered on oMLX's app; the launcher retains its original argv and import path.
 """
 
 import os
@@ -146,6 +146,80 @@ def install_persistence_routes(manager):
         return await asyncio.to_thread(manager.status)
 
 
+async def count_chat_tokens(server, body):
+    """Use the running text engine's real chat tokenizer, never run inference.
+
+    Preserve request/model template controls. Do not use the native Anthropic
+    counter, which does not forward enable_thinking/reasoning_effort.
+    """
+    import inspect
+    request = server.ChatCompletionRequest.model_validate(body)
+    lease = server._LLMEngineLease()
+    try:
+        engine = await server.get_engine_for_model(request.model, lease=lease)
+        await server._raise_if_llm_lease_abort_requested(lease)
+        if isinstance(engine, server.VLMBatchedEngine) or getattr(engine, "supports_multimodal_fallback", False):
+            raise ValueError("native multimodal token counting is not verified for this runtime")
+        if server._server_state.mcp_manager and server.mcp_tools_exposed():
+            raise ValueError("token counting with implicit server MCP tools is not supported")
+        settings = server.get_model_settings_for_request(request.model)
+        kwargs = server.merge_chat_template_request_kwargs(settings,
+            server.merge_reasoning_effort_chat_template_kwargs(
+                request.chat_template_kwargs, request.reasoning_effort))
+        limit = getattr(settings, "max_tool_result_tokens", None)
+        extractor = getattr(engine, "message_extractor", None)
+        if extractor is not None:
+            options = {}
+            if "consolidate_system_messages" in inspect.signature(extractor).parameters:
+                options["consolidate_system_messages"] = False
+            messages = extractor(request.messages, limit, engine.tokenizer, **options)
+        else:
+            messages = server.extract_text_content(request.messages, limit, engine.tokenizer,
+                consolidate_system_messages=False)
+        partial = server.detect_and_strip_partial(messages)
+        tools = None if request.tool_choice == "none" else request.tools
+        tools = server.convert_tools_for_template(tools) if tools else None
+        if tools and "gemma" in request.model.lower():
+            tools = server.enrich_tool_params_for_gemma4(tools)
+        await server._ensure_tokenizer_for_system_probe(engine, messages)
+        messages = server.prepare_system_messages_for_template(messages, engine.tokenizer,
+            tools=tools, chat_template_kwargs=kwargs or None, is_partial=partial,
+            merge_consecutive_roles=True,
+            unsupported_mid_system_policy=server._unsupported_mid_system_policy())
+        count = engine.count_chat_tokens(messages, tools,
+            chat_template_kwargs=kwargs or None, is_partial=partial)
+        if type(count) is not int or count < 0:
+            raise ValueError("native tokenizer returned an invalid token count")
+        return {"input_tokens": count}
+    finally:
+        await lease.release()
+
+
+def install_token_count_route():
+    import json
+    # Keep the generic lifetime supervisor usable with diagnostic launchers
+    # that do not import oMLX (including the tiny process-lifecycle fixtures).
+    try:
+        from omlx import server
+    except ModuleNotFoundError as error:
+        if error.name == "omlx":
+            return
+        raise
+    from fastapi import Depends, HTTPException, Request
+
+    @server.app.post("/werk/tokenize", dependencies=[Depends(server.verify_api_key)])
+    async def tokenize(request: Request):
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > 128 * 1024 * 1024:
+                raise HTTPException(413, "token count request exceeds 128 MiB")
+            raw.extend(chunk)
+        try:
+            return await count_chat_tokens(server, json.loads(raw))
+        except (ValueError, TypeError) as error:
+            raise HTTPException(400, str(error)) from error
+
+
 def stop_owned_worker():
     """Never signal a process group that also belongs to the parent or a shell."""
     pid = os.getpid()
@@ -221,6 +295,7 @@ def main():
         from _werk_omlx_persistence import install
         manager = install(persistence_model, persistence_directory)
         install_persistence_routes(manager)
+    install_token_count_route()
     runpy.run_path(launcher, run_name="__main__")
 
 

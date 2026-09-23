@@ -42,6 +42,10 @@ struct MockVllmServer {
 
 impl MockVllmServer {
     fn start(responses: Vec<MockHttpResponse>) -> Self {
+        Self::start_at(responses, "/v1/chat/completions")
+    }
+
+    fn start_at(responses: Vec<MockHttpResponse>, path: &'static str) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -63,7 +67,7 @@ impl MockVllmServer {
                         Err(error) => panic!("mock vLLM accept failed: {error}"),
                     }
                 };
-                let request = read_json_request(&mut stream);
+                let request = read_json_request(&mut stream, path);
                 recorded.lock().unwrap().push(request);
                 write_response(&mut stream, response);
             }
@@ -81,17 +85,14 @@ impl MockVllmServer {
     }
 }
 
-fn read_json_request(stream: &mut TcpStream) -> Value {
+fn read_json_request(stream: &mut TcpStream, path: &str) -> Value {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).unwrap();
-    assert_eq!(
-        request_line.trim_end(),
-        "POST /v1/chat/completions HTTP/1.1"
-    );
+    assert_eq!(request_line.trim_end(), format!("POST {path} HTTP/1.1"));
     let mut content_length = None;
     loop {
         let mut line = String::new();
@@ -176,6 +177,52 @@ fn weather_tool() -> Value {
             }
         }
     })
+}
+
+#[tokio::test]
+async fn anthropic_count_uses_vllm_tokenizer_with_tool_history_and_physical_model() {
+    let server = MockVllmServer::start_at(
+        vec![MockHttpResponse::json(
+            json!({"count": 47, "tokens": [1, 2]}),
+        )],
+        "/tokenize",
+    );
+    let app = vllm_app(server.url.clone());
+    let body = json!({
+        "model":"qwen-test",
+        "system":"Use tools when needed.",
+        "tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{}}}],
+        "messages":[
+            {"role":"user","content":"Weather?"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"get_weather","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"21 C"}]}
+        ]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, json!({"input_tokens":47}));
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request["model"], "Qwen-Test");
+    assert_eq!(request["messages"][0]["role"], "system");
+    assert_eq!(request["messages"][2]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(request["messages"][3]["tool_call_id"], "call_1");
+    assert_eq!(request["tools"][0]["function"]["name"], "get_weather");
+    assert_eq!(request["add_generation_prompt"], true);
+    assert_eq!(request["add_special_tokens"], false);
+    assert!(request.get("max_tokens").is_none());
 }
 
 #[tokio::test]

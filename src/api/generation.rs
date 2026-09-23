@@ -51,6 +51,7 @@ impl GenerationError {
 pub(super) enum ContextPolicy {
     Trim,
     Reject,
+    Count,
 }
 pub(super) struct Prepared {
     pub state: ApiState,
@@ -147,6 +148,7 @@ pub(super) async fn prepare(
                 trim_messages_to_context(&mut request.messages, context_size, max_tokens)
             }
             ContextPolicy::Reject => check_context(&request, context_size).map(|()| 0),
+            ContextPolicy::Count => Ok(0),
         } {
             Ok(removed) => removed,
             Err(message) => {

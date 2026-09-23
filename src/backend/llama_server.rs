@@ -344,6 +344,34 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        if !request.image_urls.is_empty() || request.requires_tool_calling() {
+            bail!("native llama.cpp token counting currently requires text without tool calling");
+        }
+        let (server, _, _) = self.cached_server(manifest, false)?;
+        let rendered = super::openai_transport::tokenization_json(
+            &server.url,
+            "/apply-template",
+            &json!({"messages":llama_chat_messages(&request),"add_generation_prompt":true}),
+        )?;
+        let prompt = rendered
+            .get("prompt")
+            .and_then(Value::as_str)
+            .context("llama.cpp template endpoint returned no prompt")?;
+        let tokens = super::openai_transport::tokenization_json(
+            &server.url,
+            "/tokenize",
+            &json!({"content":prompt,"add_special":true,"parse_special":true}),
+        )?;
+        let tokens = tokens
+            .get("tokens")
+            .and_then(Value::as_array)
+            .context("llama.cpp tokenizer returned no token array")?;
+        if tokens.iter().any(|token| token.as_u64().is_none()) {
+            bail!("llama.cpp tokenizer returned invalid token IDs");
+        }
+        Ok(tokens.len())
+    }
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         Arc::new(LlamaRuntimeStateAdapter::new(self.clone()))
     }

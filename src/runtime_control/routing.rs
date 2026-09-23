@@ -544,6 +544,13 @@ impl Drop for StateRouteReservation<'_> {
 }
 
 impl GenerationBackend for RuntimeRoutedGenerationBackend {
+    fn count_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> anyhow::Result<usize> {
+        self.backend.count_tokens(manifest, request)
+    }
     fn with_chat_options(
         &self,
         manifest: &ModelManifest,

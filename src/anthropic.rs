@@ -13,10 +13,39 @@ pub struct MessagesRequest {
     pub stream: bool,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub metadata: Option<Metadata>,
     #[serde(default)]
     pub stop_sequences: Vec<String>,
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountTokensRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    pub system: Option<TextContent>,
+    pub tools: Option<Vec<Tool>>,
+    pub tool_choice: Option<ToolChoice>,
+}
+
+impl From<CountTokensRequest> for MessagesRequest {
+    fn from(request: CountTokensRequest) -> Self {
+        Self {
+            model: request.model,
+            messages: request.messages,
+            system: request.system,
+            tools: request.tools,
+            tool_choice: request.tool_choice,
+            max_tokens: 1,
+            stream: false,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            stop_sequences: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +68,9 @@ pub enum Block {
     Text {
         text: String,
     },
+    Image {
+        source: ImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -46,10 +78,37 @@ pub enum Block {
     },
     ToolResult {
         tool_use_id: String,
-        content: Option<TextContent>,
+        content: Option<ToolResultContent>,
         #[serde(default)]
         is_error: bool,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metadata {
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageSource {
+    Base64 { media_type: String, data: String },
+    Url { url: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ToolResultBlock>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolResultBlock {
+    Text { text: String },
+    Image { source: ImageSource },
 }
 
 #[derive(Debug, Deserialize)]
