@@ -76,22 +76,40 @@ fn model_object(manifest: ModelManifest) -> ModelObject {
 pub(super) async fn chat_completions_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    request: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(response) = state.authorize(&headers) {
         return response;
     }
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(error) => {
+            return api_error(
+                if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    error.status()
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                error.body_text(),
+                None,
+            );
+        }
+    };
     let prepared = match super::generation::prepare(
         state,
         request,
         super::generation::ContextPolicy::Trim,
         "/v1/chat/completions",
+        &headers,
     )
     .await
     {
         Ok(prepared) => prepared,
         Err(error) => return error.openai_response(),
     };
+    if !prepared.api_options.is_empty() {
+        return super::extended::openai(prepared).await;
+    }
     if prepared.stream {
         stream_chat_response(
             prepared.state,

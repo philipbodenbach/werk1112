@@ -524,6 +524,49 @@ impl OmlxBackend {
 }
 
 impl GenerationBackend for OmlxBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+        tx: Option<mpsc::Sender<Result<Value, String>>>,
+    ) -> Result<Value> {
+        super::openai_transport::validate_api_options(
+            &options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "top_k",
+                "reasoning_effort",
+            ],
+        )?;
+        reject_images(&request)?;
+        validate_tool_options(&request)?;
+        if request.requires_tool_calling() && !self.probe_tool_calling(manifest)? {
+            bail!("oMLX model does not have a verified native tool parser");
+        }
+        let (server, _) = self.cached_server(manifest)?;
+        let mut body = omlx_chat_completion_body(
+            &server.model_name,
+            &request,
+            tx.is_some(),
+            self.request_thinking.or(server.thinking),
+            self.request_reasoning_effort.or(server.reasoning_effort),
+        );
+        super::openai_transport::apply_api_options(
+            &mut body,
+            options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "top_k",
+                "reasoning_effort",
+            ],
+        )?;
+        super::openai_transport::generate_api(&server.url, Some(&server.api_key), body, tx)
+    }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         reject_images(&request)?;
         validate_tool_options(&request)?;

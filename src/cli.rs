@@ -3369,11 +3369,13 @@ fn vision_user_message(text: &str, image_urls: &[String]) -> ChatMessage {
     } else {
         let mut parts = Vec::with_capacity(image_urls.len() + 1);
         parts.push(ContentPart {
+            file: None,
             kind: "text".to_string(),
             text: Some(text.to_string()),
             image_url: None,
         });
         parts.extend(image_urls.iter().map(|url| ContentPart {
+            file: None,
             kind: "image_url".to_string(),
             text: None,
             image_url: Some(ImageUrlSpec::Url(url.clone())),
@@ -8871,6 +8873,21 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+        tx: Option<tokio::sync::mpsc::Sender<Result<serde_json::Value, String>>>,
+    ) -> Result<serde_json::Value> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .generate_api(manifest, request, options, tx)
+    }
+
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         self.backend_for_execution(
             manifest,
@@ -9094,6 +9111,21 @@ impl GgufPreferredBackend {
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+        tx: Option<tokio::sync::mpsc::Sender<Result<serde_json::Value, String>>>,
+    ) -> Result<serde_json::Value> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .generate_api(manifest, request, options, tx)
+    }
+
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         self.backend_for_execution(
             manifest,
@@ -9252,6 +9284,17 @@ impl MlxPreferredBackend {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+        tx: Option<tokio::sync::mpsc::Sender<Result<serde_json::Value, String>>>,
+    ) -> Result<serde_json::Value> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .generate_api(manifest, request, options, tx)
+    }
+
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         self.backend_for_request(manifest, !request.image_urls.is_empty())?
             .count_tokens(manifest, request)
@@ -9430,6 +9473,17 @@ impl VllmPreferredBackend {
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+        tx: Option<tokio::sync::mpsc::Sender<Result<serde_json::Value, String>>>,
+    ) -> Result<serde_json::Value> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .generate_api(manifest, request, options, tx)
+    }
+
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         self.backend_for_request(manifest, !request.image_urls.is_empty())?
             .count_tokens(manifest, request)
@@ -14203,6 +14257,7 @@ mod tests {
         let store = test_store("omlx-node-explicit-backend");
         let model = test_manifest(ModelFormat::Mlx, Some("deepseek_v4"));
         let controls = crate::openai::ChatRuntimeOptions {
+            documents: None,
             omlx: Some(crate::openai::OmlxChatOptions {
                 reasoning_effort: None,
                 thinking: Some(false),
@@ -14245,6 +14300,7 @@ mod tests {
             SelectionOptions::default(),
         );
         let controls = crate::openai::ChatRuntimeOptions {
+            documents: None,
             omlx: Some(crate::openai::OmlxChatOptions {
                 reasoning_effort: None,
                 thinking: Some(false),

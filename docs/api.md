@@ -15,9 +15,9 @@ of truth.
 
 Current surface:
 
-- 33 unique paths
-- 35 method/path operations
-- JSON requests except raw output downloads
+- 36 unique paths
+- 40 method/path operations
+- JSON requests, multipart file uploads and raw file/output downloads
 - server-sent events only for chat streaming
 - persisted asynchronous jobs for video, generated audio and the native job API
 - a separate, versioned Werk Protocol 1.0 runtime-control surface
@@ -70,6 +70,11 @@ Do not infer compatibility with an entire upstream API from the path prefix.
 | OpenAI-compatible subset | POST | <code>/v1/chat/completions</code> | JSON completion or SSE stream |
 | Anthropic Messages subset | POST | <code>/v1/messages</code> | JSON message or named SSE events, including client tool calling |
 | Anthropic Messages subset | POST | <code>/v1/messages/count_tokens</code> | Backend-native input token count |
+| OpenAI / Anthropic Files subsets | POST | <code>/v1/files</code> | Multipart upload; principal-scoped persistent file |
+| OpenAI / Anthropic Files subsets | GET | <code>/v1/files</code> | Paginated file inventory |
+| OpenAI / Anthropic Files subsets | GET | <code>/v1/files/{id}</code> | File metadata |
+| OpenAI / Anthropic Files subsets | DELETE | <code>/v1/files/{id}</code> | Delete uploaded bytes and metadata |
+| OpenAI Files subset | GET | <code>/v1/files/{id}/content</code> | Uploaded bytes; Anthropic input files are not downloadable |
 | OpenAI-compatible extended | POST | <code>/v1/images/generations</code> | Synchronous Base64 or persisted Werk URL |
 | Werk JSON | POST | <code>/v1/images/edits</code> | Synchronous JSON image edit/inpaint |
 | Comfy alias | POST | <code>/proxy/openai/images/generations</code> | Same handler as image generation |
@@ -383,7 +388,7 @@ Returns the same summary shape for one installed ID, or 404.
 
 ### POST /v1/messages
 
-Anthropic-compatible text/images, named SSE streaming and complete client-side tool
+Anthropic-compatible text/images/documents, named SSE streaming and complete client-side tool
 cycles share the existing model/backend path. Require `anthropic-version:
 2023-06-01` and the usual Werk API key. See [Anthropic clients](integrations/anthropic-clients.md)
 for the field matrix, SDK/Curl examples, errors, streaming limits and model tests.
@@ -396,6 +401,15 @@ without generating a completion or appending session history. The same
 Anthropic authentication/version headers apply. Backend/media restrictions
 are listed in [Anthropic clients](integrations/anthropic-clients.md#native-token-counting);
 unsupported counters return an error rather than a guessed count.
+
+### Documents and files
+
+Both chat routes and native counting expand inline documents and `file_id`
+references in a shared layer, before any model/backend execution. Text extraction
+works with every text backend, including CUDA; PDF rendering follows actual
+vision readiness. `werk.documents` selects local `auto`/`text`/`vision` processing
+and optional OCR. See [Documents and file references](integrations/documents.md)
+for `/v1/files` contracts, supported formats, installation, quotas and cleanup.
 
 ### POST /v1/chat/completions
 
@@ -416,7 +430,36 @@ Accepted top-level fields:
 | <code>tools</code> | No | array | OpenAI function-tool definitions; supported by the vLLM adapter |
 | <code>tool_choice</code> | No | string or object | <code>none</code>, <code>auto</code>, <code>required</code>, or a named function selection |
 | <code>parallel_tool_calls</code> | No | boolean | Forwarded unchanged to vLLM |
-| <code>werk</code> | No | object | Validated Werk chat runtime options; currently <code>omlx.thinking</code>, <code>omlx.reasoning_effort</code>, <code>omlx.expert_cache_mb</code> and <code>omlx.ngram_cache_mb</code> |
+| <code>response_format</code> | No | object | `text`, `json_object`, or `json_schema`; native structured-output support required |
+| <code>frequency_penalty</code>, <code>presence_penalty</code> | No | number | `[-2, 2]`; native adapter support required |
+| <code>n</code> | No | integer | `1..16`; multiple choices retained through native adapters that support them |
+| <code>logprobs</code>, <code>top_logprobs</code> | No | boolean / integer | Native token logprobs; top count `0..20` requires `logprobs: true` |
+| <code>logit_bias</code> | No | object | Token-ID keys with biases in `[-100,100]`; native support required |
+| <code>reasoning_effort</code> | No | string | Forwarded as a provider field where supported, separately from `werk.omlx` |
+| <code>store</code> | No | boolean | Only `false`/null supported; no provider completion-storage service |
+| <code>werk</code> | No | object | Local `omlx` runtime controls and `documents.mode` / `documents.ocr` |
+
+Unknown top-level fields fail explicitly. Extended requests use a native rich
+response path so choice indices, logprobs and usage survive both JSON and SSE.
+The ordinary path remains in place when these options are absent. Extended
+requests reuse the native worker and its own prefix cache; they do not pass
+through Werk's simple `ChatGenerationSession` snapshot path.
+
+| Native adapter | JSON/schema, penalties | Multiple choices / logprobs / logit bias | Anthropic `top_k` | Anthropic matched `stop_sequences` |
+| --- | --- | --- | --- | --- |
+| vLLM | Forwarded | Forwarded, actual choices/logprobs checked | Forwarded | Requires actual native `stop_reason` |
+| llama.cpp server | Forwarded | Forwarded, actual choices/logprobs checked | Forwarded | Explicitly unsupported by this adapter |
+| oMLX | Forwarded; grammar-fallback warning fails | Explicitly unsupported | Forwarded | Explicitly unsupported by this adapter |
+| Other adapters | Explicit error for extended options | Explicit error | Explicit error | Explicit error |
+
+This matrix concerns extended output controls, **not document support**.
+The installed runtime version/model must support the requested field or schema;
+native validation failures remain errors. Provider thinking signatures, cache
+TTLs/billing and server-side tools are not synthesized from Werk settings.
+OpenAI `stop` retains its existing behavior without claiming a matched-stop
+string. Anthropic `output_config.format` maps JSON Schema into the same native
+structured-output path. Structured output is enforced by the native runtime,
+not by a second Werk JSON-Schema validator.
 
 #### oMLX chat options
 
@@ -621,16 +664,9 @@ runtime selection. <code>backend</code>, <code>accelerator</code> and Werk media
 <code>routing</code> are not chat request fields; constrain the backend when
 starting Werk when an exact route is required.
 
-Not implemented:
-
-- structured <code>response_format</code>
-- audio or video content
-- choice count <code>n</code>
-- log probabilities
-- frequency and presence penalties
-
-Unknown chat fields are currently ignored by deserialization. Clients should
-not interpret acceptance as support.
+Audio/video chat content remains unsupported. Structured formats, multiple
+choices, log probabilities and penalties use the explicit native-adapter matrix
+above. Unknown top-level fields fail validation rather than being ignored.
 
 ### Chat SSE
 
@@ -1164,7 +1200,8 @@ The following are not currently implemented:
 - real backend progress percentages
 - HTTP byte ranges
 - idempotency-key contract
-- rate limiting, scopes and tenant separation
+- general request rate limiting and authorization scopes (file storage and
+  runtime state have key isolation; document/file concurrency is bounded)
 - machine-readable OpenAPI
 
 The generic job route provides typed access to many tasks in the meantime, but

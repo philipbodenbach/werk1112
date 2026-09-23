@@ -544,6 +544,25 @@ impl Drop for StateRouteReservation<'_> {
 }
 
 impl GenerationBackend for RuntimeRoutedGenerationBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+        tx: Option<tokio::sync::mpsc::Sender<anyhow::Result<serde_json::Value, String>>>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let has_images = !request.image_urls.is_empty();
+        let result = self.backend.generate_api(manifest, request, options, tx);
+        if let Ok(adapter) = self
+            .backend
+            .runtime_control_adapter_for_request(manifest, has_images)
+        {
+            let _ = self
+                .runtime
+                .record_model_adapter(manifest, has_images, adapter);
+        }
+        result
+    }
     fn count_tokens(
         &self,
         manifest: &ModelManifest,
@@ -1895,6 +1914,7 @@ mod tests {
             "default-instance"
         );
         let controls = crate::openai::ChatRuntimeOptions {
+            documents: None,
             omlx: Some(crate::openai::OmlxChatOptions {
                 reasoning_effort: None,
                 thinking: Some(false),

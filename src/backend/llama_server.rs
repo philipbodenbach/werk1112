@@ -344,6 +344,58 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn generate_api(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+        tx: Option<mpsc::Sender<Result<Value, String>>>,
+    ) -> Result<Value> {
+        super::openai_transport::validate_api_options(
+            &options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "logit_bias",
+                "n",
+                "logprobs",
+                "top_logprobs",
+                "top_k",
+            ],
+        )?;
+        if request.requires_tool_calling() {
+            bail!("llama.cpp adapter does not expose native tool calling");
+        }
+        let (server, _, _) = self.cached_server(manifest, !request.image_urls.is_empty())?;
+        let _guard = server
+            .state_gate
+            .lock()
+            .map_err(|_| anyhow!("llama-server state operation mutex poisoned"))?;
+        if request_has_images(&request) && server.projector_path.is_none() {
+            bail!("visual input requires a multimodal projector");
+        }
+        let mut body = chat_completion_body(&request);
+        body["stream"] = json!(tx.is_some());
+        if tx.is_none() {
+            body.as_object_mut().unwrap().remove("stream_options");
+        }
+        super::openai_transport::apply_api_options(
+            &mut body,
+            options,
+            &[
+                "response_format",
+                "frequency_penalty",
+                "presence_penalty",
+                "logit_bias",
+                "n",
+                "logprobs",
+                "top_logprobs",
+                "top_k",
+            ],
+        )?;
+        super::openai_transport::generate_api(&server.url, None, body, tx)
+    }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         if !request.image_urls.is_empty() || request.requires_tool_calling() {
             bail!("native llama.cpp token counting currently requires text without tool calling");
@@ -3462,11 +3514,13 @@ Agent 3
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
                     ContentPart {
+                        file: None,
                         kind: "text".to_string(),
                         text: Some("Inspect this layout".to_string()),
                         image_url: None,
                     },
                     ContentPart {
+                        file: None,
                         kind: "image_url".to_string(),
                         text: None,
                         image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
@@ -3475,6 +3529,7 @@ Agent 3
                         })),
                     },
                     ContentPart {
+                        file: None,
                         kind: "input_image".to_string(),
                         text: None,
                         image_url: Some(ImageUrlSpec::Url(

@@ -259,7 +259,13 @@ surface. A separate `/werk/v1` protocol provides versioned runtime capability,
 state and memory control without changing those existing routes. These classes
 are intentionally documented separately.
 
-`POST /v1/messages` supports Anthropic-style text, images, streaming and client
+Both chat APIs support documents and persistent file references through
+`/v1/files`. Text extraction is shared across all text backends, including CUDA,
+vLLM, llama.cpp and MLX/oMLX. PDF page images require a vision-capable runtime;
+local OCR is optional. See [Documents and files](docs/integrations/documents.md)
+for formats, dependencies, limits and examples.
+
+`POST /v1/messages` supports Anthropic-style text, images, documents, streaming and client
 tool cycles on the same server. `POST /v1/messages/count_tokens` provides native
 backend token counting where supported. Provider features and Werk runtime
 parameters remain separate; these endpoints do not imply full provider API coverage. See [Anthropic clients](docs/integrations/anthropic-clients.md)
@@ -278,7 +284,7 @@ explicitly instead of ignoring them. See the
 [chat API contract](docs/api.md#post-v1chatcompletions) and
 [vLLM launch configuration](docs/backends.md#vllm-launch-arguments-and-tool-calling).
 
-See the [HTTP API reference and coverage matrix](docs/api.md) for all 33
+See the [HTTP API reference and coverage matrix](docs/api.md) for all 40
 method/path operations, exact request fields, task coverage, responses,
 authentication, limits, persistence and known gaps.
 

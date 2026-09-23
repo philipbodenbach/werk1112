@@ -34,8 +34,22 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
     {
         return Err("temperature and top_p must be between 0 and 1".into());
     }
+    if request.stop_sequences.iter().any(String::is_empty) || request.stop_sequences.len() > 4 {
+        return Err("stop_sequences accepts at most four nonempty strings".into());
+    }
+    let mut extra = std::collections::BTreeMap::new();
+    if let Some(k) = request.top_k {
+        extra.insert("top_k".into(), serde_json::json!(k));
+    }
+    if let Some(config) = request.output_config {
+        let wire::OutputFormat::JsonSchema { schema } = config.format;
+        extra.insert("response_format".into(),serde_json::json!({"type":"json_schema","json_schema":{"name":"response","schema":schema,"strict":true}}));
+    }
     if !request.stop_sequences.is_empty() {
-        return Err("nonempty stop_sequences are not supported: the backend cannot report the matched sequence".into());
+        extra.insert(
+            "__werk_matched_stop".into(),
+            serde_json::json!(request.stop_sequences),
+        );
     }
     let mut names = HashSet::new();
     let tools = request
@@ -165,6 +179,20 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
                     }
                     parts.push(image_part(source)?);
                 }
+                Block::Document {
+                    source,
+                    title,
+                    context,
+                    citations,
+                } => {
+                    if message.role != "user" || !pending.is_empty() {
+                        return Err(
+                            "documents require a user message after all pending tool results"
+                                .into(),
+                        );
+                    }
+                    parts.push(document_part(source, title, context, citations)?);
+                }
                 Block::ToolUse { id, name, input } => {
                     if message.role != "assistant"
                         || !valid_name(&name)
@@ -230,6 +258,7 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
         );
     }
     Ok(ChatCompletionRequest {
+        extra,
         model: Some(request.model),
         messages,
         stream: Some(request.stream),
@@ -238,21 +267,48 @@ pub(super) fn translate(request: wire::MessagesRequest) -> Result<ChatCompletion
         max_tokens: Some(request.max_tokens),
         max_completion_tokens: None,
         stream_options: None,
-        stop: None,
+        stop: if request.stop_sequences.is_empty() {
+            None
+        } else {
+            Some(StopSpec::Many(request.stop_sequences))
+        },
         seed: None,
         tools,
         tool_choice,
         parallel_tool_calls,
-        werk: None,
+        werk: request.werk,
     })
 }
 
 fn text_part(text: String) -> ContentPart {
     ContentPart {
+        file: None,
         kind: "text".into(),
         text: Some(text),
         image_url: None,
     }
+}
+
+fn document_part(
+    source: crate::documents::DocumentSource,
+    title: Option<String>,
+    context: Option<String>,
+    citations: Option<wire::DocumentCitations>,
+) -> Result<ContentPart, String> {
+    if citations.is_some_and(|c| c.enabled) {
+        return Err("document citations are not yet supported by the response adapter".into());
+    }
+    Ok(ContentPart {
+        kind: "file".into(),
+        text: None,
+        image_url: None,
+        file: Some(crate::documents::FilePart {
+            source: Some(source),
+            filename: title,
+            context,
+            ..Default::default()
+        }),
+    })
 }
 
 fn image_part(source: wire::ImageSource) -> Result<ContentPart, String> {
@@ -288,6 +344,7 @@ fn image_part(source: wire::ImageSource) -> Result<ContentPart, String> {
         }
     };
     Ok(ContentPart {
+        file: None,
         kind: "image_url".into(),
         text: None,
         image_url: Some(ImageUrlSpec::Url(url)),
@@ -320,6 +377,12 @@ fn tool_result_content(
             .map(|block| match block {
                 wire::ToolResultBlock::Text { text } => Ok(text_part(text)),
                 wire::ToolResultBlock::Image { source } => image_part(source),
+                wire::ToolResultBlock::Document {
+                    source,
+                    title,
+                    context,
+                    citations,
+                } => document_part(source, title, context, citations),
             })
             .collect::<Result<Vec<_>, String>>()?,
     };

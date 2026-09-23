@@ -13,7 +13,10 @@ pub struct MessagesRequest {
     pub stream: bool,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
+    pub output_config: Option<OutputConfig>,
     pub metadata: Option<Metadata>,
+    pub werk: Option<crate::openai::ChatRuntimeOptions>,
     #[serde(default)]
     pub stop_sequences: Vec<String>,
     pub tools: Option<Vec<Tool>>,
@@ -23,6 +26,7 @@ pub struct MessagesRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CountTokensRequest {
+    pub werk: Option<crate::openai::ChatRuntimeOptions>,
     pub model: String,
     pub messages: Vec<Message>,
     pub system: Option<TextContent>,
@@ -42,7 +46,10 @@ impl From<CountTokensRequest> for MessagesRequest {
             stream: false,
             temperature: None,
             top_p: None,
+            top_k: None,
+            output_config: None,
             metadata: None,
+            werk: request.werk,
             stop_sequences: vec![],
         }
     }
@@ -70,6 +77,12 @@ pub enum Block {
     },
     Image {
         source: ImageSource,
+    },
+    Document {
+        source: crate::documents::DocumentSource,
+        title: Option<String>,
+        context: Option<String>,
+        citations: Option<DocumentCitations>,
     },
     ToolUse {
         id: String,
@@ -107,8 +120,35 @@ pub enum ToolResultContent {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolResultBlock {
-    Text { text: String },
-    Image { source: ImageSource },
+    Text {
+        text: String,
+    },
+    Image {
+        source: ImageSource,
+    },
+    Document {
+        source: crate::documents::DocumentSource,
+        title: Option<String>,
+        context: Option<String>,
+        citations: Option<DocumentCitations>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentCitations {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputConfig {
+    pub format: OutputFormat,
+}
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OutputFormat {
+    JsonSchema { schema: Value },
 }
 
 #[derive(Debug, Deserialize)]

@@ -70,11 +70,12 @@ user message. Check `stop_reason == "tool_use"` before executing a call;
 | Input | Behavior |
 | --- | --- |
 | `anthropic-version` | Required, exactly `2023-06-01` |
-| `anthropic-beta` | Rejected, including unknown beta flags |
+| `anthropic-beta` | Only legacy `files-api-2025-04-14` accepted; unknown flags rejected |
 | `model`, `messages`, `max_tokens` | Required; nonempty model/history and positive token budget |
 | `system` | String or text-block array; separate from messages |
 | Message roles | `user`, `assistant` |
-| Content | String or text/image/tool-use/tool-result block array; text-only blocks join with a newline; mixed text/image order is preserved |
+| Content | String or text/image/document/tool-use/tool-result block array; source order is preserved |
+| Documents and file references | Shared text/PDF/Office processing on every text backend, including CUDA; see [Documents and files](documents.md) |
 | Images | Base64 JPEG/PNG/GIF/WebP or HTTP(S) URL; user messages and tool results; requires a vision-capable model/backend |
 | `metadata.user_id` | Optional string, at most 256 bytes; accepted without provider tracking or billing semantics |
 | `temperature`, `top_p` | Optional numbers in `[0, 1]` |
@@ -83,8 +84,11 @@ user message. Check `stop_reason == "tool_use"` before executing a call;
 | `disable_parallel_tool_use` | `true` forwards a constraint; absent/false leaves backend parallelism unconstrained |
 | `strict` | Passed to backend; never silently weakened |
 | `tool_result.is_error` | Text errors become `{"content":"…","is_error":true}`; image results retain their parts with a leading error marker |
-| `stop_sequences` | Absent/empty accepted; nonempty rejected until matched-stop metadata exists |
-| Unknown fields | Rejected; includes `top_k`, `thinking`, `cache_control`, server tools and document/audio/video blocks |
+| `top_k` | Nonnegative integer; forwarded to compatible oMLX, vLLM and llama.cpp servers |
+| `output_config.format` | `json_schema` with `schema`; uses native structured output, never simulated by prompt instructions |
+| `stop_sequences` | Up to four nonempty strings; vLLM must report the actual matched sequence; oMLX/llama.cpp currently reject |
+| `werk` | Separate local options: `documents` processing and `omlx` runtime settings |
+| Unknown fields | Rejected; includes provider `thinking`, `cache_control`, server tools and audio/video blocks |
 
 oMLX currently supports `auto`/`none`; it rejects forced/named choices,
 `disable_parallel_tool_use: true` and `strict: true`. Other backends retain their
@@ -96,13 +100,15 @@ Assistant text must precede its tool-use blocks. User tool results must precede
 any trailing user text. Unsupported interleaving, orphaned/duplicate IDs,
 missing results, nonobject tool arguments and malformed JSON are rejected.
 Requests exceeding a known context limit are rejected rather than trimming a
-tool cycle. Admission uses a byte-based estimate including tool schemas,
-arguments and results; it is not exact tokenization. If model metadata provides
+tool cycle. Admission estimates text/tool schemas, arguments and results from
+their byte sizes, and images from the shared detail-based visual estimate;
+Base64 pixels are not counted as text. This is not exact tokenization. If model metadata provides
 no context ceiling, the backend's own context/memory guard is authoritative.
 
 Responses contain `id`, `type: message`, `role: assistant`, `model`, content,
-`stop_reason`, `stop_sequence: null` and usage. Stops map to `end_turn`,
-`max_tokens` and `tool_use`. Invalid completed tool JSON yields HTTP 502 rather
+`stop_reason`, `stop_sequence` and usage. Stops map to `end_turn`,
+`max_tokens`, `tool_use`, or `stop_sequence` with a verified native matched string;
+otherwise `stop_sequence` is null. Invalid completed tool JSON yields HTTP 502 rather
 than fabricated arguments. Request validation is HTTP 400, authentication 401,
 missing models 404 and oversized bodies 413, with an Anthropic error envelope.
 Responses carry `request-id`; errors also include it in the body. The existing
@@ -167,11 +173,13 @@ model/runtime still requires the console acceptance tests.
 The official Python SDK **0.86.0** is tested against a local Rust mock-backend
 server for `messages.create`, `messages.stream`, `messages.count_tokens`,
 exact final usage and two successive client tool rounds with a 64-tool catalog. The ABBA script is
-also smoke-tested against that fixture. Install the SDK in an isolated environment if needed:
+also smoke-tested against that fixture. The same test now covers file upload,
+pagination, download, deletion and references with Anthropic 0.86.0 and OpenAI
+2.29.0. Install both SDKs in an isolated environment if needed:
 
 ```bash
 python3 -m venv /tmp/werk-anthropic-sdk
-/tmp/werk-anthropic-sdk/bin/pip install -r tests/anthropic-requirements.txt
+/tmp/werk-anthropic-sdk/bin/pip install -r tests/files-requirements.txt
 env WERK_TEST_ANTHROPIC_PYTHON=/tmp/werk-anthropic-sdk/bin/python \
   cargo test --locked official_anthropic_sdk_text_stream_and_tool_loop --lib -- --ignored --nocapture
 ```
@@ -227,15 +235,39 @@ before treating timings as equivalent work. No reproducible Qwen/GLM regression
 is acceptable. Real-model results and worker reuse still require these console
 tests; passing mock/SDK tests alone is not a hardware performance claim.
 
-Remaining gaps: nonempty `stop_sequences`, `top_k`, thinking/signatures,
-documents, prompt-cache controls, server-side tools, Batch/Files APIs and full
-Claude Code compatibility. This is not complete provider-spec coverage.
+Remaining gaps: matched stops on oMLX/llama.cpp, thinking/signatures,
+provider document citations, image-file references, prompt-cache controls,
+server-side tools, Batch APIs and full Claude Code compatibility. Files APIs
+implement the documented local subset; see [Documents and files](documents.md).
+This is not complete provider-spec coverage.
 Provider API semantics and Werk settings are separate: Werk does not synthesize
 Claude signatures, Anthropic cache TTLs or provider billing from local cache
 statistics. Unsupported fields fail explicitly. `max_tokens: 0` cache-warmup
 requests are not implemented.
 
-## Verification record (2026-09-23)
+## Document and extended-output verification (2026-09-23)
+
+- API regression suite: 91 passed, two opt-in integration tests excluded.
+- oMLX adapter regression suite: 56 passed with simulated workers.
+- File storage: four tests passed, covering expiry/staging cleanup, quotas,
+  principal separation and symlink rejection.
+- Native transport: three tests passed, including actual matched-stop metadata
+  and separation of model-template terminators from client stop sequences.
+- Public-URL validation passed, including private/link-local and mapped IPv6
+  rejection. Visual admission preserves tool costs without counting Base64 as text.
+- Document worker: 11 tests passed, including PDF text/rendering, Office formats,
+  rejected XML entities and OCR subprocess handling. OCR uses mocked Tesseract.
+- Real generated PDF fixture: both APIs produce the same extracted prompt for
+  GGUF, SafeTensors and MLX model layouts using a capture backend.
+- Official SDKs: Anthropic 0.86.0 and OpenAI 2.29.0 file/reference contracts,
+  existing message/tool/count tests and ABBA fixture smoke test passed.
+- Apple Silicon release-profile build check passed. No installation or real
+  Qwen/GLM/DeepSeek/CUDA inference performed; no hardware performance claim.
+
+The full library suite has not been rerun for this extension. Historical
+unrelated baseline failures are recorded below.
+
+## Previous adapter verification (2026-09-23)
 
 - `cargo test --locked --offline api:: --lib`: 78 passed; the opt-in SDK test is
   ignored in this ordinary run.

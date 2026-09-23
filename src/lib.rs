@@ -42,6 +42,8 @@ pub mod banner;
 pub(crate) mod cache;
 pub mod capabilities;
 pub mod cli;
+pub mod documents;
+pub(crate) mod file_store;
 pub mod inference;
 pub mod inference_service;
 pub mod media_cli;

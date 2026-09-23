@@ -761,7 +761,7 @@ async fn protocols_prepare_identical_backend_requests_and_reject_oversized_tool_
 }
 
 #[tokio::test]
-#[ignore = "requires local TCP and anthropic==0.86.0; run with WERK_TEST_ANTHROPIC_PYTHON"]
+#[ignore = "requires local TCP and tests/files-requirements.txt; run with WERK_TEST_ANTHROPIC_PYTHON"]
 async fn official_anthropic_sdk_text_stream_and_tool_loop() {
     let python = std::env::var("WERK_TEST_ANTHROPIC_PYTHON")
         .expect("set Python executable with anthropic==0.86.0 installed");
@@ -790,6 +790,25 @@ async fn official_anthropic_sdk_text_stream_and_tool_loop() {
         "stdout={}\nstderr={}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
+    );
+    let files = tokio::process::Command::new(&python)
+        .args([
+            "tests/files_sdk.py",
+            "--base-url",
+            &format!("http://{address}"),
+            "--model",
+            "mock",
+            "--api-key",
+            "sdk-test",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        files.status.success(),
+        "files SDK: {}\n{}",
+        String::from_utf8_lossy(&files.stdout),
+        String::from_utf8_lossy(&files.stderr)
     );
     let result = tokio::process::Command::new(python)
         .args([
@@ -956,5 +975,34 @@ async fn count_without_native_support_fails_instead_of_estimating() {
             .as_str()
             .unwrap()
             .contains("native chat token counting")
+    );
+}
+
+#[tokio::test]
+async fn document_count_and_generation_receive_identical_expanded_messages() {
+    let backend = Arc::new(Fixture::default());
+    let app = router(state(backend.clone()));
+    let messages = json!([{"role":"user","content":[{"type":"text","text":"Summarize"},{"type":"document","title":"notes","source":{"type":"text","media_type":"text/plain","data":"The document contains 42 examples."}}]}]);
+    let response=app.clone().oneshot(Request::builder().method("POST").uri("/v1/messages/count_tokens")
+        .header("content-type","application/json").header("anthropic-version","2023-06-01")
+        .body(Body::from(json!({"model":"mock","messages":messages,"werk":{"documents":{"mode":"text"}}}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response=post(&app,json!({"model":"mock","max_tokens":32,"messages":messages,"werk":{"documents":{"mode":"text"}}})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = backend.requests.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        serde_json::to_value(&captured[0].messages).unwrap(),
+        serde_json::to_value(&captured[1].messages).unwrap()
+    );
+    assert!(
+        captured[0]
+            .prompt
+            .contains("The document contains 42 examples.")
+    );
+    assert!(
+        !serde_json::to_string(&captured[0].messages)
+            .unwrap()
+            .contains("\"type\":\"file\"")
     );
 }

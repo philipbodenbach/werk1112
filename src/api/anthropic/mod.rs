@@ -1,3 +1,4 @@
+mod extended;
 mod request;
 mod response;
 mod stream;
@@ -82,6 +83,7 @@ pub(super) async fn count_tokens_handler(
             request,
             ContextPolicy::Count,
             "/v1/messages/count_tokens",
+            &headers,
         )
         .await
         {
@@ -121,7 +123,7 @@ async fn handle(
     if let Err(error) = validate_headers(&state, &headers, request_id) {
         return error;
     }
-    handle_request(state, request, id, request_id).await
+    handle_request(state, request, id, request_id, &headers).await
 }
 
 fn validate_headers(
@@ -151,7 +153,10 @@ fn validate_headers(
             request_id,
         ));
     }
-    if headers.contains_key("anthropic-beta") {
+    if headers
+        .get("anthropic-beta")
+        .is_some_and(|v| v != "files-api-2025-04-14")
+    {
         return Err(response::error(
             StatusCode::BAD_REQUEST,
             "anthropic-beta features are not supported",
@@ -166,6 +171,7 @@ async fn handle_request(
     request: Result<Json<MessagesRequest>, JsonRejection>,
     id: &str,
     request_id: &str,
+    headers: &HeaderMap,
 ) -> Response {
     let request = match request {
         Ok(Json(request)) => request,
@@ -192,12 +198,22 @@ async fn handle_request(
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect();
-    let prepared =
-        match generation::prepare(state, request, ContextPolicy::Reject, "/v1/messages").await {
-            Ok(prepared) => prepared,
-            Err(error) => return response::error(error.status, error.message, request_id),
-        };
+    let prepared = match generation::prepare(
+        state,
+        request,
+        ContextPolicy::Reject,
+        "/v1/messages",
+        headers,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => return response::error(error.status, error.message, request_id),
+    };
     let model = prepared.manifest.id.clone();
+    if !prepared.api_options.is_empty() {
+        return extended::handle(prepared, id, request_id, tool_names).await;
+    }
     let verbose = prepared.state.verbose;
     if prepared.stream {
         let source = generation::generate_stream(

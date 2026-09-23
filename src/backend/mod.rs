@@ -1255,7 +1255,21 @@ pub trait ChatGenerationSession: Send + Sync {
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream;
 }
 
+pub type ApiGenerateStream =
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<serde_json::Value, String>> + Send>>;
+
 pub trait GenerationBackend: Send + Sync {
+    /// Rich chat responses retain choices, logprobs and structured output.
+    /// Ordinary requests keep using the existing generation/session path.
+    fn generate_api(
+        &self,
+        _manifest: &ModelManifest,
+        _request: GenerateRequest,
+        _options: std::collections::BTreeMap<String, serde_json::Value>,
+        _tx: Option<tokio::sync::mpsc::Sender<Result<serde_json::Value, String>>>,
+    ) -> Result<serde_json::Value> {
+        anyhow::bail!("the selected backend does not support the requested extended API fields")
+    }
     /// Count a fully templated prompt using the selected runtime's tokenizer.
     /// Never implement this by generating a token or estimating from bytes.
     fn count_tokens(&self, _manifest: &ModelManifest, _request: GenerateRequest) -> Result<usize> {

@@ -5,6 +5,10 @@ use crate::model_store::{ModelManifest, ModelSource};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
+    /// Standard API fields that require the backend's rich response contract.
+    /// Validated explicitly before routing; unknown fields are never ignored.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
     #[serde(default)]
     pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
@@ -44,6 +48,8 @@ pub struct ChatStreamOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatRuntimeOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents: Option<crate::documents::DocumentOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omlx: Option<OmlxChatOptions>,
 }
@@ -92,6 +98,8 @@ impl From<u64> for NgramCacheBudget {
 }
 
 impl ChatRuntimeOptions {
+    /// Whether backend-specific overrides are absent. Document preprocessing
+    /// is handled by the shared API layer and must not select an oMLX route.
     pub fn is_empty(&self) -> bool {
         self.omlx.as_ref().is_none_or(OmlxChatOptions::is_empty)
     }
@@ -284,6 +292,7 @@ impl MessageContent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentPart {
     #[serde(rename = "type")]
     pub kind: String,
@@ -291,6 +300,8 @@ pub struct ContentPart {
     pub text: Option<String>,
     #[serde(default)]
     pub image_url: Option<ImageUrlSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<crate::documents::FilePart>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

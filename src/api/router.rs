@@ -41,6 +41,28 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
         .collect::<Vec<_>>();
     let router = Router::new()
         .route(
+            "/v1/files",
+            get(super::files::list)
+                .post(super::files::upload)
+                .layer::<_, std::convert::Infallible>(axum::middleware::from_fn(
+                    super::files::response_headers,
+                ))
+                .layer(DefaultBodyLimit::max(
+                    (crate::file_store::MAX_FILE_BYTES + 1024 * 1024).min(body_limit_bytes),
+                )),
+        )
+        .route(
+            "/v1/files/{id}",
+            get(super::files::retrieve)
+                .delete(super::files::delete)
+                .layer(axum::middleware::from_fn(super::files::response_headers)),
+        )
+        .route(
+            "/v1/files/{id}/content",
+            get(super::files::content)
+                .layer(axum::middleware::from_fn(super::files::response_headers)),
+        )
+        .route(
             "/v1/messages/count_tokens",
             post(super::anthropic::count_tokens_handler)
                 .layer(DefaultBodyLimit::max(body_limit_bytes)),

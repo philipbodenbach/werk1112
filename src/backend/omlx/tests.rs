@@ -957,6 +957,7 @@ fn chat_options(
     expert_cache_mb: Option<u64>,
 ) -> crate::openai::ChatRuntimeOptions {
     crate::openai::ChatRuntimeOptions {
+        documents: None,
         omlx: Some(crate::openai::OmlxChatOptions {
             reasoning_effort: None,
             thinking,

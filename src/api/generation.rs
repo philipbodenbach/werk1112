@@ -54,6 +54,7 @@ pub(super) enum ContextPolicy {
     Count,
 }
 pub(super) struct Prepared {
+    pub api_options: std::collections::BTreeMap<String, serde_json::Value>,
     pub state: ApiState,
     pub manifest: ModelManifest,
     pub request: GenerateRequest,
@@ -66,7 +67,14 @@ pub(super) async fn prepare(
     mut request: ChatCompletionRequest,
     context_policy: ContextPolicy,
     endpoint: &str,
+    headers: &axum::http::HeaderMap,
 ) -> Result<Prepared, GenerationError> {
+    if let Err(error) =
+        super::extended::validate(&request.extra, endpoint.starts_with("/v1/messages"))
+    {
+        return Err(GenerationError::new(StatusCode::BAD_REQUEST, error, None));
+    }
+    super::extended::normalize(&mut request.extra);
     if let Some(options) = &request.werk
         && let Err(error) = options.validate()
     {
@@ -121,6 +129,13 @@ pub(super) async fn prepare(
         ));
     }
 
+    if let Err(error) = super::documents::expand(&state, headers, &manifest, &mut request).await {
+        return Err(GenerationError::new(
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+            Some("messages".into()),
+        ));
+    }
     let max_tokens = request.max_completion_tokens();
     let context_size =
         effective_chat_context_size(state.chat_context_size, &manifest).or_else(|| {
@@ -309,6 +324,7 @@ pub(super) async fn prepare(
     };
 
     Ok(Prepared {
+        api_options: request.extra,
         state,
         manifest,
         request: generate_request,
@@ -321,9 +337,30 @@ pub(super) async fn prepare(
 // Admission estimate, not an exact tokenizer. Includes tool schemas and history;
 // never drop messages from a protocol with paired tool-use/result blocks.
 fn check_context(request: &ChatCompletionRequest, context_size: usize) -> Result<(), String> {
-    let history = serde_json::to_vec(&request.messages)
-        .map_err(|e| e.to_string())?
-        .len();
+    let has_images = request.messages.iter().any(|m|matches!(&m.content,
+        Some(crate::openai::MessageContent::Parts(parts)) if parts.iter().any(|p|p.image_url.is_some())));
+    let history = if has_images {
+        // Encoded pixels are not text tokens. Use the shared visual estimate,
+        // still accounting for tool arguments/identities without copying image data.
+        let mut bytes = estimate_message_tokens(&request.messages).saturating_mul(3);
+        for message in &request.messages {
+            bytes = bytes.saturating_add(
+                serde_json::to_vec(&(
+                    &message.role,
+                    &message.name,
+                    &message.tool_calls,
+                    &message.tool_call_id,
+                ))
+                .map_err(|e| e.to_string())?
+                .len(),
+            );
+        }
+        bytes
+    } else {
+        serde_json::to_vec(&request.messages)
+            .map_err(|e| e.to_string())?
+            .len()
+    };
     let tools = request
         .tools
         .as_ref()
@@ -514,8 +551,23 @@ mod tests {
     use crate::openai::{ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
 
     #[test]
+    fn anthropic_visual_admission_counts_images_instead_of_base64_bytes_and_keeps_tool_cost() {
+        let mut request:ChatCompletionRequest=serde_json::from_value(serde_json::json!({
+            "max_tokens":128,"messages":[{"role":"user","content":[
+                {"type":"text","text":"Describe the page"},
+                {"type":"image_url","image_url":format!("data:image/png;base64,{}","A".repeat(1024*1024))}
+            ]}]})).unwrap();
+        assert!(check_context(&request, 4096).is_ok());
+        request.messages.push(serde_json::from_value(serde_json::json!({"role":"assistant","tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"tool","arguments":"x".repeat(20000)}}
+        ]})).unwrap());
+        assert!(check_context(&request, 4096).is_err());
+    }
+
+    #[test]
     fn multimodal_context_estimate_accounts_for_image_detail() {
         let low = MessageContent::Parts(vec![ContentPart {
+            file: None,
             kind: "image_url".to_string(),
             text: None,
             image_url: Some(ImageUrlSpec::Object(ImageUrlPart {
@@ -524,6 +576,7 @@ mod tests {
             })),
         }]);
         let high = MessageContent::Parts(vec![ContentPart {
+            file: None,
             kind: "input_image".to_string(),
             text: None,
             image_url: Some(ImageUrlSpec::Object(ImageUrlPart {

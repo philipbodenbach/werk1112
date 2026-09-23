@@ -41,6 +41,7 @@ pub(super) struct MessagesStream {
     text_started: bool,
     tool_started: bool,
     pub tool_names: Vec<String>,
+    pub matched_stop: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     message_id: String,
     tool_order: Vec<usize>,
     text_closed: bool,
@@ -60,6 +61,7 @@ impl MessagesStream {
             text_started: false,
             tool_started: false,
             tool_names: Vec::new(),
+            matched_stop: None,
             message_id: id.into(),
             tool_order: Vec::new(),
             text_closed: false,
@@ -251,7 +253,15 @@ impl MessagesStream {
                         &backend_diagnostics,
                     );
                 }
-                let stop = stop_reason(&finish_reason)?;
+                let matched_stop = self
+                    .matched_stop
+                    .as_ref()
+                    .and_then(|s| s.lock().ok().and_then(|v| v.clone()));
+                let stop = if matched_stop.is_some() {
+                    "stop_sequence"
+                } else {
+                    stop_reason(&finish_reason)?
+                };
                 validate_finish(stop, !self.tools.is_empty())?;
                 let mut ids = HashSet::new();
                 for tool in self.tools.values() {
@@ -279,7 +289,7 @@ impl MessagesStream {
                 }
                 self.push(
                     "message_delta",
-                    json!({"delta":{"stop_reason":stop,"stop_sequence":null},
+                    json!({"delta":{"stop_reason":stop,"stop_sequence":matched_stop},
                     "usage":{"input_tokens":prompt_tokens,"output_tokens":completion_tokens}}),
                 );
                 self.push("message_stop", json!({}));

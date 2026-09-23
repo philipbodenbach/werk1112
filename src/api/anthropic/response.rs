@@ -17,7 +17,19 @@ pub(super) fn stop_reason(reason: &str) -> Result<&'static str, String> {
 }
 
 pub(super) fn message(id: &str, model: &str, response: GenerateResponse) -> Result<Value, String> {
-    let stop = stop_reason(&response.finish_reason)?;
+    message_with_stop(id, model, response, None)
+}
+pub(super) fn message_with_stop(
+    id: &str,
+    model: &str,
+    response: GenerateResponse,
+    matched: Option<String>,
+) -> Result<Value, String> {
+    let stop = if matched.is_some() {
+        "stop_sequence"
+    } else {
+        stop_reason(&response.finish_reason)?
+    };
     let assistant = response
         .assistant_message
         .unwrap_or(GeneratedAssistantMessage {
@@ -51,7 +63,7 @@ pub(super) fn message(id: &str, model: &str, response: GenerateResponse) -> Resu
     }
     Ok(
         json!({"id":id,"type":"message","role":"assistant","model":model,
-        "content":content,"stop_reason":stop,"stop_sequence":null,
+        "content":content,"stop_reason":stop,"stop_sequence":matched,
         "usage":{"input_tokens":response.prompt_tokens,"output_tokens":response.completion_tokens}}),
     )
 }

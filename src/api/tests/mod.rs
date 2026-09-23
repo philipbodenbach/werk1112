@@ -3,6 +3,7 @@ mod automatic1111;
 mod chat;
 mod chat_options;
 mod cors;
+mod documents;
 mod media;
 mod support;
 mod vllm_tools;
