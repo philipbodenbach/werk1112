@@ -735,6 +735,7 @@ The install targets are:
 
 ~~~text
 llama-cuda
+llama-cuda-nvfp4
 llama-cuda-offload
 llama-rocm
 llama-vulkan
@@ -755,6 +756,7 @@ There is currently no <code>werk backend uninstall</code> command. See
 | Target | Provisioning behavior | Main prerequisites | Validation |
 | --- | --- | --- | --- |
 | <code>llama-cuda</code> | Shallow-clones current llama.cpp and builds llama-server with CMake and GGML CUDA. | Git, CMake, C/C++ compiler, NVIDIA driver and CUDA toolkit. | llama-server help plus known CUDA initialization failures. |
+| <code>llama-cuda-nvfp4</code> | Builds pinned llama.cpp with native-first NVFP4 dispatch and standalone Marlin CUDA kernels; WERK retains persistence. | CUDA toolchain; native Blackwell requires architecture-specific kernels. | Device/build capability probe and hashed build receipt; see [NVFP4 support](nvfp4.md) for conversion, limits and overrides. |
 | <code>llama-cuda-offload</code> | Builds a pinned experimental CUDA expert-cache fork through the same installer and selects it for the existing CUDA adapter. | Same CUDA toolchain; see the limits below. | CUDA initialization and advertised expert/lazy-row/slot controls; installation does not certify a model. |
 | <code>llama-rocm</code> | Builds llama-server with GGML HIP. | Git, CMake, C/C++ compiler and compatible ROCm/HIP toolchain. | Executable help; a real HIP inference is not part of installation validation. |
 | <code>llama-vulkan</code> | Builds llama-server with GGML Vulkan. | Git, CMake, C/C++ compiler and Vulkan development SDK. | Executable help; a real Vulkan inference is not part of installation validation. |

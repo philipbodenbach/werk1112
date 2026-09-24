@@ -51,17 +51,6 @@ impl LlamaChatPersistence {
             ]));
         }
         files.sort_by_key(Value::to_string);
-        let mut runtime_environment = env::vars()
-            .filter(|(key, _)| {
-                key.starts_with("LLAMA_ARG_")
-                    || key.starts_with("GGML_")
-                    || matches!(
-                        key.as_str(),
-                        "CUDA_VISIBLE_DEVICES" | "LD_LIBRARY_PATH" | "LD_PRELOAD"
-                    )
-            })
-            .collect::<Vec<_>>();
-        runtime_environment.sort();
         let key = sha256_json_value(&json!({
             "format": "werk-llama-chat-v1",
             "model": server.model_identity.to_string(),
@@ -69,7 +58,7 @@ impl LlamaChatPersistence {
             "runtime": identity.executable.binary_sha256,
             "version": identity.executable.version,
             "libraries": runtime_libraries(server)?,
-            "environment": runtime_environment,
+            "execution": server.execution,
             "mode": label(server.mode),
             "args": persistent_args(&server.args),
         }))?;

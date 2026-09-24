@@ -10,7 +10,7 @@ use crate::{
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct RunOptions {
-    #[arg(long, value_name = "URL", conflicts_with_all = ["backend", "device", "threads", "threads_batch", "ctx_size", "batch_size", "ubatch_size", "gpu_layers", "main_gpu", "kv_cache_type", "flash_attn", "kv_offload", "warmup_tokens", "chat_template"], help = "Send text/vision/tool requests to an existing werk serve (http://HOST:PORT); configure the worker on serve")]
+    #[arg(long, value_name = "URL", conflicts_with_all = ["backend", "device", "fp4_kernel", "threads", "threads_batch", "ctx_size", "batch_size", "ubatch_size", "gpu_layers", "main_gpu", "kv_cache_type", "flash_attn", "kv_offload", "warmup_tokens", "chat_template"], help = "Send text/vision/tool requests to an existing werk serve (http://HOST:PORT); configure the worker on serve")]
     pub server: Option<String>,
     #[arg(
         long,

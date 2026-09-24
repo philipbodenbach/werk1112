@@ -42,7 +42,7 @@ use crate::{
     api_keys,
     backend::{
         BackendAccelerator, BackendRuntime, BurnBackend, BurnMode, CandleBackend, CandleDeviceMode,
-        ChatGenerationSession, GenerateRequest, GenerateStreamEvent, GenerationBackend,
+        ChatGenerationSession, Fp4Kernel, GenerateRequest, GenerateStreamEvent, GenerationBackend,
         GenerationTimings, LlamaCppBackend, LlamaCppMode, LlamaFastBackend, LlamaFastRuntimeReport,
         LlamaKvCacheType, LlamaRuntimeOptions, LlamaServerBackend, LlamaServerDiscovery,
         LlamaServerInstallOptions, MlxBackend, MlxVlmBackend, OmlxBackend, OnnxProvisionOptions,
@@ -74,8 +74,8 @@ use crate::{
     },
     media_companion::CompanionClient,
     model_store::{
-        ArtifactStatus, ModelArtifact, ModelFormat, ModelManifest, ModelSource, ModelStore,
-        PullProgress, TempPurgeSummary,
+        ArtifactStatus, GgufConversionOptions, ModelArtifact, ModelFormat, ModelManifest,
+        ModelSource, ModelStore, PullProgress, TempPurgeSummary,
     },
     openai::{
         ChatMessage, ChatTemplateOptions, ChatTemplateSource, ContentPart, ImageUrlSpec,
@@ -266,6 +266,15 @@ pub struct LlamaRuntimeArgs {
     #[arg(
         long,
         global = true,
+        value_enum,
+        env = "WERK_FP4_KERNEL",
+        help = "NVFP4 CUDA kernel policy; default auto prefers native Blackwell, then Marlin, then GGML"
+    )]
+    pub fp4_kernel: Option<Fp4Kernel>,
+
+    #[arg(
+        long,
+        global = true,
         env = "WERK_LLAMA_CTX",
         help = "llama.cpp context size; 0 uses the model default"
     )]
@@ -362,6 +371,7 @@ pub struct LlamaRuntimeArgs {
 impl LlamaRuntimeArgs {
     fn to_options(&self) -> LlamaRuntimeOptions {
         LlamaRuntimeOptions {
+            fp4_kernel: self.fp4_kernel,
             ctx_size: self.ctx_size,
             batch_size: self.batch_size.map(|value| value as usize),
             ubatch_size: self.ubatch_size,
@@ -386,6 +396,8 @@ pub enum BenchCompareArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendInstallArg {
     LlamaCuda,
+    /// Pinned CUDA runtime with native NVFP4 and standalone Marlin kernels.
+    LlamaCudaNvfp4,
     /// Experimental pinned CUDA runtime with MoE caching and lazy PLE reads.
     LlamaCudaOffload,
     LlamaRocm,
@@ -404,7 +416,9 @@ pub enum BackendInstallArg {
 impl BackendInstallArg {
     fn mode(self) -> Option<LlamaCppMode> {
         match self {
-            Self::LlamaCuda | Self::LlamaCudaOffload => Some(LlamaCppMode::Cuda),
+            Self::LlamaCuda | Self::LlamaCudaOffload | Self::LlamaCudaNvfp4 => {
+                Some(LlamaCppMode::Cuda)
+            }
             Self::LlamaRocm => Some(LlamaCppMode::Rocm),
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaMetal => Some(LlamaCppMode::Metal),
@@ -1018,6 +1032,25 @@ pub enum Commands {
         link: bool,
     },
 
+    #[command(about = "Convert an installed NVFP4 Hugging Face model to a separate GGUF model")]
+    Convert {
+        #[arg(help = "Installed source model id")]
+        model: String,
+        #[arg(long, default_value = "gguf", value_parser = ["gguf"])]
+        to: String,
+        #[arg(long, help = "New model id; existing models are never overwritten")]
+        name: String,
+        #[arg(long, help = "Path to llama.cpp convert_hf_to_gguf.py")]
+        converter: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Python interpreter with converter dependencies installed"
+        )]
+        python: Option<PathBuf>,
+        #[arg(long)]
+        verbose: bool,
+    },
+
     #[command(about = "Pull a Hugging Face repository into the managed model store")]
     Pull {
         #[arg(help = "Hugging Face repo id, for example org/model")]
@@ -1493,6 +1526,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         cli.auto_install_backends,
         cli.no_auto_install_backends,
     );
+    let selection_options = SelectionOptions {
+        fp4_kernel: cli.llama.fp4_kernel,
+        ..selection_options
+    };
     let llama_options = cli.llama.to_options();
     let command = cli.command.unwrap_or(Commands::Serve {
         host: "127.0.0.1".to_string(),
@@ -1863,6 +1900,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                             LlamaServerInstallOptions {
                                 verbose: true,
                                 cuda_offload: target == BackendInstallArg::LlamaCudaOffload,
+                                cuda_nvfp4: target == BackendInstallArg::LlamaCudaNvfp4,
+                                ..Default::default()
                             },
                         )?;
                         println!(
@@ -2126,6 +2165,27 @@ pub async fn run(cli: Cli) -> Result<()> {
             if all {
                 println!("{action} {} models.", manifests.len());
             }
+            Ok(())
+        }
+        Commands::Convert {
+            model,
+            to: _,
+            name,
+            converter,
+            python,
+            verbose,
+        } => {
+            let store = ModelStore::resolve(model_home)?;
+            let manifest = store.convert_gguf(
+                &model,
+                &GgufConversionOptions {
+                    name,
+                    converter,
+                    python,
+                    verbose,
+                },
+            )?;
+            print_manifest_summary("Converted", &manifest);
             Ok(())
         }
         Commands::Pull { repo, name, file } => {
@@ -4551,6 +4611,7 @@ fn should_print_startup_banner_for(
         | Commands::Audio { .. } => true,
         Commands::Chat { .. } => stdin_is_terminal,
         Commands::Import { .. }
+        | Commands::Convert { .. }
         | Commands::Pull { .. }
         | Commands::Remove { .. }
         | Commands::Estimate { .. }
@@ -4581,6 +4642,7 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         Commands::Audio { command } => command.routing().verbose || command.routing().debug,
         Commands::Bench { debug, .. } => *debug,
         Commands::Import { .. }
+        | Commands::Convert { .. }
         | Commands::Pull { .. }
         | Commands::Remove { .. }
         | Commands::Estimate { .. }
@@ -8710,6 +8772,7 @@ impl RouteDiagnostics {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SelectionOptions {
+    fp4_kernel: Option<Fp4Kernel>,
     provision_missing_backends: bool,
     verbose_backend_installs: bool,
     vllm_automatic_prefix_caching: Option<bool>,
@@ -8720,6 +8783,7 @@ impl SelectionOptions {
     fn from_cli(backend: BackendArg, auto_install: bool, no_auto_install: bool) -> Self {
         let default_provision = matches!(backend, BackendArg::Auto);
         Self {
+            fp4_kernel: None,
             provision_missing_backends: !no_auto_install && (auto_install || default_provision),
             verbose_backend_installs: false,
             vllm_automatic_prefix_caching: None,
@@ -8994,7 +9058,13 @@ impl GenerationBackend for AutoBackend {
         task: InferenceTask,
     ) -> Option<TaskReadiness> {
         (task == InferenceTask::ImageUnderstanding).then(|| {
-            generation_backend_task_readiness(&self.store, BackendChoice::Auto, manifest, task)
+            generation_backend_task_readiness(
+                &self.store,
+                BackendChoice::Auto,
+                manifest,
+                task,
+                self.selection_options,
+            )
         })
     }
 
@@ -9241,6 +9311,7 @@ impl GenerationBackend for GgufPreferredBackend {
             requested,
             manifest,
             task,
+            self.selection_options,
         ))
     }
 
@@ -9715,12 +9786,35 @@ fn resolve_backend(
     Ok(backend_arg_to_choice(backend))
 }
 
+fn validate_fp4_backend_policy(
+    backend: BackendChoice,
+    runtime_options: &LlamaRuntimeOptions,
+) -> Result<()> {
+    if runtime_options
+        .fp4_kernel
+        .is_some_and(|policy| policy != Fp4Kernel::Auto)
+        && !matches!(
+            backend,
+            BackendChoice::Auto
+                | BackendChoice::LlamaServer(LlamaCppMode::Cuda)
+                | BackendChoice::GgufPreferred {
+                    llama: LlamaCppMode::Cuda,
+                    ..
+                }
+        )
+    {
+        bail!("--fp4-kernel native/marlin/ggml requires the llama.cpp CUDA backend");
+    }
+    Ok(())
+}
+
 fn build_generation_backend(
     store: ModelStore,
     backend: BackendChoice,
     runtime_options: LlamaRuntimeOptions,
     selection_options: SelectionOptions,
 ) -> Result<Arc<dyn GenerationBackend>> {
+    validate_fp4_backend_policy(backend, &runtime_options)?;
     match backend {
         BackendChoice::Auto => Ok(Arc::new(AutoBackend::new(
             store,
@@ -9742,6 +9836,7 @@ fn build_concrete_backend(
     runtime_options: LlamaRuntimeOptions,
     selection_options: SelectionOptions,
 ) -> Result<Arc<dyn GenerationBackend>> {
+    validate_fp4_backend_policy(backend, &runtime_options)?;
     match backend {
         BackendChoice::Auto => bail!("auto backend cannot be built as a concrete backend"),
         BackendChoice::GgufPreferred { llama, candle } => Ok(Arc::new(GgufPreferredBackend::new(
@@ -10073,24 +10168,48 @@ fn backend_unavailability_reason(
             .err()
             .map(|_| VllmBackend::rocm_unavailable_reason(store)),
         BackendChoice::LlamaServer(mode) => {
-            if LlamaServerBackend::probe(store, mode).is_ok() {
-                None
-            } else if selection_options.provision_missing_backends
-                && should_auto_install_llama_server(mode)
+            let cuda_nvfp4 = match LlamaServerBackend::needs_nvfp4_runtime(store, manifest, mode) {
+                Ok(value) => value && selection_options.fp4_kernel != Some(Fp4Kernel::Ggml),
+                Err(error) => return Some(compact_reason(&format!("{error:#}"))),
+            };
+            let probe_error = match LlamaServerBackend::probe_for_model(
+                store,
+                manifest,
+                mode,
+                selection_options.fp4_kernel,
+            ) {
+                Ok(_) => return None,
+                Err(error) => error,
+            };
+            let discovery = LlamaServerBackend::discover(store, mode);
+            if selection_options.provision_missing_backends
+                && (should_auto_install_llama_server(mode)
+                    || (cuda_nvfp4 && LlamaServerBackend::can_auto_install_nvfp4()))
+                && !(cuda_nvfp4 && discovery.source.starts_with("env "))
             {
                 install_managed_llama_server_with_options(
                     store,
                     mode,
                     LlamaServerInstallOptions {
                         verbose: selection_options.verbose_backend_installs,
+                        cuda_nvfp4,
+                        preserve_active: cuda_nvfp4,
                         ..Default::default()
                     },
                 )
-                .and_then(|_| LlamaServerBackend::probe(store, mode).map(|_| ()))
+                .and_then(|_| {
+                    LlamaServerBackend::probe_for_model(
+                        store,
+                        manifest,
+                        mode,
+                        selection_options.fp4_kernel,
+                    )
+                    .map(|_| ())
+                })
                 .err()
                 .map(|err| compact_reason(&err.to_string()))
             } else {
-                Some(LlamaServerBackend::missing_message(store, mode))
+                Some(compact_reason(&format!("{probe_error:#}")))
             }
         }
         BackendChoice::LlamaFast(mode) => LlamaFastBackend::probe(mode)
@@ -10123,11 +10242,14 @@ fn backend_unavailability_reason_for_request(
     }
 
     match backend {
-        BackendChoice::LlamaServer(mode) => {
-            LlamaServerBackend::probe_image_input(store, manifest, mode)
-                .err()
-                .map(|error| compact_reason(&error.to_string()))
-        }
+        BackendChoice::LlamaServer(mode) => LlamaServerBackend::probe_image_input(
+            store,
+            manifest,
+            mode,
+            selection_options.fp4_kernel,
+        )
+        .err()
+        .map(|error| compact_reason(&error.to_string())),
         BackendChoice::Vllm | BackendChoice::VllmRocm
             if !vllm_architecture_supports_images(manifest.architecture.as_deref()) =>
         {
@@ -10154,6 +10276,7 @@ fn generation_backend_task_readiness(
     requested_backend: BackendChoice,
     manifest: &ModelManifest,
     task: InferenceTask,
+    selection_options: SelectionOptions,
 ) -> TaskReadiness {
     debug_assert_eq!(task, InferenceTask::ImageUnderstanding);
     if !manifest.supports_task(task) {
@@ -10174,7 +10297,10 @@ fn generation_backend_task_readiness(
 
     // Capability discovery must be read-only: explicitly ignore the serve
     // command's auto-install policy while reusing the real request router.
-    let readiness_options = SelectionOptions::default();
+    let readiness_options = SelectionOptions {
+        provision_missing_backends: false,
+        ..selection_options
+    };
     match selected_backend_for_request(store, requested_backend, manifest, true, readiness_options)
     {
         Ok(selected) => TaskReadiness {
@@ -10329,6 +10455,10 @@ fn select_backend_with_planner(
     selection_options: SelectionOptions,
 ) -> Result<RoutedBackend> {
     let requested = requested_backend_for_choice(backend);
+    if let Some(reason) = crate::runtime_planner::nvfp4_hf_conversion_required(manifest, requested)
+    {
+        bail!("{reason}");
+    }
     let omlx = runtime_candidate_ids_for_selection(store, manifest, requested)
         .contains(&RuntimeId::Omlx)
         .then(|| configured_omlx_backend(store, selection_options.omlx_server_prefix_cache))
@@ -11679,6 +11809,38 @@ mod tests {
             &mut history_index,
         ));
         assert_eq!(line.as_string(), "draft");
+    }
+
+    #[test]
+    fn nvfp4_cli_contracts() {
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "llama-cuda-nvfp4"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Backend {
+                command: BackendCommands::Install {
+                    target: BackendInstallArg::LlamaCudaNvfp4
+                }
+            })
+        ));
+        for kernel in ["auto", "native", "marlin", "ggml"] {
+            let cli = Cli::try_parse_from(["werk", "--fp4-kernel", kernel, "serve"]).unwrap();
+            assert_eq!(cli.llama.to_options().fp4_kernel.unwrap().label(), kernel);
+        }
+        assert!(Cli::try_parse_from(["werk", "--fp4-kernel", "int4", "serve"]).is_err());
+        let cli = Cli::try_parse_from([
+            "werk",
+            "convert",
+            "source",
+            "--to",
+            "gguf",
+            "--name",
+            "converted",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Commands::Convert { model, name, .. }) if model == "source" && name == "converted")
+        );
+        assert!(Cli::try_parse_from(["werk", "convert", "source"]).is_err());
     }
 
     #[test]
@@ -14599,6 +14761,7 @@ mod tests {
             },
             &ready,
             InferenceTask::ImageUnderstanding,
+            SelectionOptions::default(),
         );
         assert_eq!(readiness.status, TaskReadinessStatus::Available);
         assert_eq!(readiness.adapter.as_deref(), Some("llama-server-cpu"));
@@ -14612,10 +14775,122 @@ mod tests {
             BackendChoice::Auto,
             &missing,
             InferenceTask::ImageUnderstanding,
+            SelectionOptions::default(),
         );
         assert_eq!(readiness.status, TaskReadinessStatus::Unavailable);
         assert!(readiness.detail.contains("multimodal projector"));
         assert!(!managed_backend_dir(&missing_store, LlamaCppMode::Cpu).exists());
+    }
+
+    #[test]
+    fn explicit_fp4_policy_is_rejected_before_non_cuda_backend_construction() {
+        let store = test_store("fp4-policy-backend-guard");
+        for backend in [BackendChoice::Mlx, BackendChoice::Vllm] {
+            let error = build_generation_backend(
+                store.clone(),
+                backend,
+                LlamaRuntimeOptions {
+                    fp4_kernel: Some(Fp4Kernel::Native),
+                    ..Default::default()
+                },
+                SelectionOptions::default(),
+            )
+            .err()
+            .expect("forced FP4 policy cannot be ignored by a non-CUDA wrapper");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires the llama.cpp CUDA backend")
+            );
+        }
+        assert!(
+            build_generation_backend(
+                store,
+                BackendChoice::Auto,
+                LlamaRuntimeOptions {
+                    fp4_kernel: Some(Fp4Kernel::Native),
+                    ..Default::default()
+                },
+                SelectionOptions::default(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gguf_vision_readiness_preserves_fp4_policy_without_installing() {
+        let store = test_store("gguf-vision-fp4-policy");
+        let mut manifest = test_manifest(ModelFormat::Gguf, Some("qwen3_vl"));
+        manifest.model_path = Some("files/model.gguf".into());
+        manifest.metadata.tasks = vec![
+            InferenceTask::TextGeneration,
+            InferenceTask::ImageUnderstanding,
+        ];
+        // One complete native NVFP4 tensor, so the actual routing path must
+        // distinguish the pinned profile from the explicit stock GGML policy.
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3_u32.to_le_bytes());
+        bytes.extend(1_u64.to_le_bytes());
+        bytes.extend(0_u64.to_le_bytes());
+        bytes.extend(6_u64.to_le_bytes());
+        bytes.extend(b"weight");
+        bytes.extend(1_u32.to_le_bytes());
+        bytes.extend(64_u64.to_le_bytes());
+        bytes.extend(40_u32.to_le_bytes());
+        bytes.extend(0_u64.to_le_bytes());
+        bytes.resize(bytes.len().div_ceil(32) * 32 + 36, 0);
+        manifest.files = vec![
+            model_file("files/model.gguf", bytes.len() as u64),
+            model_file("files/mmproj-f16.gguf", 4),
+        ];
+        write_store_file(&store, &manifest, "files/mmproj-f16.gguf", "proj");
+        fs::write(
+            store.absolute_model_file(&manifest, "files/model.gguf"),
+            bytes,
+        )
+        .unwrap();
+        assert!(
+            store
+                .quantization_profile(&manifest)
+                .unwrap()
+                .unwrap()
+                .has_nvfp4()
+        );
+        install_fake_multimodal_llama_server(&store, LlamaCppMode::Cuda);
+        let runtime_root = managed_backend_dir(&store, LlamaCppMode::Cuda);
+        let initial_entries = fs::read_dir(&runtime_root).unwrap().count();
+
+        for (policy, expected) in [
+            (Fp4Kernel::Ggml, TaskReadinessStatus::Available),
+            (Fp4Kernel::Native, TaskReadinessStatus::Unavailable),
+        ] {
+            let backend = GgufPreferredBackend::new(
+                store.clone(),
+                LlamaCppMode::Cuda,
+                CandleDeviceMode::Cuda,
+                LlamaRuntimeOptions {
+                    fp4_kernel: Some(policy),
+                    ..Default::default()
+                },
+                SelectionOptions {
+                    fp4_kernel: Some(policy),
+                    provision_missing_backends: true,
+                    ..Default::default()
+                },
+            );
+            let readiness = backend
+                .task_readiness(&manifest, InferenceTask::ImageUnderstanding)
+                .unwrap();
+            assert_eq!(readiness.status, expected, "{}", readiness.detail);
+            if policy == Fp4Kernel::Native {
+                assert!(readiness.detail.contains("NVFP4"), "{}", readiness.detail);
+            }
+            assert_eq!(
+                fs::read_dir(&runtime_root).unwrap().count(),
+                initial_entries
+            );
+        }
     }
 
     #[test]

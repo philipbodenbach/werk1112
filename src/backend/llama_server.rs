@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 mod cuda_offload;
+mod fp4;
 #[cfg(target_os = "linux")]
 mod model_prefetch;
 #[cfg(target_os = "linux")]
@@ -77,6 +78,7 @@ struct LlamaServerProcess {
     executable: PathBuf,
     discovery_source: String,
     args: Vec<String>,
+    execution: fp4::Execution,
     model_path: PathBuf,
     projector_path: Option<PathBuf>,
     model_id: String,
@@ -209,9 +211,10 @@ impl LlamaServerBackend {
         store: &ModelStore,
         manifest: &ModelManifest,
         mode: LlamaCppMode,
+        policy: Option<super::Fp4Kernel>,
     ) -> Result<String> {
         let projector = Self::validate_image_model(store, manifest)?;
-        let discovery = require_llama_server(store, mode)?;
+        let discovery = require_llama_server_for_model(store, mode, manifest, policy)?;
         let executable = discovery
             .path
             .as_ref()
@@ -227,6 +230,72 @@ impl LlamaServerBackend {
             display_name(mode),
             projector.display()
         ))
+    }
+
+    pub(crate) fn can_auto_install_nvfp4() -> bool {
+        if !cfg!(any(target_os = "linux", windows))
+            || cuda_compiler().is_none()
+            || env::var("CUDA_VISIBLE_DEVICES").is_ok_and(|value| matches!(value.trim(), "" | "-1"))
+        {
+            return false;
+        }
+        Command::new("nvidia-smi")
+            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && cuda_architectures_from_compute_caps(&String::from_utf8_lossy(
+                        &output.stdout,
+                    ))
+                    .is_some()
+            })
+    }
+
+    pub(crate) fn needs_nvfp4_runtime(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        mode: LlamaCppMode,
+    ) -> Result<bool> {
+        Ok(mode == LlamaCppMode::Cuda && fp4::is_nvfp4_model(store, manifest)?)
+    }
+
+    pub(crate) fn probe_for_model(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        mode: LlamaCppMode,
+        policy: Option<super::Fp4Kernel>,
+    ) -> Result<String> {
+        let discovery = require_llama_server_for_model(store, mode, manifest, policy)?;
+        let result = format!(
+            "llama.cpp server {} at {}",
+            display_name(mode),
+            discovery
+                .path
+                .as_ref()
+                .context("missing llama-server path")?
+                .display()
+        );
+        if Self::needs_nvfp4_runtime(store, manifest, mode)?
+            && policy != Some(super::Fp4Kernel::Ggml)
+        {
+            fp4::validate_runtime(
+                discovery
+                    .path
+                    .as_deref()
+                    .context("missing llama-server path")?,
+            )?;
+        }
+        if policy.is_some() {
+            fp4::prepare(
+                discovery
+                    .path
+                    .as_deref()
+                    .context("missing llama-server path")?,
+                mode,
+                policy,
+            )?;
+        }
+        Ok(result)
     }
 
     pub fn discover(store: &ModelStore, mode: LlamaCppMode) -> LlamaServerDiscovery {
@@ -283,6 +352,8 @@ impl LlamaServerBackend {
                 .gpu_layers
                 .unwrap_or_else(|| gpu_layers(self.mode))
         );
+
+        let key = format!("{key}:{}", serde_json::to_string(&self.runtime_options)?);
 
         if let Some(server) = self
             .servers
@@ -470,7 +541,13 @@ impl GenerationBackend for LlamaServerBackend {
                 manifest.id
             ))
         } else {
-            Self::probe_image_input(&self.store, manifest, self.mode).map(|_| ())
+            Self::probe_image_input(
+                &self.store,
+                manifest,
+                self.mode,
+                self.runtime_options.fp4_kernel,
+            )
+            .map(|_| ())
         };
         Some(match readiness {
             Ok(()) => TaskReadiness {
@@ -613,11 +690,19 @@ impl LlamaServerProcess {
         projector_path: Option<&Path>,
         runtime_options: &LlamaRuntimeOptions,
     ) -> Result<Self> {
-        let discovery = require_llama_server(store, mode)?;
+        let discovery =
+            require_llama_server_for_model(store, mode, manifest, runtime_options.fp4_kernel)?;
         let executable = discovery
             .path
             .clone()
             .context("llama-server discovery had no executable path")?;
+        if mode == LlamaCppMode::Cuda
+            && runtime_options.fp4_kernel != Some(super::Fp4Kernel::Ggml)
+            && fp4::is_nvfp4_model(store, manifest)?
+        {
+            fp4::validate_runtime(&executable)?;
+        }
+        let execution = fp4::prepare(&executable, mode, runtime_options.fp4_kernel)?;
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         let inspection_started = Instant::now();
@@ -661,7 +746,7 @@ impl LlamaServerProcess {
             .then(|| {
                 inspection
                     .as_ref()
-                    .and_then(|value| value.process_identity(&args).ok())
+                    .and_then(|value| value.process_identity(&args, &execution).ok())
             })
             .flatten();
 
@@ -680,6 +765,7 @@ impl LlamaServerProcess {
         };
         let mut command = Command::new(&executable);
         command.args(&args);
+        execution.apply(&mut command);
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
         if env_true("WERK_LLAMA_LOG") {
             command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -717,6 +803,7 @@ impl LlamaServerProcess {
             executable,
             discovery_source: discovery.source,
             args,
+            execution,
             model_path: model_path.to_path_buf(),
             projector_path: projector_path.map(Path::to_path_buf),
             model_id: manifest.id.clone(),
@@ -740,6 +827,9 @@ impl LlamaServerProcess {
         };
         #[cfg(target_os = "linux")]
         if let Some(diagnostic) = prefetch_diagnostic {
+            process.startup_diagnostics.push(diagnostic);
+        }
+        if let Some(diagnostic) = process.execution.diagnostic() {
             process.startup_diagnostics.push(diagnostic);
         }
         // Do not compete with native model loading for disk/cache bandwidth.
@@ -1949,6 +2039,9 @@ fn help_has_exact_option(help: &str, option: &str) -> bool {
 pub struct LlamaServerInstallOptions {
     pub verbose: bool,
     pub cuda_offload: bool,
+    pub cuda_nvfp4: bool,
+    /// Automatic model-specific provisioning must not change the default runtime.
+    pub preserve_active: bool,
 }
 
 pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<PathBuf> {
@@ -1970,12 +2063,22 @@ pub fn install_managed_llama_server_with_options(
     if mode == LlamaCppMode::Metal && !cfg!(target_os = "macos") {
         bail!("llama.cpp Metal backend can only be built on macOS");
     }
+    if options.cuda_offload && options.cuda_nvfp4 {
+        bail!(
+            "CUDA expert-cache and NVFP4 profiles use different source pins and cannot be combined"
+        );
+    }
+    if options.cuda_nvfp4 && mode != LlamaCppMode::Cuda {
+        bail!("the NVFP4 kernel profile requires CUDA");
+    }
     if options.cuda_offload && mode != LlamaCppMode::Cuda {
         bail!("the expert-cache runtime requires CUDA");
     }
 
     let base_root = managed_backend_dir(store, mode);
-    let root = if options.cuda_offload {
+    let root = if options.cuda_nvfp4 {
+        base_root.join(fp4::profile_directory())
+    } else if options.cuda_offload {
         base_root.join(format!("offload-{}", cuda_offload::REVISION))
     } else {
         base_root
@@ -1985,7 +2088,30 @@ pub fn install_managed_llama_server_with_options(
     fs::create_dir_all(&root)
         .with_context(|| format!("failed to create backend cache {}", root.display()))?;
 
-    if options.cuda_offload {
+    let _install_lock = if options.cuda_nvfp4 {
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("install.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock).context("cannot lock NVFP4 runtime installation")?;
+        if options.preserve_active {
+            if let Some(executable) = server_candidates_under(&root)
+                .into_iter()
+                .find(|path| path.is_file() && fp4::validate_runtime(path).is_ok())
+            {
+                return Ok(executable);
+            }
+        }
+        Some(lock)
+    } else {
+        None
+    };
+
+    if options.cuda_nvfp4 {
+        fp4::prepare_source(&source_dir, options.verbose)?;
+    } else if options.cuda_offload {
         cuda_offload::prepare_source(&source_dir, options.verbose)?;
     } else if !source_dir.join(".git").is_dir() {
         if source_dir.exists() {
@@ -2032,7 +2158,14 @@ pub fn install_managed_llama_server_with_options(
     if options.verbose {
         eprintln!("Configuring llama.cpp {} build", display_name(mode));
     }
-    let mut configure = Command::new("cmake");
+    let mut configure = if options.cuda_nvfp4 {
+        fp4::build_command()
+    } else {
+        Command::new("cmake")
+    };
+    if options.cuda_nvfp4 {
+        fp4::configure_build(&mut configure)?;
+    }
     configure
         .arg("-B")
         .arg(&build_dir)
@@ -2054,7 +2187,11 @@ pub fn install_managed_llama_server_with_options(
                 }
                 configure.arg(format!("-DCMAKE_CUDA_COMPILER={}", nvcc.display()));
             }
-            if let Some(arch) = cuda_architecture() {
+            if let Some(arch) = if options.cuda_nvfp4 {
+                fp4::build_architecture()
+            } else {
+                cuda_architecture()
+            } {
                 if options.verbose {
                     eprintln!("Using CUDA architecture {arch}");
                 }
@@ -2112,19 +2249,47 @@ pub fn install_managed_llama_server_with_options(
     if options.verbose {
         eprintln!("Building llama-server");
     }
-    run_command(
+    let mut build = if options.cuda_nvfp4 {
+        fp4::build_command()
+    } else {
         Command::new("cmake")
-            .arg("--build")
-            .arg(&build_dir)
-            .arg("--config")
-            .arg("Release")
-            .arg("--target")
-            .arg("llama-server")
-            .arg("-j"),
+    };
+    build.arg("--build").arg(&build_dir).args([
+        "--config",
+        "Release",
+        "--target",
+        "llama-server",
+        "-j",
+    ]);
+    if options.cuda_nvfp4 {
+        // CUDA templates are memory intensive. Respect an explicit CMake limit;
+        // otherwise avoid starting one compiler per host hardware thread.
+        let jobs = env::var("CMAKE_BUILD_PARALLEL_LEVEL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| thread::available_parallelism().map_or(2, |v| v.get().min(4)));
+        build.arg(jobs.to_string());
+    }
+    run_command(
+        &mut build,
         "failed to build llama-server with CMake",
         options.verbose,
     )?;
 
+    if options.cuda_nvfp4 {
+        run_command(
+            fp4::build_command().arg("--build").arg(&build_dir).args([
+                "--config",
+                "Release",
+                "--target",
+                "werk-fp4-probe",
+                "-j",
+            ]),
+            "failed to build NVFP4 capability probe",
+            options.verbose,
+        )?;
+    }
     let executable = server_candidates_under(&root)
         .into_iter()
         .find(|path| path.is_file())
@@ -2135,13 +2300,19 @@ pub fn install_managed_llama_server_with_options(
             )
         })?;
     validate_llama_server(&executable, mode)?;
+    if options.cuda_nvfp4 {
+        fp4::register_runtime(&executable)?;
+        fp4::validate_runtime(&executable)?;
+    }
     if options.cuda_offload {
         cuda_offload::validate_runtime(&executable)?;
     }
-    fs::write(
-        managed_path_file(store, mode),
-        executable.display().to_string(),
-    )?;
+    if !options.preserve_active {
+        fs::write(
+            managed_path_file(store, mode),
+            executable.display().to_string(),
+        )?;
+    }
     Ok(executable)
 }
 
@@ -2219,6 +2390,37 @@ fn validate_llama_server(path: &Path, mode: LlamaCppMode) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn require_llama_server_for_model(
+    store: &ModelStore,
+    mode: LlamaCppMode,
+    manifest: &ModelManifest,
+    policy: Option<super::Fp4Kernel>,
+) -> Result<LlamaServerDiscovery> {
+    let mut discovery = discover_llama_server(store, mode);
+    if mode == LlamaCppMode::Cuda
+        && policy != Some(super::Fp4Kernel::Ggml)
+        && !discovery.source.starts_with("env ")
+        && fp4::is_nvfp4_model(store, manifest)?
+    {
+        let root = managed_backend_dir(store, mode).join(fp4::profile_directory());
+        if let Some(path) = server_candidates_under(&root)
+            .into_iter()
+            .find(|path| path.is_file())
+        {
+            discovery.path = Some(path);
+            discovery.source = "managed NVFP4 profile".into();
+        } else {
+            bail!(
+                "no NVFP4 CUDA profile for the current source/patch/architecture is installed; run `werk backend install llama-cuda-nvfp4` or allow automatic backend installation"
+            );
+        }
+    }
+    if discovery.path.is_none() {
+        bail!("{}", missing_llama_server_message(&discovery));
+    }
+    Ok(discovery)
 }
 
 fn require_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<LlamaServerDiscovery> {
@@ -2888,12 +3090,27 @@ fn cuda_architecture() -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
+    cuda_architectures_from_compute_caps(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn cuda_architectures_from_compute_caps(output: &str) -> Option<String> {
+    let architectures = output
         .lines()
-        .find_map(|line| {
-            let arch = line.trim().replace('.', "");
-            (!arch.is_empty() && arch.chars().all(|ch| ch.is_ascii_digit())).then_some(arch)
+        .filter_map(|line| {
+            let (major, minor) = line.trim().split_once('.')?;
+            let (major, minor): (u32, u32) = (major.parse().ok()?, minor.parse().ok()?);
+            if minor > 9 || major == 0 {
+                return None;
+            }
+            let architecture = major * 10 + minor;
+            Some(if major == 12 {
+                format!("{architecture}a-real")
+            } else {
+                architecture.to_string()
+            })
         })
+        .collect::<std::collections::BTreeSet<_>>();
+    (!architectures.is_empty()).then(|| architectures.into_iter().collect::<Vec<_>>().join(";"))
 }
 
 fn current_host_is_dgx_spark() -> bool {
@@ -4147,6 +4364,23 @@ Agent 3
         assert_eq!(completion.prompt_seconds, 0.123);
         assert!((completion.decode_seconds - 0.377).abs() < 0.000001);
         assert!(completion.completion_tokens > 0);
+    }
+
+    #[test]
+    fn cuda_architectures_include_blackwell_features_and_all_devices() {
+        assert_eq!(
+            cuda_architectures_from_compute_caps("8.6\n12.0\n8.6\n"),
+            Some("120a-real;86".into())
+        );
+        assert_eq!(
+            cuda_architectures_from_compute_caps("12.1"),
+            Some("121a-real".into())
+        );
+        assert_eq!(
+            cuda_architectures_from_compute_caps("8.9"),
+            Some("89".into())
+        );
+        assert_eq!(cuda_architectures_from_compute_caps("not available"), None);
     }
 
     #[test]

@@ -1,0 +1,17 @@
+This package contains Marlin CUDA kernel code.
+Copyright (C) Marlin.2024 Elias Frantar. Modified by Neural Magic and vLLM contributors.
+
+Original project: https://github.com/IST-DASLab/marlin
+Vendored source: https://github.com/vllm-project/vllm/tree/26f49e336a1498300a442a0d95911c11f5284500/csrc/libtorch_stable/quantization/marlin
+Scalar types: https://github.com/vllm-project/vllm/blob/26f49e336a1498300a442a0d95911c11f5284500/csrc/core/scalar_type.hpp
+License: Apache License 2.0; see LICENSE-Marlin-Apache-2.0 and preserved source notices.
+
+WERK changes to vendored code (2026): remove scalar_type.hpp's libtorch exception dependency;
+extend Marlin FP4 type validation to exact 16-bit block scales; add GPU-resident expert
+row bounds and remainder handling; write reduced FP32 accumulators directly into GGML
+outputs before the normal model global-scale operation. Unmodified FP4 dequantization
+and BF16 tensor-core MMA from Marlin remain in use.
+
+New WERK adapter code is covered by the repository's Elastic License 2.0. It implements
+GGUF NVFP4 layout conversion, BF16 activation conversion, GGML dense/MoE dispatch,
+architecture gates, probe and regression tests. No vLLM inference runtime is included.
