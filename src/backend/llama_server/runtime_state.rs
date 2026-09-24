@@ -3654,6 +3654,8 @@ mod tests {
         LlamaServerProcess {
             #[cfg(target_os = "linux")]
             _model_file_cache: None,
+            #[cfg(target_os = "linux")]
+            expert_memory: Default::default(),
             child,
             executable,
             discovery_source: "test".to_string(),

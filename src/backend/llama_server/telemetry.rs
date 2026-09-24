@@ -43,6 +43,8 @@ pub(super) fn sample(backend: &LlamaServerBackend) -> Vec<BackendSnapshot> {
                     .insert("process_resident_bytes".into(), process.memory() as f64);
             }
             placement(&mut sample, &server.args);
+            #[cfg(target_os = "linux")]
+            server.expert_memory.sample(&server.model_path, &mut sample);
             if let Some(slots) = client
                 .as_ref()
                 .and_then(|client| fetch_slots(client, &server.url))
@@ -96,6 +98,7 @@ fn parse_slots(sample: &mut BackendSnapshot, value: &Value) -> bool {
     let mut capacity = 0.;
     let mut context = 0.;
     let mut cached = Some(0.);
+    let mut processed = Some(0.);
     let mut decoded = Some(0.);
     for slot in slots {
         let (Some(id), Some(processing), Some(n_ctx)) = (
@@ -113,6 +116,9 @@ fn parse_slots(sample: &mut BackendSnapshot, value: &Value) -> bool {
         active += 1.;
         cached = cached
             .zip(slot["n_prompt_tokens_cache"].as_u64())
+            .map(|(sum, n)| sum + n as f64);
+        processed = processed
+            .zip(slot["n_prompt_tokens_processed"].as_u64())
             .map(|(sum, n)| sum + n as f64);
         decoded = decoded
             .zip(slot["next_token"][0]["n_decoded"].as_u64())
@@ -135,7 +141,14 @@ fn parse_slots(sample: &mut BackendSnapshot, value: &Value) -> bool {
     ] {
         sample.gauges.insert(key.into(), value);
     }
+    let prompt = cached.zip(processed).map(|(c, p)| c + p);
+    let hit_ratio = cached
+        .zip(prompt)
+        .filter(|(_, total)| *total > 0.)
+        .map(|(cached, total)| cached / total);
     for (key, value) in [
+        ("active_prompt_tokens", prompt),
+        ("prompt_cache_hit_ratio", hit_ratio),
         ("active_cached_tokens", cached),
         ("active_output_tokens", decoded),
     ] {
@@ -221,7 +234,7 @@ mod observability_tests {
             &mut sample,
             &serde_json::json!([
                 {"id":0,"id_task":42,"is_processing":true,"n_ctx":32768,
-                 "n_prompt_tokens":1234,"n_prompt_tokens_cache":1000,
+                 "n_prompt_tokens":1234,"n_prompt_tokens_cache":1000,"n_prompt_tokens_processed":200,
                  "next_token":[{"n_decoded":34}],"prompt":"private","generated":"private"},
                 {"id":1,"is_processing":false,"n_ctx":32768}
             ])
@@ -230,6 +243,8 @@ mod observability_tests {
         assert_eq!(sample.gauges["context_capacity_tokens"], 65536.);
         assert_eq!(sample.gauges["active_output_tokens"], 34.);
         assert_eq!(sample.gauges["slot_0_task"], 42.);
+        assert_eq!(sample.gauges["active_prompt_tokens"], 1200.);
+        assert_eq!(sample.gauges["prompt_cache_hit_ratio"], 1000. / 1200.);
         assert!(!serde_json::to_string(&sample).unwrap().contains("private"));
         assert!(!parse_slots(
             &mut BackendSnapshot::default(),

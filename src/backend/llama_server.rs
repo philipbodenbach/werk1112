@@ -24,6 +24,8 @@ mod model_prefetch_linux;
 mod model_prefetch_policy;
 #[cfg(target_os = "linux")]
 use super::model_file_cache;
+#[cfg(target_os = "linux")]
+mod expert_memory;
 mod runtime_state;
 mod telemetry;
 #[cfg(test)]
@@ -76,6 +78,8 @@ struct LlamaServerProcess {
     // Fields drop in declaration order, after Drop has reaped the native worker.
     #[cfg(target_os = "linux")]
     _model_file_cache: Option<model_file_cache::CacheReleaseGuard>,
+    #[cfg(target_os = "linux")]
+    expert_memory: expert_memory::State,
     executable: PathBuf,
     discovery_source: String,
     args: Vec<String>,
@@ -805,6 +809,8 @@ impl LlamaServerProcess {
             child,
             #[cfg(target_os = "linux")]
             _model_file_cache: model_file_cache,
+            #[cfg(target_os = "linux")]
+            expert_memory: expert_memory::State::new(model_path, &args, &supported),
             executable,
             discovery_source: discovery.source,
             args,

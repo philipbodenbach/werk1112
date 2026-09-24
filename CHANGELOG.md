@@ -5,6 +5,12 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Show Linux llama.cpp CPU expert RAM residency and GGUF weight size with a live
+  history, plus prompt/KV cache hit rate, memory history and animated panel status.
+  Count reclaimable file cache in host occupancy, label host/GPU pressure
+  separately, and remove SSD-read wording from CPU/RAM offload panels. Preserve
+  the existing oMLX/macOS layout and expert-cache/offload-read displays.
+
 - Fix empty `werk top` live panels for llama.cpp workers: collect native slot
   token counts, context occupancy, process RSS and configured layer placement.
   Derive decode speed only across the same native task; show context/placement

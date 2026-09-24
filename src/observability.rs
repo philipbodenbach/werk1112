@@ -60,6 +60,8 @@ pub struct Totals {
 pub struct Snapshot {
     #[serde(default)]
     pub host_swap_used_bytes: Option<u64>,
+    #[serde(default)]
+    pub host_memory_free_bytes: Option<u64>,
     pub schema_version: u32,
     pub observed_at_ms: u64,
     pub server_started_ms: u64,
@@ -134,6 +136,7 @@ impl Telemetry {
         requests.extend(r.recent.iter().rev().cloned());
         Snapshot {
             host_swap_used_bytes: None,
+            host_memory_free_bytes: None,
             schema_version: 1,
             observed_at_ms: time,
             server_started_ms: self.started_ms,

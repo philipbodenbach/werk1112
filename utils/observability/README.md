@@ -65,7 +65,21 @@ already-running workers; unsupported values remain absent, not fabricated zeroes
   `/slots`. Werk enables that endpoint on supported workers, including without
   persistence. The TUI shows process RSS, host memory and configured CPU/GPU
   layer placement; GPU memory is device-wide. llama.cpp does not expose oMLX
-  expert-cache or disk-read counters, so its panels show context and placement.
+  expert-cache or disk-read counters. Its prompt-cache graph measures cached /
+  (cached + evaluated) prompt tokens, excluding generated tokens: KV prefix
+  reuse, not expert-cache hits. Context occupancy remains visible below it.
+  On Linux, CPU/RAM offload shows resident CPU expert weight bytes against the
+  selected GGUF expert footprint. Bounded passive `cachestat` queries (with
+  `mincore` fallback) check file-backed RAM without reading, prefaulting or
+  pinning tensor payload. It
+  requires unambiguous mmap placement and owned files; unsupported or changed
+  files leave residency unavailable. This is CPU/RAM placement, not SSD expert
+  streaming. The graph reports resident GiB. Memory/cache/offload histories keep
+  90 samples, with panel activity markers controlled by the animation toggle.
+  Host occupancy includes reclaimable cache; host availability includes memory
+  reclaimable from that cache. Host and GPU pressure are labelled separately.
+  These new panels and animations apply only to llama.cpp; the oMLX layout and
+  its expert-cache/offload-read displays remain unchanged.
 * Native live counters also supplement **oMLX**: active/waiting requests,
   expert-cache occupancy/budgets/hits/misses/evictions, n-gram cache, offload
   reads and memory-guard budget reductions. Live worker telemetry is still absent
