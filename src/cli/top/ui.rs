@@ -49,6 +49,13 @@ fn native(app: &App, key: &str) -> Option<f64> {
         .get(key)
         .copied()
 }
+fn llama(app: &App) -> bool {
+    app.snapshot
+        .as_ref()
+        .and_then(|s| s.backends.get(app.worker))
+        .is_some_and(|b| b.backend.starts_with("llama.cpp"))
+}
+
 fn duration(seconds: f64) -> String {
     let s = seconds.max(0.) as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -227,7 +234,7 @@ fn inference(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let active = app.snapshot.as_ref().map_or(0, |s| s.totals.active);
-    let phase = if app.rates.decode_estimate.is_some() {
+    let phase = if app.rates.decode_estimate.is_some() && active > 0 {
         "DECODE"
     } else if active > 0 {
         "WORKING"
@@ -254,12 +261,21 @@ fn inference(frame: &mut Frame, area: Rect, app: &App) {
     }
     if inner.height > 1 {
         frame.render_widget(
-            Paragraph::new(format!(
-                "Active {active}   Queued {}   ~ interval estimate",
-                native(app, "requests_waiting")
-                    .map(|n| format!("{n:.0}"))
-                    .unwrap_or_else(|| "n/a".into())
-            ))
+            Paragraph::new(if llama(app) {
+                format!(
+                    "Active {active}   Output {} tokens   ~ interval estimate",
+                    native(app, "active_output_tokens")
+                        .map(|n| format!("{n:.0}"))
+                        .unwrap_or_else(|| "n/a".into())
+                )
+            } else {
+                format!(
+                    "Active {active}   Queued {}   ~ interval estimate",
+                    native(app, "requests_waiting")
+                        .map(|n| format!("{n:.0}"))
+                        .unwrap_or_else(|| "n/a".into())
+                )
+            })
             .style(Style::default().fg(MUTED)),
             Rect {
                 x: inner.x,
@@ -274,14 +290,28 @@ fn memory(frame: &mut Frame, area: Rect, app: &App) {
     let block = panel("MEMORY", VIOLET);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let resident = native(app, "expert_cache_resident_bytes");
-    let budget = native(app, "expert_cache_budget_bytes");
+    let host = app.snapshot.as_ref().and_then(|s| s.memory.as_ref());
+    let (resident, budget, label_name) = if llama(app) {
+        let capacity = host.and_then(|m| m.host.capacity_bytes).map(|n| n as f64);
+        let available = host.and_then(|m| m.host.available_bytes).map(|n| n as f64);
+        (
+            capacity.zip(available).map(|(c, a)| (c - a).max(0.)),
+            capacity,
+            "Host",
+        )
+    } else {
+        (
+            native(app, "expert_cache_resident_bytes"),
+            native(app, "expert_cache_budget_bytes"),
+            "Experts",
+        )
+    };
     let ratio = resident
         .zip(budget)
         .and_then(|(a, b)| (b > 0.).then_some((a / b).clamp(0., 1.)))
         .unwrap_or(0.);
     let label = format!(
-        "Experts {} / {}",
+        "{label_name} {} / {}",
         number(resident.map(|n| n / 1073741824.), "GiB"),
         number(budget.map(|n| n / 1073741824.), "GiB")
     );
@@ -293,15 +323,24 @@ fn memory(frame: &mut Frame, area: Rect, app: &App) {
             .use_unicode(true),
         Rect { height: 1, ..inner },
     );
-    let host = app.snapshot.as_ref().and_then(|s| s.memory.as_ref());
     let lines = vec![
-        Line::raw(format!(
-            "Effective expert budget {}",
-            number(
-                native(app, "expert_cache_effective_budget_bytes").map(|n| n / 1073741824.),
-                "GiB"
+        Line::raw(if llama(app) {
+            format!(
+                "Worker RSS {}",
+                number(
+                    native(app, "process_resident_bytes").map(|n| n / 1073741824.),
+                    "GiB"
+                )
             )
-        )),
+        } else {
+            format!(
+                "Effective expert budget {}",
+                number(
+                    native(app, "expert_cache_effective_budget_bytes").map(|n| n / 1073741824.),
+                    "GiB"
+                )
+            )
+        }),
         Line::raw(format!(
             "Host available {}",
             number(
@@ -342,6 +381,43 @@ fn memory(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 fn cache(frame: &mut Frame, area: Rect, app: &App) {
+    if llama(app) {
+        let used = native(app, "context_used_tokens");
+        let capacity = native(app, "context_capacity_tokens");
+        let block = panel("CONTEXT", BLUE);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let ratio = used
+            .zip(capacity)
+            .filter(|(_, c)| *c > 0.)
+            .map_or(0., |(u, c)| (u / c).clamp(0., 1.));
+        frame.render_widget(
+            Gauge::default()
+                .ratio(ratio)
+                .label(format!(
+                    "{} / {} tokens",
+                    tokens(used.map(|n| n as u64)),
+                    tokens(capacity.map(|n| n as u64))
+                ))
+                .gauge_style(Style::default().fg(BLUE).bg(BG)),
+            Rect { height: 1, ..inner },
+        );
+        if inner.height > 1 {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Cached prompt {} tokens\nSlots {}\nSlot context includes retained tokens",
+                    tokens(native(app, "active_cached_tokens").map(|n| n as u64)),
+                    tokens(native(app, "slots_total").map(|n| n as u64))
+                )),
+                Rect {
+                    y: inner.y + 1,
+                    height: inner.height - 1,
+                    ..inner
+                },
+            );
+        }
+        return;
+    }
     let block = panel("EXPERT CACHE", BLUE);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -392,6 +468,33 @@ fn cache(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 fn offload(frame: &mut Frame, area: Rect, app: &App) {
+    if llama(app) {
+        let cpu = if native(app, "cpu_moe_all") == Some(1.) {
+            "all".into()
+        } else {
+            native(app, "cpu_moe_layers")
+                .map(|n| format!("{n:.0}"))
+                .unwrap_or_else(|| "default".into())
+        };
+        let gpu = native(app, "gpu_layers_requested")
+            .map(|n| format!("{n:.0}"))
+            .unwrap_or_else(|| "default".into());
+        let accelerator = app
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.memory.as_ref())
+            .map(|m| &m.accelerator);
+        let capacity = accelerator.and_then(|m| m.capacity_bytes);
+        let used = capacity
+            .zip(accelerator.and_then(|m| m.available_bytes))
+            .map(|(c, a)| c.saturating_sub(a));
+        frame.render_widget(Paragraph::new(format!(
+            "CPU expert layers {cpu}\nGPU layers requested {gpu}\nGPU memory {} / {}\nStatic layer placement\nExpert-cache / disk-read counters not exposed",
+            number(used.map(|n| n as f64 / 1073741824.), "GiB"),
+            number(capacity.map(|n| n as f64 / 1073741824.), "GiB")))
+            .block(panel("OFFLOAD", PINK)), area);
+        return;
+    }
     let block = panel("OFFLOAD", PINK);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -567,6 +670,51 @@ fn details(frame: &mut Frame, app: &App) {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn observability_llama_panels_show_context_memory_and_placement() {
+        let args = super::super::TopArgs {
+            url: "http://localhost:11434".into(),
+            api_key: None,
+            interval_ms: 2000,
+            once: false,
+            json: false,
+            no_animation: true,
+            demo: false,
+        };
+        let mut app = App::new(&args);
+        let mut snapshot = super::super::demo(3.);
+        snapshot.backends[0].backend = "llama.cpp / CUDA".into();
+        snapshot.backends[0].gauges.extend([
+            ("decode_tokens_per_second_estimate".into(), 12.),
+            ("context_used_tokens".into(), 1200.),
+            ("context_capacity_tokens".into(), 32768.),
+            ("active_cached_tokens".into(), 1000.),
+            ("active_output_tokens".into(), 200.),
+            ("process_resident_bytes".into(), 1073741824.),
+            ("cpu_moe_layers".into(), 38.),
+        ]);
+        app.update(snapshot);
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for value in [
+            "12.0 tok/s",
+            "CONTEXT",
+            "1200 / 32768",
+            "Worker RSS 1.0 GiB",
+            "CPU expert layers 38",
+        ] {
+            assert!(text.contains(value), "missing {value}");
+        }
+        assert!(!text.contains("EXPERT CACHE"));
+    }
+
     #[test]
     fn observability_layouts_render_at_small_medium_and_large_sizes() {
         let args = super::super::TopArgs {

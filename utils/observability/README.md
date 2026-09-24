@@ -60,13 +60,22 @@ already-running workers; unsupported values remain absent, not fabricated zeroes
 * These common request/timing metrics work across text backends, including
   llama.cpp/CUDA and vLLM. Standalone `werk run`, media jobs and explicit Werk
   prefill/decode routes are not included in these chat counters yet.
-* Native live counters currently supplement **oMLX**: active/waiting requests,
+* Native **llama.cpp** workers (CUDA, Vulkan, Metal, ROCm and CPU) expose live
+  decoded tokens, active slots, context occupancy and cached prompt tokens via
+  `/slots`. Werk enables that endpoint on supported workers, including without
+  persistence. The TUI shows process RSS, host memory and configured CPU/GPU
+  layer placement; GPU memory is device-wide. llama.cpp does not expose oMLX
+  expert-cache or disk-read counters, so its panels show context and placement.
+* Native live counters also supplement **oMLX**: active/waiting requests,
   expert-cache occupancy/budgets/hits/misses/evictions, n-gram cache, offload
-  reads and memory-guard budget reductions. Other backends can implement the
-  additive `GenerationBackend::telemetry` hook without changing generation.
-* `decode_tokens_per_second_estimate` is explicitly an estimate from native
-  decode-context growth, only between samples of a single active request with
-  unchanged completion count. It is not an exact per-token trace; request/phase
+  reads and memory-guard budget reductions. Live worker telemetry is still absent
+  for vLLM, Candle, Burn, ONNX, standalone MLX/MLX-VLM, Transformers and legacy
+  embedded llama adapters; they provide common completed-request metrics only.
+  Auto/preferred/runtime routing forwards telemetry from its concrete backends.
+* `decode_tokens_per_second_estimate` uses native decoded-token deltas for
+  llama.cpp slots with unchanged task IDs, excluding prefill and counter resets.
+  oMLX uses decode-context growth between samples of a single active request
+  with unchanged completion count. It is not an exact per-token trace; request/phase
   transitions and missing samples can make it unavailable. Completed request
   decode/prefill rates use the backend's reported token counts and timings.
 * Expert hit ratio uses interval hit/miss deltas. No accesses means unavailable.
@@ -75,7 +84,8 @@ already-running workers; unsupported values remain absent, not fabricated zeroes
   measure physical SSD traffic or disk-space growth.
 * Physical host/accelerator memory and managed accounting are different scopes.
   The memory panel uses host telemetry and native expert residency. It does not
-  claim that expert-cache bytes equal total Metal/VRAM allocation.
+  claim that expert-cache bytes equal total Metal/VRAM allocation. Linux host
+  availability includes reclaimable cache (`MemAvailable`), not only free pages.
 
 ## Prometheus and Grafana
 

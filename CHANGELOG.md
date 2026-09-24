@@ -5,6 +5,13 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Fix empty `werk top` live panels for llama.cpp workers: collect native slot
+  token counts, context occupancy, process RSS and configured layer placement.
+  Derive decode speed only across the same native task; show context/placement
+  panels for llama.cpp instead of unsupported oMLX expert-cache statistics.
+  Enable supported slot monitoring independently of persistence. Correct Linux
+  host memory availability to include reclaimable file cache.
+
 - Expose function tool calling across every implemented chat and vision adapter:
   native llama.cpp transport, existing vLLM, native/generic oMLX, and a shared
   validated tool protocol for Candle, Burn, ONNX, MLX/MLX-VLM, Transformers and

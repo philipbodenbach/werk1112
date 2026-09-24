@@ -25,6 +25,7 @@ mod model_prefetch_policy;
 #[cfg(target_os = "linux")]
 use super::model_file_cache;
 mod runtime_state;
+mod telemetry;
 #[cfg(test)]
 mod tool_call_tests;
 mod tool_calls;
@@ -419,6 +420,10 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        telemetry::sample(self)
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         true
     }
@@ -1214,8 +1219,11 @@ fn llama_server_args_with_state(
             args.push(r#"{"enable_thinking":false}"#.to_string());
         }
     }
-    if let Some(snapshot_dir) = state_snapshot_dir {
+    // Monitoring also needs slots when persistence is disabled.
+    if supported.slots || state_snapshot_dir.is_some() {
         args.push("--slots".to_string());
+    }
+    if let Some(snapshot_dir) = state_snapshot_dir {
         args.push("--slot-save-path".to_string());
         args.push(snapshot_dir.display().to_string());
         if supported.cache_ram {

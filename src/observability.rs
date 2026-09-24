@@ -432,7 +432,24 @@ impl Rates {
                 == new.counters.get("requests_completed_total")
             && old.gauges.get("requests_active") == Some(&1.)
             && new.gauges.get("requests_active") == Some(&1.);
-        let decode_estimate = if same_request {
+        // llama.cpp exposes per-slot generation counts. Task IDs prevent a new
+        // request (including prompt evaluation) from becoming a false decode spike.
+        let slot_deltas: Vec<_> = new
+            .gauges
+            .iter()
+            .filter_map(|(key, task)| {
+                let slot = key.strip_prefix("slot_")?.strip_suffix("_task")?;
+                if old.gauges.get(key) != Some(task) {
+                    return None;
+                }
+                let key = format!("slot_{slot}_decoded");
+                let (a, b) = (old.gauges.get(&key)?, new.gauges.get(&key)?);
+                (a > &0. && b >= a).then_some((b - a) / seconds)
+            })
+            .collect();
+        let decode_estimate = if !slot_deltas.is_empty() {
+            Some(slot_deltas.iter().sum())
+        } else if same_request {
             old.gauges
                 .get("decode_context_tokens")
                 .zip(new.gauges.get("decode_context_tokens"))
@@ -522,6 +539,29 @@ mod tests {
         assert_eq!(t.snapshot().totals.output_tokens, 6);
         assert_eq!(t.snapshot().totals.completed, 1);
     }
+    #[test]
+    fn observability_llama_decode_uses_task_identity_and_excludes_prefill() {
+        let mut a = BackendSnapshot {
+            available: true,
+            instance: "worker".into(),
+            ..Default::default()
+        };
+        a.gauges
+            .extend([("slot_0_task".into(), 42.), ("slot_0_decoded".into(), 100.)]);
+        let mut b = a.clone();
+        b.gauges.insert("slot_0_decoded".into(), 124.);
+        assert_eq!(Rates::between(&a, &b, 2.).decode_estimate, Some(12.));
+        b.gauges.insert("slot_0_task".into(), 43.);
+        assert!(Rates::between(&a, &b, 2.).decode_estimate.is_none());
+        b = a.clone();
+        b.gauges.insert("slot_0_decoded".into(), 2.);
+        assert!(Rates::between(&a, &b, 2.).decode_estimate.is_none());
+        a.gauges.insert("slot_0_decoded".into(), 0.);
+        assert!(Rates::between(&a, &b, 2.).decode_estimate.is_none());
+        b.gauges.clear(); // Idle slots must not reuse the last request's speed.
+        assert!(Rates::between(&a, &b, 2.).decode_estimate.is_none());
+    }
+
     #[test]
     fn interval_resets_and_idle_are_not_hits() {
         let mut a = BackendSnapshot {
