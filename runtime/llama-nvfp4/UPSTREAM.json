@@ -1,0 +1,19 @@
+{
+  "llama_revision": "fc343a84bbd925b37dde3219de35ea0bed50d630",
+  "marlin_repository": "https://github.com/vllm-project/vllm",
+  "marlin_revision": "26f49e336a1498300a442a0d95911c11f5284500",
+  "original_source_sha256": {
+    "marlin.cuh": "edaa19c541dfbe5e06e547c0be5bcdc1b78b4bbc68d596b72c41a932e2366926",
+    "marlin_dtypes.cuh": "15b90a65eadb200a3f7165e2e0d7d899f36d4993b20dbd89093ef2cea274da71",
+    "marlin_mma.h": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b",
+    "marlin_template.h": "972ffd66fdfb6781dad13daea1167981821a78b86a93d865baa2b3c3ed11cd19",
+    "dequant.h": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728",
+    "scalar_type.hpp": "8d3671759c43a0219f51e3a1f32c94ef5d70ecc99e264100f4015a781d94bb99",
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "local_modifications": [
+    "scalar_type.hpp: remove libtorch exception dependency",
+    "marlin_template.h: exact BF16 scales, device expert bounds and FP32 final store",
+    "new adapter: direct GGUF repacking, dense/MoE dispatch and tests"
+  ]
+}

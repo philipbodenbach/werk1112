@@ -2187,10 +2187,14 @@ pub(super) struct LlamaExecutableInspection {
 }
 
 impl LlamaExecutableInspection {
-    pub(super) fn process_identity(&self, args: &[String]) -> Result<LlamaProcessIdentity> {
+    pub(super) fn process_identity(
+        &self,
+        args: &[String],
+        execution: &super::fp4::Execution,
+    ) -> Result<LlamaProcessIdentity> {
         Ok(LlamaProcessIdentity {
             executable: self.identity.clone(),
-            args_sha256: sha256_json_value(args)?,
+            args_sha256: sha256_json_value(&json!({ "args": args, "execution": execution }))?,
         })
     }
 
@@ -2739,6 +2743,96 @@ mod tests {
         assert_eq!(calls.lines().filter(|line| *line == "--version").count(), 1);
         fs::write(&executable, "#!/bin/sh\necho replacement\n").unwrap();
         assert!(inspection.verify_unchanged(&executable).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fp4_execution_changes_invalidate_runtime_envelopes_and_chat_cache_directories() {
+        use crate::backend::Fp4Kernel;
+        use std::collections::BTreeSet;
+
+        let root = test_root("fp4-cache-identity");
+        let store = ModelStore::resolve(Some(root.clone())).unwrap();
+        let manifest = test_manifest();
+        let cache_root = root.join("chat-cache");
+        let snapshots = root.join("snapshots");
+        ensure_real_directory(&snapshots, true).unwrap();
+        let mut process = test_process("http://127.0.0.1:9".into(), snapshots);
+        process.mode = LlamaCppMode::Cuda;
+        process.args = vec!["--ctx-size".into(), "4096".into()];
+        let inspection = LlamaExecutableInspection {
+            help: String::new(),
+            identity: process
+                .state_runtime
+                .identity
+                .as_ref()
+                .unwrap()
+                .executable
+                .clone(),
+            stamp: FileStamp::read(&process.executable).unwrap(),
+        };
+        let runtime_options = LlamaRuntimeOptions::default();
+        let mut previous_envelope: Option<CompatibilityEnvelope> = None;
+        let mut directories = BTreeSet::new();
+        let read_directories = || {
+            fs::read_dir(&cache_root)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    assert!(entry.file_type().unwrap().is_dir());
+                    entry.file_name()
+                })
+                .collect::<BTreeSet<_>>()
+        };
+
+        // Model, binary, arguments and prompt stay identical. Exercise both
+        // policy changes and a rebuild with the same effective policy.
+        for (policy, build) in [
+            (Fp4Kernel::Auto, "build-a"),
+            (Fp4Kernel::Native, "build-a"),
+            (Fp4Kernel::Marlin, "build-a"),
+            (Fp4Kernel::Marlin, "build-b"),
+        ] {
+            process.execution = super::super::fp4::Execution::test_identity(policy, build);
+            process.state_runtime.identity = Some(
+                inspection
+                    .process_identity(&process.args, &process.execution)
+                    .unwrap(),
+            );
+            let envelope =
+                build_llama_compatibility(&manifest, &process, &runtime_options, "same-prompt")
+                    .unwrap();
+            validate_request_generation(&process, &manifest.id, &envelope).unwrap();
+            if let Some(previous) = &previous_envelope {
+                assert_eq!(previous.model_fingerprint, envelope.model_fingerprint);
+                assert_eq!(
+                    previous.tokenizer_fingerprint,
+                    envelope.tokenizer_fingerprint
+                );
+                assert_eq!(previous.prompt_fingerprint, envelope.prompt_fingerprint);
+                assert!(validate_compatibility(previous, &envelope).is_err());
+                assert!(validate_request_generation(&process, &manifest.id, previous).is_err());
+            }
+
+            let cache =
+                LlamaChatPersistence::open(&process, &store, &manifest, &cache_root).unwrap();
+            assert!(!cache.reuse_previously_observed);
+            let next_directories = read_directories();
+            assert_eq!(next_directories.len(), directories.len() + 1);
+            assert!(next_directories.is_superset(&directories));
+
+            // Reopening identical execution must select the existing directory.
+            LlamaChatPersistence::open(&process, &store, &manifest, &cache_root).unwrap();
+            assert_eq!(read_directories(), next_directories);
+            let repeated =
+                build_llama_compatibility(&manifest, &process, &runtime_options, "same-prompt")
+                    .unwrap();
+            validate_compatibility(&envelope, &repeated).unwrap();
+            directories = next_directories;
+            previous_envelope = Some(envelope);
+        }
+        assert_eq!(directories.len(), 4);
+        drop(process);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3564,6 +3658,7 @@ mod tests {
             executable,
             discovery_source: "test".to_string(),
             args: Vec::new(),
+            execution: Default::default(),
             model_path: PathBuf::from("model.gguf"),
             projector_path: None,
             model_id: "test-model".to_string(),

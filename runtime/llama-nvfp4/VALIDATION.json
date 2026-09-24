@@ -1,0 +1,78 @@
+{
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "cuda": "13.0.48",
+  "probe": {
+    "schema": 1,
+    "kernel_abi": "werk-nvfp4-v1",
+    "revision": "fc343a84bbd925b37dde3219de35ea0bed50d630",
+    "marlin": true,
+    "native": false,
+    "operations": [
+      "mul_mat",
+      "mul_mat_id"
+    ],
+    "marlin_activation": "bf16",
+    "native_activation": "fp4",
+    "devices": [
+      {
+        "index": 0,
+        "compute_capability": 86,
+        "compiled_arch": 86,
+        "loaded_cuda_arch": 860,
+        "probe_cuda_error": 0,
+        "native_nvfp4": false,
+        "marlin_nvfp4": true
+      }
+    ]
+  },
+  "hidden_probe": {
+    "schema": 1,
+    "kernel_abi": "werk-nvfp4-v1",
+    "revision": "fc343a84bbd925b37dde3219de35ea0bed50d630",
+    "marlin": true,
+    "native": false,
+    "operations": [
+      "mul_mat",
+      "mul_mat_id"
+    ],
+    "marlin_activation": "bf16",
+    "native_activation": "fp4",
+    "devices": []
+  },
+  "integrated_cases": {
+    "auto": 10,
+    "marlin": 9,
+    "ggml": 10
+  },
+  "raw_kernel_cases": 17,
+  "blackwell_compile": "sm_120a passed; no execution hardware available",
+  "date": "2026-09-24",
+  "patch_sha256": "6f89cbce3e458a7aff380554049cd12a9a730ee44bdb946fc65ebad94ee66904",
+  "llama_revision": "fc343a84bbd925b37dde3219de35ea0bed50d630",
+  "build_targets": [
+    "llama-server",
+    "werk-fp4-probe",
+    "werk-marlin-smoke",
+    "werk-nvfp4-smoke"
+  ],
+  "negative_checks": [
+    "forced native on SM86 rejected",
+    "forced Marlin unsupported N96/K64 rejected"
+  ],
+  "compile_checks": [
+    "Marlin CUDA fatbin SM75 + SM86 + SM120a",
+    "GGML adapter and actual-image probe SM120a"
+  ],
+  "patch_checks": [
+    "clean git apply --check at pinned revision",
+    "git apply --reverse --check",
+    "git diff --check"
+  ],
+  "runtime_dependencies": "GGML, CUDA runtime/driver, cuBLAS and standard system libraries; no libtorch or vLLM runtime",
+  "limits": [
+    "No Blackwell hardware execution test",
+    "No full model accuracy/perplexity run",
+    "No throughput benchmark claim",
+    "Marlin repacks per operation and uses BF16 activation rounding"
+  ]
+}

@@ -4,6 +4,13 @@ use crate::capabilities::{
 };
 mod import_collection;
 pub use import_collection::ModelImportCandidate;
+mod gguf_conversion;
+pub use gguf_conversion::GgufConversionOptions;
+mod quantization;
+pub use quantization::{
+    ActivationScheme, QuantizationEvidence, QuantizationFormat, QuantizationGroup,
+    QuantizationProfile,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use candle_core::quantized::gguf_file::{self, Value as GgufValue};
@@ -2833,12 +2840,16 @@ fn detect_architecture(
 
 fn detect_gguf_architecture(path: &Path) -> Result<Option<String>> {
     let mut file = BufReader::new(fs::File::open(path)?);
-    let content = gguf_file::Content::read(&mut file)?;
-    Ok(content
-        .metadata
-        .get("general.architecture")
-        .and_then(|value| value.to_string().ok())
-        .cloned())
+    match gguf_file::Content::read(&mut file) {
+        Ok(content) => Ok(content
+            .metadata
+            .get("general.architecture")
+            .and_then(|value| value.to_string().ok())
+            .cloned()),
+        // Candle may not yet recognize a newer GGML tensor type such as NVFP4.
+        Err(_) => gguf_conversion::inspect_gguf(&path.canonicalize()?)
+            .map(|inspection| inspection.architecture),
+    }
 }
 
 fn detect_config_architecture(path: &Path) -> Result<Option<String>> {
@@ -3032,8 +3043,51 @@ fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
         manifest.metadata.precision =
             infer_precision(manifest, root_config.as_ref(), model_index.as_ref());
     }
-    if manifest.metadata.quantization.is_none() {
-        manifest.metadata.quantization = infer_quantization(manifest, root_config.as_ref());
+    let quant_sidecar = find_root_repository_file(manifest, "hf_quant_config.json")
+        .and_then(|path| read_repository_json(model_dir, manifest, &path));
+    let quant_profile = if manifest.format == ModelFormat::Gguf {
+        quantization::gguf_profile(model_dir, manifest)
+            .ok()
+            .flatten()
+            .filter(|profile| {
+                profile.has_nvfp4()
+                    || profile
+                        .groups
+                        .iter()
+                        .any(|group| group.format == QuantizationFormat::Mxfp4)
+            })
+            .or_else(|| {
+                quantization::infer_profile(None, None, &selection_sensitive_weight_paths(manifest))
+            })
+    } else {
+        quantization::infer_profile(
+            root_config.as_ref(),
+            quant_sidecar.as_ref(),
+            &selection_sensitive_weight_paths(manifest),
+        )
+    };
+    let refine_exporter_only = manifest
+        .metadata
+        .quantization
+        .as_deref()
+        .is_some_and(|name| matches!(name, "modelopt" | "compressed-tensors"))
+        && quant_profile
+            .as_ref()
+            .is_some_and(|profile| profile.format != QuantizationFormat::Other);
+    if manifest.metadata.quantization.is_none() || refine_exporter_only {
+        manifest.metadata.quantization = quant_profile
+            .filter(|profile| profile.format != QuantizationFormat::Other)
+            .map(|profile| profile.label())
+            .or_else(|| {
+                infer_quantization(
+                    manifest,
+                    if manifest.format == ModelFormat::Gguf {
+                        None
+                    } else {
+                        root_config.as_ref()
+                    },
+                )
+            });
     }
     if manifest.metadata.components.is_empty() {
         manifest.metadata.components = detect_model_components(model_dir, manifest);
@@ -4183,6 +4237,11 @@ fn infer_inference_tasks(
         ],
     ) || (!audio && hint.contains("vlm"))
         || root_config.is_some_and(|config| config.get("vision_config").is_some())
+        || (manifest.format == ModelFormat::Gguf
+            && manifest
+                .files
+                .iter()
+                .any(|file| is_gguf_projector_path(&file.path)))
     {
         push_unique(&mut tasks, InferenceTask::TextGeneration);
         push_unique(&mut tasks, InferenceTask::ImageUnderstanding);
@@ -4393,7 +4452,16 @@ fn infer_quantization_from_paths_and_json(
     paths: &[String],
     config: Option<&Value>,
 ) -> Option<String> {
-    if let Some(quantization) = config.and_then(|config| config.get("quantization_config")) {
+    if let Some(profile) = quantization::infer_profile(config, None, paths)
+        && profile.format != QuantizationFormat::Other
+    {
+        return Some(profile.label());
+    }
+    if let Some(quantization) = config.and_then(|config| {
+        config
+            .get("quantization_config")
+            .or_else(|| config.pointer("/text_config/quantization_config"))
+    }) {
         let method = quantization
             .get("quant_method")
             .or_else(|| quantization.get("quantization_method"))

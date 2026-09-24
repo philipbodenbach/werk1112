@@ -1225,8 +1225,41 @@ impl LlamaKvCacheType {
     }
 }
 
+/// NVFP4 execution policy. Auto prefers native Blackwell, then Marlin, then GGML.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Fp4Kernel {
+    #[default]
+    Auto,
+    Native,
+    Marlin,
+    Ggml,
+}
+
+impl Fp4Kernel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Native => "native",
+            Self::Marlin => "marlin",
+            Self::Ggml => "ggml",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LlamaRuntimeOptions {
+    pub fp4_kernel: Option<Fp4Kernel>,
     pub ctx_size: Option<usize>,
     pub batch_size: Option<usize>,
     pub ubatch_size: Option<u32>,

@@ -274,6 +274,26 @@ fn plan_runtime_from_candidates(
     available_runtimes: &[RuntimeAvailability],
     candidate_ids: &[RuntimeId],
 ) -> RuntimePlan {
+    if request_capabilities
+        .task
+        .is_none_or(|task| !is_media_task(task))
+        && let Some(reason) = nvfp4_hf_conversion_required(manifest, requested_backend)
+    {
+        return plan_from_decisions(
+            manifest,
+            requested_backend,
+            request_capabilities,
+            [(
+                RuntimeDecision {
+                    runtime_id: RuntimeId::LlamaServerCuda,
+                    display_name: runtime_descriptor(RuntimeId::LlamaServerCuda).display_name,
+                    status: RuntimeDecisionStatus::Rejected,
+                    reason,
+                },
+                false,
+            )],
+        );
+    }
     let availability = availability_map(available_runtimes);
     let decisions = candidate_ids.iter().copied().map(|runtime_id| {
         (
@@ -390,10 +410,44 @@ pub fn runtime_candidate_ids_for_task(
     typed_runtime_candidate_ids(manifest, requested_backend, task)
 }
 
+/// Raw NVFP4 HF tensors need an explicit, format-preserving GGUF conversion
+/// before the native llama.cpp route can load them. Never install vLLM as an
+/// implicit substitute; an explicit vLLM selection remains available.
+pub fn nvfp4_hf_conversion_required(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+) -> Option<String> {
+    let chat_model = manifest.metadata.tasks.is_empty()
+        || manifest.metadata.tasks.iter().any(|task| {
+            matches!(
+                task,
+                InferenceTask::TextGeneration | InferenceTask::ImageUnderstanding
+            )
+        });
+    if requested_backend != RequestedBackend::Auto
+        || manifest.format != ModelFormat::SafeTensors
+        || !chat_model
+        || !manifest
+            .metadata
+            .quantization
+            .as_deref()
+            .is_some_and(|quantization| quantization.to_ascii_lowercase().contains("nvfp4"))
+    {
+        return None;
+    }
+    let id = manifest.id.replace('\'', "'\\''");
+    Some(format!(
+        "native NVFP4 auto routing requires a GGUF model; convert the installed HF model with werk convert '{id}' --to gguf --name <new-id>, then use the converted model; automatic vLLM fallback is disabled for NVFP4"
+    ))
+}
+
 pub fn runtime_candidate_ids(
     manifest: &ModelManifest,
     requested_backend: RequestedBackend,
 ) -> Vec<RuntimeId> {
+    if nvfp4_hf_conversion_required(manifest, requested_backend).is_some() {
+        return Vec::new();
+    }
     let mut candidates = match requested_backend {
         RequestedBackend::Auto => auto_candidates(manifest),
         RequestedBackend::Cpu => cpu_candidates(manifest),
@@ -430,6 +484,9 @@ fn runtime_candidate_ids_for_plan(
         .filter(|task| is_media_task(*task))
     {
         return typed_runtime_candidate_ids(manifest, requested_backend, task);
+    }
+    if nvfp4_hf_conversion_required(manifest, requested_backend).is_some() {
+        return Vec::new();
     }
     let mut candidates = runtime_candidate_ids(manifest, requested_backend);
     if requested_backend == RequestedBackend::Auto
@@ -891,10 +948,21 @@ fn rejection_reason(
         return Some(model_support_rejection(manifest, descriptor.runtime));
     }
     if descriptor.runtime == BackendRuntime::Candle
+        && manifest.format == ModelFormat::Gguf
+        && let Some(quantization) = manifest.metadata.quantization.as_deref()
+        && ["nvfp4", "mxfp4"]
+            .iter()
+            .any(|layout| quantization.to_ascii_lowercase().contains(layout))
+    {
+        return Some(format!(
+            "Candle does not support the GGUF tensor layout '{quantization}'; use a compatible llama.cpp runtime"
+        ));
+    }
+    if descriptor.runtime == BackendRuntime::Candle
         && manifest.format == ModelFormat::SafeTensors
         && let Some(quantization) = manifest.metadata.quantization.as_deref()
         && [
-            "awq", "gptq", "nf4", "int4", "int8", "fp8", "mxfp4", "affine",
+            "awq", "gptq", "nf4", "int4", "int8", "fp8", "mxfp4", "nvfp4", "modelopt", "affine",
         ]
         .iter()
         .any(|layout| quantization.to_ascii_lowercase().contains(layout))
@@ -1229,6 +1297,13 @@ mod tests {
             ("deepseek_v4", None, "architecture 'deepseek_v4'"),
             ("llama", Some("MXFP4/MXFP8"), "quantized safetensors layout"),
             ("qwen3", Some("gptq-4bit"), "quantized safetensors layout"),
+            ("qwen3", Some("nvfp4"), "quantized safetensors layout"),
+            ("qwen3", Some("modelopt"), "quantized safetensors layout"),
+            (
+                "qwen3",
+                Some("mixed_precision[nvfp4,fp8]"),
+                "quantized safetensors layout",
+            ),
         ] {
             let mut manifest = manifest(ModelFormat::SafeTensors, Some(architecture));
             manifest.metadata.quantization = quantization.map(str::to_owned);
@@ -1241,6 +1316,59 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains(expected));
         }
+    }
+
+    #[test]
+    fn fp4_gguf_does_not_fall_back_to_unsupported_candle_reader() {
+        for format in ["nvfp4", "mixed_precision[nvfp4,ggml_type_8]", "mxfp4"] {
+            let mut manifest = manifest(ModelFormat::Gguf, Some("llama"));
+            manifest.metadata.quantization = Some(format.into());
+            let error = select_runtime(
+                &manifest,
+                RequestedBackend::Candle,
+                RequestCapabilities::text(false),
+                &[available(RuntimeId::CandleCpu)],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("GGUF tensor layout"), "{error}");
+        }
+    }
+
+    #[test]
+    fn nvfp4_hf_auto_requires_native_conversion_without_vllm_fallback() {
+        for quantization in ["nvfp4", "mixed_precision[nvfp4,fp8]"] {
+            let mut manifest = manifest(ModelFormat::SafeTensors, Some("qwen3"));
+            manifest.metadata.quantization = Some(quantization.into());
+            assert!(runtime_candidate_ids(&manifest, RequestedBackend::Auto).is_empty());
+            let error = select_runtime(
+                &manifest,
+                RequestedBackend::Auto,
+                RequestCapabilities::text(true),
+                &[
+                    available(RuntimeId::VllmCuda),
+                    available(RuntimeId::VllmRocm),
+                    available(RuntimeId::CandleCpu),
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("werk convert"), "{error}");
+            assert!(error.contains("--to gguf"), "{error}");
+            let explicit = select_runtime(
+                &manifest,
+                RequestedBackend::Vllm,
+                RequestCapabilities::text(true),
+                &[available(RuntimeId::VllmCuda)],
+            )
+            .unwrap();
+            assert_eq!(explicit.runtime_id, RuntimeId::VllmCuda);
+            manifest.format = ModelFormat::Gguf;
+            assert!(nvfp4_hf_conversion_required(&manifest, RequestedBackend::Auto).is_none());
+        }
+        let mut media = media_manifest(InferenceTask::ImageGeneration);
+        media.metadata.quantization = Some("nvfp4".into());
+        assert!(nvfp4_hf_conversion_required(&media, RequestedBackend::Auto).is_none());
     }
 
     fn deepseek_fixture() -> ModelManifest {
