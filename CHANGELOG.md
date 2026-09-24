@@ -5,6 +5,16 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Expose function tool calling across every implemented chat and vision adapter:
+  native llama.cpp transport, existing vLLM, native/generic oMLX, and a shared
+  validated tool protocol for Candle, Burn, ONNX, MLX/MLX-VLM, Transformers and
+  legacy llama adapters. Preserve tool history, image inputs and structured
+  streaming; tool capability no longer depends on a predicted model skill.
+- Add authenticated `/v1/tools` function schemas and `/v1/tools/call` dispatch
+  for every inference task, including image/video/audio/music jobs, results,
+  cancellation and chat/vision. Media calls reuse existing runtime selection,
+  validation and output storage. Chat never auto-executes selected tools.
+
 - Add `werk top`: a responsive Ratatui dashboard in the Werk logo palette with
   animated status, bounded live charts, request selection and detail view.
   Add authenticated `/werk/v1/observability` and Prometheus `/metrics`, shared

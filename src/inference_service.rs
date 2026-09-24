@@ -10,6 +10,7 @@ mod jobs;
 mod output;
 mod resources;
 mod service;
+mod tools;
 mod types;
 
 pub use backend::{BackendExecution, BackendOutput, BackendProbe, MediaInferenceBackend};
@@ -18,6 +19,7 @@ pub use jobs::{JobManager, JobRecord, JobStatus, JobStore};
 pub use output::OutputStore;
 pub use resources::detect_host_resources;
 pub use service::InferenceService;
+pub use tools::{tool_definition, tool_definitions, tool_inference_request};
 pub use types::{
     InferenceResult, InferenceTimings, OutputMetadata, RuntimeAttemptOutcome, RuntimeAttemptTiming,
 };

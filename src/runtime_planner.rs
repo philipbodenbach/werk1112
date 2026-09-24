@@ -834,7 +834,7 @@ fn rejection_reason(
             "runtime does not match the explicit {requested_backend:?} backend/device binding"
         ));
     }
-    if request_capabilities.tool_calling && !descriptor.supports_native_tool_calling() {
+    if request_capabilities.tool_calling && !descriptor.supports_tool_calling() {
         return Some("runtime does not support OpenAI tool calling".to_string());
     }
     if let Some(task) = request_capabilities.task {
@@ -1193,24 +1193,21 @@ mod tests {
     }
 
     #[test]
-    fn restricted_candidates_do_not_escape_device_or_tool_calling_requirements() {
+    fn tool_calling_preserves_restricted_candidates_and_device_requirements() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
         let available = [
             available(RuntimeId::CandleCpu),
             available(RuntimeId::CandleCuda),
         ];
-        let error = select_runtime_from_candidates(
+        let selected = select_runtime_from_candidates(
             &manifest,
             RequestedBackend::Cuda,
             RequestCapabilities::text(true).with_tool_calling(true),
             &available,
             &[RuntimeId::CandleCuda],
         )
-        .unwrap_err();
-        assert_eq!(error.decisions.len(), 1);
-        assert_eq!(error.decisions[0].runtime_id, RuntimeId::CandleCuda);
-        assert!(error.to_string().contains("tool calling"));
-        assert!(!error.to_string().contains("Candle CPU"));
+        .unwrap();
+        assert_eq!(selected.runtime_id, RuntimeId::CandleCuda);
         let error = select_runtime_from_candidates(
             &manifest,
             RequestedBackend::Cuda,
@@ -1402,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn omlx_respects_devices_formats_modalities_and_model_tool_probe() {
+    fn omlx_respects_devices_formats_modalities_and_runtime_availability() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("llama"));
         for requested in [
             RequestedBackend::Cpu,
@@ -1436,11 +1433,11 @@ mod tests {
             &[RuntimeAvailability {
                 runtime_id: RuntimeId::Omlx,
                 available: false,
-                reason: Some("installed oMLX has no verified tool parser for this model".into()),
+                reason: Some("installed oMLX cannot load this model".into()),
             }],
         )
         .unwrap_err();
-        assert!(error.to_string().contains("verified tool parser"));
+        assert!(error.to_string().contains("cannot load this model"));
         for request in [
             RequestCapabilities::text_with_images(true, true),
             RequestCapabilities::for_task(InferenceTask::TextEmbedding),
@@ -1557,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_calling_capability_never_falls_back_from_vllm() {
+    fn tool_calling_can_fall_back_to_generic_adapter_within_device_binding() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
         let tool_request = RequestCapabilities::text(true).with_tool_calling(true);
         let unavailable_vllm = [
@@ -1579,13 +1576,7 @@ mod tests {
             tool_request,
             &unavailable_vllm,
         );
-        assert!(rejected.selected.is_none());
-        assert!(rejected.candidates.iter().any(|decision| {
-            decision.runtime_id == RuntimeId::CandleCuda
-                && decision
-                    .reason
-                    .contains("does not support OpenAI tool calling")
-        }));
+        assert_eq!(rejected.selected.unwrap().runtime_id, RuntimeId::CandleCuda);
 
         let available_vllm = [
             RuntimeAvailability {

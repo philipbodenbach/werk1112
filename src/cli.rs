@@ -10312,9 +10312,6 @@ fn routed_backend_for_request_with_tools(
             if !backend_available_for_store(store, backend, manifest, selection_options) {
                 bail!("{}", unavailable_backend_message(store, backend, manifest));
             }
-            if tool_calling {
-                bail!("runtime does not support OpenAI tool calling");
-            }
             Ok(RoutedBackend {
                 choice: backend,
                 selection: None,
@@ -10517,19 +10514,9 @@ fn runtime_unavailability_reason(
 fn omlx_unavailability_reason(
     backend: &OmlxBackend,
     manifest: &ModelManifest,
-    capabilities: RequestCapabilities,
+    _capabilities: RequestCapabilities,
 ) -> Option<String> {
-    let probe = if capabilities.tool_calling {
-        backend.probe_tool_calling(manifest).and_then(|supported| {
-            if supported {
-                Ok(())
-            } else {
-                bail!("oMLX has no verified native tool parser for this model")
-            }
-        })
-    } else {
-        backend.probe_model(manifest)
-    };
+    let probe = backend.probe_model(manifest);
     probe
         .err()
         .map(|error| compact_reason(&format!("{error:#}")))
@@ -14415,9 +14402,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_candle_binding_rejects_required_tool_calling() {
+    fn explicit_candle_binding_accepts_tool_calling() {
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
-        let error = selected_backend_for_request_with_tools(
+        let selected = selected_backend_for_request_with_tools(
             &test_store("candle-required-tools"),
             BackendChoice::Candle(CandleDeviceMode::Cpu),
             &manifest,
@@ -14425,8 +14412,11 @@ mod tests {
             true,
             SelectionOptions::default(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("tool calling"), "{error}");
+        .unwrap();
+        assert!(matches!(
+            selected,
+            BackendChoice::Candle(CandleDeviceMode::Cpu)
+        ));
     }
 
     #[test]

@@ -10,15 +10,14 @@ fn text_worker_helpers_bootstrap_without_model_directory_imports() {
         Some("glm5_next"),
     ] {
         let source = "import json\nprint(json.dumps({name: name in sys.modules for name in ('_werk_omlx_decode', '_werk_omlx_glm_profile')}))\n";
-        let output = Command::new(&python)
-            .args([
-                "-I",
-                "-c",
-                &text_worker_script_source(source, architecture),
-                "/unused",
-            ])
-            .output()
-            .unwrap();
+        let mut command = Command::new(&python);
+        command.arg("-I");
+        let _script = attach_python_script(
+            &mut command,
+            &text_worker_script_source(source, architecture),
+        )
+        .unwrap();
+        let output = command.arg("/unused").output().unwrap();
         assert!(
             output.status.success(),
             "{}",
@@ -197,7 +196,6 @@ impl Fixture {
                 detail: "fixture".into(),
                 version: "test-0.6.4".into(),
                 tools: true,
-                tool_calling_detail: None,
                 runtime: json!({}),
                 cache_paths: vec![],
             },
@@ -729,7 +727,6 @@ fn fixture_backend(fixture: &Fixture) -> OmlxBackend {
             detail: "fixture".into(),
             version: "test-0.6.4".into(),
             tools: true,
-            tool_calling_detail: None,
             runtime: json!({"fixture":true}),
             cache_paths: vec![],
         }),
@@ -1398,7 +1395,6 @@ fn persistent_cache_namespace_survives_restart_but_separates_model_and_runtime_s
         detail: "fixture".into(),
         version: "0.6.4".into(),
         tools: false,
-        tool_calling_detail: None,
         runtime: json!({"omlx_version":"0.6.4","mlx_version":"0.32.2"}),
         cache_paths: vec![],
     };
@@ -1651,43 +1647,218 @@ fn closing_parent_lifetime_pipe_stops_child_without_dropping_owner() {
     assert!(!base.exists());
 }
 
+fn generic_tool_request() -> GenerateRequest {
+    let mut req = request();
+    req.tool_config = Some(super::super::ToolCallingConfig {
+        tools: Some(
+            serde_json::from_value(json!([{"type":"function","function":{
+                "name":"lookup","parameters":{"type":"object","properties":{"a":{"type":"integer"}}}
+            }}]))
+            .unwrap(),
+        ),
+        tool_choice: Some(serde_json::from_value(json!("required")).unwrap()),
+        parallel_tool_calls: Some(false),
+    });
+    req
+}
+
+#[tokio::test]
+async fn generic_tools_cover_missing_native_parser_options_sessions_and_token_counting() {
+    use tokio_stream::StreamExt;
+    let fixture = Fixture::new(
+        json!({"response":{"choices":[{"index":0,"message":{"role":"assistant","content":
+        "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"a\":1}}</tool_call>"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":10,"completion_tokens":7}}}),
+    );
+    let mut backend = fixture_backend(&fixture);
+    backend.test_probe.as_mut().unwrap().tools = false;
+    let manifest = fixture_model_for_backend(&fixture);
+    let model_dir = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let request = generic_tool_request();
+    assert!(backend.supports_tool_calling(&manifest, false));
+    assert_eq!(
+        backend.count_tokens(&manifest, request.clone()).unwrap(),
+        37
+    );
+    let response = backend.generate(&manifest, request.clone()).unwrap();
+    assert_eq!(response.finish_reason, "tool_calls");
+    assert_eq!(
+        response.assistant_message.unwrap().tool_calls.unwrap()[0]
+            .function
+            .name,
+        "lookup"
+    );
+    let count_body: Value =
+        serde_json::from_slice(&fs::read(model_dir.join("tokenize.json")).unwrap()).unwrap();
+    let chat_body: Value =
+        serde_json::from_slice(&fs::read(model_dir.join("request.json")).unwrap()).unwrap();
+    assert_eq!(count_body["messages"], chat_body["messages"]);
+    assert!(chat_body.get("tools").is_none());
+    assert!(
+        chat_body["messages"]
+            .to_string()
+            .contains("werk-tool-call-v1")
+    );
+    let session = backend
+        .start_chat_session(&manifest, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.generate(request.clone()).unwrap().finish_reason,
+        "tool_calls"
+    );
+    for mut stream in [
+        backend.generate_stream(manifest, request.clone()),
+        session.generate_stream(request),
+    ] {
+        let mut calls = 0;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                GenerateStreamEvent::ToolCallDelta(delta) => calls += delta.len(),
+                GenerateStreamEvent::Done { finish_reason, .. } => {
+                    assert_eq!(finish_reason, "tool_calls")
+                }
+                other => panic!("unexpected fallback event: {other:?}"),
+            }
+        }
+        assert_eq!(calls, 1);
+    }
+}
+
 #[test]
-fn unsupported_tool_options_fail_before_any_worker_or_chat_starts() {
+fn generic_tools_preserve_extended_options_and_native_auto_requests() {
+    let fixture = Fixture::new(
+        json!({"response":{"choices":[{"index":0,"message":{"role":"assistant","content":
+        "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"a\":1}}</tool_call>"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":10,"completion_tokens":7}}}),
+    );
+    let backend = fixture_backend(&fixture);
+    let manifest = fixture_model_for_backend(&fixture);
+    let model_dir = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let mut options = std::collections::BTreeMap::new();
+    options.insert("top_k".into(), json!(8));
+    let value = backend
+        .generate_api(&manifest, generic_tool_request(), options, None)
+        .unwrap();
+    assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+    assert_eq!(value["usage"]["prompt_tokens"], 10);
+    let body: Value =
+        serde_json::from_slice(&fs::read(model_dir.join("request.json")).unwrap()).unwrap();
+    assert_eq!(body["top_k"], 8);
+    assert!(body.get("tools").is_none());
+    let mut native = generic_tool_request();
+    native.tool_config.as_mut().unwrap().tool_choice = None;
+    native.tool_config.as_mut().unwrap().parallel_tool_calls = None;
+    let (prepared, policy) = backend.prepare_tool_request(&manifest, native).unwrap();
+    assert!(policy.is_none());
+    assert!(prepared.tool_config.is_some());
+    backend.count_tokens(&manifest, prepared).unwrap();
+    let native_count: Value =
+        serde_json::from_slice(&fs::read(model_dir.join("tokenize.json")).unwrap()).unwrap();
+    assert_eq!(native_count["tools"][0]["function"]["name"], "lookup");
+
+    let (tx, mut rx) = mpsc::channel(2);
+    let returned = backend
+        .generate_api(
+            &manifest,
+            generic_tool_request(),
+            Default::default(),
+            Some(tx),
+        )
+        .unwrap();
+    assert!(returned.is_null());
+    let chunk = rx.blocking_recv().unwrap().unwrap();
+    assert_eq!(chunk["object"], "chat.completion.chunk");
+    assert!(chunk["choices"][0].get("message").is_none());
+    assert_eq!(chunk["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+    assert_eq!(
+        chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+    assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
+    assert!(rx.blocking_recv().is_none());
+}
+
+#[test]
+fn generic_tools_preserve_runtime_errors_and_reject_malformed_native_envelopes() {
+    let fixture = Fixture::new(json!({"chat_http_error":true}));
+    let backend = fixture_backend(&fixture);
+    let manifest = fixture_model_for_backend(&fixture);
+    let error = backend
+        .generate(&manifest, generic_tool_request())
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("quantization kernel failed"));
+    let (_, policy) = backend
+        .prepare_tool_request(&manifest, generic_tool_request())
+        .unwrap();
+    for mut value in [
+        json!({"choices":[null]}),
+        json!({"choices":[{"message":null}]}),
+    ] {
+        assert!(apply_generic_api_tools(&mut value, policy.as_ref().unwrap()).is_err());
+    }
+}
+
+#[test]
+fn generic_api_never_promotes_interrupted_tool_calls_including_streaming() {
+    for reason in ["length", "content_filter"] {
+        let fixture = Fixture::new(json!({"response":{"choices":[{"index":0,
+            "message":{"role":"assistant","content":
+                "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"a\":1}}</tool_call>"},
+            "finish_reason":reason}],"usage":{"prompt_tokens":10,"completion_tokens":7}}}));
+        let backend = fixture_backend(&fixture);
+        let manifest = fixture_model_for_backend(&fixture);
+        let result =
+            backend.generate_api(&manifest, generic_tool_request(), Default::default(), None);
+        assert!(
+            result.is_err(),
+            "{reason} must not become an executable tool call"
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+        let result = backend.generate_api(
+            &manifest,
+            generic_tool_request(),
+            Default::default(),
+            Some(tx),
+        );
+        assert!(
+            result.is_err(),
+            "{reason} must not become an executable streamed tool call"
+        );
+        assert!(
+            rx.blocking_recv().is_none(),
+            "no executable delta may escape validation"
+        );
+    }
+}
+
+#[test]
+fn invalid_tool_options_fail_before_any_worker_or_chat_starts() {
     let fixture = Fixture::new(json!({}));
     let backend = fixture_backend(&fixture);
-    for config in [
-        json!({"tool_choice":"required"}),
-        json!({"tool_choice":{"type":"function","function":{"name":"lookup"}}}),
-        json!({"parallel_tool_calls":false}),
-        json!({"parallel_tool_calls":true}),
-        json!({"tools":[{"type":"function","function":{"name":"lookup","strict":true}}]}),
-    ] {
-        let mut req = request();
-        req.tool_config = Some(super::super::ToolCallingConfig {
-            tools: config
-                .get("tools")
-                .map(|value| serde_json::from_value(value.clone()).unwrap()),
-            tool_choice: config
-                .get("tool_choice")
-                .map(|value| serde_json::from_value(value.clone()).unwrap()),
-            parallel_tool_calls: config.get("parallel_tool_calls").and_then(Value::as_bool),
-        });
-        assert!(
-            backend
-                .generate_inner(&fixture_manifest(), req, None)
-                .is_err()
-        );
+    let manifest = fixture_model_for_backend(&fixture);
+    for invalid in ["required-without-tools", "unknown-name", "strict"] {
+        let mut request = generic_tool_request();
+        let config = request.tool_config.as_mut().unwrap();
+        match invalid {
+            "required-without-tools" => config.tools = None,
+            "unknown-name" => {
+                config.tool_choice = Some(
+                    serde_json::from_value(
+                        json!({"type":"function","function":{"name":"missing"}}),
+                    )
+                    .unwrap(),
+                )
+            }
+            _ => config.tools.as_mut().unwrap()[0].function.strict = Some(true),
+        }
+        assert!(backend.generate(&manifest, request).is_err());
         assert!(backend.servers.lock().unwrap().is_empty());
         assert!(!fixture.model.join("chat_started").exists());
-    }
-    for choice in ["auto", "none"] {
-        let mut req = request();
-        req.tool_config = Some(super::super::ToolCallingConfig {
-            tools: None,
-            tool_choice: Some(serde_json::from_value(json!(choice)).unwrap()),
-            parallel_tool_calls: None,
-        });
-        validate_tool_options(&req).unwrap();
     }
 }
 

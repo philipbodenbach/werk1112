@@ -701,15 +701,8 @@ fn dynamic_tools(models: &[Value]) -> Vec<Value> {
     tasks.dedup();
     tasks
         .into_iter()
-        .map(|task| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": task.replace('-', "_"),
-                    "description": format!("Run Werk task {task} using an available local model")
-                }
-            })
-        })
+        .filter_map(|task| task.parse::<InferenceTask>().ok())
+        .map(super::tools::tool_definition)
         .collect()
 }
 

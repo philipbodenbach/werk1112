@@ -159,6 +159,11 @@ pub(super) async fn prepare(
         });
     let removed_messages = if let Some(context_size) = context_size {
         match match context_policy {
+            ContextPolicy::Trim if request.requires_tool_calling() => {
+                // Tool schemas and assistant/result pairs are indivisible. Do
+                // not silently trim half a tool cycle or ignore schema tokens.
+                check_context(&request, context_size).map(|()| 0)
+            }
             ContextPolicy::Trim => {
                 trim_messages_to_context(&mut request.messages, context_size, max_tokens)
             }
@@ -233,7 +238,7 @@ pub(super) async fn prepare(
     {
         return Err(GenerationError::with_code(
             StatusCode::BAD_REQUEST,
-            "the configured backend does not support OpenAI tool calling; use --backend vllm or --backend omlx with a compatible model and native tool parser"
+            "the configured adapter does not provide chat tool transport for this request"
                 .to_string(),
             Some(tool_calling_parameter(&request).to_string()),
             Some("unsupported_tool_calling".to_string()),
@@ -368,11 +373,20 @@ fn check_context(request: &ChatCompletionRequest, context_size: usize) -> Result
         .transpose()
         .map_err(|e| e.to_string())?
         .map_or(0, |v| v.len());
+    // Admission uses a conservative allowance for the shared tool contract.
+    // Native templates have their own formatting overhead; exact counts remain
+    // the runtime tokenizer's responsibility.
+    let tool_overhead = if request.requires_tool_calling() {
+        crate::backend::tool_calling::generic_prompt_overhead_tokens(request.tool_choice.as_ref())
+    } else {
+        0
+    };
     let estimate = history
         .saturating_add(tools)
         .div_ceil(3)
         .saturating_add(16usize.saturating_mul(request.messages.len()))
         .saturating_add(request.max_completion_tokens())
+        .saturating_add(tool_overhead)
         .saturating_add(64);
     if estimate > context_size {
         return Err(format!(

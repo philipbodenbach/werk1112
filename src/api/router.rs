@@ -104,6 +104,11 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
             post(audio_translations_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
         )
         .route("/v1/capabilities", get(capabilities_handler))
+        .route("/v1/tools", get(super::tools::list))
+        .route(
+            "/v1/tools/call",
+            post(super::tools::call).layer(DefaultBodyLimit::max(body_limit_bytes)),
+        )
         .route("/v1/parameters", get(parameters_handler))
         .route("/v1/outputs/{id}", get(output_handler))
         .route(

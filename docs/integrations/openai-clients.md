@@ -63,13 +63,14 @@ optional <code>detail</code> hint. See
 example, the supported backend matrix and visual-inspection guidance.
 
 OpenAI function tools, named or string `tool_choice`, parallel-tool preference,
-assistant `tool_calls` and `tool` result messages are supported when the
-selected chat adapter is vLLM. This includes indexed partial tool-call deltas
-in streaming responses. Werk forwards these values but does not execute tools
-or configure vLLM's model-specific tool parser. Other adapters reject a
-tool-requiring request with HTTP 400 and code `unsupported_tool_calling`; they
-do not silently discard it. See the [chat request contract](../api.md#post-v1chatcompletions)
-for a complete curl request and continuation shape.
+assistant `tool_calls` and `tool` result messages are supported across chat and
+vision adapters. Native transports stream indexed tool-call deltas; the generic
+protocol buffers tool-enabled output for validation before emitting structured
+calls. A model still needs to follow the selected protocol. Generic strict
+schema decoding is not available. Chat never executes tools automatically;
+clients can explicitly invoke Werk's image/video/audio/music functions through
+`/v1/tools/call`. See [Tool calling](../tool-calling.md) and the
+[chat request contract](../api.md#post-v1chatcompletions).
 
 Documents and stored `file_id` references are expanded by a shared layer for
 every text backend, including CUDA. See [Documents and files](documents.md)

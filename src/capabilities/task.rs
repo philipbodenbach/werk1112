@@ -130,6 +130,46 @@ impl InferenceTask {
         }
     }
 
+    pub const fn accepts_prompt(self) -> bool {
+        !matches!(
+            self,
+            Self::SpeechToText
+                | Self::SpeechTranslation
+                | Self::AudioEventDetection
+                | Self::VoiceActivityDetection
+                | Self::SpeakerIdentification
+                | Self::LanguageIdentification
+                | Self::SpeechEmotionRecognition
+                | Self::SpeakerDiarization
+                | Self::AudioClassification
+                | Self::AudioEmbedding
+                | Self::AudioEnhancement
+        )
+    }
+
+    pub const fn accepts_negative_prompt(self) -> bool {
+        !matches!(
+            self,
+            Self::TextToSpeech
+                | Self::SpeechToText
+                | Self::SpeechTranslation
+                | Self::AudioEventDetection
+                | Self::VoiceActivityDetection
+                | Self::SpeakerIdentification
+                | Self::LanguageIdentification
+                | Self::SpeechEmotionRecognition
+                | Self::AudioCaptioning
+                | Self::SpeakerDiarization
+                | Self::AudioClassification
+                | Self::AudioUnderstanding
+                | Self::AudioEmbedding
+                | Self::VoiceConversion
+                | Self::StemSeparation
+                | Self::AudioEnhancement
+                | Self::AudioEditing
+        )
+    }
+
     pub const fn requires_prompt(self) -> bool {
         matches!(
             self,

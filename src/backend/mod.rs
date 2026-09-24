@@ -10,6 +10,7 @@ mod omlx;
 mod onnxruntime;
 mod openai_transport;
 mod qwen_tts;
+pub(crate) mod tool_calling;
 mod vllm;
 pub(crate) mod werk_server_client;
 
@@ -214,10 +215,18 @@ pub struct RuntimeDescriptor {
 }
 
 impl RuntimeDescriptor {
-    /// Native OpenAI tool transport; each backend still validates the concrete
-    /// model and configured parser before a tool request is executable.
+    /// Native structured transport, independent of a model's ability to choose tools.
     pub fn supports_native_tool_calling(&self) -> bool {
-        matches!(self.runtime, BackendRuntime::Vllm | BackendRuntime::Omlx)
+        matches!(
+            self.runtime,
+            BackendRuntime::LlamaServer | BackendRuntime::Vllm | BackendRuntime::Omlx
+        )
+    }
+
+    /// Chat and vision adapters expose native or generic structured tool calls.
+    /// Media-only runtimes are invoked through the media function-tool API.
+    pub fn supports_tool_calling(&self) -> bool {
+        self.capabilities.text_generation || self.capabilities.vision_language
     }
 
     pub fn supports_task(&self, task: InferenceTask) -> bool {
@@ -1393,6 +1402,21 @@ pub trait GenerationBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_chat_and_vision_runtimes_expose_tool_transport() {
+        for descriptor in RUNTIME_REGISTRY {
+            if descriptor.capabilities.text_generation || descriptor.capabilities.vision_language {
+                assert!(
+                    descriptor.supports_tool_calling(),
+                    "{}",
+                    descriptor.display_name
+                );
+            }
+        }
+        assert!(runtime_descriptor(RuntimeId::LlamaServerCuda).supports_native_tool_calling());
+        assert!(runtime_descriptor(RuntimeId::MlxVlm).supports_tool_calling());
+    }
 
     #[test]
     fn omlx_requires_model_probe_and_has_no_install_target_or_vision_claim() {

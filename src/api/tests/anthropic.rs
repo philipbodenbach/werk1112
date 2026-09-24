@@ -506,7 +506,7 @@ async fn error_envelopes_cover_auth_version_json_size_missing_model_and_capabili
         response_json(response).await["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("does not support")
+            .contains("the configured adapter does not provide chat tool transport")
     );
 }
 

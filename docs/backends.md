@@ -174,8 +174,7 @@ werk video generate VIDEO_MODEL \
 ## Optional local oMLX backend
 
 On Apple Silicon, `auto` considers an installed oMLX after MLX-LM for compatible
-MLX and Hugging Face safetensors text models. Requests without tool requirements
-stay on MLX-LM when its loader supports the model. If its actual loader cannot
+MLX and Hugging Face safetensors text models. Requests stay on MLX-LM when its loader supports the model. If its actual loader cannot
 accept a model but oMLX's loader can, Werk
 selects oMLX and reports the MLX-LM rejection and compatible fallback on stderr.
 `--backend omlx` binds execution to oMLX; `--backend mlx` retains its existing
@@ -229,16 +228,18 @@ and runtime processes are reused while their backend lives and stopped when
 Werk releases them. A parent-lifetime pipe also stops the worker if Werk exits
 without normal cleanup. Failed startup and load attempts retain their diagnostics.
 
-Text, chat, streaming and native tool calls use `/v1/chat/completions`. Tool
-requests require a verified model parser. Verified paths include DeepSeek V4's
+Text, chat, streaming and native tool calls use `/v1/chat/completions`. Native
+parsing uses a compatible installed parser; other tool requests use Werk's
+generic tool protocol instead of being rejected by model capability checks. Verified paths include DeepSeek V4's
 native DSML parser/template and Qwen `qwen4_exp` text offload with the installed
 `qwen3_coder` XML parser, plus GLM `glm5_next` with the installed `glm47`
 `<arg_key>`/`<arg_value>` parser. Both text adapters check the actual local
 template, tokenizer-loader wiring and typed argument parser without loading
 model weights. Explicit incompatible parser/template overrides remain rejected. The verified oMLX API supports
-omitted, `auto` and `none` tool choice; required/named choices, explicit
-`parallel_tool_calls` (either value) and function definitions with `strict: true`
-are rejected because their constraints are not enforced by that upstream API.
+omitted, `auto` and `none` tool choice. Required/named choices and explicit
+`parallel_tool_calls` use the generic protocol, which validates returned calls.
+Function definitions with `strict: true` remain unsupported because neither
+this upstream API nor the generic protocol guarantees constrained schema decoding.
 Omit `strict` or set it to `false`. Image, embedding and media requests are
 outside this adapter's scope. Separate upstream reasoning fields are not
 rendered as answer text; empty reasoning-only results are errors. Errors after
@@ -414,7 +415,7 @@ required. See the [Qwen/DeepSeek comparison](benchmarks/2026-09-12-flash-offload
 for measurements at an unchanged 20-GiB expert budget.
 They do not enable MTP. See the [GLM decode measurements and design](glm-decode-optimization.md).
 
-GLM tool calls require the verified native `glm47` parser described above.
+Native GLM tool parsing uses the verified `glm47` parser described above.
 The text adapter does not enable vision or MTP.
 
 For the verified Qwen/GLM text adapters, automatic expert selection first checks
@@ -600,13 +601,17 @@ tool-result messages to vLLM without translating their contents. It likewise
 preserves structured tool calls in normal and streaming responses. Werk does
 not execute tools or select a vLLM tool parser for the operator.
 
-The optional oMLX adapter also supports verified native tool configurations as
-described above. Adapters without tool support explicitly reject a request
-that requires it with HTTP 400 and error code `unsupported_tool_calling`. Automatic
-routing treats tool calling as a required backend capability and cannot send
-such a request to an incompatible runtime. An explicit `--backend vllm` route
-is strict and never falls back to a non-vLLM backend. Merely setting
+All implemented chat/vision adapters now expose tool calling. Native llama.cpp
+and vLLM transports preserve the request and response fields. oMLX selects
+native parsing or the generic protocol according to runtime support. Other
+adapters use Werk's generic protocol with validation of generated function
+calls. Automatic routing can therefore choose any compatible adapter, while
+an explicit `--backend vllm` binding still remains strict. Merely setting
 `WERK_VLLM_ARGS` does not activate or prefer vLLM.
+
+Pure media runtimes are exposed as executable function tools using the same
+inference planner and job service. See [Tool calling](tool-calling.md) for the
+backend matrix, generic protocol limits and media tool execution API.
 
 These guarantees cover Werk's argv construction and HTTP transport. Actual
 tool-call quality, model support, vLLM-version compatibility, quantization,

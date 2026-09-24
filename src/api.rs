@@ -16,6 +16,7 @@ mod observability;
 mod response;
 mod router;
 mod state;
+mod tools;
 mod werk;
 
 #[cfg(test)]
