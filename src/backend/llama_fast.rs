@@ -70,6 +70,7 @@ mod imp {
     }
 
     struct LlamaFastChatSession {
+        manifest: ModelManifest,
         state: Arc<Mutex<LlamaFastContext>>,
     }
 
@@ -301,6 +302,10 @@ mod imp {
     }
 
     impl GenerationBackend for LlamaFastBackend {
+        fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+            compiled(self.mode)
+        }
+
         fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
             let (status, detail) = if compiled(self.mode) {
                 (
@@ -338,6 +343,7 @@ mod imp {
             let (model, _) = self.cached_model(manifest)?;
             let context = self.create_context(model, seed)?;
             Ok(Some(Box::new(LlamaFastChatSession {
+                manifest: manifest.clone(),
                 state: Arc::new(Mutex::new(context)),
             })))
         }
@@ -347,7 +353,9 @@ mod imp {
             manifest: &ModelManifest,
             request: GenerateRequest,
         ) -> Result<GenerateResponse> {
-            self.generate_inner(manifest, request, None)
+            crate::backend::tool_calling::generate(manifest, request, |request| {
+                self.generate_inner(manifest, request, None)
+            })
         }
 
         fn generate_stream(
@@ -355,35 +363,42 @@ mod imp {
             manifest: ModelManifest,
             request: GenerateRequest,
         ) -> GenerateStream {
-            let backend = self.clone();
-            let (tx, rx) = mpsc::channel(16);
-            tokio::task::spawn_blocking(move || {
-                let result = backend.generate_inner(&manifest, request, Some(tx.clone()));
-                send_stream_result(tx, result);
-            });
-            Box::pin(ReceiverStream::new(rx))
+            let tool_manifest = manifest.clone();
+            crate::backend::tool_calling::generate_stream(&tool_manifest, request, |request| {
+                let backend = self.clone();
+                let (tx, rx) = mpsc::channel(16);
+                tokio::task::spawn_blocking(move || {
+                    let result = backend.generate_inner(&manifest, request, Some(tx.clone()));
+                    send_stream_result(tx, result);
+                });
+                Box::pin(ReceiverStream::new(rx))
+            })
         }
     }
 
     impl ChatGenerationSession for LlamaFastChatSession {
         fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
-            self.state
-                .lock()
-                .map_err(|_| anyhow!("llama.cpp legacy FFI chat session mutex poisoned"))
-                .and_then(|mut state| state.generate(request, None))
+            crate::backend::tool_calling::generate(&self.manifest, request, |request| {
+                self.state
+                    .lock()
+                    .map_err(|_| anyhow!("llama.cpp legacy FFI chat session mutex poisoned"))
+                    .and_then(|mut state| state.generate(request, None))
+            })
         }
 
         fn generate_stream(&self, request: GenerateRequest) -> GenerateStream {
-            let state = self.state.clone();
-            let (tx, rx) = mpsc::channel(16);
-            tokio::task::spawn_blocking(move || {
-                let result = state
-                    .lock()
-                    .map_err(|_| anyhow!("llama.cpp legacy FFI chat session mutex poisoned"))
-                    .and_then(|mut state| state.generate(request, Some(tx.clone())));
-                send_stream_result(tx, result);
-            });
-            Box::pin(ReceiverStream::new(rx))
+            crate::backend::tool_calling::generate_stream(&self.manifest, request, |request| {
+                let state = self.state.clone();
+                let (tx, rx) = mpsc::channel(16);
+                tokio::task::spawn_blocking(move || {
+                    let result = state
+                        .lock()
+                        .map_err(|_| anyhow!("llama.cpp legacy FFI chat session mutex poisoned"))
+                        .and_then(|mut state| state.generate(request, Some(tx.clone())));
+                    send_stream_result(tx, result);
+                });
+                Box::pin(ReceiverStream::new(rx))
+            })
         }
     }
 

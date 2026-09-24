@@ -121,6 +121,10 @@ pub fn probe_device(mode: CandleDeviceMode) -> Result<String> {
 }
 
 impl GenerationBackend for CandleBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         Arc::new(
             StaticRuntimeAdapter::new(
@@ -145,44 +149,49 @@ impl GenerationBackend for CandleBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        self.generate_inner(manifest, request, None)
+        crate::backend::tool_calling::generate(manifest, request, |request| {
+            self.generate_inner(manifest, request, None)
+        })
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
-        let backend = self.clone();
-        let (tx, rx) = mpsc::channel(16);
-        let stream_granularity = request.stream_granularity;
+        let tool_manifest = manifest.clone();
+        crate::backend::tool_calling::generate_stream(&tool_manifest, request, |request| {
+            let backend = self.clone();
+            let (tx, rx) = mpsc::channel(16);
+            let stream_granularity = request.stream_granularity;
 
-        tokio::task::spawn_blocking(move || {
-            let emitter = StreamEmitter::new(tx.clone(), stream_granularity);
-            let callback_emitter = emitter.clone();
-            let result = generate_with_candle(
-                &backend,
-                &manifest,
-                request,
-                Some(Box::new(move |text| {
-                    callback_emitter.push(text);
-                })),
-            );
+            tokio::task::spawn_blocking(move || {
+                let emitter = StreamEmitter::new(tx.clone(), stream_granularity);
+                let callback_emitter = emitter.clone();
+                let result = generate_with_candle(
+                    &backend,
+                    &manifest,
+                    request,
+                    Some(Box::new(move |text| {
+                        callback_emitter.push(text);
+                    })),
+                );
 
-            match result {
-                Ok(response) => {
-                    emitter.flush();
-                    let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
-                        finish_reason: response.finish_reason,
-                        prompt_tokens: response.prompt_tokens,
-                        completion_tokens: response.completion_tokens,
-                        timings: response.timings,
-                        backend_diagnostics: response.backend_diagnostics,
-                    }));
+                match result {
+                    Ok(response) => {
+                        emitter.flush();
+                        let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
+                            finish_reason: response.finish_reason,
+                            prompt_tokens: response.prompt_tokens,
+                            completion_tokens: response.completion_tokens,
+                            timings: response.timings,
+                            backend_diagnostics: response.backend_diagnostics,
+                        }));
+                    }
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(err.to_string()));
+                    }
                 }
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(err.to_string()));
-                }
-            }
-        });
+            });
 
-        Box::pin(ReceiverStream::new(rx))
+            Box::pin(ReceiverStream::new(rx))
+        })
     }
 }
 

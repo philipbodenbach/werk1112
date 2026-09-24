@@ -579,6 +579,7 @@ impl std::ops::Deref for CachedLlamaCppModel {
 
 #[cfg(feature = "llama-cpp")]
 struct LlamaCppChatSession {
+    manifest: ModelManifest,
     state: Arc<Mutex<LlamaCppChatState>>,
 }
 
@@ -1205,29 +1206,8 @@ impl LlamaCppBackend {
         let completion = session
             .start_completing_with(sampler_for(&request), request.max_tokens)
             .map_err(|err| anyhow!("failed to start llama.cpp completion: {err}"))?;
-        let mut finish_reason = "length".to_string();
-        let mut text = String::new();
-        let mut completion_tokens = 0usize;
-
-        for chunk in completion.into_strings() {
-            completion_tokens += 1;
-            if chunk.is_empty() {
-                continue;
-            }
-            let previous_len = text.len();
-            text.push_str(&chunk);
-
-            if let Some(stop_index) = first_stop_index(&text, &request.stop) {
-                if stop_index > previous_len {
-                    send_text_chunk(&tx, text[previous_len..stop_index].to_string())?;
-                }
-                text.truncate(stop_index);
-                finish_reason = "stop".to_string();
-                break;
-            }
-
-            send_text_chunk(&tx, chunk)?;
-        }
+        let (text, completion_tokens, finish_reason) =
+            collect_llama_completion(&model, completion, request.max_tokens, &request.stop, &tx)?;
 
         let decode_seconds = decode_started.elapsed().as_secs_f64();
         Ok(GenerateResponse {
@@ -1304,29 +1284,8 @@ impl LlamaCppChatState {
             .session
             .start_completing_with(sampler_for(&request), max_predictions)
             .map_err(|err| anyhow!("failed to start llama.cpp completion: {err}"))?;
-        let mut finish_reason = "length".to_string();
-        let mut text = String::new();
-        let mut completion_tokens = 0usize;
-
-        for chunk in completion.into_strings() {
-            completion_tokens += 1;
-            if chunk.is_empty() {
-                continue;
-            }
-            let previous_len = text.len();
-            text.push_str(&chunk);
-
-            if let Some(stop_index) = first_stop_index(&text, &request.stop) {
-                if stop_index > previous_len {
-                    send_text_chunk(&tx, text[previous_len..stop_index].to_string())?;
-                }
-                text.truncate(stop_index);
-                finish_reason = "stop".to_string();
-                break;
-            }
-
-            send_text_chunk(&tx, chunk)?;
-        }
+        let (text, completion_tokens, finish_reason) =
+            collect_llama_completion(&self.model, completion, max_predictions, &request.stop, &tx)?;
 
         let decode_seconds = decode_started.elapsed().as_secs_f64();
         Ok(GenerateResponse {
@@ -1349,46 +1308,127 @@ impl LlamaCppChatState {
     }
 }
 
+#[cfg(any(feature = "llama-cpp", test))]
+#[derive(Default)]
+struct LlamaCompletionEnd {
+    tokens: std::cell::Cell<usize>,
+    eos: std::cell::Cell<bool>,
+}
+
+#[cfg(any(feature = "llama-cpp", test))]
+impl LlamaCompletionEnd {
+    fn bounded_tokens<T: PartialEq>(
+        &self,
+        tokens: impl Iterator<Item = T>,
+        eos: T,
+        limit: usize,
+    ) -> impl Iterator<Item = T> {
+        tokens.take(limit).take_while(move |token| {
+            if *token == eos {
+                self.eos.set(true);
+                false
+            } else {
+                self.tokens.set(self.tokens.get() + 1);
+                true
+            }
+        })
+    }
+
+    fn finish_reason(&self, limit: usize, matched_stop: bool) -> Result<&'static str> {
+        if matched_stop || self.eos.get() {
+            Ok("stop")
+        } else if self.tokens.get() >= limit {
+            Ok("length")
+        } else {
+            // The worker closes its channel on decode errors too.
+            bail!("llama.cpp completion ended before EOS or its token limit")
+        }
+    }
+}
+
+#[cfg(feature = "llama-cpp")]
+fn collect_llama_completion(
+    model: &LlamaModel,
+    completion: llama_cpp::CompletionHandle,
+    max_tokens: usize,
+    stop: &[String],
+    tx: &Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+) -> Result<(String, usize, String)> {
+    let end = LlamaCompletionEnd::default();
+    // llama_cpp 0.3.2 sends EOS through the token channel and checks its
+    // prediction limit after sending a token. Observe EOS before detokenizing
+    // and cap the raw iterator ourselves to avoid the extra over-budget token.
+    let tokens = end.bounded_tokens(completion, model.eos(), max_tokens);
+    let mut text = String::new();
+    let mut matched_stop = false;
+    for chunk in llama_cpp::TokensToStrings::new(tokens, model.clone()) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let previous_len = text.len();
+        text.push_str(&chunk);
+        if let Some(stop_index) = first_stop_index(&text, stop) {
+            if stop_index > previous_len {
+                send_text_chunk(tx, text[previous_len..stop_index].to_string())?;
+            }
+            text.truncate(stop_index);
+            matched_stop = true;
+            break;
+        }
+        send_text_chunk(tx, chunk)?;
+    }
+    let reason = end.finish_reason(max_tokens, matched_stop)?;
+    Ok((text, end.tokens.get(), reason.to_string()))
+}
+
 #[cfg(feature = "llama-cpp")]
 impl ChatGenerationSession for LlamaCppChatSession {
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
-        self.state
-            .lock()
-            .map_err(|_| anyhow!("llama.cpp chat session mutex poisoned"))
-            .and_then(|mut state| state.generate_inner(request, None))
+        crate::backend::tool_calling::generate(&self.manifest, request, |request| {
+            self.state
+                .lock()
+                .map_err(|_| anyhow!("llama.cpp chat session mutex poisoned"))
+                .and_then(|mut state| state.generate_inner(request, None))
+        })
     }
 
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream {
-        let state = self.state.clone();
-        let (tx, rx) = mpsc::channel(16);
+        crate::backend::tool_calling::generate_stream(&self.manifest, request, |request| {
+            let state = self.state.clone();
+            let (tx, rx) = mpsc::channel(16);
 
-        tokio::task::spawn_blocking(move || {
-            let result = state
-                .lock()
-                .map_err(|_| anyhow!("llama.cpp chat session mutex poisoned"))
-                .and_then(|mut state| state.generate_inner(request, Some(tx.clone())));
-            match result {
-                Ok(response) => {
-                    let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
-                        finish_reason: response.finish_reason,
-                        prompt_tokens: response.prompt_tokens,
-                        completion_tokens: response.completion_tokens,
-                        timings: response.timings,
-                        backend_diagnostics: response.backend_diagnostics,
-                    }));
+            tokio::task::spawn_blocking(move || {
+                let result = state
+                    .lock()
+                    .map_err(|_| anyhow!("llama.cpp chat session mutex poisoned"))
+                    .and_then(|mut state| state.generate_inner(request, Some(tx.clone())));
+                match result {
+                    Ok(response) => {
+                        let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
+                            finish_reason: response.finish_reason,
+                            prompt_tokens: response.prompt_tokens,
+                            completion_tokens: response.completion_tokens,
+                            timings: response.timings,
+                            backend_diagnostics: response.backend_diagnostics,
+                        }));
+                    }
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(format_error_chain(&err)));
+                    }
                 }
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(format_error_chain(&err)));
-                }
-            }
-        });
+            });
 
-        Box::pin(ReceiverStream::new(rx))
+            Box::pin(ReceiverStream::new(rx))
+        })
     }
 }
 
 #[cfg(feature = "llama-cpp")]
 impl GenerationBackend for LlamaCppBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        self.mode.compiled()
+    }
+
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         let (status, detail) = if self.mode.compiled() {
             (
@@ -1426,6 +1466,7 @@ impl GenerationBackend for LlamaCppBackend {
         let (model, _) = self.cached_model(manifest)?;
         let (session, params) = self.create_session(&model, seed)?;
         Ok(Some(Box::new(LlamaCppChatSession {
+            manifest: manifest.clone(),
             state: Arc::new(Mutex::new(LlamaCppChatState {
                 model,
                 session,
@@ -1439,30 +1480,35 @@ impl GenerationBackend for LlamaCppBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        self.generate_inner(manifest, request, None)
+        crate::backend::tool_calling::generate(manifest, request, |request| {
+            self.generate_inner(manifest, request, None)
+        })
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
-        let backend = self.clone();
-        let (tx, rx) = mpsc::channel(16);
-        tokio::task::spawn_blocking(move || {
-            let result = backend.generate_inner(&manifest, request, Some(tx.clone()));
-            match result {
-                Ok(response) => {
-                    let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
-                        finish_reason: response.finish_reason,
-                        prompt_tokens: response.prompt_tokens,
-                        completion_tokens: response.completion_tokens,
-                        timings: response.timings,
-                        backend_diagnostics: response.backend_diagnostics,
-                    }));
+        let tool_manifest = manifest.clone();
+        crate::backend::tool_calling::generate_stream(&tool_manifest, request, |request| {
+            let backend = self.clone();
+            let (tx, rx) = mpsc::channel(16);
+            tokio::task::spawn_blocking(move || {
+                let result = backend.generate_inner(&manifest, request, Some(tx.clone()));
+                match result {
+                    Ok(response) => {
+                        let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
+                            finish_reason: response.finish_reason,
+                            prompt_tokens: response.prompt_tokens,
+                            completion_tokens: response.completion_tokens,
+                            timings: response.timings,
+                            backend_diagnostics: response.backend_diagnostics,
+                        }));
+                    }
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(format_error_chain(&err)));
+                    }
                 }
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(format_error_chain(&err)));
-                }
-            }
-        });
-        Box::pin(ReceiverStream::new(rx))
+            });
+            Box::pin(ReceiverStream::new(rx))
+        })
     }
 }
 
@@ -2049,6 +2095,10 @@ fn link_or_copy_file(source: &Path, target: &Path) -> Result<()> {
 }
 
 impl GenerationBackend for TransformersCompatBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
     fn runtime_control_adapter(&self) -> std::sync::Arc<dyn BackendRuntimeAdapter> {
         let capacity = transformers_model_cache_capacity();
         let (status, detail) = if capacity == 0 {
@@ -2097,35 +2147,45 @@ impl GenerationBackend for TransformersCompatBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        self.generate_inner(manifest, request)
+        crate::backend::tool_calling::generate(manifest, request, |request| {
+            self.generate_inner(manifest, request)
+        })
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
-        let backend = self.clone();
-        let (tx, rx) = mpsc::channel(16);
-        tokio::task::spawn_blocking(move || match backend.generate_inner(&manifest, request) {
-            Ok(response) => {
-                if !response.text.is_empty() {
-                    let _ =
-                        tx.blocking_send(Ok(GenerateStreamEvent::TextChunk(response.text.clone())));
+        let tool_manifest = manifest.clone();
+        crate::backend::tool_calling::generate_stream(&tool_manifest, request, |request| {
+            let backend = self.clone();
+            let (tx, rx) = mpsc::channel(16);
+            tokio::task::spawn_blocking(move || match backend.generate_inner(&manifest, request) {
+                Ok(response) => {
+                    if !response.text.is_empty() {
+                        let _ = tx.blocking_send(Ok(GenerateStreamEvent::TextChunk(
+                            response.text.clone(),
+                        )));
+                    }
+                    let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
+                        finish_reason: response.finish_reason,
+                        prompt_tokens: response.prompt_tokens,
+                        completion_tokens: response.completion_tokens,
+                        timings: response.timings,
+                        backend_diagnostics: response.backend_diagnostics,
+                    }));
                 }
-                let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
-                    finish_reason: response.finish_reason,
-                    prompt_tokens: response.prompt_tokens,
-                    completion_tokens: response.completion_tokens,
-                    timings: response.timings,
-                    backend_diagnostics: response.backend_diagnostics,
-                }));
-            }
-            Err(err) => {
-                let _ = tx.blocking_send(Err(format_error_chain(&err)));
-            }
-        });
-        Box::pin(ReceiverStream::new(rx))
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(format_error_chain(&err)));
+                }
+            });
+            Box::pin(ReceiverStream::new(rx))
+        })
     }
 }
 
 impl GenerationBackend for MlxBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
     fn runtime_control_adapter(&self) -> std::sync::Arc<dyn BackendRuntimeAdapter> {
         std::sync::Arc::new(
             StaticRuntimeAdapter::new("mlx")
@@ -2151,53 +2211,62 @@ impl GenerationBackend for MlxBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        self.probe_model(manifest)?;
-        let mut command = self.command_for(manifest, &request)?;
-        let program = command.get_program().to_string_lossy().to_string();
-        let started = Instant::now();
-        let output = command
-            .output()
-            .with_context(|| format!("failed to execute {program}"))?;
-        if !output.status.success() {
-            bail!(
-                "mlx generation failed: {}",
-                mlx_output_failure_detail(&output)
-            );
-        }
-        let raw_text = String::from_utf8_lossy(&output.stdout).to_string();
-        let cleaned = clean_mlx_generate_output(&raw_text);
-        if cleaned.saw_think_block && cleaned.text.is_empty() {
-            bail!(
-                "mlx generation ended after hidden reasoning without producing assistant text; retry with a larger --max-tokens value"
-            );
-        }
-        let mut text = cleaned.text;
-        let finish_reason =
-            mlx_finish_reason(&raw_text, request.max_tokens, &mut text, &request.stop);
-        let elapsed = started.elapsed().as_secs_f64();
-        Ok(external_response(
-            request.prompt.as_str(),
-            text.trim().to_string(),
-            finish_reason,
-            elapsed,
-            mlx_generate_stats(&raw_text),
-        ))
+        crate::backend::tool_calling::generate(manifest, request, |request| {
+            self.probe_model(manifest)?;
+            let mut command = self.command_for(manifest, &request)?;
+            let program = command.get_program().to_string_lossy().to_string();
+            let started = Instant::now();
+            let output = command
+                .output()
+                .with_context(|| format!("failed to execute {program}"))?;
+            if !output.status.success() {
+                bail!(
+                    "mlx generation failed: {}",
+                    mlx_output_failure_detail(&output)
+                );
+            }
+            let raw_text = String::from_utf8_lossy(&output.stdout).to_string();
+            let cleaned = clean_mlx_generate_output(&raw_text);
+            if cleaned.saw_think_block && cleaned.text.is_empty() {
+                bail!(
+                    "mlx generation ended after hidden reasoning without producing assistant text; retry with a larger --max-tokens value"
+                );
+            }
+            let mut text = cleaned.text;
+            let finish_reason =
+                mlx_finish_reason(&raw_text, request.max_tokens, &mut text, &request.stop);
+            let elapsed = started.elapsed().as_secs_f64();
+            Ok(external_response(
+                request.prompt.as_str(),
+                text.trim().to_string(),
+                finish_reason,
+                elapsed,
+                mlx_generate_stats(&raw_text),
+            ))
+        })
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
-        let backend = self.clone();
-        let (tx, rx) = mpsc::channel(16);
-        tokio::task::spawn_blocking(move || {
-            let result = backend.generate_streaming_subprocess(&manifest, request, tx.clone());
-            if let Err(err) = result {
-                let _ = tx.blocking_send(Err(format_error_chain(&err)));
-            }
-        });
-        Box::pin(ReceiverStream::new(rx))
+        let tool_manifest = manifest.clone();
+        crate::backend::tool_calling::generate_stream(&tool_manifest, request, |request| {
+            let backend = self.clone();
+            let (tx, rx) = mpsc::channel(16);
+            tokio::task::spawn_blocking(move || {
+                let result = backend.generate_streaming_subprocess(&manifest, request, tx.clone());
+                if let Err(err) = result {
+                    let _ = tx.blocking_send(Err(format_error_chain(&err)));
+                }
+            });
+            Box::pin(ReceiverStream::new(rx))
+        })
     }
 }
 
 impl GenerationBackend for MlxVlmBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
     fn runtime_control_adapter(&self) -> std::sync::Arc<dyn BackendRuntimeAdapter> {
         std::sync::Arc::new(
             StaticRuntimeAdapter::new("mlx-vlm")
@@ -2278,49 +2347,58 @@ impl GenerationBackend for MlxVlmBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        let mut prepared = self.command_for(manifest, &request, request.verbose)?;
-        let program = prepared.command.get_program().to_string_lossy().to_string();
-        let started = Instant::now();
-        let output = prepared
-            .command
-            .output()
-            .with_context(|| format!("failed to execute {program}"))?;
-        if !output.status.success() {
-            bail!(
-                "mlx-vlm generation failed: {}",
-                mlx_output_failure_detail(&output)
-            );
-        }
-        let raw_text = String::from_utf8_lossy(&output.stdout).to_string();
-        let cleaned = clean_mlx_generate_output(&raw_text);
-        if cleaned.saw_think_block && cleaned.text.is_empty() {
-            bail!(
-                "mlx-vlm generation ended after hidden reasoning without producing assistant text; retry with a larger --max-tokens value"
-            );
-        }
-        let mut text = cleaned.text;
-        let finish_reason =
-            mlx_finish_reason(&raw_text, request.max_tokens, &mut text, &request.stop);
-        let elapsed = started.elapsed().as_secs_f64();
-        Ok(external_response(
-            request.prompt.as_str(),
-            text.trim().to_string(),
-            finish_reason,
-            elapsed,
-            mlx_generate_stats(&raw_text),
-        ))
+        let needs_tool_stats = request.requires_tool_calling();
+        crate::backend::tool_calling::generate(manifest, request, |request| {
+            // The generic protocol consumes tool_config before this closure.
+            // Retain CLI statistics so EOS can be distinguished from truncation.
+            let mut prepared =
+                self.command_for(manifest, &request, request.verbose || needs_tool_stats)?;
+            let program = prepared.command.get_program().to_string_lossy().to_string();
+            let started = Instant::now();
+            let output = prepared
+                .command
+                .output()
+                .with_context(|| format!("failed to execute {program}"))?;
+            if !output.status.success() {
+                bail!(
+                    "mlx-vlm generation failed: {}",
+                    mlx_output_failure_detail(&output)
+                );
+            }
+            let raw_text = String::from_utf8_lossy(&output.stdout).to_string();
+            let cleaned = clean_mlx_generate_output(&raw_text);
+            if cleaned.saw_think_block && cleaned.text.is_empty() {
+                bail!(
+                    "mlx-vlm generation ended after hidden reasoning without producing assistant text; retry with a larger --max-tokens value"
+                );
+            }
+            let mut text = cleaned.text;
+            let finish_reason =
+                mlx_finish_reason(&raw_text, request.max_tokens, &mut text, &request.stop);
+            let elapsed = started.elapsed().as_secs_f64();
+            Ok(external_response(
+                request.prompt.as_str(),
+                text.trim().to_string(),
+                finish_reason,
+                elapsed,
+                mlx_generate_stats(&raw_text),
+            ))
+        })
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
-        let backend = self.clone();
-        let (tx, rx) = mpsc::channel(16);
-        tokio::task::spawn_blocking(move || {
-            let result = backend.generate_streaming_subprocess(&manifest, request, tx.clone());
-            if let Err(err) = result {
-                let _ = tx.blocking_send(Err(format_error_chain(&err)));
-            }
-        });
-        Box::pin(ReceiverStream::new(rx))
+        let tool_manifest = manifest.clone();
+        crate::backend::tool_calling::generate_stream(&tool_manifest, request, |request| {
+            let backend = self.clone();
+            let (tx, rx) = mpsc::channel(16);
+            tokio::task::spawn_blocking(move || {
+                let result = backend.generate_streaming_subprocess(&manifest, request, tx.clone());
+                if let Err(err) = result {
+                    let _ = tx.blocking_send(Err(format_error_chain(&err)));
+                }
+            });
+            Box::pin(ReceiverStream::new(rx))
+        })
     }
 }
 
@@ -4072,6 +4150,160 @@ ValueError: Model type chatglm not supported."#;
             mlx_finish_reason(limited_output, 2048, &mut limited, &[]),
             "length"
         );
+    }
+
+    #[test]
+    fn legacy_completion_distinguishes_eos_budget_and_broken_token_streams() {
+        for (tokens, budget, expected_tokens, reason) in [
+            (vec![11, 12, 0, 99], 8, vec![11, 12], Some("stop")),
+            (vec![0, 99], 1, vec![], Some("stop")),
+            (vec![11, 12, 0], 2, vec![11, 12], Some("length")),
+            (vec![11, 12, 13, 14], 2, vec![11, 12], Some("length")),
+            (vec![11], 8, vec![11], None),
+        ] {
+            let end = LlamaCompletionEnd::default();
+            let observed = end
+                .bounded_tokens(tokens.into_iter(), 0, budget)
+                .collect::<Vec<_>>();
+            assert_eq!(observed, expected_tokens);
+            assert_eq!(end.tokens.get(), expected_tokens.len());
+            assert_eq!(end.finish_reason(budget, false).ok(), reason);
+        }
+        // Session context capacity can lower max_predictions independently of
+        // request.max_tokens. The effective budget controls the finish reason.
+        let end = LlamaCompletionEnd::default();
+        let _ = end
+            .bounded_tokens([11, 12, 13].into_iter(), 0, 1)
+            .collect::<Vec<_>>();
+        assert_eq!(end.finish_reason(1, false).unwrap(), "length");
+        assert!(end.finish_reason(8, false).is_err());
+        assert_eq!(end.finish_reason(8, true).unwrap(), "stop");
+    }
+
+    fn tool_request() -> GenerateRequest {
+        let mut request = test_request("Use lookup to describe the attached image.");
+        request.tool_config = Some(crate::backend::ToolCallingConfig {
+            tools: Some(serde_json::from_value(json!([{"type":"function","function":{
+                "name":"lookup","parameters":{"type":"object","properties":{"image":{"type":"string"}}}
+            }}])).unwrap()),
+            tool_choice: Some(serde_json::from_value(json!("required")).unwrap()),
+            parallel_tool_calls: Some(false),
+        });
+        request
+    }
+
+    #[cfg(unix)]
+    fn tool_fixture_backend() -> (tempfile::TempDir, ModelStore, ModelManifest, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = ModelStore::resolve(Some(root.path().join("store"))).unwrap();
+        let manifest = test_manifest("owner/tool-model", "qwen2");
+        let model_dir = store.model_dir(&manifest.id).join("files");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), r#"{"model_type":"qwen2"}"#).unwrap();
+        let python = find_program_in_path("python3").unwrap();
+        let runner = root.path().join("tool-runtime");
+        fs::write(
+            &runner,
+            format!(
+                "#!{}\n{}",
+                python.display(),
+                r#"
+import json, pathlib, sys
+if '-c' in sys.argv:
+    json.load(sys.stdin)
+    print(json.dumps({'ok':True,'detail':'fixture'}))
+    raise SystemExit(0)
+if sys.argv[-1] == 'execute':
+    request=json.load(sys.stdin)
+    prompt=json.dumps(request['messages'])
+else:
+    request={'argv':sys.argv}
+    prompt=sys.argv[sys.argv.index('--prompt')+1]
+assert 'lookup' in prompt and 'werk-tool-call-v1' in prompt
+pathlib.Path(__file__).with_suffix('.request.json').write_text(json.dumps(request))
+text='<tool_call>{"name":"lookup","arguments":{"image":"sample.png"}}</tool_call>'
+if sys.argv[-1] == 'execute':
+    print(json.dumps({'ok':True,'text':text,'stats':{'prompt_tokens':20,'generation_tokens':12,'finish_reason':'stop'}}))
+else:
+    assert '--no-verbose' not in sys.argv
+    print(text)
+    print('Prompt: 20 tokens, 100.000 tokens-per-sec')
+    print('Generation: 12 tokens, 10.000 tokens-per-sec')
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
+        (root, store, manifest, runner)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mlx_and_transformers_tool_calls_roundtrip_through_real_adapter_entry_points() {
+        use tokio_stream::StreamExt;
+        for flavor in ["mlx", "mlx-vlm", "transformers"] {
+            let (_root, store, mut manifest, runner) = tool_fixture_backend();
+            let mut request = tool_request();
+            let backend: Box<dyn GenerationBackend> = match flavor {
+                "mlx" => Box::new(MlxBackend {
+                    store,
+                    invocation: MlxInvocation::Module {
+                        python: runner.clone(),
+                        module: "fixture".into(),
+                    },
+                }),
+                "mlx-vlm" => {
+                    request.image_urls = vec!["sample.png".into()];
+                    Box::new(MlxVlmBackend {
+                        store,
+                        python: runner.clone(),
+                        module: "fixture".into(),
+                    })
+                }
+                _ => {
+                    manifest.format = ModelFormat::SafeTensors;
+                    manifest.architecture = Some("chatglm".into());
+                    Box::new(TransformersCompatBackend {
+                        store,
+                        client: CompanionClient::from_command(
+                            &runner,
+                            Vec::<std::ffi::OsString>::new(),
+                        ),
+                    })
+                }
+            };
+            assert!(backend.supports_tool_calling(&manifest, !request.image_urls.is_empty()));
+            let response = backend.generate(&manifest, request.clone()).unwrap();
+            assert_eq!(response.finish_reason, "tool_calls", "{flavor}");
+            let message = response.assistant_message.unwrap();
+            assert_eq!(message.content, None, "{flavor}");
+            assert_eq!(
+                message.tool_calls.unwrap()[0].function.name,
+                "lookup",
+                "{flavor}"
+            );
+            let events = backend
+                .generate_stream(manifest, request)
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(events.len(), 2, "{flavor}: {events:?}");
+            assert!(
+                matches!(&events[0], Ok(GenerateStreamEvent::ToolCallDelta(calls)) if calls[0].function.as_ref().unwrap().name.as_deref() == Some("lookup"))
+            );
+            assert!(
+                matches!(&events[1], Ok(GenerateStreamEvent::Done { finish_reason, .. }) if finish_reason == "tool_calls")
+            );
+            if flavor == "mlx-vlm" {
+                let sent: Value = serde_json::from_slice(
+                    &fs::read(runner.with_extension("request.json")).unwrap(),
+                )
+                .unwrap();
+                let args = sent["argv"].as_array().unwrap();
+                let image_index = args.iter().position(|arg| arg == "--image").unwrap();
+                assert_eq!(args[image_index + 1], "sample.png");
+            }
+        }
     }
 
     fn test_store(name: &str) -> ModelStore {

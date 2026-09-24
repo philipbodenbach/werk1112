@@ -22,7 +22,8 @@ The browser-friendly index is published as the
 | Implement a runtime-control client | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |
 | Review runtime persistence, memory and backend boundaries | [Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md) |
 | Install or select a backend | [Backends](backends.md) |
-| Configure vLLM arguments or OpenAI tool calling | [vLLM launch and tools](backends.md#vllm-launch-arguments-and-tool-calling) |
+| Use tool calling across backends and media | [Tool calling](tool-calling.md) |
+| Configure vLLM arguments | [vLLM launch](backends.md#vllm-launch-arguments-and-tool-calling) |
 | Run Werk and Nemotron on NVIDIA DGX Spark | [DGX Spark](integrations/dgx-spark.md) |
 | Run Werk on AMD Strix Halo | [AMD Strix Halo](integrations/strix-halo.md) |
 | Inspect rendered pages and slides with a VLM | [Vision and visual QA](integrations/vision.md) |

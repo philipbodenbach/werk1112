@@ -291,15 +291,14 @@ curl -fsS http://127.0.0.1:11434/v1/models \
   -H "Authorization: Bearer $WERK_API_KEY"
 ~~~
 
-OpenAI function tools are supported through compatible local or remote vLLM
-servers. Werk preserves normal and streaming tool-call structures, while the
-operator remains responsible for selecting the model-specific vLLM tool parser
-and enabling any required vLLM flags. Other chat adapters reject tool requests
-explicitly instead of ignoring them. See the
-[chat API contract](docs/api.md#post-v1chatcompletions) and
-[vLLM launch configuration](docs/backends.md#vllm-launch-arguments-and-tool-calling).
+All chat and vision adapters expose OpenAI function-tool calls. llama.cpp and
+vLLM preserve native tool transport; oMLX uses native parsing where available.
+Other generators use Werk's shared structured tool protocol. Model compliance
+is separate from adapter capability. Image, video, audio and music functions
+are available as callable tools through `/v1/tools` and `/v1/tools/call`.
+See [Tool calling across backends and modalities](docs/tool-calling.md).
 
-See the [HTTP API reference and coverage matrix](docs/api.md) for all 40
+See the [HTTP API reference and coverage matrix](docs/api.md) for all 42
 method/path operations, exact request fields, task coverage, responses,
 authentication, limits, persistence and known gaps.
 

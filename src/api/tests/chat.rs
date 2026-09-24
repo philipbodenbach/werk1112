@@ -577,9 +577,12 @@ async fn unsupported_backend_rejects_tool_calling_before_backend_execution() {
     assert_eq!(value["error"]["type"], "invalid_request_error");
     assert_eq!(value["error"]["code"], "unsupported_tool_calling");
     assert_eq!(value["error"]["param"], "tools");
-    assert!(value["error"]["message"].as_str().unwrap().contains(
-        "--backend vllm or --backend omlx with a compatible model and native tool parser"
-    ));
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the configured adapter does not provide chat tool transport")
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 

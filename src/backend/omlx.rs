@@ -69,6 +69,28 @@ fn console_script_source(source: &str) -> String {
     )
 }
 
+// Keep embedded helpers out of argv: Linux limits each argument to 128 KiB.
+// Retain the private file until startup has completed; the bootstrap uses only
+// builtins before console_script_source establishes the verified import path.
+fn attach_python_script(command: &mut Command, source: &str) -> Result<tempfile::NamedTempFile> {
+    let mut script = tempfile::Builder::new()
+        .prefix("werk-omlx-")
+        .suffix(".py")
+        .tempfile()?;
+    script.write_all(source.as_bytes())?;
+    let path = serde_json::to_string(
+        script
+            .path()
+            .to_str()
+            .context("oMLX temporary script path is not UTF-8")?,
+    )?;
+    command.args([
+        "-c",
+        &format!("exec(compile(open({path}, encoding='utf-8').read(), '<werk-omlx>', 'exec'))"),
+    ]);
+    Ok(script)
+}
+
 fn worker_script_source(source: &str) -> String {
     // Embed Werk's helper in a private module, never import code from model paths.
     let mut script = String::from("import types\n");
@@ -166,7 +188,6 @@ struct ProbeReport {
     detail: String,
     version: String,
     tools: bool,
-    tool_calling_detail: Option<String>,
     runtime: Value,
     cache_paths: Vec<PathBuf>,
 }
@@ -289,6 +310,7 @@ struct OmlxProcess {
 }
 
 struct OmlxChatSession {
+    manifest: ModelManifest,
     server: Arc<OmlxProcess>,
     request_thinking: Option<bool>,
     request_reasoning_effort: Option<OmlxReasoningEffort>,
@@ -332,16 +354,7 @@ impl OmlxBackend {
     }
 
     pub fn probe_tool_calling(&self, manifest: &ModelManifest) -> Result<bool> {
-        let (_, report) = self.model_probe(manifest)?;
-        if !report.tools {
-            bail!(
-                "{}",
-                report
-                    .tool_calling_detail
-                    .as_deref()
-                    .unwrap_or("oMLX model has no verified native tool parser")
-            );
-        }
+        self.model_probe(manifest)?;
         Ok(true)
     }
 
@@ -504,24 +517,24 @@ impl OmlxBackend {
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<GenerateResponse> {
         reject_images(&request)?;
-        validate_tool_options(&request)?;
-        if request.requires_tool_calling() && !self.probe_tool_calling(manifest)? {
-            bail!(
-                "oMLX does not have a verified native tool parser for model '{}'",
-                manifest.id
-            );
-        }
-        let started = Instant::now();
-        let (server, load_seconds) = self.cached_server(manifest)?;
-        let mut response = server.generate_with_controls(
-            &request,
-            tx,
-            self.request_thinking,
-            self.request_reasoning_effort,
-        )?;
-        response.timings.load_seconds = load_seconds;
-        response.timings.total_seconds = started.elapsed().as_secs_f64();
-        Ok(response)
+        let native_tools = if request.requires_tool_calling() {
+            self.model_probe(manifest)?.1.tools
+        } else {
+            true
+        };
+        generate_with_tool_fallback(manifest, request, tx, native_tools, |request, tx| {
+            let started = Instant::now();
+            let (server, load_seconds) = self.cached_server(manifest)?;
+            let mut response = server.generate_with_controls(
+                &request,
+                tx,
+                self.request_thinking,
+                self.request_reasoning_effort,
+            )?;
+            response.timings.load_seconds = load_seconds;
+            response.timings.total_seconds = started.elapsed().as_secs_f64();
+            Ok(response)
+        })
     }
 }
 
@@ -547,15 +560,12 @@ impl GenerationBackend for OmlxBackend {
             ],
         )?;
         reject_images(&request)?;
-        validate_tool_options(&request)?;
-        if request.requires_tool_calling() && !self.probe_tool_calling(manifest)? {
-            bail!("oMLX model does not have a verified native tool parser");
-        }
+        let (request, policy) = self.prepare_tool_request(manifest, request)?;
         let (server, _) = self.cached_server(manifest)?;
         let mut body = omlx_chat_completion_body(
             &server.model_name,
             &request,
-            tx.is_some(),
+            tx.is_some() && policy.is_none(),
             self.request_thinking.or(server.thinking),
             self.request_reasoning_effort.or(server.reasoning_effort),
         );
@@ -570,11 +580,42 @@ impl GenerationBackend for OmlxBackend {
                 "reasoning_effort",
             ],
         )?;
-        super::openai_transport::generate_api(&server.url, Some(&server.api_key), body, tx)
+        if let Some(policy) = policy {
+            let mut value = super::openai_transport::generate_api(
+                &server.url,
+                Some(&server.api_key),
+                body,
+                None,
+            )?;
+            apply_generic_api_tools(&mut value, &policy)?;
+            if let Some(tx) = tx {
+                value["object"] = json!("chat.completion.chunk");
+                for choice in value["choices"].as_array_mut().into_iter().flatten() {
+                    let choice = choice
+                        .as_object_mut()
+                        .context("oMLX response choice must be an object")?;
+                    let mut delta = choice
+                        .remove("message")
+                        .context("oMLX response choice has no message")?;
+                    if let Some(calls) = delta["tool_calls"].as_array_mut() {
+                        for (index, call) in calls.iter_mut().enumerate() {
+                            call["index"] = json!(index);
+                        }
+                    }
+                    choice.insert("delta".into(), delta);
+                }
+                tx.blocking_send(Ok(value))
+                    .map_err(|_| anyhow!("stream receiver closed"))?;
+                return Ok(Value::Null);
+            }
+            Ok(value)
+        } else {
+            super::openai_transport::generate_api(&server.url, Some(&server.api_key), body, tx)
+        }
     }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         reject_images(&request)?;
-        validate_tool_options(&request)?;
+        let (request, _) = self.prepare_tool_request(manifest, request)?;
         let (server, _) = self.cached_server(manifest)?;
         let body = omlx_chat_completion_body(
             &server.model_name,
@@ -607,8 +648,8 @@ impl GenerationBackend for OmlxBackend {
         Ok(Arc::new(configured))
     }
 
-    fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
-        !has_images && self.probe_tool_calling(manifest).unwrap_or(false)
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
     }
 
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
@@ -661,6 +702,7 @@ impl GenerationBackend for OmlxBackend {
     ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
         let (server, _) = self.cached_server(manifest)?;
         Ok(Some(Box::new(OmlxChatSession {
+            manifest: manifest.clone(),
             server,
             request_thinking: self.request_thinking,
             request_reasoning_effort: self.request_reasoning_effort,
@@ -697,6 +739,7 @@ impl GenerationBackend for OmlxBackend {
             status.and_then(|value| verified_persistent_cache_status(&value, &server.model_name));
         match active {
             Ok(true) => Ok(Some(Box::new(OmlxChatSession {
+                manifest: manifest.clone(),
                 server,
                 request_thinking: self.request_thinking,
                 request_reasoning_effort: self.request_reasoning_effort,
@@ -764,30 +807,132 @@ impl GenerationBackend for OmlxBackend {
 
 impl ChatGenerationSession for OmlxChatSession {
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
-        self.server.generate_with_controls(
-            &request,
+        generate_with_tool_fallback(
+            &self.manifest,
+            request,
             None,
-            self.request_thinking,
-            self.request_reasoning_effort,
+            self.server.tools,
+            |request, tx| {
+                self.server.generate_with_controls(
+                    &request,
+                    tx,
+                    self.request_thinking,
+                    self.request_reasoning_effort,
+                )
+            },
         )
     }
 
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream {
         let server = self.server.clone();
+        let manifest = self.manifest.clone();
         let thinking = self.request_thinking;
         let reasoning_effort = self.request_reasoning_effort;
         let (tx, rx) = mpsc::channel(16);
         tokio::task::spawn_blocking(move || {
-            let result = server.generate_with_controls(
-                &request,
+            let result = generate_with_tool_fallback(
+                &manifest,
+                request,
                 Some(tx.clone()),
-                thinking,
-                reasoning_effort,
+                server.tools,
+                |request, tx| {
+                    server.generate_with_controls(&request, tx, thinking, reasoning_effort)
+                },
             );
             send_stream_result(tx, result);
         });
         Box::pin(ReceiverStream::new(rx))
     }
+}
+
+impl OmlxBackend {
+    fn prepare_tool_request(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<(GenerateRequest, Option<super::tool_calling::Policy>)> {
+        if request.requires_tool_calling()
+            && (!self.model_probe(manifest)?.1.tools || validate_tool_options(&request).is_err())
+        {
+            let (request, policy) = super::tool_calling::prepare(manifest, request)?;
+            Ok((request, Some(policy)))
+        } else {
+            Ok((request, None))
+        }
+    }
+}
+
+fn generate_with_tool_fallback(
+    manifest: &ModelManifest,
+    request: GenerateRequest,
+    tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+    native_tools: bool,
+    run: impl FnOnce(
+        GenerateRequest,
+        Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+    ) -> Result<GenerateResponse>,
+) -> Result<GenerateResponse> {
+    if !request.requires_tool_calling() || (native_tools && validate_tool_options(&request).is_ok())
+    {
+        return run(request, tx);
+    }
+    // Validate the complete fallback output before emitting executable deltas.
+    let response = super::tool_calling::generate(manifest, request, |request| run(request, None))?;
+    if !response.text.is_empty() {
+        send_text_chunk(&tx, response.text.clone())?;
+    }
+    if let Some(calls) = response
+        .assistant_message
+        .as_ref()
+        .and_then(|message| message.tool_calls.as_ref())
+    {
+        let deltas = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| crate::openai::ChatCompletionToolCallDelta {
+                index,
+                id: Some(call.id.clone()),
+                kind: Some(call.kind.clone()),
+                function: Some(crate::openai::ChatCompletionFunctionCallDelta {
+                    name: Some(call.function.name.clone()),
+                    arguments: Some(call.function.arguments.clone()),
+                }),
+            })
+            .collect();
+        send_tool_call_delta(&tx, deltas)?;
+    }
+    Ok(response)
+}
+
+fn apply_generic_api_tools(value: &mut Value, policy: &super::tool_calling::Policy) -> Result<()> {
+    let choices = value["choices"]
+        .as_array_mut()
+        .context("oMLX response has no choices")?;
+    for choice in choices {
+        let finish_reason = choice["finish_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let message = choice
+            .get_mut("message")
+            .context("oMLX response choice has no message")?;
+        anyhow::ensure!(
+            message.is_object(),
+            "oMLX response message must be an object"
+        );
+        anyhow::ensure!(
+            message["tool_calls"].as_array().is_none_or(Vec::is_empty),
+            "generic tool protocol received unexpected native tool calls"
+        );
+        let parsed = policy.parse(message["content"].as_str().unwrap_or_default())?;
+        super::tool_calling::validate_finish_reason(&parsed, &finish_reason)?;
+        message["content"] = serde_json::to_value(parsed.content)?;
+        if let Some(calls) = parsed.tool_calls {
+            message["tool_calls"] = serde_json::to_value(calls)?;
+            choice["finish_reason"] = json!("tool_calls");
+        }
+    }
+    Ok(())
 }
 
 fn residency_adapter(server: Option<&OmlxProcess>) -> StaticRuntimeAdapter {
@@ -1025,8 +1170,8 @@ impl OmlxInvocation {
             self.verify_import_paths(directory)?;
         }
         let mut command = self.python_command();
+        let _script = attach_python_script(&mut command, &worker_script_source(PROBE))?;
         command
-            .args(["-c", &worker_script_source(PROBE)])
             .arg(
                 self.launcher
                     .parent()
@@ -1103,10 +1248,6 @@ impl OmlxInvocation {
                 .get("supports_tool_calling")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            tool_calling_detail: value
-                .get("tool_calling_detail")
-                .and_then(Value::as_str)
-                .map(str::to_string),
             runtime,
             cache_paths: value
                 .get("cache_paths")
@@ -1625,8 +1766,8 @@ impl OmlxProcess {
             .and_then(Value::as_str);
         let worker_source = text_worker_script_source(SUPERVISOR, architecture);
         let mut command = invocation.python_command();
+        let _script = attach_python_script(&mut command, &worker_source)?;
         command
-            .args(["-c", &worker_source])
             .arg(
                 invocation
                     .launcher

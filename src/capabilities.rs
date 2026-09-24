@@ -27,6 +27,10 @@ macro_rules! string_enum {
             $($(#[$variant_meta])* $variant),+
         }
 
+        impl $name {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+
         impl std::fmt::Display for $name {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(match self {

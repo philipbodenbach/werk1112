@@ -308,50 +308,14 @@ fn validate_required_inputs(request: &InferenceRequest) -> Result<()> {
         .prompt
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
-    if has_prompt
-        && matches!(
-            request.task,
-            InferenceTask::SpeechToText
-                | InferenceTask::SpeechTranslation
-                | InferenceTask::AudioEventDetection
-                | InferenceTask::VoiceActivityDetection
-                | InferenceTask::SpeakerIdentification
-                | InferenceTask::LanguageIdentification
-                | InferenceTask::SpeechEmotionRecognition
-                | InferenceTask::SpeakerDiarization
-                | InferenceTask::AudioClassification
-                | InferenceTask::AudioEmbedding
-                | InferenceTask::AudioEnhancement
-        )
-    {
+    if has_prompt && !request.task.accepts_prompt() {
         bail!("task {} does not consume a prompt", request.task);
     }
     let has_negative_prompt = request
         .negative_prompt
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
-    if has_negative_prompt
-        && matches!(
-            request.task,
-            InferenceTask::TextToSpeech
-                | InferenceTask::SpeechToText
-                | InferenceTask::SpeechTranslation
-                | InferenceTask::AudioEventDetection
-                | InferenceTask::VoiceActivityDetection
-                | InferenceTask::SpeakerIdentification
-                | InferenceTask::LanguageIdentification
-                | InferenceTask::SpeechEmotionRecognition
-                | InferenceTask::AudioCaptioning
-                | InferenceTask::SpeakerDiarization
-                | InferenceTask::AudioClassification
-                | InferenceTask::AudioUnderstanding
-                | InferenceTask::AudioEmbedding
-                | InferenceTask::VoiceConversion
-                | InferenceTask::StemSeparation
-                | InferenceTask::AudioEnhancement
-                | InferenceTask::AudioEditing
-        )
-    {
+    if has_negative_prompt && !request.task.accepts_negative_prompt() {
         bail!("task {} does not consume a negative prompt", request.task);
     }
     for required in request.task.required_input_modalities() {

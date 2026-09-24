@@ -734,6 +734,13 @@ impl BurnMode {
 }
 
 impl GenerationBackend for BurnBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        match self.mode {
+            BurnMode::Cpu => cfg!(feature = "burn-cpu"),
+            BurnMode::Cuda => cfg!(feature = "burn-cuda"),
+        }
+    }
+
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         let runtime = Self::runtime_status(self.mode);
         let (status, detail) = if runtime.available {
@@ -772,37 +779,42 @@ impl GenerationBackend for BurnBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        self.generate_inner(manifest, request, None)
+        crate::backend::tool_calling::generate(manifest, request, |request| {
+            self.generate_inner(manifest, request, None)
+        })
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
-        let backend = self.clone();
-        let (tx, rx) = mpsc::channel(4);
-        tokio::task::spawn_blocking(move || {
-            let callback_tx = tx.clone();
-            let result = backend.generate_inner(
-                &manifest,
-                request,
-                Some(Box::new(move |text| {
-                    let _ = callback_tx.blocking_send(Ok(GenerateStreamEvent::TextChunk(text)));
-                })),
-            );
-            match result {
-                Ok(response) => {
-                    let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
-                        finish_reason: response.finish_reason,
-                        prompt_tokens: response.prompt_tokens,
-                        completion_tokens: response.completion_tokens,
-                        timings: response.timings,
-                        backend_diagnostics: response.backend_diagnostics,
-                    }));
+        let tool_manifest = manifest.clone();
+        crate::backend::tool_calling::generate_stream(&tool_manifest, request, |request| {
+            let backend = self.clone();
+            let (tx, rx) = mpsc::channel(4);
+            tokio::task::spawn_blocking(move || {
+                let callback_tx = tx.clone();
+                let result = backend.generate_inner(
+                    &manifest,
+                    request,
+                    Some(Box::new(move |text| {
+                        let _ = callback_tx.blocking_send(Ok(GenerateStreamEvent::TextChunk(text)));
+                    })),
+                );
+                match result {
+                    Ok(response) => {
+                        let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
+                            finish_reason: response.finish_reason,
+                            prompt_tokens: response.prompt_tokens,
+                            completion_tokens: response.completion_tokens,
+                            timings: response.timings,
+                            backend_diagnostics: response.backend_diagnostics,
+                        }));
+                    }
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(err.to_string()));
+                    }
                 }
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(err.to_string()));
-                }
-            }
-        });
-        Box::pin(ReceiverStream::new(rx))
+            });
+            Box::pin(ReceiverStream::new(rx))
+        })
     }
 }
 

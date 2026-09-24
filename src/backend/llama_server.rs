@@ -24,6 +24,9 @@ mod model_prefetch_policy;
 #[cfg(target_os = "linux")]
 use super::model_file_cache;
 mod runtime_state;
+#[cfg(test)]
+mod tool_call_tests;
+mod tool_calls;
 
 use runtime_state::{
     LlamaChatPersistence, LlamaProcessStateRuntime, LlamaRuntimeStateAdapter,
@@ -120,6 +123,7 @@ pub struct BackendDoctorCheck {
 #[derive(Default)]
 struct ServerCompletion {
     text: String,
+    assistant_message: Option<super::GeneratedAssistantMessage>,
     prompt_tokens: usize,
     cached_prompt_tokens: Option<usize>,
     completion_tokens: usize,
@@ -325,7 +329,7 @@ impl LlamaServerBackend {
         let completion = server.complete(&request, tx)?;
         Ok(GenerateResponse {
             text: completion.text,
-            assistant_message: None,
+            assistant_message: completion.assistant_message,
             prompt_tokens: completion.prompt_tokens,
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
@@ -344,6 +348,10 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -364,10 +372,11 @@ impl GenerationBackend for LlamaServerBackend {
                 "top_k",
             ],
         )?;
-        if request.requires_tool_calling() {
-            bail!("llama.cpp adapter does not expose native tool calling");
+        let has_images = request_has_images(&request);
+        if has_images {
+            validate_llama_image_sources(&request)?;
         }
-        let (server, _, _) = self.cached_server(manifest, !request.image_urls.is_empty())?;
+        let (server, _, _) = self.cached_server(manifest, has_images)?;
         let _guard = server
             .state_gate
             .lock()
@@ -375,11 +384,7 @@ impl GenerationBackend for LlamaServerBackend {
         if request_has_images(&request) && server.projector_path.is_none() {
             bail!("visual input requires a multimodal projector");
         }
-        let mut body = chat_completion_body(&request);
-        body["stream"] = json!(tx.is_some());
-        if tx.is_none() {
-            body.as_object_mut().unwrap().remove("stream_options");
-        }
+        let mut body = chat_api_body(&request, tx.is_some());
         super::openai_transport::apply_api_options(
             &mut body,
             options,
@@ -397,32 +402,11 @@ impl GenerationBackend for LlamaServerBackend {
         super::openai_transport::generate_api(&server.url, None, body, tx)
     }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
-        if !request.image_urls.is_empty() || request.requires_tool_calling() {
-            bail!("native llama.cpp token counting currently requires text without tool calling");
+        if request_has_images(&request) {
+            bail!("native llama.cpp token counting does not expose image token counts");
         }
         let (server, _, _) = self.cached_server(manifest, false)?;
-        let rendered = super::openai_transport::tokenization_json(
-            &server.url,
-            "/apply-template",
-            &json!({"messages":llama_chat_messages(&request),"add_generation_prompt":true}),
-        )?;
-        let prompt = rendered
-            .get("prompt")
-            .and_then(Value::as_str)
-            .context("llama.cpp template endpoint returned no prompt")?;
-        let tokens = super::openai_transport::tokenization_json(
-            &server.url,
-            "/tokenize",
-            &json!({"content":prompt,"add_special":true,"parse_special":true}),
-        )?;
-        let tokens = tokens
-            .get("tokens")
-            .and_then(Value::as_array)
-            .context("llama.cpp tokenizer returned no token array")?;
-        if tokens.iter().any(|token| token.as_u64().is_none()) {
-            bail!("llama.cpp tokenizer returned invalid token IDs");
-        }
-        Ok(tokens.len())
+        count_request_tokens(&server.url, &request)
     }
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         Arc::new(LlamaRuntimeStateAdapter::new(self.clone()))
@@ -570,7 +554,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                 .complete_with_cache(&request, None, self.persistence.as_deref())?;
         Ok(GenerateResponse {
             text: completion.text,
-            assistant_message: None,
+            assistant_message: completion.assistant_message,
             prompt_tokens: completion.prompt_tokens,
             completion_tokens: completion.completion_tokens,
             finish_reason: completion.finish_reason,
@@ -598,7 +582,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                 .complete_with_cache(&request, Some(tx.clone()), persistence.as_deref())
                 .map(|completion| GenerateResponse {
                     text: completion.text,
-                    assistant_message: None,
+                    assistant_message: completion.assistant_message,
                     prompt_tokens: completion.prompt_tokens,
                     completion_tokens: completion.completion_tokens,
                     finish_reason: completion.finish_reason,
@@ -823,83 +807,23 @@ impl LlamaServerProcess {
         let cache_notice = persistence.map(|cache| cache.restore(self)).transpose()?;
         let restored_tokens = cache_notice.as_ref().and_then(|(_, tokens)| *tokens);
         let restore_seconds = restore_started.elapsed().as_secs_f64();
-        let use_chat_endpoint = !request.messages.is_empty() || request_has_images(request);
-        let (path, body) = if use_chat_endpoint {
-            ("/v1/chat/completions", chat_completion_body(request))
-        } else {
-            ("/completion", completion_body(request))
-        };
-        let mut stream = post_json(&self.url, path, &body)?;
-        let mut completion = ServerCompletion {
-            finish_reason: "length".to_string(),
-            backend_diagnostics: if use_chat_endpoint {
-                vec![
-                    "llama.cpp request endpoint: /v1/chat/completions".to_string(),
-                    "chat template applied by backend/model: yes".to_string(),
-                ]
-            } else {
-                vec!["llama.cpp request endpoint: /completion".to_string()]
-            },
-            ..Default::default()
-        };
-        let mut sse = SseAccumulator::default();
-        let mut finished = false;
+        let mut completion = complete_request(&self.url, request, tx, started)?;
         if let Some((notice, _)) = cache_notice {
             completion.backend_diagnostics.push(notice);
-        }
-
-        stream_body(&mut stream, |bytes| {
-            sse.push(bytes, |event| {
-                if event == "[DONE]" {
-                    finished = true;
-                    return Ok(());
-                }
-                let value: Value = serde_json::from_str(event)
-                    .with_context(|| format!("invalid llama-server SSE event: {event}"))?;
-                if let Some(error) = value.get("error") {
-                    bail!("llama-server generation failed: {error}");
-                }
-                finished |= value.get("stop").and_then(Value::as_bool) == Some(true)
-                    || value
-                        .pointer("/choices/0/finish_reason")
-                        .and_then(Value::as_str)
-                        .is_some_and(|reason| !reason.is_empty());
-                let chunk = if use_chat_endpoint {
-                    update_chat_completion_from_event(&mut completion, &value);
-                    if chat_delta_has_reasoning_content(&value) {
-                        completion.saw_reasoning_content = true;
-                    }
-                    chat_delta_content(&value)
-                } else {
-                    update_completion_from_event(&mut completion, &value);
-                    value
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                };
-                if let Some(chunk) = chunk
-                    && !chunk.is_empty()
-                {
-                    if completion.first_token_seconds <= 0.0 {
-                        completion.first_token_seconds = started.elapsed().as_secs_f64();
-                    }
-                    completion.text.push_str(&chunk);
-                    send_text_chunk(&tx, chunk)?;
-                }
-                Ok(())
-            })
-        })?;
-
-        if !finished {
-            bail!(
-                "llama-server stream ended before a completion marker; native snapshot not saved"
-            );
         }
         // Estimated display metrics must never become restore evidence.
         let reported_prompt_tokens = completion.prompt_tokens;
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
-        if use_chat_endpoint
-            && completion.text.trim().is_empty()
+        if completion.text.trim().is_empty()
+            && !completion
+                .assistant_message
+                .as_ref()
+                .is_some_and(|message| {
+                    message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty())
+                })
             && completion.completion_tokens > 0
             && completion.saw_reasoning_content
         {
@@ -1212,10 +1136,153 @@ fn llama_server_args_with_state(
             args.push("--no-cache-idle-slots".to_string());
         }
     }
-    if let Ok(extra) = env::var("WERK_LLAMA_ARGS") {
-        args.extend(split_args(&extra));
-    }
+    let extra = env::var("WERK_LLAMA_ARGS")
+        .map(|value| split_args(&value))
+        .unwrap_or_default();
+    append_jinja_default(&mut args, supported.jinja, &extra);
+    args.extend(extra);
     args
+}
+
+fn append_jinja_default(args: &mut Vec<String>, supported: bool, extra: &[String]) {
+    // The model's Jinja template handles tools and multimodal history. Explicit
+    // native overrides retain their usual precedence, without duplicate flags.
+    if supported
+        && !extra
+            .iter()
+            .any(|arg| matches!(arg.split('=').next(), Some("--jinja" | "--no-jinja")))
+    {
+        args.push("--jinja".to_string());
+    }
+}
+
+fn count_request_tokens(url: &str, request: &GenerateRequest) -> Result<usize> {
+    let rendered = super::openai_transport::tokenization_json(
+        url,
+        "/apply-template",
+        &chat_template_body(request),
+    )?;
+    let prompt = rendered
+        .get("prompt")
+        .and_then(Value::as_str)
+        .context("llama.cpp template endpoint returned no prompt")?;
+    let tokens = super::openai_transport::tokenization_json(
+        url,
+        "/tokenize",
+        &json!({"content":prompt,"add_special":true,"parse_special":true}),
+    )?;
+    let tokens = tokens
+        .get("tokens")
+        .and_then(Value::as_array)
+        .context("llama.cpp tokenizer returned no token array")?;
+    if tokens.iter().any(|token| token.as_u64().is_none()) {
+        bail!("llama.cpp tokenizer returned invalid token IDs");
+    }
+    Ok(tokens.len())
+}
+
+fn complete_request(
+    url: &str,
+    request: &GenerateRequest,
+    tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+    started: Instant,
+) -> Result<ServerCompletion> {
+    let use_chat_endpoint = !request.messages.is_empty()
+        || request_has_images(request)
+        || request.requires_tool_calling();
+    let (path, body) = if use_chat_endpoint {
+        ("/v1/chat/completions", chat_completion_body(request))
+    } else {
+        ("/completion", completion_body(request))
+    };
+    let mut stream = post_json(url, path, &body)?;
+    let mut completion = ServerCompletion {
+        finish_reason: "length".to_string(),
+        backend_diagnostics: if use_chat_endpoint {
+            vec![
+                "llama.cpp request endpoint: /v1/chat/completions".to_string(),
+                "chat template applied by backend/model: yes".to_string(),
+            ]
+        } else {
+            vec!["llama.cpp request endpoint: /completion".to_string()]
+        },
+        ..Default::default()
+    };
+    let mut sse = SseAccumulator::default();
+    let mut finished = false;
+    let mut saw_done = false;
+    let mut tool_calls = tool_calls::ToolCallAccumulator::default();
+
+    stream_body(&mut stream, |bytes| {
+        sse.push(bytes, |event| {
+            if event == "[DONE]" {
+                finished = true;
+                saw_done = true;
+                return Ok(());
+            }
+            if saw_done {
+                bail!("llama-server emitted data after DONE; native snapshot not saved");
+            }
+            let value: Value = serde_json::from_str(event)
+                .with_context(|| format!("invalid llama-server SSE event: {event}"))?;
+            if let Some(error) = value.get("error") {
+                bail!("llama-server generation failed: {error}");
+            }
+            finished |= value.get("stop").and_then(Value::as_bool) == Some(true)
+                || value
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty());
+            let chunk = if use_chat_endpoint {
+                update_chat_completion_from_event(&mut completion, &value);
+                if chat_delta_has_reasoning_content(&value) {
+                    completion.saw_reasoning_content = true;
+                }
+                if let Some(deltas) = super::openai_transport::delta_tool_calls(&value)? {
+                    if !deltas.is_empty() && completion.first_token_seconds <= 0.0 {
+                        completion.first_token_seconds = started.elapsed().as_secs_f64();
+                    }
+                    tool_calls.push(&deltas)?;
+                    super::openai_transport::send_tool_call_delta(&tx, deltas)?;
+                }
+                chat_delta_content(&value)
+            } else {
+                update_completion_from_event(&mut completion, &value);
+                value
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            if let Some(chunk) = chunk
+                && !chunk.is_empty()
+            {
+                if completion.first_token_seconds <= 0.0 {
+                    completion.first_token_seconds = started.elapsed().as_secs_f64();
+                }
+                completion.text.push_str(&chunk);
+                send_text_chunk(&tx, chunk)?;
+            }
+            Ok(())
+        })
+    })?;
+
+    if !finished {
+        bail!("llama-server stream ended before a completion marker; native snapshot not saved");
+    }
+    if let Some(tool_calls) = tool_calls.finish()? {
+        if completion.finish_reason != "tool_calls" {
+            bail!(
+                "llama-server returned tool calls without a tool_calls finish reason; native snapshot not saved"
+            );
+        }
+        completion.assistant_message = Some(super::GeneratedAssistantMessage {
+            content: (!completion.text.is_empty()).then(|| completion.text.clone()),
+            tool_calls: Some(tool_calls),
+        });
+    } else if completion.finish_reason == "tool_calls" {
+        bail!("llama-server reported tool_calls without tool calls; native snapshot not saved");
+    }
+    Ok(completion)
 }
 
 fn llama_server_non_thinking(manifest: &ModelManifest) -> bool {
@@ -1255,6 +1322,30 @@ fn completion_body(request: &GenerateRequest) -> Value {
     body
 }
 
+fn chat_template_body(request: &GenerateRequest) -> Value {
+    let mut body = json!({
+        "messages": llama_chat_messages(request),
+        "add_generation_prompt": true,
+    });
+    if let Some(config) = &request.tool_config {
+        let fields =
+            serde_json::to_value(config).expect("ToolCallingConfig serialization cannot fail");
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+    }
+    body
+}
+
+fn chat_api_body(request: &GenerateRequest, stream: bool) -> Value {
+    let mut body = chat_completion_body(request);
+    body["stream"] = json!(stream);
+    if !stream {
+        body.as_object_mut().unwrap().remove("stream_options");
+    }
+    body
+}
+
 fn chat_completion_body(request: &GenerateRequest) -> Value {
     let mut body = json!({
         "messages": llama_chat_messages(request),
@@ -1263,6 +1354,13 @@ fn chat_completion_body(request: &GenerateRequest) -> Value {
         "stream_options": {"include_usage": true},
         "cache_prompt": true,
     });
+    if let Some(config) = &request.tool_config {
+        let fields =
+            serde_json::to_value(config).expect("ToolCallingConfig serialization cannot fail");
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+    }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
     }
@@ -1295,10 +1393,19 @@ fn llama_chat_messages(request: &GenerateRequest) -> Vec<Value> {
             if let Some(name) = &message.name {
                 value["name"] = json!(name);
             }
+            if let Some(calls) = &message.tool_calls {
+                value["tool_calls"] = json!(calls);
+            }
+            if let Some(id) = &message.tool_call_id {
+                value["tool_call_id"] = json!(id);
+            }
             value
         })
         .collect::<Vec<_>>();
 
+    if messages.is_empty() {
+        messages.push(json!({"role": "user", "content": request.prompt}));
+    }
     let messages_have_images = request.messages.iter().any(|message| {
         message
             .content
@@ -1778,6 +1885,7 @@ struct SupportedArgs {
     warmup: bool,
     reasoning: bool,
     chat_template_kwargs: bool,
+    jinja: bool,
     mmproj: bool,
     slots: bool,
     slot_save_path: bool,
@@ -1815,6 +1923,7 @@ fn supported_args_from_help(text: &str) -> SupportedArgs {
         warmup: help_has_exact_option(&text, "--warmup"),
         reasoning: text.contains("--reasoning ") || text.contains("-rea,"),
         chat_template_kwargs: text.contains("--chat-template-kwargs"),
+        jinja: help_has_exact_option(text, "--jinja"),
         mmproj: text.split_whitespace().any(|argument| {
             argument.trim_matches(|character: char| character == ',' || character == ';')
                 == "--mmproj"

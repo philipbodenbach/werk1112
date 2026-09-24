@@ -15,8 +15,8 @@ of truth.
 
 Current surface:
 
-- 36 unique paths
-- 40 method/path operations
+- 38 unique paths
+- 42 method/path operations
 - JSON requests, multipart file uploads and raw file/output downloads
 - server-sent events only for chat streaming
 - persisted asynchronous jobs for video, generated audio and the native job API
@@ -85,6 +85,8 @@ Do not infer compatibility with an entire upstream API from the path prefix.
 | OpenAI-inspired | POST | <code>/v1/audio/transcriptions</code> | Synchronous Werk JSON |
 | OpenAI-inspired | POST | <code>/v1/audio/translations</code> | Synchronous Werk JSON |
 | Werk-native | GET | <code>/v1/capabilities</code> | Model/task/runtime discovery |
+| Werk-native | GET | <code>/v1/tools</code> | Function schemas for all tasks and job controls |
+| Werk-native | POST | <code>/v1/tools/call</code> | Explicit function invocation; chat response or correlated media job |
 | Werk-native | GET | <code>/v1/parameters</code> | Task/model parameter schema |
 | Werk-native | GET | <code>/v1/outputs/{id}</code> | Persisted bytes |
 | Werk-native | POST | <code>/v1/jobs</code> | 202 generic canonical task |
@@ -427,9 +429,9 @@ Accepted top-level fields:
 | <code>max_completion_tokens</code> | No | integer | Wins over max_tokens |
 | <code>stop</code> | No | string or string array | Added to model/template stops |
 | <code>seed</code> | No | integer | Backend dependent |
-| <code>tools</code> | No | array | OpenAI function-tool definitions; supported by the vLLM adapter |
+| <code>tools</code> | No | array | OpenAI function-tool definitions; all chat/vision adapters |
 | <code>tool_choice</code> | No | string or object | <code>none</code>, <code>auto</code>, <code>required</code>, or a named function selection |
-| <code>parallel_tool_calls</code> | No | boolean | Forwarded unchanged to vLLM |
+| <code>parallel_tool_calls</code> | No | boolean | Native forwarding or generic protocol validation |
 | <code>response_format</code> | No | object | `text`, `json_object`, or `json_schema`; native structured-output support required |
 | <code>frequency_penalty</code>, <code>presence_penalty</code> | No | number | `[-2, 2]`; native adapter support required |
 | <code>n</code> | No | integer | `1..16`; multiple choices retained through native adapters that support them |
@@ -552,15 +554,23 @@ name, optional description, arbitrary JSON Schema in `parameters` and optional
 {"type":"function","function":{"name":"get_weather"}}
 ~~~
 
-Werk forwards these request fields and tool-message fields unchanged through
-the local and remote vLLM chat transports. It does not execute tools, hardcode
-a parser or automatically enable vLLM's automatic tool choice. vLLM generally
-requires `--enable-auto-tool-choice` for `tool_choice: "auto"`. Parser names and
-required server flags vary by model and vLLM version; Werk does not validate,
-replace or rewrite an arbitrary parser name. Configure these values where vLLM
-is launched. Other chat adapters return HTTP 400 with error code
-`unsupported_tool_calling`, rather than ignoring the fields. With
-`--backend auto`, tool support is a required routing capability.
+All implemented chat and vision adapters support tool requests. llama.cpp and
+vLLM use their native OpenAI transport. oMLX uses native parsing for supported
+options and a generic protocol otherwise. Candle, Burn, ONNX Runtime, MLX,
+MLX-VLM, Transformers and legacy llama adapters render the schemas and full
+history in an explicit protocol and validate structured calls in the response.
+Generic tool-enabled streaming buffers output before emitting validated calls.
+The generic protocol validates choice, function name, JSON arguments and
+parallel-call limits; it rejects `strict: true` because it cannot guarantee
+constrained JSON Schema decoding. Native runtime options remain subject to
+that runtime's actual API contract. Tool support is an adapter capability and
+does not certify any particular model's tool-use quality.
+
+Chat requests never execute model-selected functions automatically. Clients
+can explicitly invoke Werk media functions through `/v1/tools/call`; the same
+authentication and inference validation apply. Tool-bearing conversations
+include schemas in admission estimates and are rejected if oversized instead
+of silently breaking assistant/result pairs. See [Tool calling](tool-calling.md).
 
 Image input additionally requires a model manifest that advertises
 <code>image-understanding</code> and an eligible vision runtime. Current routes

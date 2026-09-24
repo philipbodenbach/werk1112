@@ -910,6 +910,10 @@ impl OnnxRuntimeBackend {
 }
 
 impl GenerationBackend for OnnxRuntimeBackend {
+    fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
+        true
+    }
+
     fn runtime_control_adapter(&self) -> Arc<dyn crate::runtime_control::BackendRuntimeAdapter> {
         let route = if discover_onnx_runtime(&self.store, self.mode).path.is_some() {
             OnnxResidencyRoute::OneShotRunner
@@ -954,35 +958,40 @@ impl GenerationBackend for OnnxRuntimeBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        self.generate_inner(manifest, request)
+        crate::backend::tool_calling::generate(manifest, request, |request| {
+            self.generate_inner(manifest, request)
+        })
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
-        let backend = self.clone();
-        let (tx, rx) = mpsc::channel(4);
-        tokio::task::spawn_blocking(move || {
-            let result = backend.generate_inner(&manifest, request);
-            match result {
-                Ok(response) => {
-                    if !response.text.is_empty() {
-                        let _ = tx.blocking_send(Ok(GenerateStreamEvent::TextChunk(
-                            response.text.clone(),
-                        )));
+        let tool_manifest = manifest.clone();
+        crate::backend::tool_calling::generate_stream(&tool_manifest, request, |request| {
+            let backend = self.clone();
+            let (tx, rx) = mpsc::channel(4);
+            tokio::task::spawn_blocking(move || {
+                let result = backend.generate_inner(&manifest, request);
+                match result {
+                    Ok(response) => {
+                        if !response.text.is_empty() {
+                            let _ = tx.blocking_send(Ok(GenerateStreamEvent::TextChunk(
+                                response.text.clone(),
+                            )));
+                        }
+                        let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
+                            finish_reason: response.finish_reason,
+                            prompt_tokens: response.prompt_tokens,
+                            completion_tokens: response.completion_tokens,
+                            timings: response.timings,
+                            backend_diagnostics: response.backend_diagnostics,
+                        }));
                     }
-                    let _ = tx.blocking_send(Ok(GenerateStreamEvent::Done {
-                        finish_reason: response.finish_reason,
-                        prompt_tokens: response.prompt_tokens,
-                        completion_tokens: response.completion_tokens,
-                        timings: response.timings,
-                        backend_diagnostics: response.backend_diagnostics,
-                    }));
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(err.to_string()));
+                    }
                 }
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(err.to_string()));
-                }
-            }
-        });
-        Box::pin(ReceiverStream::new(rx))
+            });
+            Box::pin(ReceiverStream::new(rx))
+        })
     }
 }
 
@@ -1646,6 +1655,90 @@ for raw in sys.stdin:
 
     fn python_for_test() -> Option<PathBuf> {
         find_in_path("python3").or_else(|| find_in_path("python"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tools_roundtrip_through_onnx_runners_for_every_execution_provider() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio_stream::StreamExt;
+
+        let Some(python) = python_for_test() else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store = ModelStore::resolve(Some(root.path().join("store"))).unwrap();
+        let manifest = manifest_with_model_path("tools", Some("files/model.onnx"));
+        let model = store.absolute_model_file(&manifest, "files/model.onnx");
+        fs::create_dir_all(model.parent().unwrap()).unwrap();
+        fs::write(&model, b"fixture").unwrap();
+        for mode in [
+            OnnxRuntimeMode::Cpu,
+            OnnxRuntimeMode::Cuda,
+            OnnxRuntimeMode::Rocm,
+        ] {
+            let runner = managed_runner_path(&store, mode);
+            fs::create_dir_all(runner.parent().unwrap()).unwrap();
+            fs::write(&runner, format!("#!{}\n{}", python.display(), r#"
+import json, sys
+from pathlib import Path
+if '--help' in sys.argv:
+    raise SystemExit(0)
+args = sys.argv[1:]
+assert 'werk-tool-call-v1' in args[args.index('--prompt') + 1]
+Path(sys.argv[0]).with_suffix('.request.json').write_text(json.dumps(args))
+print(json.dumps({'text': '<tool_call>{"name":"lookup","arguments":{"id":7}}</tool_call>', 'prompt_tokens':11, 'completion_tokens':9, 'finish_reason':'stop'}))
+"#)).unwrap();
+            fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
+            let backend = OnnxRuntimeBackend::new(store.clone(), mode);
+            assert_eq!(backend.runner().unwrap(), runner);
+            assert!(backend.supports_tool_calling(&manifest, false));
+            let mut request = generate_request("Look up item 7");
+            request.tool_config = Some(crate::backend::ToolCallingConfig {
+                tools: Some(serde_json::from_value(serde_json::json!([{
+                    "type":"function", "function":{"name":"lookup","parameters":{"type":"object"}}
+                }])).unwrap()),
+                tool_choice: Some(serde_json::from_value(serde_json::json!("required")).unwrap()),
+                parallel_tool_calls: Some(false),
+            });
+            let response = backend.generate(&manifest, request.clone()).unwrap();
+            assert_eq!(response.finish_reason, "tool_calls");
+            assert_eq!(response.prompt_tokens, 11);
+            let call = response
+                .assistant_message
+                .unwrap()
+                .tool_calls
+                .unwrap()
+                .remove(0);
+            assert_eq!(call.function.name, "lookup");
+            assert_eq!(
+                serde_json::from_str::<Value>(&call.function.arguments).unwrap(),
+                serde_json::json!({"id":7})
+            );
+            let events = backend
+                .generate_stream(manifest.clone(), request)
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(&events[0], Ok(GenerateStreamEvent::ToolCallDelta(calls)) if calls.len() == 1)
+            );
+            assert!(
+                matches!(&events[1], Ok(GenerateStreamEvent::Done { finish_reason, .. }) if finish_reason == "tool_calls")
+            );
+            let args: Vec<String> =
+                serde_json::from_slice(&fs::read(runner.with_extension("request.json")).unwrap())
+                    .unwrap();
+            let provider = args.iter().position(|arg| arg == "--backend").unwrap();
+            assert_eq!(
+                args[provider + 1],
+                match mode {
+                    OnnxRuntimeMode::Cpu => "cpu",
+                    OnnxRuntimeMode::Cuda => "cuda",
+                    OnnxRuntimeMode::Rocm => "rocm",
+                }
+            );
+        }
     }
 
     #[test]
