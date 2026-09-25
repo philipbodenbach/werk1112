@@ -1335,6 +1335,19 @@ pub trait GenerationBackend: Send + Sync {
     fn count_tokens(&self, _manifest: &ModelManifest, _request: GenerateRequest) -> Result<usize> {
         anyhow::bail!("the selected backend does not expose native chat token counting")
     }
+    /// Count the same chat template as generate_api, including request overrides.
+    /// A counter that cannot preserve these options must report unsupported.
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<usize> {
+        if !options.is_empty() {
+            anyhow::bail!("native token counting with API options is not supported")
+        }
+        self.count_tokens(manifest, request)
+    }
     /// Applies explicit API runtime controls without changing process-wide
     /// environment or silently routing them to an unrelated backend.
     fn with_chat_options(

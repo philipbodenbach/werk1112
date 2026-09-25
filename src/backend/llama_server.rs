@@ -486,11 +486,22 @@ impl GenerationBackend for LlamaServerBackend {
         super::openai_transport::generate_api(&server.url, None, body, tx)
     }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        self.count_api_tokens(manifest, request, Default::default())
+    }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+    ) -> Result<usize> {
+        self.validate_api_options(manifest, &request, &options)?;
         if request_has_images(&request) {
             bail!("native llama.cpp token counting does not expose image token counts");
         }
         let (server, _, _) = self.cached_server(manifest, false)?;
-        count_request_tokens(&server.url, &request)
+        let mut body = chat_template_body(&request);
+        apply_chat_api_options(&mut body, options)?;
+        count_request_tokens(&server.url, &body)
     }
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         Arc::new(LlamaRuntimeStateAdapter::new(self.clone()))
@@ -1285,12 +1296,8 @@ fn append_jinja_default(args: &mut Vec<String>, supported: bool, extra: &[String
     }
 }
 
-fn count_request_tokens(url: &str, request: &GenerateRequest) -> Result<usize> {
-    let rendered = super::openai_transport::tokenization_json(
-        url,
-        "/apply-template",
-        &chat_template_body(request),
-    )?;
+fn count_request_tokens(url: &str, body: &Value) -> Result<usize> {
+    let rendered = super::openai_transport::tokenization_json(url, "/apply-template", body)?;
     let prompt = rendered
         .get("prompt")
         .and_then(Value::as_str)

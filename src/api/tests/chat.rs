@@ -1199,6 +1199,7 @@ async fn chat_route_reports_when_current_message_cannot_fit_gguf_context() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let value = response_json(response).await;
     assert_eq!(value["error"]["param"], "messages");
+    assert_eq!(value["error"]["code"], "context_length_exceeded");
     assert!(
         value["error"]["message"]
             .as_str()

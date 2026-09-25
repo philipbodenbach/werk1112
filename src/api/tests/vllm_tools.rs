@@ -134,6 +134,10 @@ fn write_response(stream: &mut TcpStream, response: MockHttpResponse) {
 }
 
 fn vllm_app(server_url: String) -> Router {
+    router(vllm_state(server_url))
+}
+
+fn vllm_state(server_url: String) -> ApiState {
     let store = test_store();
     let manifest = ModelManifest {
         storage: Default::default(),
@@ -167,7 +171,7 @@ fn vllm_app(server_url: String) -> Router {
     .unwrap();
     let backend =
         VllmBackend::with_mock_http_server(store.clone(), server_url, "Qwen-Test".to_string());
-    router(ApiState::new(store, Arc::new(backend)))
+    ApiState::new(store, Arc::new(backend))
 }
 
 fn weather_tool() -> Value {
@@ -804,4 +808,54 @@ async fn vllm_streaming_tool_deltas_keep_indexes_fragments_finish_and_done() {
     assert_eq!(requests[0]["tool_choice"], "required");
     assert_eq!(requests[0]["parallel_tool_calls"], true);
     assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn vllm_token_count_preserves_request_reasoning_template_options() {
+    for (effort, thinking) in [("low", true), ("none", false)] {
+        let server = MockVllmServer::start_at(
+            vec![MockHttpResponse::json(json!({"count":47,"tokens":[]}))],
+            "/tokenize",
+        );
+        let state = vllm_state(server.url.clone());
+        let manifest = state.store.get("qwen-test").unwrap();
+        let request = GenerateRequest {
+            prompt: String::new(),
+            messages: serde_json::from_value(json!([{"role":"user","content":"Weather?"}]))
+                .unwrap(),
+            image_urls: vec![],
+            max_tokens: 32,
+            temperature: None,
+            top_p: None,
+            stop: vec![],
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+            tool_config: Some(crate::backend::ToolCallingConfig {
+                tools: Some(serde_json::from_value(json!([weather_tool()])).unwrap()),
+                tool_choice: None,
+                parallel_tool_calls: None,
+            }),
+        };
+        let count = state
+            .backend
+            .count_api_tokens(
+                &manifest,
+                request,
+                BTreeMap::from([("reasoning_effort".into(), json!(effort))]),
+            )
+            .unwrap();
+        assert_eq!(count, 47);
+        let requests = server.finish();
+        assert_eq!(
+            requests[0]["chat_template_kwargs"]["reasoning_effort"],
+            effort
+        );
+        assert_eq!(
+            requests[0]["chat_template_kwargs"]["enable_thinking"],
+            thinking
+        );
+        assert_eq!(requests[0]["tools"][0]["function"]["name"], "get_weather");
+    }
 }

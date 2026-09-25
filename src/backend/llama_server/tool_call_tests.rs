@@ -418,11 +418,19 @@ fn token_count_templates_tool_schemas_and_tool_result_history() {
             json!({"tokens":[1,2,3,4,5,6]}).to_string(),
         ),
     ]);
-    assert_eq!(count_request_tokens(&url, &request).unwrap(), 6);
+    let mut template = chat_template_body(&request);
+    apply_chat_api_options(
+        &mut template,
+        std::collections::BTreeMap::from([("reasoning_effort".into(), json!("low"))]),
+    )
+    .unwrap();
+    assert_eq!(count_request_tokens(&url, &template).unwrap(), 6);
     let bodies = server.join().unwrap();
     assert_eq!(bodies[0]["tools"][0]["function"]["name"], "weather");
     assert_eq!(bodies[0]["messages"][2]["tool_call_id"], "call_weather");
     assert_eq!(bodies[0]["add_generation_prompt"], true);
+    assert_eq!(bodies[0]["reasoning_effort"], "low");
+    assert_eq!(bodies[0]["chat_template_kwargs"]["enable_thinking"], true);
     assert_eq!(bodies[1]["content"], "tools+history+assistant");
     assert_eq!(bodies[1]["parse_special"], true);
 }

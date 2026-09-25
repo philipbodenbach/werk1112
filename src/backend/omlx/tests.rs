@@ -2088,17 +2088,31 @@ fn api_reasoning_effort_toggles_each_request_without_changing_worker_defaults() 
         (Some(json!("max")), true),
         (None, false),
     ] {
-        let options = effort
+        let options: std::collections::BTreeMap<String, Value> = effort
             .clone()
             .map(|value| ("reasoning_effort".into(), value))
             .into_iter()
             .collect();
+        assert_eq!(
+            backend
+                .count_api_tokens(&manifest, request(), options.clone())
+                .unwrap(),
+            37
+        );
+        let counted: Value =
+            serde_json::from_slice(&fs::read(model_dir.join("tokenize.json")).unwrap()).unwrap();
         backend
             .generate_api(&manifest, request(), options, None)
             .unwrap();
         let body: Value =
             serde_json::from_slice(&fs::read(model_dir.join("request.json")).unwrap()).unwrap();
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], thinking);
+        assert_eq!(
+            counted["chat_template_kwargs"],
+            body["chat_template_kwargs"]
+        );
+        assert_eq!(counted["reasoning_effort"], body["reasoning_effort"]);
+        assert_eq!(counted["messages"], body["messages"]);
         match effort {
             Some(value) if value == json!("none") => {
                 assert!(body.get("reasoning_effort").is_none());

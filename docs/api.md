@@ -447,6 +447,16 @@ The ordinary path remains in place when these options are absent. Extended
 requests reuse the native worker and its own prefix cache; they do not pass
 through Werk's simple `ChatGenerationSession` snapshot path.
 
+For tool-bearing requests and the Anthropic endpoint, a context estimate that
+exceeds the configured limit is checked against the selected runtime's native
+chat tokenizer when available. Tool schemas, tool-result pairs and request
+reasoning options are preserved; no generation is performed for counting. A
+real overflow returns HTTP 400 before SSE with `code: "context_length_exceeded"`,
+`prompt_tokens`, `max_tokens`, `context_length`, and `token_count_method` so clients
+can trigger compaction. If native counting is unavailable, the conservative
+fallback is explicitly labeled `token_count_method: "estimate"`. Small requests
+that fit the estimate do not add tokenizer round trips.
+
 Adapter support is checked before an HTTP response or generation begins. An
 unsupported extended option returns HTTP 400 with code `unsupported_api_options`
 for both JSON and streaming requests, rather than an error inside an HTTP 200

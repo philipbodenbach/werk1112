@@ -46,6 +46,35 @@ const API_OPTIONS: &[&str] = &[
     "reasoning_effort",
 ];
 
+fn apply_omlx_api_options(
+    body: &mut Value,
+    options: std::collections::BTreeMap<String, Value>,
+) -> Result<()> {
+    let effort_override = options.get("reasoning_effort").cloned();
+    super::openai_transport::apply_api_options(body, options, API_OPTIONS)?;
+    // Keep native effort values and types in sync with the template.
+    // Only recognized standard levels change the thinking switch; custom
+    // strings and numeric efforts retain their model-specific meaning.
+    if let Some(effort) = effort_override {
+        let thinking = super::openai_transport::reasoning_effort_thinking(&effort);
+        if let Some(enabled) = thinking {
+            body["chat_template_kwargs"]["enable_thinking"] = json!(enabled);
+        }
+        if thinking == Some(false) {
+            // Native oMLX forwards "none" literally to model templates.
+            // Disable thinking without sending that unsupported sentinel.
+            body.as_object_mut().unwrap().remove("reasoning_effort");
+            body["chat_template_kwargs"]
+                .as_object_mut()
+                .unwrap()
+                .remove("reasoning_effort");
+        } else {
+            body["chat_template_kwargs"]["reasoning_effort"] = effort;
+        }
+    }
+    Ok(())
+}
+
 const PROBE: &str = include_str!("omlx_probe.py");
 const SUPERVISOR: &str = include_str!("omlx_supervisor.py");
 const EXPERTS: &str = include_str!("omlx_experts.py");
@@ -576,28 +605,7 @@ impl GenerationBackend for OmlxBackend {
             self.request_thinking.or(server.thinking),
             self.request_reasoning_effort.or(server.reasoning_effort),
         );
-        let effort_override = options.get("reasoning_effort").cloned();
-        super::openai_transport::apply_api_options(&mut body, options, API_OPTIONS)?;
-        // Keep native effort values and types in sync with the template.
-        // Only recognized standard levels change the thinking switch; custom
-        // strings and numeric efforts retain their model-specific meaning.
-        if let Some(effort) = effort_override {
-            let thinking = super::openai_transport::reasoning_effort_thinking(&effort);
-            if let Some(enabled) = thinking {
-                body["chat_template_kwargs"]["enable_thinking"] = json!(enabled);
-            }
-            if thinking == Some(false) {
-                // Native oMLX forwards "none" literally to model templates.
-                // Disable thinking without sending that unsupported sentinel.
-                body.as_object_mut().unwrap().remove("reasoning_effort");
-                body["chat_template_kwargs"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("reasoning_effort");
-            } else {
-                body["chat_template_kwargs"]["reasoning_effort"] = effort;
-            }
-        }
+        apply_omlx_api_options(&mut body, options)?;
         if let Some(policy) = policy {
             let mut value = super::openai_transport::generate_api(
                 &server.url,
@@ -632,16 +640,26 @@ impl GenerationBackend for OmlxBackend {
         }
     }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        self.count_api_tokens(manifest, request, Default::default())
+    }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+    ) -> Result<usize> {
+        self.validate_api_options(manifest, &request, &options)?;
         reject_images(&request)?;
         let (request, _) = self.prepare_tool_request(manifest, request)?;
         let (server, _) = self.cached_server(manifest)?;
-        let body = omlx_chat_completion_body(
+        let mut body = omlx_chat_completion_body(
             &server.model_name,
             &request,
             false,
             self.request_thinking.or(server.thinking),
             self.request_reasoning_effort.or(server.reasoning_effort),
         );
+        apply_omlx_api_options(&mut body, options)?;
         let value = server.json_request(
             "POST",
             "/werk/tokenize",

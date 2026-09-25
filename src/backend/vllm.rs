@@ -518,13 +518,30 @@ impl GenerationBackend for VllmBackend {
         super::openai_transport::generate_api(&server.url, None, body, tx)
     }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        self.count_api_tokens(manifest, request, Default::default())
+    }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+    ) -> Result<usize> {
+        self.validate_api_options(manifest, &request, &options)?;
         validate_vllm_image_request(manifest.architecture.as_deref(), &request)?;
         let (server, _, _) = self.cached_server(manifest)?;
-        let chat = chat_completion_body(&server.model_name, &request, false);
+        let mut chat = chat_completion_body(&server.model_name, &request, false);
+        super::openai_transport::apply_api_options(&mut chat, options, API_OPTIONS)?;
+        apply_vllm_reasoning_effort(&mut chat);
         let mut body = serde_json::json!({"model":server.model_name,"messages":chat["messages"],
             "add_generation_prompt":true,"add_special_tokens":false});
         if let Some(tools) = chat.get("tools") {
             body["tools"] = tools.clone();
+        }
+        if let Some(kwargs) = chat.get("chat_template_kwargs") {
+            body["chat_template_kwargs"] = kwargs.clone();
+        }
+        if let Some(effort) = chat.get("reasoning_effort") {
+            body["chat_template_kwargs"]["reasoning_effort"] = effort.clone();
         }
         let result = super::openai_transport::tokenization_json(&server.url, "/tokenize", &body)?;
         result

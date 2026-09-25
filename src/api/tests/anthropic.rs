@@ -708,7 +708,7 @@ async fn anthropic_cors_allows_version_header_and_exposes_request_id() {
 }
 
 #[tokio::test]
-async fn protocols_prepare_identical_backend_requests_and_reject_oversized_tool_history() {
+async fn protocols_prepare_identical_requests_and_count_large_tool_history_natively() {
     let backend = Arc::new(Fixture::tools());
     let state = state(backend.clone());
     let app = router(state.clone());
@@ -750,14 +750,10 @@ async fn protocols_prepare_identical_backend_requests_and_reject_oversized_tool_
     .unwrap();
     let limited = router(state.with_chat_context_size(Some(512)));
     req["tools"][0]["description"] = "x".repeat(2000).into();
+    // The fixture's actual templated count is 23: serialized tool-schema size
+    // must not reject a prompt that the native tokenizer says fits.
     let response = post(&limited, req).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(
-        response_json(response).await["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("exceed")
-    );
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
