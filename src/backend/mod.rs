@@ -9,6 +9,7 @@ pub(crate) mod model_file_cache;
 mod omlx;
 mod onnxruntime;
 mod openai_transport;
+pub(crate) use openai_transport::ApiOptionError;
 mod qwen_tts;
 pub(crate) mod tool_calling;
 mod vllm;
@@ -1304,6 +1305,19 @@ pub trait GenerationBackend: Send + Sync {
     /// Read only: sample already-running workers; never load or prepare models.
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         Vec::new()
+    }
+    /// Validate extended API fields before starting a response or loading a model.
+    /// Routing adapters must select the same concrete backend as `generate_api`.
+    fn validate_api_options(
+        &self,
+        _manifest: &ModelManifest,
+        _request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        if !options.is_empty() {
+            anyhow::bail!("the selected backend does not support the requested extended API fields")
+        }
+        Ok(())
     }
     /// Rich chat responses retain choices, logprobs and structured output.
     /// Ordinary requests keep using the existing generation/session path.

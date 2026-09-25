@@ -41,6 +41,33 @@ use super::openai_transport::{
     stream_body, update_completion_from_event, update_completion_from_message,
 };
 
+const API_OPTIONS: &[&str] = &[
+    "response_format",
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
+    "n",
+    "logprobs",
+    "top_logprobs",
+    "top_k",
+    "reasoning_effort",
+    "__werk_matched_stop",
+];
+
+fn apply_vllm_reasoning_effort(body: &mut Value) {
+    let Some(enabled) = body
+        .get("reasoning_effort")
+        .and_then(super::openai_transport::reasoning_effort_thinking)
+    else {
+        return;
+    };
+    // Match vLLM ChatCompletionRequest.build_chat_params, including versions
+    // before automatic enable_thinking injection. Only explicit requests
+    // override the server default; the native model/template owns effort levels.
+    // https://docs.vllm.ai/en/latest/features/reasoning_outputs/#automatic-enable_thinking-activation
+    body["chat_template_kwargs"]["enable_thinking"] = enabled.into();
+}
+
 const DEFAULT_HEALTH_TIMEOUT_SECONDS: u64 = 300;
 const DGX_SPARK_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 const STRIX_HALO_HEALTH_TIMEOUT_SECONDS: u64 = 900;
@@ -457,6 +484,25 @@ impl VllmBackend {
 }
 
 impl GenerationBackend for VllmBackend {
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<()> {
+        super::openai_transport::validate_api_options(options, API_OPTIONS)?;
+        if let Some(effort) = options.get("reasoning_effort")
+            && super::openai_transport::reasoning_effort_thinking(effort).is_none()
+        {
+            return Err(super::ApiOptionError::reasoning_effort(
+                "vLLM",
+                Some(&["none", "minimal", "low", "medium", "high", "xhigh", "max"]),
+                &["string"],
+            )
+            .into());
+        }
+        validate_vllm_image_request(manifest.architecture.as_deref(), request)
+    }
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -464,40 +510,11 @@ impl GenerationBackend for VllmBackend {
         options: std::collections::BTreeMap<String, Value>,
         tx: Option<mpsc::Sender<Result<Value, String>>>,
     ) -> Result<Value> {
-        super::openai_transport::validate_api_options(
-            &options,
-            &[
-                "response_format",
-                "frequency_penalty",
-                "presence_penalty",
-                "logit_bias",
-                "n",
-                "logprobs",
-                "top_logprobs",
-                "top_k",
-                "reasoning_effort",
-                "__werk_matched_stop",
-            ],
-        )?;
-        validate_vllm_image_request(manifest.architecture.as_deref(), &request)?;
+        self.validate_api_options(manifest, &request, &options)?;
         let (server, _, _) = self.cached_server(manifest)?;
         let mut body = chat_completion_body(&server.model_name, &request, tx.is_some());
-        super::openai_transport::apply_api_options(
-            &mut body,
-            options,
-            &[
-                "response_format",
-                "frequency_penalty",
-                "presence_penalty",
-                "logit_bias",
-                "n",
-                "logprobs",
-                "top_logprobs",
-                "top_k",
-                "reasoning_effort",
-                "__werk_matched_stop",
-            ],
-        )?;
+        super::openai_transport::apply_api_options(&mut body, options, API_OPTIONS)?;
+        apply_vllm_reasoning_effort(&mut body);
         super::openai_transport::generate_api(&server.url, None, body, tx)
     }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {

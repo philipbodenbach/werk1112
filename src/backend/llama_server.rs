@@ -53,6 +53,17 @@ const DEFAULT_CTX_SIZE: usize = 4096;
 const DEFAULT_BATCH_SIZE: usize = 2048;
 const DEFAULT_UBATCH_SIZE: u32 = 512;
 const DEFAULT_PROMPT_CACHE_MIB: usize = 8192;
+const API_OPTIONS: &[&str] = &[
+    "response_format",
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
+    "n",
+    "logprobs",
+    "top_logprobs",
+    "top_k",
+    "reasoning_effort",
+];
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -433,6 +444,26 @@ impl GenerationBackend for LlamaServerBackend {
         true
     }
 
+    fn validate_api_options(
+        &self,
+        _manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<()> {
+        super::openai_transport::validate_api_options(options, API_OPTIONS)?;
+        if let Some(effort) = options.get("reasoning_effort")
+            && !effort.is_string()
+        {
+            return Err(
+                super::ApiOptionError::reasoning_effort("llama.cpp", None, &["string"]).into(),
+            );
+        }
+        if request_has_images(request) {
+            validate_llama_image_sources(request)?;
+        }
+        Ok(())
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -440,23 +471,8 @@ impl GenerationBackend for LlamaServerBackend {
         options: std::collections::BTreeMap<String, Value>,
         tx: Option<mpsc::Sender<Result<Value, String>>>,
     ) -> Result<Value> {
-        super::openai_transport::validate_api_options(
-            &options,
-            &[
-                "response_format",
-                "frequency_penalty",
-                "presence_penalty",
-                "logit_bias",
-                "n",
-                "logprobs",
-                "top_logprobs",
-                "top_k",
-            ],
-        )?;
+        self.validate_api_options(manifest, &request, &options)?;
         let has_images = request_has_images(&request);
-        if has_images {
-            validate_llama_image_sources(&request)?;
-        }
         let (server, _, _) = self.cached_server(manifest, has_images)?;
         let _guard = server
             .state_gate
@@ -466,20 +482,7 @@ impl GenerationBackend for LlamaServerBackend {
             bail!("visual input requires a multimodal projector");
         }
         let mut body = chat_api_body(&request, tx.is_some());
-        super::openai_transport::apply_api_options(
-            &mut body,
-            options,
-            &[
-                "response_format",
-                "frequency_penalty",
-                "presence_penalty",
-                "logit_bias",
-                "n",
-                "logprobs",
-                "top_logprobs",
-                "top_k",
-            ],
-        )?;
+        apply_chat_api_options(&mut body, options)?;
         super::openai_transport::generate_api(&server.url, None, body, tx)
     }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
@@ -1474,6 +1477,22 @@ fn chat_template_body(request: &GenerateRequest) -> Value {
             .extend(fields.as_object().unwrap().clone());
     }
     body
+}
+
+fn apply_chat_api_options(
+    body: &mut Value,
+    options: std::collections::BTreeMap<String, Value>,
+) -> Result<()> {
+    let thinking = options
+        .get("reasoning_effort")
+        .and_then(super::openai_transport::reasoning_effort_thinking);
+    super::openai_transport::apply_api_options(body, options, API_OPTIONS)?;
+    if let Some(enabled) = thinking {
+        // Standard effort levels override the server's thinking default.
+        // Omitted or template-specific strings retain native semantics.
+        body["chat_template_kwargs"]["enable_thinking"] = json!(enabled);
+    }
+    Ok(())
 }
 
 fn chat_api_body(request: &GenerateRequest, stream: bool) -> Value {

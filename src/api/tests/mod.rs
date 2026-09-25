@@ -1,4 +1,5 @@
 mod anthropic;
+mod api_options;
 mod automatic1111;
 mod chat;
 mod chat_options;

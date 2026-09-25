@@ -8961,6 +8961,20 @@ impl GenerationBackend for AutoBackend {
         samples
     }
 
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .validate_api_options(manifest, request, options)
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -9223,6 +9237,20 @@ impl GenerationBackend for GgufPreferredBackend {
         samples
     }
 
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .validate_api_options(manifest, request, options)
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -9401,6 +9429,16 @@ impl GenerationBackend for MlxPreferredBackend {
         let mut samples = self.text_backend.telemetry();
         samples.extend(self.vision_backend.telemetry());
         samples
+    }
+
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .validate_api_options(manifest, request, options)
     }
 
     fn generate_api(
@@ -9599,6 +9637,16 @@ impl GenerationBackend for VllmPreferredBackend {
             .map(|b| b.values().cloned().collect())
             .unwrap_or_default();
         backends.iter().flat_map(|b| b.telemetry()).collect()
+    }
+
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .validate_api_options(manifest, request, options)
     }
 
     fn generate_api(

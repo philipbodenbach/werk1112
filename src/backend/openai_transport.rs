@@ -12,6 +12,62 @@ use std::{
 use tokio::sync::mpsc;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Machine-readable correction hints for a rejected native API option.
+#[derive(Debug, Clone)]
+pub(crate) struct ApiOptionError {
+    pub param: String,
+    pub message: String,
+    pub details: std::collections::BTreeMap<String, Value>,
+}
+
+impl ApiOptionError {
+    pub(crate) fn reasoning_effort(
+        backend: &str,
+        supported_values: Option<&[&str]>,
+        supported_types: &[&str],
+    ) -> Self {
+        let mut details = std::collections::BTreeMap::from([
+            ("supported_types".into(), json!(supported_types)),
+            ("values_depend_on_model".into(), json!(true)),
+        ]);
+        let explanation = if let Some(values) = supported_values {
+            details.insert("supported_values".into(), json!(values));
+            details.insert("values_scope".into(), json!("backend"));
+            format!(
+                "Supported values: {}. Their effect depends on the model/template.",
+                json!(values)
+            )
+        } else {
+            format!(
+                "Supported types: {}. Valid values depend on the model/template.",
+                supported_types.join(", ")
+            )
+        };
+        Self {
+            param: "reasoning_effort".into(),
+            message: format!("Invalid reasoning_effort for {backend}. {explanation}"),
+            details,
+        }
+    }
+}
+
+impl std::fmt::Display for ApiOptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for ApiOptionError {}
+
+/// Only standard effort values imply a thinking toggle. Native/custom effort
+/// values keep their own semantics; in particular "off" is not an on switch.
+pub(super) fn reasoning_effort_thinking(value: &Value) -> Option<bool> {
+    match value.as_str()? {
+        "none" => Some(false),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(true),
+        _ => None,
+    }
+}
+
 pub(super) fn apply_api_options(
     body: &mut Value,
     options: std::collections::BTreeMap<String, Value>,

@@ -16,6 +16,16 @@ pub(super) fn api_error_with_code(
     param: Option<String>,
     code: Option<String>,
 ) -> Response {
+    api_error_with_details(status, message, param, code, Default::default())
+}
+
+pub(super) fn api_error_with_details(
+    status: StatusCode,
+    message: String,
+    param: Option<String>,
+    code: Option<String>,
+    details: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Response {
     (
         status,
         Json(ErrorResponse {
@@ -24,6 +34,7 @@ pub(super) fn api_error_with_code(
                 kind: "invalid_request_error".to_string(),
                 param,
                 code,
+                details,
             },
         }),
     )

@@ -20,6 +20,7 @@ pub(super) struct GenerationError {
     pub message: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    pub details: std::collections::BTreeMap<String, serde_json::Value>,
 }
 impl GenerationError {
     fn new(status: StatusCode, message: String, param: Option<String>) -> Self {
@@ -28,6 +29,7 @@ impl GenerationError {
             message,
             param,
             code: None,
+            details: Default::default(),
         }
     }
     fn with_code(
@@ -41,10 +43,35 @@ impl GenerationError {
             message,
             param,
             code,
+            details: Default::default(),
+        }
+    }
+    fn api_options(error: anyhow::Error, fallback_code: Option<&str>) -> Self {
+        if let Some(option) = error.downcast_ref::<crate::backend::ApiOptionError>() {
+            Self {
+                status: StatusCode::BAD_REQUEST,
+                message: option.message.clone(),
+                param: Some(option.param.clone()),
+                code: Some("invalid_reasoning_effort".into()),
+                details: option.details.clone(),
+            }
+        } else {
+            Self::with_code(
+                StatusCode::BAD_REQUEST,
+                format!("{error:#}"),
+                None,
+                fallback_code.map(str::to_owned),
+            )
         }
     }
     pub fn openai_response(self) -> axum::response::Response {
-        super::response::api_error_with_code(self.status, self.message, self.param, self.code)
+        super::response::api_error_with_details(
+            self.status,
+            self.message,
+            self.param,
+            self.code,
+            self.details,
+        )
     }
 }
 #[derive(Clone, Copy)]
@@ -72,7 +99,7 @@ pub(super) async fn prepare(
     if let Err(error) =
         super::extended::validate(&request.extra, endpoint.starts_with("/v1/messages"))
     {
-        return Err(GenerationError::new(StatusCode::BAD_REQUEST, error, None));
+        return Err(GenerationError::api_options(error, None));
     }
     super::extended::normalize(&mut request.extra);
     if let Some(options) = &request.werk
@@ -327,6 +354,35 @@ pub(super) async fn prepare(
         debug: false,
         tool_config,
     };
+
+    if !request.extra.is_empty() {
+        let backend = state.backend.clone();
+        let selected_model = manifest.clone();
+        let selected_request = generate_request.clone();
+        let options = request.extra.clone();
+        // Auto routing may probe a runtime. Validate off the async executor,
+        // before a streaming handler commits HTTP 200 and starts generation.
+        match tokio::task::spawn_blocking(move || {
+            backend.validate_api_options(&selected_model, &selected_request, &options)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(GenerationError::api_options(
+                    error,
+                    Some("unsupported_api_options"),
+                ));
+            }
+            Err(error) => {
+                return Err(GenerationError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("API option validation task failed: {error}"),
+                    None,
+                ));
+            }
+        }
+    }
 
     Ok(Prepared {
         api_options: request.extra,

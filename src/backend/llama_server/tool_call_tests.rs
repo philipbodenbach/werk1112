@@ -254,6 +254,150 @@ fn native_api_nonstream_preserves_tool_only_response_and_tool_schema() {
     assert_eq!(bodies[0]["tools"][0]["function"]["name"], "weather");
 }
 
+#[tokio::test]
+async fn native_api_forwards_reasoning_effort_with_tools_and_streaming() {
+    for effort in [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "default",
+        "off",
+        "custom_thinking",
+    ] {
+        for stream in [false, true] {
+            let request = tool_request();
+            let expected = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"ready"},"finish_reason":"stop"}]});
+            let (mime, response) = if stream {
+                (
+                    "text/event-stream",
+                    sse(
+                        vec![
+                            json!({"choices":[{"index":0,"delta":{"content":"ready"},"finish_reason":"stop"}]}),
+                        ],
+                        true,
+                    ),
+                )
+            } else {
+                ("application/json", expected.to_string())
+            };
+            let (url, server) = mock_http(vec![("/v1/chat/completions", mime, response)]);
+            let mut body = chat_api_body(&request, stream);
+            apply_chat_api_options(
+                &mut body,
+                std::collections::BTreeMap::from([("reasoning_effort".into(), json!(effort))]),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let result = tokio::task::spawn_blocking(move || {
+                crate::backend::openai_transport::generate_api(
+                    &url,
+                    None,
+                    body,
+                    stream.then_some(tx),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if stream {
+                let chunk = rx.recv().await.unwrap().unwrap();
+                assert_eq!(chunk["choices"][0]["delta"]["content"], "ready");
+                assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
+                assert!(rx.recv().await.is_none());
+            } else {
+                assert_eq!(result, expected);
+            }
+            let bodies = server.join().unwrap();
+            assert_eq!(bodies[0]["reasoning_effort"], effort);
+            assert_eq!(bodies[0]["tools"][0]["function"]["name"], "weather");
+            assert_eq!(bodies[0]["cache_prompt"], true);
+            assert_eq!(bodies[0]["stream"], stream);
+            if matches!(effort, "default" | "off" | "custom_thinking") {
+                assert!(bodies[0].get("chat_template_kwargs").is_none());
+            } else {
+                assert_eq!(
+                    bodies[0]["chat_template_kwargs"]["enable_thinking"],
+                    effort != "none"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_api_reasoning_effort_preflight_accepts_native_strings_without_loading() {
+    let store =
+        ModelStore::resolve(Some(std::env::temp_dir().join("werk-effort-preflight"))).unwrap();
+    let backend = LlamaServerBackend::new(store, LlamaCppMode::Cpu, LlamaRuntimeOptions::default());
+    let manifest = ModelManifest {
+        storage: Default::default(),
+        id: "effort-preflight".into(),
+        source: crate::model_store::ModelSource::LocalPath {
+            path: "missing-fixture".into(),
+        },
+        format: ModelFormat::Gguf,
+        architecture: Some("qwen3".into()),
+        tokenizer_path: None,
+        config_path: None,
+        model_path: None,
+        backend: "llama-cpu".into(),
+        created_unix: 1,
+        files: Vec::new(),
+        artifacts: Vec::new(),
+        metadata: Default::default(),
+    };
+    let request = tool_request();
+    for effort in ["default", "off", "custom_thinking", "low", "none"] {
+        backend
+            .validate_api_options(
+                &manifest,
+                &request,
+                &std::collections::BTreeMap::from([("reasoning_effort".into(), json!(effort))]),
+            )
+            .unwrap();
+    }
+    for effort in [json!(42), json!(0.5), json!(true)] {
+        let error = backend
+            .validate_api_options(
+                &manifest,
+                &request,
+                &std::collections::BTreeMap::from([("reasoning_effort".into(), effort)]),
+            )
+            .unwrap_err();
+        let error = error
+            .downcast_ref::<crate::backend::ApiOptionError>()
+            .unwrap();
+        assert_eq!(error.param, "reasoning_effort");
+        assert!(error.message.contains("string"));
+        assert_eq!(
+            error.details.get("supported_types"),
+            Some(&json!(["string"]))
+        );
+        assert_eq!(
+            error.details.get("values_depend_on_model"),
+            Some(&json!(true))
+        );
+        assert!(!error.details.contains_key("supported_values"));
+    }
+    assert!(backend.servers.lock().unwrap().is_empty());
+}
+
+#[test]
+fn native_api_omitted_effort_preserves_server_thinking_default() {
+    let mut body = chat_api_body(&tool_request(), false);
+    apply_chat_api_options(
+        &mut body,
+        std::collections::BTreeMap::from([("frequency_penalty".into(), json!(0.2))]),
+    )
+    .unwrap();
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("chat_template_kwargs").is_none());
+}
+
 #[test]
 fn token_count_templates_tool_schemas_and_tool_result_history() {
     let mut request = tool_request();

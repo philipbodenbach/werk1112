@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, convert::Infallible};
 use tokio_stream::StreamExt;
 
-pub(super) fn validate(options: &BTreeMap<String, Value>, anthropic: bool) -> Result<(), String> {
+pub(super) fn validate(options: &BTreeMap<String, Value>, anthropic: bool) -> anyhow::Result<()> {
     for (key, v) in options {
         if v.is_null()
             && matches!(
@@ -52,19 +52,24 @@ pub(super) fn validate(options: &BTreeMap<String, Value>, anthropic: bool) -> Re
                             })
                     })
             }
-            "reasoning_effort" => {
-                !anthropic
-                    && v.as_str().is_some_and(|s| {
-                        matches!(s, "none" | "minimal" | "low" | "medium" | "high" | "xhigh")
-                    })
-            }
+            // Effort vocabularies and even types belong to the selected
+            // runtime/model (for example oMLX also supports numeric effort).
+            "reasoning_effort" => !anthropic && (v.is_string() || v.is_number()),
             "top_k" => anthropic && v.as_u64().is_some_and(|n| n <= u32::MAX as u64),
             "response_format" => valid_format(v),
             "store" => !anthropic && v == &json!(false),
-            _ => return Err(format!("unsupported request field: {key}")),
+            _ => anyhow::bail!("unsupported request field: {key}"),
         };
         if !valid {
-            return Err(format!("unsupported or invalid value for {key}"));
+            if key == "reasoning_effort" && !anthropic {
+                return Err(crate::backend::ApiOptionError::reasoning_effort(
+                    "Werk request schema",
+                    None,
+                    &["string", "number", "null"],
+                )
+                .into());
+            }
+            anyhow::bail!("unsupported or invalid value for {key}");
         }
     }
     Ok(())
@@ -262,5 +267,41 @@ impl tokio_stream::Stream for OpenAiStream {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_effort_levels_validate_and_null_uses_runtime_default() {
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let mut options = BTreeMap::from([("reasoning_effort".into(), json!(effort))]);
+            validate(&options, false).unwrap();
+            normalize(&mut options);
+            assert_eq!(options["reasoning_effort"], effort);
+            assert!(validate(&options, true).is_err());
+        }
+        for value in [
+            json!("custom_effort"),
+            json!("default"),
+            json!(0.35),
+            json!(1),
+        ] {
+            let mut options = BTreeMap::from([("reasoning_effort".into(), value.clone())]);
+            validate(&options, false).unwrap();
+            normalize(&mut options);
+            assert_eq!(options["reasoning_effort"], value);
+        }
+        for value in [json!(true), json!({}), json!([])] {
+            assert!(
+                validate(&BTreeMap::from([("reasoning_effort".into(), value)]), false).is_err()
+            );
+        }
+        let mut options = BTreeMap::from([("reasoning_effort".into(), Value::Null)]);
+        validate(&options, false).unwrap();
+        normalize(&mut options);
+        assert!(options.is_empty());
     }
 }

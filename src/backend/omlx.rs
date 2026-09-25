@@ -38,6 +38,14 @@ use crate::{
     runtime_control::{BackendRuntimeAdapter, ModelResidencyStatus, StaticRuntimeAdapter},
 };
 
+const API_OPTIONS: &[&str] = &[
+    "response_format",
+    "frequency_penalty",
+    "presence_penalty",
+    "top_k",
+    "reasoning_effort",
+];
+
 const PROBE: &str = include_str!("omlx_probe.py");
 const SUPERVISOR: &str = include_str!("omlx_supervisor.py");
 const EXPERTS: &str = include_str!("omlx_experts.py");
@@ -542,6 +550,15 @@ impl GenerationBackend for OmlxBackend {
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         telemetry::sample(self)
     }
+    fn validate_api_options(
+        &self,
+        _manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<()> {
+        super::openai_transport::validate_api_options(options, API_OPTIONS)?;
+        reject_images(request)
+    }
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -549,17 +566,7 @@ impl GenerationBackend for OmlxBackend {
         options: std::collections::BTreeMap<String, Value>,
         tx: Option<mpsc::Sender<Result<Value, String>>>,
     ) -> Result<Value> {
-        super::openai_transport::validate_api_options(
-            &options,
-            &[
-                "response_format",
-                "frequency_penalty",
-                "presence_penalty",
-                "top_k",
-                "reasoning_effort",
-            ],
-        )?;
-        reject_images(&request)?;
+        self.validate_api_options(manifest, &request, &options)?;
         let (request, policy) = self.prepare_tool_request(manifest, request)?;
         let (server, _) = self.cached_server(manifest)?;
         let mut body = omlx_chat_completion_body(
@@ -569,17 +576,28 @@ impl GenerationBackend for OmlxBackend {
             self.request_thinking.or(server.thinking),
             self.request_reasoning_effort.or(server.reasoning_effort),
         );
-        super::openai_transport::apply_api_options(
-            &mut body,
-            options,
-            &[
-                "response_format",
-                "frequency_penalty",
-                "presence_penalty",
-                "top_k",
-                "reasoning_effort",
-            ],
-        )?;
+        let effort_override = options.get("reasoning_effort").cloned();
+        super::openai_transport::apply_api_options(&mut body, options, API_OPTIONS)?;
+        // Keep native effort values and types in sync with the template.
+        // Only recognized standard levels change the thinking switch; custom
+        // strings and numeric efforts retain their model-specific meaning.
+        if let Some(effort) = effort_override {
+            let thinking = super::openai_transport::reasoning_effort_thinking(&effort);
+            if let Some(enabled) = thinking {
+                body["chat_template_kwargs"]["enable_thinking"] = json!(enabled);
+            }
+            if thinking == Some(false) {
+                // Native oMLX forwards "none" literally to model templates.
+                // Disable thinking without sending that unsupported sentinel.
+                body.as_object_mut().unwrap().remove("reasoning_effort");
+                body["chat_template_kwargs"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reasoning_effort");
+            } else {
+                body["chat_template_kwargs"]["reasoning_effort"] = effort;
+            }
+        }
         if let Some(policy) = policy {
             let mut value = super::openai_transport::generate_api(
                 &server.url,

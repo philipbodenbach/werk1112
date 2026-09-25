@@ -199,7 +199,7 @@ async fn rich_openai_responses_preserve_multiple_choices_logprobs_and_schema_con
         "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}))]);
     let app = vllm_app(server.url.clone());
     let response=post_json(&app,"/v1/chat/completions",json!({"model":"qwen-test","messages":[{"role":"user","content":"Hello"}],
-        "n":2,"logprobs":true,"top_logprobs":1,"frequency_penalty":0.2,"presence_penalty":0.1,"logit_bias":{"12":-5}}),None).await;
+        "n":2,"logprobs":true,"top_logprobs":1,"frequency_penalty":0.2,"presence_penalty":0.1,"logit_bias":{"12":-5},"reasoning_effort":"low"}),None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let value = response_json(response).await;
     assert_eq!(value["model"], "qwen-test");
@@ -208,6 +208,113 @@ async fn rich_openai_responses_preserve_multiple_choices_logprobs_and_schema_con
     let sent = server.finish();
     assert_eq!(sent[0]["n"], 2);
     assert_eq!(sent[0]["logit_bias"]["12"], -5);
+    assert_eq!(sent[0]["reasoning_effort"], "low");
+    assert_eq!(sent[0]["chat_template_kwargs"]["enable_thinking"], true);
+}
+
+#[tokio::test]
+async fn vllm_reasoning_effort_overrides_thinking_per_request_for_json_and_sse() {
+    for stream in [false, true] {
+        // Change the mode on one backend, then omit it to prove no override
+        // leaks into later requests that should retain the native default.
+        let efforts = [Some("low"), Some("none"), None];
+        let responses = efforts.iter().map(|_| {
+            if stream {
+                MockHttpResponse::sse(vec![json!({
+                    "choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+                })])
+            } else {
+                MockHttpResponse::json(json!({
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+                }))
+            }
+        }).collect();
+        let server = MockVllmServer::start(responses);
+        let app = vllm_app(server.url.clone());
+        for effort in efforts {
+            let mut payload = json!({"model":"qwen-test","stream":stream,"max_tokens":32,
+                "messages":[{"role":"user","content":"Hello"}],"frequency_penalty":0.1});
+            if let Some(effort) = effort {
+                payload["reasoning_effort"] = effort.into();
+            }
+            let response = post_json(&app, "/v1/chat/completions", payload, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            if stream {
+                assert!(
+                    String::from_utf8(bytes.to_vec())
+                        .unwrap()
+                        .contains("data: [DONE]")
+                );
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["choices"][0]["message"]["content"], "answer");
+            }
+        }
+        let sent = server.finish();
+        assert_eq!(sent.len(), efforts.len());
+        for (body, effort) in sent.iter().zip(efforts) {
+            if let Some(effort) = effort {
+                assert_eq!(body["reasoning_effort"], effort);
+                assert_eq!(
+                    body["chat_template_kwargs"]["enable_thinking"],
+                    effort != "none"
+                );
+            } else {
+                assert!(body.get("reasoning_effort").is_none());
+                assert!(body.get("chat_template_kwargs").is_none());
+            }
+            assert_eq!(body["stream"], stream);
+        }
+    }
+}
+
+#[tokio::test]
+async fn vllm_reasoning_effort_rejects_values_outside_native_schema_before_json_or_sse() {
+    let server = MockVllmServer::start(vec![]);
+    let app = vllm_app(server.url.clone());
+    for effort in [
+        json!("off"),
+        json!("default"),
+        json!("custom_thinking"),
+        json!(42),
+        json!(0.5),
+    ] {
+        for stream in [false, true] {
+            let response = post_json(
+                &app,
+                "/v1/chat/completions",
+                json!({
+                    "model":"qwen-test","messages":[{"role":"user","content":"Hello"}],
+                    "reasoning_effort":effort,"stream":stream
+                }),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["code"], "invalid_reasoning_effort");
+            assert_eq!(body["error"]["param"], "reasoning_effort");
+            assert_eq!(
+                body["error"]["supported_values"],
+                json!(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+            );
+            assert_eq!(body["error"]["supported_types"], json!(["string"]));
+            assert_eq!(body["error"]["values_scope"], "backend");
+            assert_eq!(body["error"]["values_depend_on_model"], true);
+            assert!(body["error"]["message"].as_str().unwrap().contains("vLLM"));
+            let message = body["error"]["message"].as_str().unwrap();
+            for value in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+                assert!(message.contains(value), "{message}");
+            }
+        }
+    }
+    assert!(server.finish().is_empty());
 }
 
 #[tokio::test]
