@@ -5,6 +5,11 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Retain interleaved llama.cpp API prompt contexts in a bounded native RAM cache
+  on compatible runtimes instead of disabling the cache for private snapshot
+  storage. Keep explicit state and persistent-chat requests pinned to their slot,
+  and validate cache/slot overrides before advertising state capabilities.
+
 - Show Linux llama.cpp CPU expert RAM residency and GGUF weight size with a live
   history, plus prompt/KV cache hit rate, memory history and animated panel status.
   Count reclaimable file cache in host occupancy, label host/GPU pressure

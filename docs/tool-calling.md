@@ -24,6 +24,44 @@ runtime available. Vision-capable adapters preserve images alongside tools.
 switching the model to vLLM. Use the normal Werk serve command and a context
 large enough for the messages, tool definitions and answer budget.
 
+## OpenCode: native tools and Code Mode
+
+OpenCode 2.0.16 exposes ordinary tools such as `read`, `glob`, `grep` and
+`shell` separately from its JavaScript `execute` tool. Inside `execute`, only
+paths from the current Code Mode catalog or its `search` function are callable.
+For example, `return await search({query: "session management"})` discovers
+catalog tools; call the returned exact paths and signatures.
+
+An outer `execute` call can succeed while its JavaScript fails with
+`Unknown tool 'execute'`, `execute_b9` or `shell`. Inspect the call's `code`
+argument: invented nested calls such as `tools.execute(...)` or `tools.shell(...)`
+are not aliases for ordinary shell tools. Call the advertised native tool
+directly when permitted. A suggestion such as `tools.opencode.session_move`
+is a name-search result, not a substitute for the requested operation. Werk
+forwards these tool arguments without rewriting JavaScript or inventing aliases.
+
+For a local-file reviewer that needs only native read/search tools, OpenCode's
+agent configuration can explicitly restrict the Code Mode wrapper:
+
+```json
+{
+  "agent": {
+    "code-reviewer": {
+      "mode": "subagent",
+      "permission": { "edit": "deny", "bash": "deny", "execute": "deny" }
+    }
+  }
+}
+```
+
+Merge these permissions with the reviewer's existing configuration. In 2.0.16,
+`execute: deny` removes the wrapper and its catalog while leaving permitted
+native tools available. This also removes Code Mode MCP/session helpers for
+that agent; use it only when the reviewer does not need those helpers. Keep
+shell-based checks with an agent whose shell permission allows them. Prompt
+hints about direct calls and discovery can reduce model mistakes but do not
+guarantee tool selection.
+
 ## Generic protocol
 
 Generators without native tool transport receive the schemas and complete

@@ -45,7 +45,7 @@ const STATE_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
 const STATE_HTTP_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const STATE_HTTP_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const STATE_SNAPSHOT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const STATE_SLOT_ID: u32 = 0;
+pub(super) const STATE_SLOT_ID: u32 = 0;
 const MAX_CANONICAL_STATE_RECORDS: usize = 1024;
 const MAX_DEFERRED_CLEANUPS: usize = MAX_CANONICAL_STATE_RECORDS;
 const STATE_CAPABILITY_PROBE_PROMPT: &str =
@@ -2328,8 +2328,10 @@ pub(super) fn llama_state_args_are_effective(
         && last_option_value(args, &["--port"]).and_then(|value| value.parse::<u16>().ok())
             == Some(port)
         && last_toggle_value(args, "--slots", "--no-slots", true)
-        && (!args.iter().any(|argument| argument == "--cache-ram")
-            || last_option_value(args, &["--cache-ram"]) == Some("0"))
+        && (last_option_value(args, &["--cache-ram", "-cram"]).is_none_or(|v| v == "0")
+            || last_option_value(args, &["--slot-prompt-similarity", "-sps"])
+                .and_then(|v| v.parse::<f64>().ok())
+                == Some(0.0))
         && !last_toggle_value(args, "--cache-idle-slots", "--no-cache-idle-slots", false)
         && last_option_value(args, &["--api-prefix"]).is_none_or(str::is_empty)
 }
@@ -2463,6 +2465,64 @@ mod tests {
             ));
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_ram_cache_requires_explicit_slot_isolation_after_all_overrides() {
+        let model = Path::new("/model.gguf");
+        let snapshots = Path::new("/private");
+        let base: Vec<String> = [
+            "-m",
+            "/model.gguf",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "32123",
+            "-np",
+            "1",
+            "--slots",
+            "--slot-save-path",
+            "/private",
+            "--cache-ram",
+            "8192",
+            "--slot-prompt-similarity",
+            "0",
+            "--no-cache-idle-slots",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert!(llama_state_args_are_effective(
+            &base, snapshots, model, 32123
+        ));
+        for extra in [
+            vec!["-sps", "0.5"],
+            vec!["--slot-prompt-similarity=0.5"],
+            vec!["--cache-idle-slots"],
+            vec!["-sps", "NaN"],
+        ] {
+            let mut args = base.clone();
+            args.extend(extra.into_iter().map(str::to_string));
+            assert!(!llama_state_args_are_effective(
+                &args, snapshots, model, 32123
+            ));
+        }
+        for cache_override in [vec!["-cram", "0"], vec!["--cache-ram=0"]] {
+            let mut args = base.clone();
+            args.extend(["-sps".into(), "0.5".into()]);
+            args.extend(cache_override.into_iter().map(str::to_string));
+            assert!(llama_state_args_are_effective(
+                &args, snapshots, model, 32123
+            ));
+        }
+        for cache_override in [vec!["-cram", "1"], vec!["--cache-ram=8192"]] {
+            let mut args = base.clone();
+            args.extend(["-sps".into(), "0.5".into()]);
+            args.extend(cache_override.into_iter().map(str::to_string));
+            assert!(!llama_state_args_are_effective(
+                &args, snapshots, model, 32123
+            ));
+        }
     }
 
     #[test]

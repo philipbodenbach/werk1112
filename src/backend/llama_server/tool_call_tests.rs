@@ -402,3 +402,36 @@ fn native_stream_rejects_tool_data_after_done_without_forwarding_it() {
     assert!(rx.try_recv().is_err(), "post-DONE tool call was forwarded");
     server.join().unwrap();
 }
+
+#[test]
+fn snapshot_requests_pin_the_slot_while_api_requests_allow_native_cache_selection() {
+    for chat in [false, true] {
+        for slot in [None, Some(STATE_SLOT_ID)] {
+            let mut request = tool_request();
+            if !chat {
+                request.tool_config = None;
+            }
+            let path = if chat {
+                "/v1/chat/completions"
+            } else {
+                "/completion"
+            };
+            let event = if chat {
+                json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]})
+            } else {
+                json!({"content":"ok","stop":true})
+            };
+            let (url, server) =
+                mock_http(vec![(path, "text/event-stream", sse(vec![event], true))]);
+            let result =
+                complete_request_in_slot(&url, &request, None, Instant::now(), slot).unwrap();
+            assert_eq!(result.text, "ok");
+            let bodies = server.join().unwrap();
+            assert_eq!(bodies[0]["cache_prompt"], true);
+            assert_eq!(
+                bodies[0].get("id_slot").and_then(Value::as_u64),
+                slot.map(u64::from)
+            );
+        }
+    }
+}

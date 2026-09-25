@@ -104,6 +104,13 @@ The matching `werk serve` options override the resource-tuning variables.
 | `WERK_LLAMA_LOG` | Truthy value enables child-runtime logging. |
 | `WERK_LLAMA_ARGS` | Additional whitespace-split arguments appended to `llama-server`. Advanced use: these can change runtime behavior outside Werk's typed validation. If the final arguments override the private single-slot state configuration, Werk leaves runtime-state capabilities unavailable. |
 
+With the required native slot controls available, Werk enables an 8192 MiB
+RAM prompt cache for alternating API conversations, independently of
+`serve --persistence`. Append `--cache-ram 2048` or `--cache-ram 0` through
+`WERK_LLAMA_ARGS` to reduce or disable it. See
+[llama.cpp prompt caching](../backends.md#llamacpp-prompt-caching-across-api-conversations)
+for snapshot isolation and compatibility with older runtimes.
+
 Managed CUDA builds additionally read `WERK_LLAMA_CUDA_COMPILER`,
 `WERK_LLAMA_CUDA_HOST_COMPILER`, and `WERK_LLAMA_CUDA_ARCH`.
 

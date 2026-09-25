@@ -33,7 +33,7 @@ mod tool_call_tests;
 mod tool_calls;
 
 use runtime_state::{
-    LlamaChatPersistence, LlamaProcessStateRuntime, LlamaRuntimeStateAdapter,
+    LlamaChatPersistence, LlamaProcessStateRuntime, LlamaRuntimeStateAdapter, STATE_SLOT_ID,
     cleanup_llama_snapshot_dir, inspect_llama_executable, llama_state_args_are_effective,
     prepare_llama_state_snapshot_dir,
 };
@@ -52,6 +52,7 @@ use crate::{
 const DEFAULT_CTX_SIZE: usize = 4096;
 const DEFAULT_BATCH_SIZE: usize = 2048;
 const DEFAULT_UBATCH_SIZE: u32 = 512;
+const DEFAULT_PROMPT_CACHE_MIB: usize = 8192;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -908,7 +909,13 @@ impl LlamaServerProcess {
         let cache_notice = persistence.map(|cache| cache.restore(self)).transpose()?;
         let restored_tokens = cache_notice.as_ref().and_then(|(_, tokens)| *tokens);
         let restore_seconds = restore_started.elapsed().as_secs_f64();
-        let mut completion = complete_request(&self.url, request, tx, started)?;
+        // A restored terminal-chat snapshot must remain the source of reuse.
+        // Automatic API requests can instead select among native RAM entries.
+        let mut completion = if persistence.is_some() {
+            complete_request_in_slot(&self.url, request, tx, started, Some(STATE_SLOT_ID))?
+        } else {
+            complete_request(&self.url, request, tx, started)?
+        };
         if let Some((notice, _)) = cache_notice {
             completion.backend_diagnostics.push(notice);
         }
@@ -1233,8 +1240,23 @@ fn llama_server_args_with_state(
         args.push("--slot-save-path".to_string());
         args.push(snapshot_dir.display().to_string());
         if supported.cache_ram {
+            // Preserve different API conversations in native RAM even with a
+            // single GPU slot. Disable similarity selection so explicit
+            // id_slot requests used by runtime-state operations bypass native
+            // cache save/load, while unpinned API requests use its LRU path.
+            let isolated_cache = supported.slot_prompt_similarity && supported.cache_idle_slots;
             args.push("--cache-ram".to_string());
-            args.push("0".to_string());
+            args.push(
+                if isolated_cache {
+                    DEFAULT_PROMPT_CACHE_MIB
+                } else {
+                    0
+                }
+                .to_string(),
+            );
+            if isolated_cache {
+                args.extend(["--slot-prompt-similarity".to_string(), "0".to_string()]);
+            }
         }
         if supported.cache_idle_slots {
             args.push("--no-cache-idle-slots".to_string());
@@ -1291,14 +1313,27 @@ fn complete_request(
     tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     started: Instant,
 ) -> Result<ServerCompletion> {
+    complete_request_in_slot(url, request, tx, started, None)
+}
+
+fn complete_request_in_slot(
+    url: &str,
+    request: &GenerateRequest,
+    tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+    started: Instant,
+    slot: Option<u32>,
+) -> Result<ServerCompletion> {
     let use_chat_endpoint = !request.messages.is_empty()
         || request_has_images(request)
         || request.requires_tool_calling();
-    let (path, body) = if use_chat_endpoint {
+    let (path, mut body) = if use_chat_endpoint {
         ("/v1/chat/completions", chat_completion_body(request))
     } else {
         ("/completion", completion_body(request))
     };
+    if let Some(slot) = slot {
+        body["id_slot"] = json!(slot);
+    }
     let mut stream = post_json(url, path, &body)?;
     let mut completion = ServerCompletion {
         finish_reason: "length".to_string(),
@@ -1996,6 +2031,7 @@ struct SupportedArgs {
     parallel: bool,
     cache_ram: bool,
     cache_idle_slots: bool,
+    slot_prompt_similarity: bool,
     help_succeeded: bool,
 }
 
@@ -2037,6 +2073,7 @@ fn supported_args_from_help(text: &str) -> SupportedArgs {
         parallel: help_has_exact_option(&text, "--parallel"),
         cache_ram: help_has_exact_option(&text, "--cache-ram"),
         cache_idle_slots: help_has_exact_option(&text, "--cache-idle-slots"),
+        slot_prompt_similarity: help_has_exact_option(text, "--slot-prompt-similarity"),
         help_succeeded: true,
     }
 }
@@ -4395,6 +4432,38 @@ Agent 3
             Some("89".into())
         );
         assert_eq!(cuda_architectures_from_compute_caps("not available"), None);
+    }
+
+    #[test]
+    fn prompt_cache_retains_api_conversations_without_compromising_private_slots() {
+        for mode in [LlamaCppMode::Cpu, LlamaCppMode::Cuda, LlamaCppMode::Metal] {
+            for modern in [false, true] {
+                let supported = supported_args_from_help(if modern {
+                    "--slots --slot-save-path --parallel --cache-ram --cache-idle-slots --slot-prompt-similarity"
+                } else {
+                    "--slots --slot-save-path --parallel --cache-ram --cache-idle-slots"
+                });
+                let model = Path::new("/model.gguf");
+                let snapshots = Path::new("/private");
+                let args = llama_server_args_with_state(
+                    mode,
+                    model,
+                    None,
+                    12345,
+                    &LlamaRuntimeOptions::default(),
+                    &supported,
+                    false,
+                    Some(snapshots),
+                );
+                let cache = args.iter().position(|v| v == "--cache-ram").unwrap();
+                assert_eq!(args[cache + 1], if modern { "8192" } else { "0" });
+                assert_eq!(args.iter().any(|v| v == "--slot-prompt-similarity"), modern);
+                assert!(args.iter().any(|v| v == "--no-cache-idle-slots"));
+                assert!(llama_state_args_are_effective(
+                    &args, snapshots, model, 12345
+                ));
+            }
+        }
     }
 
     #[test]
