@@ -859,3 +859,73 @@ fn vllm_token_count_preserves_request_reasoning_template_options() {
         assert_eq!(requests[0]["tools"][0]["function"]["name"], "get_weather");
     }
 }
+
+#[tokio::test]
+async fn extended_api_preserves_native_timing_formats_in_request_history() {
+    // Exercise the shared raw HTTP transport and API observation with both
+    // native timing formats, plus plain OpenAI usage without phase durations.
+    for format in ["llama.cpp", "omlx", "plain"] {
+        for stream in [false, true] {
+            let mut metadata = json!({"choices": [], "usage": {
+                "prompt_tokens": 100, "completion_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }});
+            match format {
+                "llama.cpp" => {
+                    metadata["timings"] = json!({
+                        "prompt_n": 20, "prompt_ms": 500,
+                        "predicted_n": 30, "predicted_ms": 2000
+                    })
+                }
+                "omlx" => {
+                    metadata["usage"]["prompt_eval_duration"] = json!(0.5);
+                    metadata["usage"]["generation_duration"] = json!(2.0);
+                }
+                _ => {}
+            }
+            let upstream = if stream {
+                MockHttpResponse::sse(vec![
+                    json!({"choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]}),
+                    metadata,
+                ])
+            } else {
+                metadata["choices"] = json!([{"index": 0,
+                    "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]);
+                MockHttpResponse::json(metadata)
+            };
+            let server = MockVllmServer::start(vec![upstream]);
+            let state = vllm_state(server.url.clone());
+            let telemetry = state.telemetry.clone();
+            let app = router(state);
+            let response = post_json(
+                &app,
+                "/v1/chat/completions",
+                json!({
+                    "model": "qwen-test", "messages": [{"role": "user", "content": "hello"}],
+                    "frequency_penalty": 0.2, "stream": stream
+                }),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let snapshot = telemetry.snapshot();
+            assert_eq!(snapshot.totals.completed, 1, "{format}, stream={stream}");
+            let row = &snapshot.requests[0];
+            assert_eq!(row.output_tokens, Some(30));
+            assert_eq!(row.cached_tokens, Some(80));
+            assert_eq!(
+                row.decode_tokens_per_second,
+                (format != "plain").then_some(15.),
+                "{format}, stream={stream}"
+            );
+            assert_eq!(
+                row.prefill_tokens_per_second,
+                (format != "plain").then_some(40.)
+            );
+            server.finish();
+        }
+    }
+}

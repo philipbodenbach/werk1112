@@ -92,6 +92,12 @@ already-running workers; unsupported values remain absent, not fabricated zeroes
   with unchanged completion count. It is not an exact per-token trace; request/phase
   transitions and missing samples can make it unavailable. Completed request
   decode/prefill rates use the backend's reported token counts and timings.
+  Extended API requests retain llama.cpp's `timings` and oMLX's usage durations,
+  including when metadata arrives in separate stream chunks. Plain OpenAI usage
+  without phase timings (for example a vLLM extended response) still reports
+  token counts but leaves decode/prefill rates unavailable. Regular adapter paths
+  continue using their existing `GenerationTimings`, which may include adapter
+  measurements or estimates.
 * Expert hit ratio uses interval hit/miss deltas. No accesses means unavailable.
   Prefix reuse is separate, shown in each completed request's cached-token count.
 * Expert read bytes include reads satisfied by the OS file cache. They do not

@@ -5,6 +5,10 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Preserve native llama.cpp and oMLX timing metadata in extended chat API
+  responses and streams so completed requests in `werk top` retain decode and
+  prefill rates. Keep timings across separate usage and completion chunks.
+
 - Retain interleaved llama.cpp API prompt contexts in a bounded native RAM cache
   on compatible runtimes instead of disabling the cache for private snapshot
   storage. Keep explicit state and persistent-chat requests pinned to their slot,
