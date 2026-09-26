@@ -60,6 +60,8 @@ pub struct Totals {
 pub struct Snapshot {
     #[serde(default)]
     pub host_swap_used_bytes: Option<u64>,
+    #[serde(default)]
+    pub host_memory_free_bytes: Option<u64>,
     pub schema_version: u32,
     pub observed_at_ms: u64,
     pub server_started_ms: u64,
@@ -117,6 +119,7 @@ impl Telemetry {
             start: Instant::now(),
             finished: false,
             first: false,
+            raw_timings: RawTimings::default(),
         }
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -134,6 +137,7 @@ impl Telemetry {
         requests.extend(r.recent.iter().rev().cloned());
         Snapshot {
             host_swap_used_bytes: None,
+            host_memory_free_bytes: None,
             schema_version: 1,
             observed_at_ms: time,
             server_started_ms: self.started_ms,
@@ -147,19 +151,80 @@ impl Telemetry {
     }
 }
 
+// Retain only scalar metadata from native API responses, never response content.
+#[derive(Default)]
+struct RawTimings {
+    usage_prompt_tokens: Option<u64>,
+    usage_output_tokens: Option<u64>,
+    usage_cached_tokens: Option<u64>,
+    prompt_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    prompt_seconds: Option<f64>,
+    decode_seconds: Option<f64>,
+    first_token_seconds: Option<f64>,
+}
+
 pub struct RequestGuard {
     telemetry: Arc<Telemetry>,
     entry: RequestSnapshot,
     start: Instant,
     finished: bool,
     first: bool,
+    raw_timings: RawTimings,
 }
 impl RequestGuard {
+    fn raw_metadata(&mut self, value: &serde_json::Value) {
+        let usage = &value["usage"];
+        let timings = &value["timings"];
+        let raw = &mut self.raw_timings;
+        raw.usage_prompt_tokens = usage["prompt_tokens"].as_u64().or(raw.usage_prompt_tokens);
+        raw.usage_output_tokens = usage["completion_tokens"]
+            .as_u64()
+            .or(raw.usage_output_tokens);
+        raw.usage_cached_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .or(raw.usage_cached_tokens);
+        raw.prompt_tokens = timings["prompt_n"].as_u64().or(raw.prompt_tokens);
+        raw.output_tokens = timings["predicted_n"].as_u64().or(raw.output_tokens);
+        raw.cached_tokens = timings["cache_n"].as_u64().or(raw.cached_tokens);
+        let seconds = |v: &serde_json::Value| v.as_f64().filter(|s| s.is_finite() && *s >= 0.);
+        // llama.cpp reports milliseconds; oMLX extends usage with seconds.
+        raw.prompt_seconds = seconds(&timings["prompt_ms"])
+            .map(|ms| ms / 1000.)
+            .or_else(|| seconds(&usage["prompt_eval_duration"]))
+            .or(raw.prompt_seconds);
+        raw.decode_seconds = seconds(&timings["predicted_ms"])
+            .map(|ms| ms / 1000.)
+            .or_else(|| seconds(&usage["generation_duration"]))
+            .or(raw.decode_seconds);
+        raw.first_token_seconds =
+            seconds(&usage["time_to_first_token"]).or(raw.first_token_seconds);
+    }
     pub fn raw_complete(&mut self, value: &serde_json::Value) {
-        self.entry.prompt_tokens = value["usage"]["prompt_tokens"].as_u64();
-        self.entry.output_tokens = value["usage"]["completion_tokens"].as_u64();
-        self.entry.cached_tokens =
-            value["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64();
+        if self.finished {
+            return;
+        }
+        self.raw_metadata(value);
+        let raw = &self.raw_timings;
+        self.entry.prompt_tokens = raw.usage_prompt_tokens;
+        self.entry.output_tokens = raw.usage_output_tokens;
+        self.entry.cached_tokens = raw.usage_cached_tokens.or(raw.cached_tokens);
+        self.entry.decode_tokens_per_second = raw
+            .output_tokens
+            .or(self.entry.output_tokens)
+            .zip(raw.decode_seconds)
+            .and_then(|(n, s)| positive_rate(n, s));
+        let evaluated = raw.prompt_tokens.or_else(|| {
+            self.entry
+                .prompt_tokens
+                .map(|n| n.saturating_sub(self.entry.cached_tokens.unwrap_or(0)))
+        });
+        self.entry.prefill_tokens_per_second = evaluated
+            .zip(raw.prompt_seconds)
+            .and_then(|(n, s)| positive_rate(n, s));
+        self.entry.first_output_seconds =
+            raw.first_token_seconds.or(self.entry.first_output_seconds);
         let reason = value["choices"]
             .as_array()
             .and_then(|c| c.first())
@@ -331,7 +396,6 @@ pub fn observe_raw_stream(
         guard,
         expected,
         finished: std::collections::BTreeSet::new(),
-        usage: None,
         reason: String::new(),
         ended: false,
     })
@@ -341,7 +405,6 @@ struct RawStream {
     guard: RequestGuard,
     expected: usize,
     finished: std::collections::BTreeSet<u64>,
-    usage: Option<serde_json::Value>,
     reason: String,
     ended: bool,
 }
@@ -360,9 +423,7 @@ impl tokio_stream::Stream for RawStream {
                 if value.get("error").is_some() {
                     self.guard.error();
                 }
-                if value["usage"].is_object() {
-                    self.usage = Some(value["usage"].clone());
-                }
+                self.guard.raw_metadata(&value);
                 if let Some(choices) = value["choices"].as_array() {
                     for choice in choices {
                         if choice["delta"]["content"]
@@ -391,7 +452,7 @@ impl tokio_stream::Stream for RawStream {
             Poll::Ready(None) => {
                 self.ended = true;
                 if self.finished.len() == self.expected {
-                    let raw = serde_json::json!({"usage":self.usage,"choices":[{"finish_reason":self.reason}]});
+                    let raw = serde_json::json!({"choices":[{"finish_reason":self.reason}]});
                     self.guard.raw_complete(&raw);
                 } else {
                     self.guard.error();
@@ -432,7 +493,24 @@ impl Rates {
                 == new.counters.get("requests_completed_total")
             && old.gauges.get("requests_active") == Some(&1.)
             && new.gauges.get("requests_active") == Some(&1.);
-        let decode_estimate = if same_request {
+        // llama.cpp exposes per-slot generation counts. Task IDs prevent a new
+        // request (including prompt evaluation) from becoming a false decode spike.
+        let slot_deltas: Vec<_> = new
+            .gauges
+            .iter()
+            .filter_map(|(key, task)| {
+                let slot = key.strip_prefix("slot_")?.strip_suffix("_task")?;
+                if old.gauges.get(key) != Some(task) {
+                    return None;
+                }
+                let key = format!("slot_{slot}_decoded");
+                let (a, b) = (old.gauges.get(&key)?, new.gauges.get(&key)?);
+                (a > &0. && b >= a).then_some((b - a) / seconds)
+            })
+            .collect();
+        let decode_estimate = if !slot_deltas.is_empty() {
+            Some(slot_deltas.iter().sum())
+        } else if same_request {
             old.gauges
                 .get("decode_context_tokens")
                 .zip(new.gauges.get("decode_context_tokens"))
@@ -451,6 +529,159 @@ impl Rates {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_completion_preserves_backend_rates() {
+        let t = Arc::new(Telemetry::default());
+        t.begin("mock").raw_complete(&serde_json::json!({
+            "choices": [{"finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 30,
+                      "prompt_tokens_details": {"cached_tokens": 80}},
+            "timings": {"prompt_n": 20, "prompt_ms": 500,
+                        "predicted_n": 30, "predicted_ms": 2000}
+        }));
+        let s = t.snapshot();
+        let r = &s.requests[0];
+        assert_eq!(r.state, "tool_calls");
+        assert_eq!(r.decode_tokens_per_second, Some(15.));
+        assert_eq!(r.prefill_tokens_per_second, Some(40.));
+        assert_eq!(r.cached_tokens, Some(80));
+        assert_eq!(s.totals.output_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn raw_stream_retains_timings_across_separate_usage_and_finish_chunks() {
+        // Timings may arrive before or after the separate usage chunk.
+        for timings_first in [false, true] {
+            let t = Arc::new(Telemetry::default());
+            let timing = serde_json::json!({"choices": [], "timings": {
+                "prompt_n": 20, "prompt_ms": 500, "cache_n": 80,
+                "predicted_n": 30, "predicted_ms": 2000
+            }});
+            let usage = serde_json::json!({"choices": [], "usage": {
+                "prompt_tokens": 100, "completion_tokens": 30
+            }});
+            let mut items = vec![serde_json::json!({"choices": [{
+                "index": 0, "delta": {"tool_calls": []}, "finish_reason": "tool_calls"
+            }]})];
+            items.extend(if timings_first {
+                [timing, usage]
+            } else {
+                [usage, timing]
+            });
+            let output: Vec<_> = observe_raw_stream(
+                Box::pin(tokio_stream::iter(
+                    items.iter().cloned().map(Ok).collect::<Vec<_>>(),
+                )),
+                t.begin("mock"),
+                1,
+            )
+            .collect()
+            .await;
+            assert_eq!(
+                output.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+                items
+            );
+            let s = t.snapshot();
+            let r = &s.requests[0];
+            assert_eq!(r.state, "tool_calls");
+            assert_eq!(r.decode_tokens_per_second, Some(15.));
+            assert_eq!(r.prefill_tokens_per_second, Some(40.));
+            assert_eq!(r.cached_tokens, Some(80));
+            assert_eq!(s.totals.completed, 1);
+            assert_eq!(s.totals.output_tokens, 30);
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_omlx_usage_timings_survive_partial_and_invalid_usage_chunks() {
+        let t = Arc::new(Telemetry::default());
+        let values = vec![
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 30,
+                    "prompt_tokens_details": {"cached_tokens": 80},
+                    "time_to_first_token": 0.75, "prompt_eval_duration": 0.5,
+                    "generation_duration": 2.0}}),
+            serde_json::json!({"choices": [], "usage": {
+                "generation_duration": -1, "prompt_eval_duration": "invalid",
+                "time_to_first_token": null}}),
+        ];
+        let _: Vec<_> = observe_raw_stream(
+            Box::pin(tokio_stream::iter(values.into_iter().map(Ok))),
+            t.begin("omlx"),
+            1,
+        )
+        .collect()
+        .await;
+        let s = t.snapshot();
+        let r = &s.requests[0];
+        assert_eq!(r.decode_tokens_per_second, Some(15.));
+        assert_eq!(r.prefill_tokens_per_second, Some(40.));
+        assert_eq!(r.first_output_seconds, Some(0.75));
+        assert_eq!(r.cached_tokens, Some(80));
+        assert_eq!(s.totals.output_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn typed_backend_timings_reach_both_completed_request_paths() {
+        let t = Arc::new(Telemetry::default());
+        let response = GenerateResponse {
+            text: "private".into(),
+            assistant_message: None,
+            prompt_tokens: 100,
+            completion_tokens: 30,
+            finish_reason: "stop".into(),
+            timings: GenerationTimings {
+                cached_prompt_tokens: Some(80),
+                prompt_seconds: 0.5,
+                decode_seconds: 2.,
+                first_token_seconds: 0.75,
+                ..Default::default()
+            },
+            backend_diagnostics: vec![],
+        };
+        t.begin("typed").complete(&response);
+        let _: Vec<_> = observe_stream(
+            Box::pin(tokio_stream::iter(vec![Ok(GenerateStreamEvent::Done {
+                finish_reason: response.finish_reason,
+                prompt_tokens: response.prompt_tokens,
+                completion_tokens: response.completion_tokens,
+                timings: response.timings,
+                backend_diagnostics: vec![],
+            })])),
+            t.begin("typed"),
+        )
+        .collect()
+        .await;
+        let s = t.snapshot();
+        assert_eq!(s.totals.completed, 2);
+        for r in s.requests {
+            assert_eq!(r.decode_tokens_per_second, Some(15.));
+            assert_eq!(r.prefill_tokens_per_second, Some(40.));
+            assert_eq!(r.first_output_seconds, Some(0.75));
+        }
+    }
+
+    #[test]
+    fn raw_completion_without_valid_timings_keeps_rates_unavailable() {
+        for ms in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("invalid"),
+        ] {
+            let t = Arc::new(Telemetry::default());
+            t.begin("mock").raw_complete(&serde_json::json!({
+                "choices": [{"finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 30},
+                "timings": {"prompt_ms": ms, "predicted_ms": ms}
+            }));
+            let s = t.snapshot();
+            assert_eq!(s.requests[0].decode_tokens_per_second, None);
+            assert_eq!(s.requests[0].prefill_tokens_per_second, None);
+            assert_eq!(s.totals.output_tokens, 30);
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_stream_and_premature_eof_are_distinct() {
         let t = Arc::new(Telemetry::default());
@@ -522,6 +753,29 @@ mod tests {
         assert_eq!(t.snapshot().totals.output_tokens, 6);
         assert_eq!(t.snapshot().totals.completed, 1);
     }
+    #[test]
+    fn observability_llama_decode_uses_task_identity_and_excludes_prefill() {
+        let mut a = BackendSnapshot {
+            available: true,
+            instance: "worker".into(),
+            ..Default::default()
+        };
+        a.gauges
+            .extend([("slot_0_task".into(), 42.), ("slot_0_decoded".into(), 100.)]);
+        let mut b = a.clone();
+        b.gauges.insert("slot_0_decoded".into(), 124.);
+        assert_eq!(Rates::between(&a, &b, 2.).decode_estimate, Some(12.));
+        b.gauges.insert("slot_0_task".into(), 43.);
+        assert!(Rates::between(&a, &b, 2.).decode_estimate.is_none());
+        b = a.clone();
+        b.gauges.insert("slot_0_decoded".into(), 2.);
+        assert!(Rates::between(&a, &b, 2.).decode_estimate.is_none());
+        a.gauges.insert("slot_0_decoded".into(), 0.);
+        assert!(Rates::between(&a, &b, 2.).decode_estimate.is_none());
+        b.gauges.clear(); // Idle slots must not reuse the last request's speed.
+        assert!(Rates::between(&a, &b, 2.).decode_estimate.is_none());
+    }
+
     #[test]
     fn interval_resets_and_idle_are_not_hits() {
         let mut a = BackendSnapshot {

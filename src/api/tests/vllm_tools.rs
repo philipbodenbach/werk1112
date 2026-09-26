@@ -134,6 +134,10 @@ fn write_response(stream: &mut TcpStream, response: MockHttpResponse) {
 }
 
 fn vllm_app(server_url: String) -> Router {
+    router(vllm_state(server_url))
+}
+
+fn vllm_state(server_url: String) -> ApiState {
     let store = test_store();
     let manifest = ModelManifest {
         storage: Default::default(),
@@ -167,7 +171,7 @@ fn vllm_app(server_url: String) -> Router {
     .unwrap();
     let backend =
         VllmBackend::with_mock_http_server(store.clone(), server_url, "Qwen-Test".to_string());
-    router(ApiState::new(store, Arc::new(backend)))
+    ApiState::new(store, Arc::new(backend))
 }
 
 fn weather_tool() -> Value {
@@ -199,7 +203,7 @@ async fn rich_openai_responses_preserve_multiple_choices_logprobs_and_schema_con
         "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}))]);
     let app = vllm_app(server.url.clone());
     let response=post_json(&app,"/v1/chat/completions",json!({"model":"qwen-test","messages":[{"role":"user","content":"Hello"}],
-        "n":2,"logprobs":true,"top_logprobs":1,"frequency_penalty":0.2,"presence_penalty":0.1,"logit_bias":{"12":-5}}),None).await;
+        "n":2,"logprobs":true,"top_logprobs":1,"frequency_penalty":0.2,"presence_penalty":0.1,"logit_bias":{"12":-5},"reasoning_effort":"low"}),None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let value = response_json(response).await;
     assert_eq!(value["model"], "qwen-test");
@@ -208,6 +212,113 @@ async fn rich_openai_responses_preserve_multiple_choices_logprobs_and_schema_con
     let sent = server.finish();
     assert_eq!(sent[0]["n"], 2);
     assert_eq!(sent[0]["logit_bias"]["12"], -5);
+    assert_eq!(sent[0]["reasoning_effort"], "low");
+    assert_eq!(sent[0]["chat_template_kwargs"]["enable_thinking"], true);
+}
+
+#[tokio::test]
+async fn vllm_reasoning_effort_overrides_thinking_per_request_for_json_and_sse() {
+    for stream in [false, true] {
+        // Change the mode on one backend, then omit it to prove no override
+        // leaks into later requests that should retain the native default.
+        let efforts = [Some("low"), Some("none"), None];
+        let responses = efforts.iter().map(|_| {
+            if stream {
+                MockHttpResponse::sse(vec![json!({
+                    "choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+                })])
+            } else {
+                MockHttpResponse::json(json!({
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+                }))
+            }
+        }).collect();
+        let server = MockVllmServer::start(responses);
+        let app = vllm_app(server.url.clone());
+        for effort in efforts {
+            let mut payload = json!({"model":"qwen-test","stream":stream,"max_tokens":32,
+                "messages":[{"role":"user","content":"Hello"}],"frequency_penalty":0.1});
+            if let Some(effort) = effort {
+                payload["reasoning_effort"] = effort.into();
+            }
+            let response = post_json(&app, "/v1/chat/completions", payload, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            if stream {
+                assert!(
+                    String::from_utf8(bytes.to_vec())
+                        .unwrap()
+                        .contains("data: [DONE]")
+                );
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["choices"][0]["message"]["content"], "answer");
+            }
+        }
+        let sent = server.finish();
+        assert_eq!(sent.len(), efforts.len());
+        for (body, effort) in sent.iter().zip(efforts) {
+            if let Some(effort) = effort {
+                assert_eq!(body["reasoning_effort"], effort);
+                assert_eq!(
+                    body["chat_template_kwargs"]["enable_thinking"],
+                    effort != "none"
+                );
+            } else {
+                assert!(body.get("reasoning_effort").is_none());
+                assert!(body.get("chat_template_kwargs").is_none());
+            }
+            assert_eq!(body["stream"], stream);
+        }
+    }
+}
+
+#[tokio::test]
+async fn vllm_reasoning_effort_rejects_values_outside_native_schema_before_json_or_sse() {
+    let server = MockVllmServer::start(vec![]);
+    let app = vllm_app(server.url.clone());
+    for effort in [
+        json!("off"),
+        json!("default"),
+        json!("custom_thinking"),
+        json!(42),
+        json!(0.5),
+    ] {
+        for stream in [false, true] {
+            let response = post_json(
+                &app,
+                "/v1/chat/completions",
+                json!({
+                    "model":"qwen-test","messages":[{"role":"user","content":"Hello"}],
+                    "reasoning_effort":effort,"stream":stream
+                }),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["code"], "invalid_reasoning_effort");
+            assert_eq!(body["error"]["param"], "reasoning_effort");
+            assert_eq!(
+                body["error"]["supported_values"],
+                json!(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+            );
+            assert_eq!(body["error"]["supported_types"], json!(["string"]));
+            assert_eq!(body["error"]["values_scope"], "backend");
+            assert_eq!(body["error"]["values_depend_on_model"], true);
+            assert!(body["error"]["message"].as_str().unwrap().contains("vLLM"));
+            let message = body["error"]["message"].as_str().unwrap();
+            for value in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+                assert!(message.contains(value), "{message}");
+            }
+        }
+    }
+    assert!(server.finish().is_empty());
 }
 
 #[tokio::test]
@@ -697,4 +808,124 @@ async fn vllm_streaming_tool_deltas_keep_indexes_fragments_finish_and_done() {
     assert_eq!(requests[0]["tool_choice"], "required");
     assert_eq!(requests[0]["parallel_tool_calls"], true);
     assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn vllm_token_count_preserves_request_reasoning_template_options() {
+    for (effort, thinking) in [("low", true), ("none", false)] {
+        let server = MockVllmServer::start_at(
+            vec![MockHttpResponse::json(json!({"count":47,"tokens":[]}))],
+            "/tokenize",
+        );
+        let state = vllm_state(server.url.clone());
+        let manifest = state.store.get("qwen-test").unwrap();
+        let request = GenerateRequest {
+            prompt: String::new(),
+            messages: serde_json::from_value(json!([{"role":"user","content":"Weather?"}]))
+                .unwrap(),
+            image_urls: vec![],
+            max_tokens: 32,
+            temperature: None,
+            top_p: None,
+            stop: vec![],
+            seed: None,
+            stream_granularity: crate::backend::StreamGranularity::Chunk,
+            verbose: false,
+            debug: false,
+            tool_config: Some(crate::backend::ToolCallingConfig {
+                tools: Some(serde_json::from_value(json!([weather_tool()])).unwrap()),
+                tool_choice: None,
+                parallel_tool_calls: None,
+            }),
+        };
+        let count = state
+            .backend
+            .count_api_tokens(
+                &manifest,
+                request,
+                BTreeMap::from([("reasoning_effort".into(), json!(effort))]),
+            )
+            .unwrap();
+        assert_eq!(count, 47);
+        let requests = server.finish();
+        assert_eq!(
+            requests[0]["chat_template_kwargs"]["reasoning_effort"],
+            effort
+        );
+        assert_eq!(
+            requests[0]["chat_template_kwargs"]["enable_thinking"],
+            thinking
+        );
+        assert_eq!(requests[0]["tools"][0]["function"]["name"], "get_weather");
+    }
+}
+
+#[tokio::test]
+async fn extended_api_preserves_native_timing_formats_in_request_history() {
+    // Exercise the shared raw HTTP transport and API observation with both
+    // native timing formats, plus plain OpenAI usage without phase durations.
+    for format in ["llama.cpp", "omlx", "plain"] {
+        for stream in [false, true] {
+            let mut metadata = json!({"choices": [], "usage": {
+                "prompt_tokens": 100, "completion_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }});
+            match format {
+                "llama.cpp" => {
+                    metadata["timings"] = json!({
+                        "prompt_n": 20, "prompt_ms": 500,
+                        "predicted_n": 30, "predicted_ms": 2000
+                    })
+                }
+                "omlx" => {
+                    metadata["usage"]["prompt_eval_duration"] = json!(0.5);
+                    metadata["usage"]["generation_duration"] = json!(2.0);
+                }
+                _ => {}
+            }
+            let upstream = if stream {
+                MockHttpResponse::sse(vec![
+                    json!({"choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]}),
+                    metadata,
+                ])
+            } else {
+                metadata["choices"] = json!([{"index": 0,
+                    "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]);
+                MockHttpResponse::json(metadata)
+            };
+            let server = MockVllmServer::start(vec![upstream]);
+            let state = vllm_state(server.url.clone());
+            let telemetry = state.telemetry.clone();
+            let app = router(state);
+            let response = post_json(
+                &app,
+                "/v1/chat/completions",
+                json!({
+                    "model": "qwen-test", "messages": [{"role": "user", "content": "hello"}],
+                    "frequency_penalty": 0.2, "stream": stream
+                }),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let snapshot = telemetry.snapshot();
+            assert_eq!(snapshot.totals.completed, 1, "{format}, stream={stream}");
+            let row = &snapshot.requests[0];
+            assert_eq!(row.output_tokens, Some(30));
+            assert_eq!(row.cached_tokens, Some(80));
+            assert_eq!(
+                row.decode_tokens_per_second,
+                (format != "plain").then_some(15.),
+                "{format}, stream={stream}"
+            );
+            assert_eq!(
+                row.prefill_tokens_per_second,
+                (format != "plain").then_some(40.)
+            );
+            server.finish();
+        }
+    }
 }

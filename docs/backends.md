@@ -51,6 +51,29 @@ automatic; remote vLLM, MLX and external ONNX execution remain unchanged.
 Ordinary `/v1` and media calls continue through their normal inference routes.
 Consult the live capability response before using optional runtime controls.
 
+## llama.cpp prompt caching across API conversations
+
+On native servers exposing RAM caching, slot similarity control and idle-cache
+control, Werk retains up to 8192 MiB of native prompt states for ordinary API
+requests. This lets interleaved agent conversations reuse their prefixes even
+with one GPU slot. It is a process-local RAM cache, independent of `serve
+--persistence` and CPU expert weight placement; it is not SSD expert offload or
+cross-restart persistence. Actual hits still depend on matching prompt tokens,
+available cache space and the native model's checkpoint support.
+
+Werk disables automatic idle-slot caching and sets slot similarity selection to
+zero. Ordinary API calls let llama.cpp choose the slot and load the best RAM
+entry; named runtime-state and persistent terminal-chat calls pin their slot so
+automatic cache lookup cannot substitute for an explicitly restored snapshot.
+Older runtimes without these controls retain the previous isolated-slot policy.
+
+Use `WERK_LLAMA_ARGS='--cache-ram 2048'` to lower the RAM cache limit or
+`--cache-ram 0` to disable it. These arguments are appended to any other native
+options you need. Changing slot similarity or enabling idle-slot caching can
+make named runtime-state capabilities unavailable. `werk top` and API usage
+report cached prompt tokens from the backend; the first call for a new agent
+may legitimately be cold.
+
 ## Runtime selection
 
 For a typed request Werk:

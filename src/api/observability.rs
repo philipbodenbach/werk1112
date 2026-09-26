@@ -21,6 +21,7 @@ pub(super) struct SampleCache {
 #[derive(Clone)]
 struct Cached {
     swap: Option<u64>,
+    host_free: Option<u64>,
     time: Instant,
     timestamp: u64,
     backends: Vec<BackendSnapshot>,
@@ -51,16 +52,18 @@ async fn collect(state: &ApiState) -> Snapshot {
                 return current(state);
             }
             let backend = state.backend.clone();
-            let Ok((_gate, mut backends, swap)) = tokio::task::spawn_blocking(move || {
-                let mut system = sysinfo::System::new();
-                system.refresh_memory();
-                (
-                    gate,
-                    backend.telemetry(),
-                    sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.used_swap()),
-                )
-            })
-            .await
+            let Ok((_gate, mut backends, swap, host_free)) =
+                tokio::task::spawn_blocking(move || {
+                    let mut system = sysinfo::System::new();
+                    system.refresh_memory();
+                    (
+                        gate,
+                        backend.telemetry(),
+                        sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.used_swap()),
+                        sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.free_memory()),
+                    )
+                })
+                .await
             else {
                 return current(state);
             };
@@ -100,6 +103,7 @@ async fn collect(state: &ApiState) -> Snapshot {
                 time: Instant::now(),
                 timestamp,
                 swap,
+                host_free,
                 backends,
                 memory,
             });
@@ -118,6 +122,7 @@ fn current(state: &ApiState) -> Snapshot {
     {
         snapshot.backends = c.backends.clone();
         snapshot.host_swap_used_bytes = c.swap;
+        snapshot.host_memory_free_bytes = c.host_free;
         snapshot.memory = c.memory.clone();
         snapshot.backend_observed_at_ms = Some(c.timestamp);
     }

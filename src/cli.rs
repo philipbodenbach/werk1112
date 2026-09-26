@@ -8961,6 +8961,20 @@ impl GenerationBackend for AutoBackend {
         samples
     }
 
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .validate_api_options(manifest, request, options)
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -8983,6 +8997,19 @@ impl GenerationBackend for AutoBackend {
             request.requires_tool_calling(),
         )?
         .count_tokens(manifest, request)
+    }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .count_api_tokens(manifest, request, options)
     }
 
     fn with_chat_options(
@@ -9223,6 +9250,20 @@ impl GenerationBackend for GgufPreferredBackend {
         samples
     }
 
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .validate_api_options(manifest, request, options)
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -9245,6 +9286,19 @@ impl GenerationBackend for GgufPreferredBackend {
             request.requires_tool_calling(),
         )?
         .count_tokens(manifest, request)
+    }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_execution(
+            manifest,
+            !request.image_urls.is_empty(),
+            request.requires_tool_calling(),
+        )?
+        .count_api_tokens(manifest, request, options)
     }
 
     fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
@@ -9403,6 +9457,16 @@ impl GenerationBackend for MlxPreferredBackend {
         samples
     }
 
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .validate_api_options(manifest, request, options)
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -9417,6 +9481,15 @@ impl GenerationBackend for MlxPreferredBackend {
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         self.backend_for_request(manifest, !request.image_urls.is_empty())?
             .count_tokens(manifest, request)
+    }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .count_api_tokens(manifest, request, options)
     }
 
     fn runtime_control_adapter_for(
@@ -9601,6 +9674,16 @@ impl GenerationBackend for VllmPreferredBackend {
         backends.iter().flat_map(|b| b.telemetry()).collect()
     }
 
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .validate_api_options(manifest, request, options)
+    }
+
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -9615,6 +9698,15 @@ impl GenerationBackend for VllmPreferredBackend {
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         self.backend_for_request(manifest, !request.image_urls.is_empty())?
             .count_tokens(manifest, request)
+    }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+            .count_api_tokens(manifest, request, options)
     }
 
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {

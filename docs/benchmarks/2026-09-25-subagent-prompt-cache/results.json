@@ -1,0 +1,144 @@
+{
+  "model": "vumpt/Qwen3.8-Flash-Next-GGUF Q4_K_M",
+  "native_revision": "ec928150501c",
+  "mode": "CUDA",
+  "context_tokens": 4096,
+  "cpu_expert_layers": 38,
+  "parallel_slots": 1,
+  "slot_prompt_similarity": 0,
+  "cache_idle_slots": false,
+  "phases": [
+    {
+      "cache_mib": 0,
+      "requests": [
+        {
+          "name": "A",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 407,
+            "prompt_ms": 75743.626,
+            "prompt_per_token_ms": 186.1022751842752,
+            "prompt_per_second": 5.373389438736402,
+            "predicted_n": 1,
+            "predicted_ms": 0.001,
+            "predicted_per_token_ms": 0.0,
+            "predicted_per_second": 0.0
+          },
+          "tokens_evaluated": 407
+        },
+        {
+          "name": "B",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 407,
+            "prompt_ms": 9293.717,
+            "prompt_per_token_ms": 22.834685503685506,
+            "prompt_per_second": 43.793027052577564,
+            "predicted_n": 1,
+            "predicted_ms": 0.001,
+            "predicted_per_token_ms": 0.0,
+            "predicted_per_second": 0.0
+          },
+          "tokens_evaluated": 407
+        },
+        {
+          "name": "A-return",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 410,
+            "prompt_ms": 6510.646,
+            "prompt_per_token_ms": 15.879624390243901,
+            "prompt_per_second": 62.97378171075497,
+            "predicted_n": 1,
+            "predicted_ms": 0.001,
+            "predicted_per_token_ms": 0.0,
+            "predicted_per_second": 0.0
+          },
+          "tokens_evaluated": 410
+        },
+        {
+          "name": "B-return",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 410,
+            "prompt_ms": 6430.87,
+            "prompt_per_token_ms": 15.685048780487804,
+            "prompt_per_second": 63.75498182983018,
+            "predicted_n": 1,
+            "predicted_ms": 0.001,
+            "predicted_per_token_ms": 0.0,
+            "predicted_per_second": 0.0
+          },
+          "tokens_evaluated": 410
+        }
+      ],
+      "pinned_after_erase_cached_tokens": 0
+    },
+    {
+      "cache_mib": 1024,
+      "requests": [
+        {
+          "name": "A",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 407,
+            "prompt_ms": 10310.163,
+            "prompt_per_token_ms": 25.332095823095823,
+            "prompt_per_second": 39.47561255821076,
+            "predicted_n": 1,
+            "predicted_ms": 0.001,
+            "predicted_per_token_ms": 0.0,
+            "predicted_per_second": 0.0
+          },
+          "tokens_evaluated": 407
+        },
+        {
+          "name": "B",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 407,
+            "prompt_ms": 6915.692,
+            "prompt_per_token_ms": 16.991872235872236,
+            "prompt_per_second": 58.851666615575134,
+            "predicted_n": 1,
+            "predicted_ms": 0.001,
+            "predicted_per_token_ms": 0.0,
+            "predicted_per_second": 0.0
+          },
+          "tokens_evaluated": 407
+        },
+        {
+          "name": "A-return",
+          "timings": {
+            "cache_n": 407,
+            "prompt_n": 3,
+            "prompt_ms": 376.998,
+            "prompt_per_token_ms": 125.666,
+            "prompt_per_second": 7.957601897092292,
+            "predicted_n": 1,
+            "predicted_ms": 0.001,
+            "predicted_per_token_ms": 0.0,
+            "predicted_per_second": 0.0
+          },
+          "tokens_evaluated": 410
+        },
+        {
+          "name": "B-return",
+          "timings": {
+            "cache_n": 407,
+            "prompt_n": 3,
+            "prompt_ms": 376.221,
+            "prompt_per_token_ms": 125.407,
+            "prompt_per_second": 7.974036537035413,
+            "predicted_n": 1,
+            "predicted_ms": 0.001,
+            "predicted_per_token_ms": 0.0,
+            "predicted_per_second": 0.0
+          },
+          "tokens_evaluated": 410
+        }
+      ],
+      "pinned_after_erase_cached_tokens": 0
+    }
+  ]
+}

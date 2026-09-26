@@ -2051,6 +2051,100 @@ fn auto_native_experts_require_verified_text_adapter_and_preserve_explicit_limit
 }
 
 #[test]
+fn api_options_validate_without_starting_an_omlx_worker() {
+    let fixture = Fixture::new(json!({}));
+    let backend = fixture_backend(&fixture);
+    let manifest = fixture_model_for_backend(&fixture);
+    let mut options = std::collections::BTreeMap::from([("reasoning_effort".into(), json!("low"))]);
+    backend
+        .validate_api_options(&manifest, &request(), &options)
+        .unwrap();
+    options.insert("logprobs".into(), json!(true));
+    let error = backend
+        .validate_api_options(&manifest, &request(), &options)
+        .unwrap_err();
+    assert!(error.to_string().contains("does not support logprobs"));
+    assert!(backend.servers.lock().unwrap().is_empty());
+    assert!(backend.model_probes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn api_reasoning_effort_toggles_each_request_without_changing_worker_defaults() {
+    let fixture = Fixture::new(json!({"response": {"choices": [{"index": 0,
+        "message": {"role": "assistant", "content": "answer"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 17, "completion_tokens": 4}}}));
+    let mut backend = fixture_backend(&fixture);
+    let invocation = backend.invocation.as_mut().unwrap();
+    invocation.reasoning_effort = Some(OmlxReasoningEffort::High);
+    invocation.thinking = Some(false);
+    let manifest = fixture_model_for_backend(&fixture);
+    let model_dir = resolve_model_dir(&fixture.store, &manifest).unwrap();
+    let mut first_worker = None;
+    for (effort, thinking) in [
+        (Some(json!("low")), true),
+        (Some(json!("none")), false),
+        (Some(json!(0.35)), false),
+        (Some(json!("adaptive")), false),
+        (Some(json!("max")), true),
+        (None, false),
+    ] {
+        let options: std::collections::BTreeMap<String, Value> = effort
+            .clone()
+            .map(|value| ("reasoning_effort".into(), value))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            backend
+                .count_api_tokens(&manifest, request(), options.clone())
+                .unwrap(),
+            37
+        );
+        let counted: Value =
+            serde_json::from_slice(&fs::read(model_dir.join("tokenize.json")).unwrap()).unwrap();
+        backend
+            .generate_api(&manifest, request(), options, None)
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&fs::read(model_dir.join("request.json")).unwrap()).unwrap();
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], thinking);
+        assert_eq!(
+            counted["chat_template_kwargs"],
+            body["chat_template_kwargs"]
+        );
+        assert_eq!(counted["reasoning_effort"], body["reasoning_effort"]);
+        assert_eq!(counted["messages"], body["messages"]);
+        match effort {
+            Some(value) if value == json!("none") => {
+                assert!(body.get("reasoning_effort").is_none());
+                assert!(
+                    body["chat_template_kwargs"]
+                        .get("reasoning_effort")
+                        .is_none()
+                );
+            }
+            Some(value) => {
+                assert_eq!(body["reasoning_effort"], value);
+                assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], value);
+            }
+            None => {
+                assert_eq!(body["reasoning_effort"], "high");
+                assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], "high");
+            }
+        }
+        let servers = backend.servers.lock().unwrap();
+        assert_eq!(servers.len(), 1);
+        let worker = servers.values().next().unwrap();
+        assert_eq!(worker.reasoning_effort, Some(OmlxReasoningEffort::High));
+        assert_eq!(worker.thinking, Some(false));
+        if let Some(first) = &first_worker {
+            assert!(Arc::ptr_eq(first, worker));
+        } else {
+            first_worker = Some(worker.clone());
+        }
+    }
+}
+
+#[test]
 fn reasoning_effort_controls_native_payload_and_preserves_worker_reuse() {
     assert_eq!(reasoning_effort_enabled(None).unwrap(), None);
     for (name, effort) in [

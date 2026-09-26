@@ -20,6 +20,7 @@ pub(super) struct GenerationError {
     pub message: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    pub details: std::collections::BTreeMap<String, serde_json::Value>,
 }
 impl GenerationError {
     fn new(status: StatusCode, message: String, param: Option<String>) -> Self {
@@ -28,6 +29,7 @@ impl GenerationError {
             message,
             param,
             code: None,
+            details: Default::default(),
         }
     }
     fn with_code(
@@ -41,10 +43,35 @@ impl GenerationError {
             message,
             param,
             code,
+            details: Default::default(),
+        }
+    }
+    fn api_options(error: anyhow::Error, fallback_code: Option<&str>) -> Self {
+        if let Some(option) = error.downcast_ref::<crate::backend::ApiOptionError>() {
+            Self {
+                status: StatusCode::BAD_REQUEST,
+                message: option.message.clone(),
+                param: Some(option.param.clone()),
+                code: Some("invalid_reasoning_effort".into()),
+                details: option.details.clone(),
+            }
+        } else {
+            Self::with_code(
+                StatusCode::BAD_REQUEST,
+                format!("{error:#}"),
+                None,
+                fallback_code.map(str::to_owned),
+            )
         }
     }
     pub fn openai_response(self) -> axum::response::Response {
-        super::response::api_error_with_code(self.status, self.message, self.param, self.code)
+        super::response::api_error_with_details(
+            self.status,
+            self.message,
+            self.param,
+            self.code,
+            self.details,
+        )
     }
 }
 #[derive(Clone, Copy)]
@@ -72,7 +99,7 @@ pub(super) async fn prepare(
     if let Err(error) =
         super::extended::validate(&request.extra, endpoint.starts_with("/v1/messages"))
     {
-        return Err(GenerationError::new(StatusCode::BAD_REQUEST, error, None));
+        return Err(GenerationError::api_options(error, None));
     }
     super::extended::normalize(&mut request.extra);
     if let Some(options) = &request.werk
@@ -157,25 +184,38 @@ pub(super) async fn prepare(
                 None
             }
         });
+    let needs_context_check = matches!(context_policy, ContextPolicy::Reject)
+        || (matches!(context_policy, ContextPolicy::Trim) && request.requires_tool_calling());
+    let context_check = if needs_context_check {
+        context_size
+            .map(|size| estimate_prompt_tokens(&request).map(|prompt| (size, prompt)))
+            .transpose()
+            .map_err(|message| {
+                GenerationError::new(StatusCode::BAD_REQUEST, message, Some("messages".into()))
+            })?
+    } else {
+        None
+    };
     let removed_messages = if let Some(context_size) = context_size {
         match match context_policy {
             ContextPolicy::Trim if request.requires_tool_calling() => {
                 // Tool schemas and assistant/result pairs are indivisible. Do
                 // not silently trim half a tool cycle or ignore schema tokens.
-                check_context(&request, context_size).map(|()| 0)
+                Ok(0)
             }
             ContextPolicy::Trim => {
                 trim_messages_to_context(&mut request.messages, context_size, max_tokens)
             }
-            ContextPolicy::Reject => check_context(&request, context_size).map(|()| 0),
+            ContextPolicy::Reject => Ok(0),
             ContextPolicy::Count => Ok(0),
         } {
             Ok(removed) => removed,
             Err(message) => {
-                return Err(GenerationError::new(
+                return Err(GenerationError::with_code(
                     StatusCode::BAD_REQUEST,
                     message,
                     Some("messages".to_string()),
+                    Some("context_length_exceeded".into()),
                 ));
             }
         }
@@ -328,6 +368,85 @@ pub(super) async fn prepare(
         tool_config,
     };
 
+    if !request.extra.is_empty() {
+        let backend = state.backend.clone();
+        let selected_model = manifest.clone();
+        let selected_request = generate_request.clone();
+        let options = request.extra.clone();
+        // Auto routing may probe a runtime. Validate off the async executor,
+        // before a streaming handler commits HTTP 200 and starts generation.
+        match tokio::task::spawn_blocking(move || {
+            backend.validate_api_options(&selected_model, &selected_request, &options)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(GenerationError::api_options(
+                    error,
+                    Some("unsupported_api_options"),
+                ));
+            }
+            Err(error) => {
+                return Err(GenerationError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("API option validation task failed: {error}"),
+                    None,
+                ));
+            }
+        }
+    }
+
+    if let Some((limit, estimate)) = context_check
+        && estimate.saturating_add(max_tokens) > limit
+    {
+        let backend = state.backend.clone();
+        let selected_model = manifest.clone();
+        let selected_request = generate_request.clone();
+        let options = request.extra.clone();
+        let counted = tokio::task::spawn_blocking(move || {
+            backend.count_api_tokens(&selected_model, selected_request, options)
+        })
+        .await
+        .map_err(|error| {
+            GenerationError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("native context validation task failed: {error}"),
+                None,
+            )
+        })?;
+        let (prompt_tokens, method) = match counted {
+            Ok(tokens) => (tokens, "native"),
+            Err(_) => (estimate, "estimate"),
+        };
+        state.log_verbose(format!(
+            "[werk serve] context admission model={} prompt_tokens={} max_tokens={} context_size={} count_method={} estimated_prompt_tokens={}",
+            manifest.id, prompt_tokens, max_tokens, limit, method, estimate,
+        ));
+        if prompt_tokens.saturating_add(max_tokens) > limit {
+            let qualifier = if method == "estimate" {
+                "estimated "
+            } else {
+                ""
+            };
+            let mut error = GenerationError::with_code(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "This model's maximum context length is {limit} tokens; {qualifier}prompt ({prompt_tokens}) and response budget ({max_tokens}) exceed it. Compact messages, reduce tools or max_tokens."
+                ),
+                Some("messages".into()),
+                Some("context_length_exceeded".into()),
+            );
+            error.details = std::collections::BTreeMap::from([
+                ("prompt_tokens".into(), serde_json::json!(prompt_tokens)),
+                ("max_tokens".into(), serde_json::json!(max_tokens)),
+                ("context_length".into(), serde_json::json!(limit)),
+                ("token_count_method".into(), serde_json::json!(method)),
+            ]);
+            return Err(error);
+        }
+    }
+
     Ok(Prepared {
         api_options: request.extra,
         state,
@@ -339,9 +458,9 @@ pub(super) async fn prepare(
     })
 }
 
-// Admission estimate, not an exact tokenizer. Includes tool schemas and history;
-// never drop messages from a protocol with paired tool-use/result blocks.
-fn check_context(request: &ChatCompletionRequest, context_size: usize) -> Result<(), String> {
+// Use this estimate to decide when to ask the native tokenizer, not as proof
+// that a fully templated prompt exceeds the context. Preserve tool/result pairs.
+fn estimate_prompt_tokens(request: &ChatCompletionRequest) -> Result<usize, String> {
     let has_images = request.messages.iter().any(|m|matches!(&m.content,
         Some(crate::openai::MessageContent::Parts(parts)) if parts.iter().any(|p|p.image_url.is_some())));
     let history = if has_images {
@@ -385,15 +504,9 @@ fn check_context(request: &ChatCompletionRequest, context_size: usize) -> Result
         .saturating_add(tools)
         .div_ceil(3)
         .saturating_add(16usize.saturating_mul(request.messages.len()))
-        .saturating_add(request.max_completion_tokens())
         .saturating_add(tool_overhead)
         .saturating_add(64);
-    if estimate > context_size {
-        return Err(format!(
-            "estimated prompt and response exceed the {context_size}-token context; reduce messages, tools or max_tokens"
-        ));
-    }
-    Ok(())
+    Ok(estimate)
 }
 
 pub(super) async fn generate(
@@ -587,11 +700,13 @@ mod tests {
                 {"type":"text","text":"Describe the page"},
                 {"type":"image_url","image_url":format!("data:image/png;base64,{}","A".repeat(1024*1024))}
             ]}]})).unwrap();
-        assert!(check_context(&request, 4096).is_ok());
+        assert!(
+            estimate_prompt_tokens(&request).unwrap() + request.max_completion_tokens() <= 4096
+        );
         request.messages.push(serde_json::from_value(serde_json::json!({"role":"assistant","tool_calls":[
             {"id":"call_1","type":"function","function":{"name":"tool","arguments":"x".repeat(20000)}}
         ]})).unwrap());
-        assert!(check_context(&request, 4096).is_err());
+        assert!(estimate_prompt_tokens(&request).unwrap() + request.max_completion_tokens() > 4096);
     }
 
     #[test]

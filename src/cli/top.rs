@@ -136,6 +136,9 @@ struct App {
     history: VecDeque<Option<f64>>,
     hit_history: VecDeque<Option<f64>>,
     read_history: VecDeque<Option<f64>>,
+    memory_history: VecDeque<Option<f64>>,
+    expert_ram_history: VecDeque<Option<f64>>,
+    prompt_hit_history: VecDeque<Option<f64>>,
     error: Option<String>,
     last_received: Option<Instant>,
     paused: bool,
@@ -156,6 +159,9 @@ impl App {
             history: VecDeque::new(),
             hit_history: VecDeque::new(),
             read_history: VecDeque::new(),
+            memory_history: VecDeque::new(),
+            expert_ram_history: VecDeque::new(),
+            prompt_hit_history: VecDeque::new(),
             error: None,
             last_received: None,
             paused: false,
@@ -188,6 +194,9 @@ impl App {
                 self.history.clear();
                 self.hit_history.clear();
                 self.read_history.clear();
+                self.memory_history.clear();
+                self.expert_ram_history.clear();
+                self.prompt_hit_history.clear();
             }
         }
         if !self.demo {
@@ -199,7 +208,23 @@ impl App {
                 };
             }
         }
+        let backend = snapshot.backends.get(self.worker).filter(|b| b.available);
+        let native = |key: &str| backend.and_then(|b| b.gauges.get(key)).copied();
+        let memory = if backend.is_some_and(|b| b.backend.starts_with("llama.cpp")) {
+            host_used_bytes(&snapshot)
+        } else {
+            native("expert_cache_resident_bytes")
+        };
         for (history, value) in [
+            (
+                &mut self.prompt_hit_history,
+                native("prompt_cache_hit_ratio").map(|n| n * 100.),
+            ),
+            (&mut self.memory_history, memory.map(|n| n / 1073741824.)),
+            (
+                &mut self.expert_ram_history,
+                native("cpu_expert_resident_bytes").map(|n| n / 1073741824.),
+            ),
             (&mut self.history, self.rates.decode_estimate),
             (
                 &mut self.hit_history,
@@ -329,6 +354,9 @@ pub fn run(args: TopArgs) -> Result<()> {
                             app.history.clear();
                             app.hit_history.clear();
                             app.read_history.clear();
+                            app.memory_history.clear();
+                            app.expert_ram_history.clear();
+                            app.prompt_hit_history.clear();
                             app.rates = Rates::default();
                         }
                         KeyCode::Tab | KeyCode::Enter => app.details = !app.details,
@@ -358,6 +386,11 @@ pub fn run(args: TopArgs) -> Result<()> {
     }
     result
 }
+fn host_used_bytes(snapshot: &Snapshot) -> Option<f64> {
+    let capacity = snapshot.memory.as_ref()?.host.capacity_bytes?;
+    Some(capacity.saturating_sub(snapshot.host_memory_free_bytes?) as f64)
+}
+
 fn clean(value: &str) -> String {
     value
         .chars()
@@ -404,6 +437,7 @@ fn demo(seconds: f64) -> Snapshot {
     }
     Snapshot {
         host_swap_used_bytes: Some(1610612736),
+        host_memory_free_bytes: Some(2 * 1024 * 1024 * 1024),
         schema_version: 1,
         observed_at_ms: time,
         server_started_ms: started,
@@ -511,9 +545,15 @@ mod observability_tests {
             app.update(demo(n as f64));
         }
         assert_eq!(app.history.len(), 90);
+        assert_eq!(app.memory_history.len(), 90);
+        assert_eq!(app.prompt_hit_history.len(), 90);
+        assert_eq!(app.expert_ram_history.len(), 90);
         let mut restarted = demo(1.);
         restarted.server_started_ms += 1;
         app.update(restarted);
         assert_eq!(app.history.len(), 1);
+        assert_eq!(app.memory_history.len(), 1);
+        assert_eq!(app.prompt_hit_history.len(), 1);
+        assert_eq!(app.expert_ram_history.len(), 1);
     }
 }

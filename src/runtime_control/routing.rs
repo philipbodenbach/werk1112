@@ -547,6 +547,15 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         self.backend.telemetry()
     }
+    fn validate_api_options(
+        &self,
+        manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        self.backend
+            .validate_api_options(manifest, request, options)
+    }
     fn generate_api(
         &self,
         manifest: &ModelManifest,
@@ -573,6 +582,15 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
     ) -> anyhow::Result<usize> {
         self.backend.count_tokens(manifest, request)
     }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend.count_api_tokens(manifest, request, options)
+    }
+
     fn with_chat_options(
         &self,
         manifest: &ModelManifest,

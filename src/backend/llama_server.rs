@@ -24,13 +24,16 @@ mod model_prefetch_linux;
 mod model_prefetch_policy;
 #[cfg(target_os = "linux")]
 use super::model_file_cache;
+#[cfg(target_os = "linux")]
+mod expert_memory;
 mod runtime_state;
+mod telemetry;
 #[cfg(test)]
 mod tool_call_tests;
 mod tool_calls;
 
 use runtime_state::{
-    LlamaChatPersistence, LlamaProcessStateRuntime, LlamaRuntimeStateAdapter,
+    LlamaChatPersistence, LlamaProcessStateRuntime, LlamaRuntimeStateAdapter, STATE_SLOT_ID,
     cleanup_llama_snapshot_dir, inspect_llama_executable, llama_state_args_are_effective,
     prepare_llama_state_snapshot_dir,
 };
@@ -49,6 +52,18 @@ use crate::{
 const DEFAULT_CTX_SIZE: usize = 4096;
 const DEFAULT_BATCH_SIZE: usize = 2048;
 const DEFAULT_UBATCH_SIZE: u32 = 512;
+const DEFAULT_PROMPT_CACHE_MIB: usize = 8192;
+const API_OPTIONS: &[&str] = &[
+    "response_format",
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
+    "n",
+    "logprobs",
+    "top_logprobs",
+    "top_k",
+    "reasoning_effort",
+];
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -75,6 +90,8 @@ struct LlamaServerProcess {
     // Fields drop in declaration order, after Drop has reaped the native worker.
     #[cfg(target_os = "linux")]
     _model_file_cache: Option<model_file_cache::CacheReleaseGuard>,
+    #[cfg(target_os = "linux")]
+    expert_memory: expert_memory::State,
     executable: PathBuf,
     discovery_source: String,
     args: Vec<String>,
@@ -419,8 +436,32 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        telemetry::sample(self)
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         true
+    }
+
+    fn validate_api_options(
+        &self,
+        _manifest: &ModelManifest,
+        request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<()> {
+        super::openai_transport::validate_api_options(options, API_OPTIONS)?;
+        if let Some(effort) = options.get("reasoning_effort")
+            && !effort.is_string()
+        {
+            return Err(
+                super::ApiOptionError::reasoning_effort("llama.cpp", None, &["string"]).into(),
+            );
+        }
+        if request_has_images(request) {
+            validate_llama_image_sources(request)?;
+        }
+        Ok(())
     }
 
     fn generate_api(
@@ -430,23 +471,8 @@ impl GenerationBackend for LlamaServerBackend {
         options: std::collections::BTreeMap<String, Value>,
         tx: Option<mpsc::Sender<Result<Value, String>>>,
     ) -> Result<Value> {
-        super::openai_transport::validate_api_options(
-            &options,
-            &[
-                "response_format",
-                "frequency_penalty",
-                "presence_penalty",
-                "logit_bias",
-                "n",
-                "logprobs",
-                "top_logprobs",
-                "top_k",
-            ],
-        )?;
+        self.validate_api_options(manifest, &request, &options)?;
         let has_images = request_has_images(&request);
-        if has_images {
-            validate_llama_image_sources(&request)?;
-        }
         let (server, _, _) = self.cached_server(manifest, has_images)?;
         let _guard = server
             .state_gate
@@ -456,28 +482,26 @@ impl GenerationBackend for LlamaServerBackend {
             bail!("visual input requires a multimodal projector");
         }
         let mut body = chat_api_body(&request, tx.is_some());
-        super::openai_transport::apply_api_options(
-            &mut body,
-            options,
-            &[
-                "response_format",
-                "frequency_penalty",
-                "presence_penalty",
-                "logit_bias",
-                "n",
-                "logprobs",
-                "top_logprobs",
-                "top_k",
-            ],
-        )?;
+        apply_chat_api_options(&mut body, options)?;
         super::openai_transport::generate_api(&server.url, None, body, tx)
     }
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
+        self.count_api_tokens(manifest, request, Default::default())
+    }
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+    ) -> Result<usize> {
+        self.validate_api_options(manifest, &request, &options)?;
         if request_has_images(&request) {
             bail!("native llama.cpp token counting does not expose image token counts");
         }
         let (server, _, _) = self.cached_server(manifest, false)?;
-        count_request_tokens(&server.url, &request)
+        let mut body = chat_template_body(&request);
+        apply_chat_api_options(&mut body, options)?;
+        count_request_tokens(&server.url, &body)
     }
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         Arc::new(LlamaRuntimeStateAdapter::new(self.clone()))
@@ -800,6 +824,8 @@ impl LlamaServerProcess {
             child,
             #[cfg(target_os = "linux")]
             _model_file_cache: model_file_cache,
+            #[cfg(target_os = "linux")]
+            expert_memory: expert_memory::State::new(model_path, &args, &supported),
             executable,
             discovery_source: discovery.source,
             args,
@@ -897,7 +923,13 @@ impl LlamaServerProcess {
         let cache_notice = persistence.map(|cache| cache.restore(self)).transpose()?;
         let restored_tokens = cache_notice.as_ref().and_then(|(_, tokens)| *tokens);
         let restore_seconds = restore_started.elapsed().as_secs_f64();
-        let mut completion = complete_request(&self.url, request, tx, started)?;
+        // A restored terminal-chat snapshot must remain the source of reuse.
+        // Automatic API requests can instead select among native RAM entries.
+        let mut completion = if persistence.is_some() {
+            complete_request_in_slot(&self.url, request, tx, started, Some(STATE_SLOT_ID))?
+        } else {
+            complete_request(&self.url, request, tx, started)?
+        };
         if let Some((notice, _)) = cache_notice {
             completion.backend_diagnostics.push(notice);
         }
@@ -1214,13 +1246,31 @@ fn llama_server_args_with_state(
             args.push(r#"{"enable_thinking":false}"#.to_string());
         }
     }
-    if let Some(snapshot_dir) = state_snapshot_dir {
+    // Monitoring also needs slots when persistence is disabled.
+    if supported.slots || state_snapshot_dir.is_some() {
         args.push("--slots".to_string());
+    }
+    if let Some(snapshot_dir) = state_snapshot_dir {
         args.push("--slot-save-path".to_string());
         args.push(snapshot_dir.display().to_string());
         if supported.cache_ram {
+            // Preserve different API conversations in native RAM even with a
+            // single GPU slot. Disable similarity selection so explicit
+            // id_slot requests used by runtime-state operations bypass native
+            // cache save/load, while unpinned API requests use its LRU path.
+            let isolated_cache = supported.slot_prompt_similarity && supported.cache_idle_slots;
             args.push("--cache-ram".to_string());
-            args.push("0".to_string());
+            args.push(
+                if isolated_cache {
+                    DEFAULT_PROMPT_CACHE_MIB
+                } else {
+                    0
+                }
+                .to_string(),
+            );
+            if isolated_cache {
+                args.extend(["--slot-prompt-similarity".to_string(), "0".to_string()]);
+            }
         }
         if supported.cache_idle_slots {
             args.push("--no-cache-idle-slots".to_string());
@@ -1246,12 +1296,8 @@ fn append_jinja_default(args: &mut Vec<String>, supported: bool, extra: &[String
     }
 }
 
-fn count_request_tokens(url: &str, request: &GenerateRequest) -> Result<usize> {
-    let rendered = super::openai_transport::tokenization_json(
-        url,
-        "/apply-template",
-        &chat_template_body(request),
-    )?;
+fn count_request_tokens(url: &str, body: &Value) -> Result<usize> {
+    let rendered = super::openai_transport::tokenization_json(url, "/apply-template", body)?;
     let prompt = rendered
         .get("prompt")
         .and_then(Value::as_str)
@@ -1277,14 +1323,27 @@ fn complete_request(
     tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     started: Instant,
 ) -> Result<ServerCompletion> {
+    complete_request_in_slot(url, request, tx, started, None)
+}
+
+fn complete_request_in_slot(
+    url: &str,
+    request: &GenerateRequest,
+    tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
+    started: Instant,
+    slot: Option<u32>,
+) -> Result<ServerCompletion> {
     let use_chat_endpoint = !request.messages.is_empty()
         || request_has_images(request)
         || request.requires_tool_calling();
-    let (path, body) = if use_chat_endpoint {
+    let (path, mut body) = if use_chat_endpoint {
         ("/v1/chat/completions", chat_completion_body(request))
     } else {
         ("/completion", completion_body(request))
     };
+    if let Some(slot) = slot {
+        body["id_slot"] = json!(slot);
+    }
     let mut stream = post_json(url, path, &body)?;
     let mut completion = ServerCompletion {
         finish_reason: "length".to_string(),
@@ -1425,6 +1484,22 @@ fn chat_template_body(request: &GenerateRequest) -> Value {
             .extend(fields.as_object().unwrap().clone());
     }
     body
+}
+
+fn apply_chat_api_options(
+    body: &mut Value,
+    options: std::collections::BTreeMap<String, Value>,
+) -> Result<()> {
+    let thinking = options
+        .get("reasoning_effort")
+        .and_then(super::openai_transport::reasoning_effort_thinking);
+    super::openai_transport::apply_api_options(body, options, API_OPTIONS)?;
+    if let Some(enabled) = thinking {
+        // Standard effort levels override the server's thinking default.
+        // Omitted or template-specific strings retain native semantics.
+        body["chat_template_kwargs"]["enable_thinking"] = json!(enabled);
+    }
+    Ok(())
 }
 
 fn chat_api_body(request: &GenerateRequest, stream: bool) -> Value {
@@ -1982,6 +2057,7 @@ struct SupportedArgs {
     parallel: bool,
     cache_ram: bool,
     cache_idle_slots: bool,
+    slot_prompt_similarity: bool,
     help_succeeded: bool,
 }
 
@@ -2023,6 +2099,7 @@ fn supported_args_from_help(text: &str) -> SupportedArgs {
         parallel: help_has_exact_option(&text, "--parallel"),
         cache_ram: help_has_exact_option(&text, "--cache-ram"),
         cache_idle_slots: help_has_exact_option(&text, "--cache-idle-slots"),
+        slot_prompt_similarity: help_has_exact_option(text, "--slot-prompt-similarity"),
         help_succeeded: true,
     }
 }
@@ -4381,6 +4458,38 @@ Agent 3
             Some("89".into())
         );
         assert_eq!(cuda_architectures_from_compute_caps("not available"), None);
+    }
+
+    #[test]
+    fn prompt_cache_retains_api_conversations_without_compromising_private_slots() {
+        for mode in [LlamaCppMode::Cpu, LlamaCppMode::Cuda, LlamaCppMode::Metal] {
+            for modern in [false, true] {
+                let supported = supported_args_from_help(if modern {
+                    "--slots --slot-save-path --parallel --cache-ram --cache-idle-slots --slot-prompt-similarity"
+                } else {
+                    "--slots --slot-save-path --parallel --cache-ram --cache-idle-slots"
+                });
+                let model = Path::new("/model.gguf");
+                let snapshots = Path::new("/private");
+                let args = llama_server_args_with_state(
+                    mode,
+                    model,
+                    None,
+                    12345,
+                    &LlamaRuntimeOptions::default(),
+                    &supported,
+                    false,
+                    Some(snapshots),
+                );
+                let cache = args.iter().position(|v| v == "--cache-ram").unwrap();
+                assert_eq!(args[cache + 1], if modern { "8192" } else { "0" });
+                assert_eq!(args.iter().any(|v| v == "--slot-prompt-similarity"), modern);
+                assert!(args.iter().any(|v| v == "--no-cache-idle-slots"));
+                assert!(llama_state_args_are_effective(
+                    &args, snapshots, model, 12345
+                ));
+            }
+        }
     }
 
     #[test]

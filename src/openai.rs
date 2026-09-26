@@ -905,6 +905,8 @@ pub struct ErrorObject {
     pub kind: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    #[serde(flatten, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub details: std::collections::BTreeMap<String, Value>,
 }
 
 #[cfg(test)]

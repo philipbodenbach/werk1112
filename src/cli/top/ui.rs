@@ -1,7 +1,7 @@
 use super::{App, clean};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap},
@@ -19,7 +19,7 @@ const VIOLET: Color = Color::Rgb(139, 92, 246);
 const PINK: Color = Color::Rgb(255, 79, 195);
 const BRAND: [Color; 5] = [CYAN, BLUE, INDIGO, VIOLET, PINK];
 
-fn panel(title: &str, color: Color) -> Block<'_> {
+fn panel(title: &str, color: Color) -> Block<'static> {
     Block::default()
         .title(Line::styled(
             format!(" {title} "),
@@ -30,6 +30,19 @@ fn panel(title: &str, color: Color) -> Block<'_> {
         .border_style(Style::default().fg(color))
         .style(Style::default().bg(PANEL).fg(TEXT))
 }
+fn live_panel(title: &str, color: Color, app: &App) -> Block<'static> {
+    let block = panel(title, color);
+    if !llama(app) || !app.animation || app.paused || app.error.is_some() || app.snapshot.is_none()
+    {
+        return block;
+    }
+    let marker = ["▁", "▂", "▄", "▆", "█", "▆", "▄", "▂"][app.tick as usize / 2 % 8];
+    block.title(
+        Line::styled(format!(" {marker} LIVE "), Style::default().fg(color))
+            .alignment(Alignment::Right),
+    )
+}
+
 fn number(value: Option<f64>, unit: &str) -> String {
     value
         .filter(|v| v.is_finite())
@@ -49,6 +62,13 @@ fn native(app: &App, key: &str) -> Option<f64> {
         .get(key)
         .copied()
 }
+fn llama(app: &App) -> bool {
+    app.snapshot
+        .as_ref()
+        .and_then(|s| s.backends.get(app.worker))
+        .is_some_and(|b| b.backend.starts_with("llama.cpp"))
+}
+
 fn duration(seconds: f64) -> String {
     let s = seconds.max(0.) as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -81,24 +101,45 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
     let body = sections[1];
     if body.height < 14 {
         let parts = Layout::vertical([Constraint::Length(4), Constraint::Min(2)]).split(body);
-        let text = format!(
-            "Decode ≈ {}    Expert hits {}\nActive {}    Offload {}",
-            number(app.rates.decode_estimate, "tok/s"),
-            number(app.rates.expert_hit_ratio.map(|v| v * 100.), "%"),
-            app.snapshot
-                .as_ref()
-                .map_or_else(|| "—".into(), |s| s.totals.active.to_string()),
-            number(
-                app.rates.read_bytes_per_second.map(|v| v / 1048576.),
-                "MiB/s"
+        let text = if llama(app) {
+            format!(
+                "Decode ≈ {}    Active {}\nCPU experts RAM {} / {}",
+                number(app.rates.decode_estimate, "tok/s"),
+                app.snapshot.as_ref().map_or(0, |s| s.totals.active),
+                number(
+                    native(app, "cpu_expert_resident_bytes").map(|n| n / 1073741824.),
+                    "GiB"
+                ),
+                number(
+                    native(app, "cpu_expert_weight_bytes").map(|n| n / 1073741824.),
+                    "GiB"
+                )
             )
-        );
+        } else {
+            format!(
+                "Decode ≈ {}    Expert hits {}\nActive {}    Offload {}",
+                number(app.rates.decode_estimate, "tok/s"),
+                number(app.rates.expert_hit_ratio.map(|v| v * 100.), "%"),
+                app.snapshot
+                    .as_ref()
+                    .map_or_else(|| "—".into(), |s| s.totals.active.to_string()),
+                number(
+                    app.rates.read_bytes_per_second.map(|v| v / 1048576.),
+                    "MiB/s"
+                )
+            )
+        };
         frame.render_widget(Paragraph::new(text).block(panel("LIVE", CYAN)), parts[0]);
         requests(frame, parts[1], app);
     } else if body.width >= 96 && body.height >= 20 {
+        let card_height = if llama(app) {
+            (body.height / 3).clamp(8, 12)
+        } else {
+            8
+        };
         let rows = Layout::vertical([
-            Constraint::Length(8),
-            Constraint::Length(8),
+            Constraint::Length(card_height),
+            Constraint::Length(card_height),
             Constraint::Min(4),
         ])
         .split(body);
@@ -223,11 +264,11 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 fn inference(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel("INFERENCE", CYAN);
+    let block = live_panel("INFERENCE", CYAN, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let active = app.snapshot.as_ref().map_or(0, |s| s.totals.active);
-    let phase = if app.rates.decode_estimate.is_some() {
+    let phase = if app.rates.decode_estimate.is_some() && active > 0 {
         "DECODE"
     } else if active > 0 {
         "WORKING"
@@ -254,12 +295,21 @@ fn inference(frame: &mut Frame, area: Rect, app: &App) {
     }
     if inner.height > 1 {
         frame.render_widget(
-            Paragraph::new(format!(
-                "Active {active}   Queued {}   ~ interval estimate",
-                native(app, "requests_waiting")
-                    .map(|n| format!("{n:.0}"))
-                    .unwrap_or_else(|| "n/a".into())
-            ))
+            Paragraph::new(if llama(app) {
+                format!(
+                    "Active {active}   Output {} tokens   ~ interval estimate",
+                    native(app, "active_output_tokens")
+                        .map(|n| format!("{n:.0}"))
+                        .unwrap_or_else(|| "n/a".into())
+                )
+            } else {
+                format!(
+                    "Active {active}   Queued {}   ~ interval estimate",
+                    native(app, "requests_waiting")
+                        .map(|n| format!("{n:.0}"))
+                        .unwrap_or_else(|| "n/a".into())
+                )
+            })
             .style(Style::default().fg(MUTED)),
             Rect {
                 x: inner.x,
@@ -271,17 +321,30 @@ fn inference(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 fn memory(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel("MEMORY", VIOLET);
+    let block = live_panel("MEMORY", VIOLET, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let resident = native(app, "expert_cache_resident_bytes");
-    let budget = native(app, "expert_cache_budget_bytes");
+    let host = app.snapshot.as_ref().and_then(|s| s.memory.as_ref());
+    let (resident, budget, label_name) = if llama(app) {
+        let capacity = host.and_then(|m| m.host.capacity_bytes).map(|n| n as f64);
+        (
+            app.snapshot.as_ref().and_then(super::host_used_bytes),
+            capacity,
+            "Host incl. cache",
+        )
+    } else {
+        (
+            native(app, "expert_cache_resident_bytes"),
+            native(app, "expert_cache_budget_bytes"),
+            "Experts",
+        )
+    };
     let ratio = resident
         .zip(budget)
         .and_then(|(a, b)| (b > 0.).then_some((a / b).clamp(0., 1.)))
         .unwrap_or(0.);
     let label = format!(
-        "Experts {} / {}",
+        "{label_name} {} / {}",
         number(resident.map(|n| n / 1073741824.), "GiB"),
         number(budget.map(|n| n / 1073741824.), "GiB")
     );
@@ -293,15 +356,24 @@ fn memory(frame: &mut Frame, area: Rect, app: &App) {
             .use_unicode(true),
         Rect { height: 1, ..inner },
     );
-    let host = app.snapshot.as_ref().and_then(|s| s.memory.as_ref());
     let lines = vec![
-        Line::raw(format!(
-            "Effective expert budget {}",
-            number(
-                native(app, "expert_cache_effective_budget_bytes").map(|n| n / 1073741824.),
-                "GiB"
+        Line::raw(if llama(app) {
+            format!(
+                "Worker RSS {}",
+                number(
+                    native(app, "process_resident_bytes").map(|n| n / 1073741824.),
+                    "GiB"
+                )
             )
-        )),
+        } else {
+            format!(
+                "Effective expert budget {}",
+                number(
+                    native(app, "expert_cache_effective_budget_bytes").map(|n| n / 1073741824.),
+                    "GiB"
+                )
+            )
+        }),
         Line::raw(format!(
             "Host available {}",
             number(
@@ -311,8 +383,21 @@ fn memory(frame: &mut Frame, area: Rect, app: &App) {
             )
         )),
         Line::raw(format!(
-            "Pressure {}",
-            host.map(|m| format!("{:?}", m.overall_pressure).to_uppercase())
+            "{} {}",
+            if llama(app) {
+                "Host pressure"
+            } else {
+                "Pressure"
+            },
+            host.map(|m| format!(
+                "{:?}",
+                if llama(app) {
+                    m.host.pressure
+                } else {
+                    m.overall_pressure
+                }
+            )
+            .to_uppercase())
                 .unwrap_or_else(|| "N/A".into())
         )),
         Line::styled(
@@ -329,20 +414,72 @@ fn memory(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(MUTED),
         ),
     ];
+    let plot_height = if llama(app) {
+        inner.height.saturating_sub(5)
+    } else {
+        0
+    };
+    graph(
+        frame,
+        Rect {
+            y: inner.y + 1,
+            height: plot_height,
+            ..inner
+        },
+        &app.memory_history,
+        VIOLET,
+    );
     if inner.height > 1 {
         frame.render_widget(
             Paragraph::new(lines),
             Rect {
-                x: inner.x,
-                y: inner.y + 1,
-                width: inner.width,
-                height: inner.height - 1,
+                y: inner.y + 1 + plot_height,
+                height: inner.height - 1 - plot_height,
+                ..inner
             },
         );
     }
 }
 fn cache(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel("EXPERT CACHE", BLUE);
+    if llama(app) {
+        let block = live_panel("PROMPT CACHE", BLUE, app);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let hit = native(app, "prompt_cache_hit_ratio");
+        frame.render_widget(
+            Gauge::default()
+                .ratio(hit.unwrap_or(0.).clamp(0., 1.))
+                .label(format!(
+                    "Prompt cache hit rate {}",
+                    number(hit.map(|n| n * 100.), "%")
+                ))
+                .gauge_style(Style::default().fg(BLUE).bg(BG)),
+            Rect { height: 1, ..inner },
+        );
+        let plot_height = inner.height.saturating_sub(4);
+        graph(
+            frame,
+            Rect {
+                y: inner.y + 1,
+                height: plot_height,
+                ..inner
+            },
+            &app.prompt_hit_history,
+            BLUE,
+        );
+        if inner.height > 1 {
+            frame.render_widget(Paragraph::new(format!(
+                "Cached prompt {} / {} tokens\nContext {} / {} tokens\nKV prefix reuse · slots {}",
+                tokens(native(app, "active_cached_tokens").map(|n| n as u64)),
+                tokens(native(app, "active_prompt_tokens").map(|n| n as u64)),
+                tokens(native(app, "context_used_tokens").map(|n| n as u64)),
+                tokens(native(app, "context_capacity_tokens").map(|n| n as u64)),
+                tokens(native(app, "slots_total").map(|n| n as u64)))),
+                Rect { y: inner.y + 1 + plot_height, height: inner.height - 1 - plot_height, ..inner });
+        }
+        return;
+    }
+    let block = live_panel("EXPERT CACHE", BLUE, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -392,7 +529,70 @@ fn cache(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 fn offload(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel("OFFLOAD", PINK);
+    if llama(app) {
+        let cpu = if native(app, "cpu_moe_all") == Some(1.) {
+            "all".into()
+        } else {
+            native(app, "cpu_moe_layers")
+                .map(|n| format!("{n:.0}"))
+                .unwrap_or_else(|| "default".into())
+        };
+        let gpu = native(app, "gpu_layers_requested")
+            .map(|n| format!("{n:.0}"))
+            .unwrap_or_else(|| "default".into());
+        let accelerator = app
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.memory.as_ref())
+            .map(|m| &m.accelerator);
+        let capacity = accelerator.and_then(|m| m.capacity_bytes);
+        let used = capacity
+            .zip(accelerator.and_then(|m| m.available_bytes))
+            .map(|(c, a)| c.saturating_sub(a));
+        let block = live_panel("CPU / RAM OFFLOAD", PINK, app);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let resident = native(app, "cpu_expert_resident_bytes");
+        let weights = native(app, "cpu_expert_weight_bytes");
+        let ratio = resident
+            .zip(weights)
+            .filter(|(_, w)| *w > 0.)
+            .map_or(0., |(r, w)| (r / w).clamp(0., 1.));
+        frame.render_widget(
+            Gauge::default()
+                .ratio(ratio)
+                .label(format!(
+                    "CPU experts in RAM {} / {}",
+                    number(resident.map(|n| n / 1073741824.), "GiB"),
+                    number(weights.map(|n| n / 1073741824.), "GiB")
+                ))
+                .gauge_style(Style::default().fg(PINK).bg(BG)),
+            Rect { height: 1, ..inner },
+        );
+        let plot_height = inner.height.saturating_sub(5);
+        graph(
+            frame,
+            Rect {
+                y: inner.y + 1,
+                height: plot_height,
+                ..inner
+            },
+            &app.expert_ram_history,
+            PINK,
+        );
+        let pressure = accelerator
+            .map(|m| format!("{:?}", m.pressure).to_uppercase())
+            .unwrap_or_else(|| "N/A".into());
+        if inner.height > 1 {
+            frame.render_widget(Paragraph::new(format!(
+                "CPU expert layers {cpu} · mmap RAM\nGPU memory {} / {}\nGPU pressure {pressure}\nGPU layers requested {gpu}",
+                number(used.map(|n| n as f64 / 1073741824.), "GiB"),
+                number(capacity.map(|n| n as f64 / 1073741824.), "GiB"))),
+                Rect { y: inner.y + 1 + plot_height, height: inner.height - 1 - plot_height, ..inner });
+        }
+        return;
+    }
+    let block = live_panel("OFFLOAD", PINK, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -567,6 +767,158 @@ fn details(frame: &mut Frame, app: &App) {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn observability_llama_panels_show_context_memory_and_placement() {
+        let args = super::super::TopArgs {
+            url: "http://localhost:11434".into(),
+            api_key: None,
+            interval_ms: 2000,
+            once: false,
+            json: false,
+            no_animation: true,
+            demo: false,
+        };
+        let mut app = App::new(&args);
+        let mut snapshot = super::super::demo(3.);
+        snapshot.backends[0].backend = "llama.cpp / CUDA".into();
+        use crate::werk_protocol::{MemoryStatusResponse, MemoryTierStatus, PressureLevel};
+        let host = MemoryTierStatus {
+            capacity_bytes: Some(100 * 1073741824),
+            available_bytes: Some(90 * 1073741824),
+            managed_bytes: 0,
+            reserved_bytes: 0,
+            pressure: PressureLevel::Normal,
+        };
+        let accelerator = MemoryTierStatus {
+            pressure: PressureLevel::Emergency,
+            ..host.clone()
+        };
+        snapshot.memory = Some(MemoryStatusResponse {
+            observed_at_unix_ms: 0,
+            overall_pressure: PressureLevel::Emergency,
+            topology: "discrete".into(),
+            host,
+            accelerator,
+            last_action_unix_ms: None,
+            counters: Default::default(),
+        });
+        snapshot.backends[0].gauges.extend([
+            ("decode_tokens_per_second_estimate".into(), 12.),
+            ("context_used_tokens".into(), 1200.),
+            ("context_capacity_tokens".into(), 32768.),
+            ("active_cached_tokens".into(), 1000.),
+            ("active_output_tokens".into(), 200.),
+            ("process_resident_bytes".into(), 1073741824.),
+            ("cpu_moe_layers".into(), 38.),
+            ("cpu_expert_weight_bytes".into(), 60. * 1073741824.),
+            ("cpu_expert_resident_bytes".into(), 59. * 1073741824.),
+            ("prompt_cache_hit_ratio".into(), 0.9),
+        ]);
+        app.update(snapshot);
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for value in [
+            "12.0 tok/s",
+            "PROMPT CACHE",
+            "Prompt cache hit rate 90.0 %",
+            "CPU experts in RAM 59.0 GiB / 60.0 GiB",
+            "1200 / 32768",
+            "Worker RSS 1.0 GiB",
+            "Host incl. cache 98.0 GiB / 100.0 GiB",
+            "Host pressure NORMAL",
+            "GPU pressure EMERGENCY",
+            "CPU expert layers 38",
+        ] {
+            assert!(text.contains(value), "missing {value}");
+        }
+        assert!(!text.contains("EXPERT CACHE"));
+        assert!(!text.contains("disk-read"));
+        assert_eq!(app.expert_ram_history.back(), Some(&Some(59.)));
+        assert_eq!(app.prompt_hit_history.back(), Some(&Some(90.)));
+        // Freeze sample age; only the animation tick changes between draws.
+        app.last_received = None;
+        // All four panels indicate live refresh, including stable memory data.
+        app.animation = true;
+        app.tick = 0;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let first = terminal.backend().buffer().clone();
+        let text = first.content.iter().map(|c| c.symbol()).collect::<String>();
+        assert_eq!(text.matches("▁ LIVE").count(), 4);
+        app.tick = 8;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert_ne!(&first, terminal.backend().buffer());
+        app.animation = false;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let still = terminal.backend().buffer().clone();
+        app.tick = 16;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert_eq!(&still, terminal.backend().buffer());
+    }
+
+    #[test]
+    fn observability_omlx_keeps_existing_mac_panels_and_layout() {
+        let args = super::super::TopArgs {
+            url: "http://localhost:11434".into(),
+            api_key: None,
+            interval_ms: 2000,
+            once: false,
+            json: false,
+            no_animation: false,
+            demo: true,
+        };
+        let mut app = App::new(&args);
+        app.update(super::super::demo(1.));
+        app.update(super::super::demo(3.));
+        let mut terminal = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: usize| {
+            buffer.content[y * 160..(y + 1) * 160]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(row(4).contains("MEMORY"));
+        assert!(row(12).contains("EXPERT CACHE"));
+        assert!(row(12).contains("OFFLOAD"));
+        assert!(row(20).contains("REQUESTS"));
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for label in [
+            "Experts",
+            "Effective expert budget",
+            "Interval hit rate",
+            "Expert reads",
+            "Logical reads include the OS file cache",
+        ] {
+            assert!(
+                text.contains(label),
+                "missing original oMLX display: {label}"
+            );
+        }
+        for label in [
+            "PROMPT CACHE",
+            "CPU / RAM OFFLOAD",
+            "Host pressure",
+            "▁ LIVE",
+        ] {
+            assert!(
+                !text.contains(label),
+                "llama.cpp-only display leaked into oMLX: {label}"
+            );
+        }
+    }
+
     #[test]
     fn observability_layouts_render_at_small_medium_and_large_sizes() {
         let args = super::super::TopArgs {

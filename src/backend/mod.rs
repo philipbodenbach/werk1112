@@ -9,6 +9,7 @@ pub(crate) mod model_file_cache;
 mod omlx;
 mod onnxruntime;
 mod openai_transport;
+pub(crate) use openai_transport::ApiOptionError;
 mod qwen_tts;
 pub(crate) mod tool_calling;
 mod vllm;
@@ -1305,6 +1306,19 @@ pub trait GenerationBackend: Send + Sync {
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         Vec::new()
     }
+    /// Validate extended API fields before starting a response or loading a model.
+    /// Routing adapters must select the same concrete backend as `generate_api`.
+    fn validate_api_options(
+        &self,
+        _manifest: &ModelManifest,
+        _request: &GenerateRequest,
+        options: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        if !options.is_empty() {
+            anyhow::bail!("the selected backend does not support the requested extended API fields")
+        }
+        Ok(())
+    }
     /// Rich chat responses retain choices, logprobs and structured output.
     /// Ordinary requests keep using the existing generation/session path.
     fn generate_api(
@@ -1320,6 +1334,19 @@ pub trait GenerationBackend: Send + Sync {
     /// Never implement this by generating a token or estimating from bytes.
     fn count_tokens(&self, _manifest: &ModelManifest, _request: GenerateRequest) -> Result<usize> {
         anyhow::bail!("the selected backend does not expose native chat token counting")
+    }
+    /// Count the same chat template as generate_api, including request overrides.
+    /// A counter that cannot preserve these options must report unsupported.
+    fn count_api_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<usize> {
+        if !options.is_empty() {
+            anyhow::bail!("native token counting with API options is not supported")
+        }
+        self.count_tokens(manifest, request)
     }
     /// Applies explicit API runtime controls without changing process-wide
     /// environment or silently routing them to an unrelated backend.

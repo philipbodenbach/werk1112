@@ -31,6 +31,14 @@ pub fn render(s: &Snapshot) -> String {
             swap as f64,
         );
     }
+    if let Some(free) = s.host_memory_free_bytes {
+        metric(
+            "werk_host_memory_free_bytes",
+            "gauge",
+            "Physically free host memory, excluding reclaimable cache.",
+            free as f64,
+        );
+    }
     for (name, value) in [
         ("started", s.totals.started),
         ("completed", s.totals.completed),

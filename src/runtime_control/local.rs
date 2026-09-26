@@ -3200,7 +3200,17 @@ fn max_pressure(left: PressureLevel, right: PressureLevel) -> PressureLevel {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
+fn host_memory_observation() -> Option<(u64, Option<u64>)> {
+    // MemAvailable includes reclaimable file cache. _SC_AVPHYS_PAGES only
+    // reports free pages and mistakes mmap'd model cache for memory pressure.
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let total = system.total_memory();
+    (total > 0).then(|| (total, Some(system.available_memory().min(total))))
+}
+
+#[cfg(target_os = "android")]
 fn host_memory_observation() -> Option<(u64, Option<u64>)> {
     // SAFETY: sysconf has no pointer arguments and is safe to query. Negative
     // values are treated as unavailable rather than cast.
@@ -3368,11 +3378,11 @@ mod tests {
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn macos_memory_observation_reports_bounded_available_memory() {
+    fn observability_memory_observation_reports_bounded_available_memory() {
         let (total, available) = host_memory_observation().expect("physical memory is available");
-        let available = available.expect("Mach VM statistics are available");
+        let available = available.expect("available memory is reported");
         assert!(total > 0);
         assert!(available <= total);
     }

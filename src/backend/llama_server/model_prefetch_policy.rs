@@ -53,17 +53,7 @@ fn prepare_inner(
     }
     // Native environment overrides are outside this positive placement proof.
     // Do not guess their interaction with arbitrary user-supplied arguments.
-    if [
-        "LLAMA_ARG_CPU_MOE",
-        "LLAMA_ARG_N_CPU_MOE",
-        "LLAMA_ARG_OVERRIDE_TENSOR",
-        "LLAMA_ARG_NO_HOST",
-        "LLAMA_ARG_NUMA",
-        "GGML_CUDA_NO_PINNED",
-    ]
-    .iter()
-    .any(|key| env::var_os(key).is_some())
-    {
+    if native_placement_override() {
         return Some(
             "llama.cpp CPU expert prefetch: skipped; native environment overrides placement".into(),
         );
@@ -128,6 +118,28 @@ fn prepare_inner(
         "llama.cpp CPU expert prefetch: {detail}; {:.6}s",
         started.elapsed().as_secs_f64()
     ))
+}
+
+fn native_placement_override() -> bool {
+    [
+        "LLAMA_ARG_CPU_MOE",
+        "LLAMA_ARG_N_CPU_MOE",
+        "LLAMA_ARG_OVERRIDE_TENSOR",
+        "LLAMA_ARG_NO_HOST",
+        "LLAMA_ARG_NUMA",
+        "GGML_CUDA_NO_PINNED",
+    ]
+    .iter()
+    .any(|key| env::var_os(key).is_some())
+}
+
+/// Capture the same conservative placement proof at worker creation, even
+/// when optional prefaulting is disabled. Sampling never changes placement.
+pub(super) fn observed_placement(args: &[String], model: &Path) -> Option<CpuMoePlacement> {
+    if native_placement_override() {
+        return None;
+    }
+    placement(args, model, env::var("LLAMA_ARG_LOAD_MODE").ok().as_deref())
 }
 
 fn option<'a>(args: &'a [String], names: &[&str]) -> Option<&'a str> {

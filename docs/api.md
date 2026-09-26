@@ -437,7 +437,7 @@ Accepted top-level fields:
 | <code>n</code> | No | integer | `1..16`; multiple choices retained through native adapters that support them |
 | <code>logprobs</code>, <code>top_logprobs</code> | No | boolean / integer | Native token logprobs; top count `0..20` requires `logprobs: true` |
 | <code>logit_bias</code> | No | object | Token-ID keys with biases in `[-100,100]`; native support required |
-| <code>reasoning_effort</code> | No | string | Forwarded as a provider field where supported, separately from `werk.omlx` |
+| <code>reasoning_effort</code> | No | string / number | Native effort value; accepted types and levels depend on the backend/model, separately from `werk.omlx` |
 | <code>store</code> | No | boolean | Only `false`/null supported; no provider completion-storage service |
 | <code>werk</code> | No | object | Local `omlx` runtime controls and `documents.mode` / `documents.ocr` |
 
@@ -446,6 +446,60 @@ response path so choice indices, logprobs and usage survive both JSON and SSE.
 The ordinary path remains in place when these options are absent. Extended
 requests reuse the native worker and its own prefix cache; they do not pass
 through Werk's simple `ChatGenerationSession` snapshot path.
+
+For tool-bearing requests and the Anthropic endpoint, a context estimate that
+exceeds the configured limit is checked against the selected runtime's native
+chat tokenizer when available. Tool schemas, tool-result pairs and request
+reasoning options are preserved; no generation is performed for counting. A
+real overflow returns HTTP 400 before SSE with `code: "context_length_exceeded"`,
+`prompt_tokens`, `max_tokens`, `context_length`, and `token_count_method` so clients
+can trigger compaction. If native counting is unavailable, the conservative
+fallback is explicitly labeled `token_count_method: "estimate"`. Small requests
+that fit the estimate do not add tokenizer round trips.
+
+Adapter support is checked before an HTTP response or generation begins. An
+unsupported extended option returns HTTP 400 with code `unsupported_api_options`
+for both JSON and streaming requests, rather than an error inside an HTTP 200
+stream. This applies through automatic and preferred-backend routing as well.
+
+`reasoning_effort` is forwarded without coercing native values to strings or
+forcing them into a global list. llama.cpp accepts strings; vLLM accepts `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; oMLX accepts strings and
+numbers, including numeric strengths used by templates such as Inkling. The
+selected runtime/model defines which values are meaningful. Omission or null
+preserves runtime defaults.
+
+For the standard levels `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`,
+llama.cpp, vLLM and oMLX enable thinking for that request; `none` disables it.
+The worker defaults remain unchanged for later requests. Other native strings
+and numbers retain their native semantics and do not implicitly toggle thinking.
+oMLX keeps the effort override consistent between the request field and
+chat-template kwargs. A standard top-level effort takes precedence over
+`werk.omlx.thinking` when both are supplied.
+
+Reasoning validation errors identify `param: "reasoning_effort"` and use code
+`invalid_reasoning_effort`. Known closed value sets are included in the message
+and `error.supported_values`; `values_scope: "backend"` identifies the source of
+that list. `supported_types` describes the expected JSON types. For open model
+vocabularies, no exhaustive value list is invented. `values_depend_on_model`
+reminds clients that accepting a value does not guarantee every model implements
+its effect. These hints are returned in HTTP 400 JSON before starting SSE, even
+when `stream: true` was requested. For example, an unsupported vLLM effort:
+
+```json
+{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "invalid_reasoning_effort",
+    "param": "reasoning_effort",
+    "message": "Invalid reasoning_effort for vLLM. Supported values: [\"none\",\"minimal\",\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]. Their effect depends on the model/template.",
+    "supported_values": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "supported_types": ["string"],
+    "values_scope": "backend",
+    "values_depend_on_model": true
+  }
+}
+```
 
 | Native adapter | JSON/schema, penalties | Multiple choices / logprobs / logit bias | Anthropic `top_k` | Anthropic matched `stop_sequences` |
 | --- | --- | --- | --- | --- |
