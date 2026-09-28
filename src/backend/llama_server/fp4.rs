@@ -3,6 +3,7 @@ use super::*;
 use crate::backend::Fp4Kernel;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 pub(super) const REVISION: &str = "fc343a84bbd925b37dde3219de35ea0bed50d630";
 const SOURCE: &str = "https://github.com/ggml-org/llama.cpp";

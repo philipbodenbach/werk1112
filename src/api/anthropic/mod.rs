@@ -221,7 +221,8 @@ async fn handle_request(
             prepared.manifest,
             prepared.request,
             prepared.explicit_runtime_options,
-        );
+        )
+        .await;
         let mut stream = stream::MessagesStream::new(source, &model, id, request_id);
         stream.verbose = verbose;
         stream.tool_names = tool_names;

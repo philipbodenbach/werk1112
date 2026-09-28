@@ -19,6 +19,50 @@ fn children() -> &'static Mutex<Children> {
     CHILDREN.get_or_init(Default::default)
 }
 
+/// Coordinates the bind handoff to owned native servers. Their CLIs cannot
+/// inherit a listening socket, so retain a logical reservation until readiness.
+/// This prevents concurrent Werk startups from selecting the same free port;
+/// unrelated external processes can still race the OS bind and cause startup to fail.
+pub(crate) struct StartupPort(u16);
+
+fn startup_ports() -> &'static Mutex<std::collections::HashSet<u16>> {
+    static PORTS: OnceLock<Mutex<std::collections::HashSet<u16>>> = OnceLock::new();
+    PORTS.get_or_init(Default::default)
+}
+
+impl StartupPort {
+    pub(crate) fn reserve() -> std::io::Result<Self> {
+        for _ in 0..128 {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+            let port = listener.local_addr()?.port();
+            if startup_ports()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(port)
+            {
+                return Ok(Self(port));
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "cannot reserve a distinct native worker port",
+        ))
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.0
+    }
+}
+
+impl Drop for StartupPort {
+    fn drop(&mut self) {
+        startup_ports()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 pub(crate) struct ManagedChild(Arc<Mutex<Child>>);
 
 /// Register before preparing resources that must also be released if startup
@@ -368,7 +412,39 @@ mod tests {
             called.fetch_add(1, Ordering::SeqCst);
         }))
         .unwrap();
+        let active = ManagedChild::spawn(Command::new("sh").args(["-c", "exec sleep 60"])).unwrap();
+        let cache = Arc::new(crate::backend::runtime_cache::RuntimeCache::<
+            u32,
+            ManagedChild,
+        >::default());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_cache = cache.clone();
+        let first = thread::spawn(move || {
+            first_cache.get_or_try_init(
+                1,
+                |_| true,
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(ManagedChild::spawn(&mut Command::new("true"))?)
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let queued_cache = cache.clone();
+        let queued = thread::spawn(move || {
+            queued_cache.get_or_try_init(
+                1,
+                |_| true,
+                || Ok(ManagedChild::spawn(&mut Command::new("true"))?),
+            )
+        });
         shutdown_children();
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        assert!(queued.join().unwrap().is_err());
+        assert!(active.lock().unwrap().try_wait().unwrap().is_some());
         drop(cleanup);
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(ManagedCleanup::register(Box::new(|| {})).is_err());
@@ -386,5 +462,36 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::StartupPort;
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    #[test]
+    fn overlapping_worker_startups_reserve_distinct_ports() {
+        let barrier = Arc::new(Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let reservation = StartupPort::reserve().unwrap();
+                    barrier.wait();
+                    reservation
+                })
+            })
+            .collect();
+        let reservations: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let ports: HashSet<_> = reservations.iter().map(StartupPort::port).collect();
+        assert_eq!(ports.len(), 16);
     }
 }

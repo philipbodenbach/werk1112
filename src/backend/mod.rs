@@ -9,6 +9,7 @@ pub(crate) mod model_file_cache;
 mod omlx;
 mod onnxruntime;
 mod openai_transport;
+pub(crate) mod runtime_cache;
 pub(crate) use openai_transport::ApiOptionError;
 mod qwen_tts;
 pub(crate) mod tool_calling;
@@ -1260,6 +1261,7 @@ impl Fp4Kernel {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LlamaRuntimeOptions {
+    pub parallel: Option<u32>,
     pub fp4_kernel: Option<Fp4Kernel>,
     pub ctx_size: Option<usize>,
     pub batch_size: Option<usize>,
@@ -1291,6 +1293,12 @@ pub type GenerateStream =
     Pin<Box<dyn Stream<Item = Result<GenerateStreamEvent, String>> + Send + 'static>>;
 
 pub trait ChatGenerationSession: Send + Sync {
+    /// A dead owned worker invalidates an API session; never replay a failed request.
+    /// Must be a quick local check: the API may call this under its session-cache lock.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     fn preparation_diagnostics(&self) -> Vec<String> {
         Vec::new()
     }

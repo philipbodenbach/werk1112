@@ -21,6 +21,7 @@ The browser-friendly index is published as the
 | Understand every HTTP route | [HTTP API](api.md) |
 | Implement a runtime-control client | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |
 | Review runtime persistence, memory and backend boundaries | [Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md) |
+| Review multi-model and multi-agent concurrency | [Inference concurrency audit and model](concepts/inference-concurrency.md) |
 | Install or select a backend | [Backends](backends.md) |
 | Use tool calling across backends and media | [Tool calling](tool-calling.md) |
 | Configure vLLM arguments | [vLLM launch](backends.md#vllm-launch-arguments-and-tool-calling) |

@@ -9,7 +9,7 @@ use super::{VllmBackend, VllmProcess};
 use crate::{
     runtime_control::{
         BackendRuntimeAdapter, BackendRuntimeDescriptor, ModelResidencyStatus,
-        UnsupportedRuntimeAdapter, model_residency_capability,
+        model_residency_capability,
     },
     werk_protocol::{Capability, CapabilityStatus},
 };
@@ -19,38 +19,23 @@ const PREFIX_CACHE_CAPABILITY: &str = "runtime.state.prefix_cache";
 
 pub(super) struct VllmRuntimeControlAdapter {
     backend: VllmBackend,
-    fallback: UnsupportedRuntimeAdapter,
 }
 
 impl VllmRuntimeControlAdapter {
     pub(super) fn new(backend: VllmBackend) -> Self {
-        let fallback = UnsupportedRuntimeAdapter::new(backend.accelerator.backend_label());
-        Self { backend, fallback }
+        Self { backend }
     }
 }
 
 impl BackendRuntimeAdapter for VllmRuntimeControlAdapter {
     fn descriptor(&self) -> BackendRuntimeDescriptor {
-        let Ok(servers) = self.backend.servers.lock() else {
-            let mut descriptor = self.fallback.descriptor();
-            descriptor.capabilities = vec![
-                model_residency_capability(
-                    ModelResidencyStatus::Unavailable,
-                    "vLLM model-residency metadata is unavailable because its process registry could not be read",
-                ),
-                prefix_cache_capability(
-                    CapabilityStatus::Unavailable,
-                    "vLLM runtime metadata is unavailable because its process registry could not be read",
-                ),
-            ];
-            return descriptor;
-        };
-        let processes = servers
-            .values()
-            .filter(|server| process_is_active_without_remote_io(server))
-            .cloned()
+        let processes = self
+            .backend
+            .servers
+            .snapshot()
+            .into_iter()
+            .filter(process_is_active_without_remote_io)
             .collect::<Vec<_>>();
-        drop(servers);
 
         let (status, detail) = active_prefix_cache_status(&processes);
         let runtime_version =
@@ -109,7 +94,7 @@ fn active_model_residency_capability(processes: &[Arc<VllmProcess>]) -> Capabili
     }
 }
 
-fn process_is_active_without_remote_io(process: &&Arc<VllmProcess>) -> bool {
+fn process_is_active_without_remote_io(process: &Arc<VllmProcess>) -> bool {
     match &process.child {
         None => true,
         Some(child) => child

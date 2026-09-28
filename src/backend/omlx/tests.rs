@@ -719,8 +719,11 @@ fn fixture_backend(fixture: &Fixture) -> OmlxBackend {
     OmlxBackend {
         store: fixture.store.clone(),
         invocation: Ok(fixture.invocation.clone()),
-        servers: Arc::new(Mutex::new(HashMap::new())),
+        servers: Arc::new(super::super::runtime_cache::RuntimeCache::retained(
+            MAX_CACHED_WORKERS,
+        )),
         model_probes: Arc::new(Mutex::new(VecDeque::new())),
+        probe_gates: Arc::new(Default::default()),
         request_thinking: None,
         request_reasoning_effort: None,
         test_probe: Some(ProbeReport {
@@ -831,7 +834,7 @@ fn stable_model_probes_reuse_verified_runtime_for_chat_and_tools() {
         .unwrap();
     assert_eq!(probe_count(&fixture), 1);
     assert_eq!(backend.model_probes.lock().unwrap().len(), 1);
-    assert!(backend.servers.lock().unwrap().is_empty());
+    assert!(backend.servers.snapshot().is_empty());
 }
 
 #[test]
@@ -1019,7 +1022,7 @@ fn native_count_reuses_worker_and_template_controls_without_generating() {
             .count(),
         1
     );
-    assert_eq!(backend.servers.lock().unwrap().len(), 1);
+    assert_eq!(backend.servers.snapshot().len(), 1);
 }
 
 #[tokio::test]
@@ -1071,7 +1074,7 @@ async fn server_prefix_cache_covers_prepare_sessions_stream_tools_and_request_op
         serde_json::from_slice(&fs::read(model.join("request.json")).unwrap()).unwrap();
     assert_eq!(sent["chat_template_kwargs"]["enable_thinking"], false);
     assert_eq!(sent["tools"][0]["function"]["name"], "lookup");
-    assert_eq!(backend.servers.lock().unwrap().len(), 1);
+    assert_eq!(backend.servers.snapshot().len(), 1);
 }
 
 #[test]
@@ -1097,7 +1100,7 @@ fn server_prefix_cache_expert_variants_have_independent_managed_cache_directorie
     assert_eq!(starts.len(), 2);
     assert_ne!(starts[0]["cache"], starts[1]["cache"]);
     assert!(starts.iter().all(|start| start["limit"] == "4GB"));
-    assert_eq!(backend.servers.lock().unwrap().len(), 2);
+    assert_eq!(backend.servers.snapshot().len(), 2);
 }
 
 #[test]
@@ -1126,7 +1129,7 @@ fn server_prefix_cache_unavailable_or_disabled_keeps_one_ordinary_worker() {
         assert_eq!(starts.lines().count(), 1);
         let start: Value = serde_json::from_str(starts.trim()).unwrap();
         assert_eq!(start["cache"].is_string(), expected_cache);
-        assert_eq!(backend.servers.lock().unwrap().len(), 1);
+        assert_eq!(backend.servers.snapshot().len(), 1);
     }
 }
 
@@ -1258,7 +1261,7 @@ fn thinking_chat_options_reuse_one_worker_and_do_not_leak_into_defaults() {
         } else {
             instance = Some(selected);
         }
-        assert_eq!(base.servers.lock().unwrap().len(), 1);
+        assert_eq!(base.servers.snapshot().len(), 1);
     }
 }
 
@@ -1317,7 +1320,7 @@ fn chat_options_probe_observes_the_applied_expert_budget_before_loading() {
         .join("probe-payload.json");
     let payload: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert_eq!(payload["expert_cache_bytes"], 7 * 1024 * 1024);
-    assert!(base.servers.lock().unwrap().is_empty());
+    assert!(base.servers.snapshot().is_empty());
     assert!(!fixture.root.join("backends").exists());
     assert!(
         base.with_chat_options(&manifest, &chat_options(None, Some(8)))
@@ -1347,9 +1350,7 @@ fn configured_expert_budget_selects_its_exact_worker_and_registry_is_bounded() {
     second.expert_cache_bytes = Some(8 * 1024 * 1024);
     let second_id = second.instance_id.clone();
     base.servers
-        .lock()
-        .unwrap()
-        .insert("different-budget-fixture".into(), Arc::new(second));
+        .insert_fixture("different-budget-fixture".into(), Arc::new(second));
     let configured = base
         .configured_for_chat(&chat_options(Some(false), Some(8)))
         .unwrap();
@@ -1369,10 +1370,9 @@ fn configured_expert_budget_selects_its_exact_worker_and_registry_is_bounded() {
         default_worker.instance_id
     );
     {
-        let mut registry = base.servers.lock().unwrap();
-        while registry.len() < MAX_CACHED_WORKERS {
-            let key = format!("retained-fixture-{}", registry.len());
-            registry.insert(key, default_worker.clone());
+        while base.servers.snapshot().len() < MAX_CACHED_WORKERS {
+            let key = format!("retained-fixture-{}", base.servers.snapshot().len());
+            base.servers.insert_fixture(key, default_worker.clone());
         }
     }
     assert!(
@@ -1382,7 +1382,7 @@ fn configured_expert_budget_selects_its_exact_worker_and_registry_is_bounded() {
     let error = configured.cached_server(&manifest).err().unwrap();
     assert!(error.to_string().contains("limit of 16 retained workers"));
     assert!(default_worker.is_running());
-    assert_eq!(base.servers.lock().unwrap().len(), MAX_CACHED_WORKERS);
+    assert_eq!(base.servers.snapshot().len(), MAX_CACHED_WORKERS);
 }
 
 #[test]
@@ -1477,7 +1477,7 @@ fn unverified_native_cache_version_returns_normal_fallback_without_starting_work
             .is_none()
     );
     assert!(!cache.exists());
-    assert!(backend.servers.lock().unwrap().is_empty());
+    assert!(backend.servers.snapshot().is_empty());
     assert!(!fixture.root.join("backends").exists());
 }
 
@@ -1597,9 +1597,7 @@ fn model_controls_require_unique_worker_when_chat_cache_namespaces_differ() {
     let second = Arc::new(second);
     backend
         .servers
-        .lock()
-        .unwrap()
-        .insert("another-chat-cache".into(), second.clone());
+        .insert_fixture("another-chat-cache".into(), second.clone());
     let descriptor = backend
         .runtime_control_adapter_for(&manifest)
         .unwrap()
@@ -1857,7 +1855,7 @@ fn invalid_tool_options_fail_before_any_worker_or_chat_starts() {
             _ => config.tools.as_mut().unwrap()[0].function.strict = Some(true),
         }
         assert!(backend.generate(&manifest, request).is_err());
-        assert!(backend.servers.lock().unwrap().is_empty());
+        assert!(backend.servers.snapshot().is_empty());
         assert!(!fixture.model.join("chat_started").exists());
     }
 }
@@ -2016,9 +2014,9 @@ fn auto_expert_cache_activates_only_for_probe_verified_models() {
                 json!({"cache_budget_mode":"auto"});
         }
         backend.prepare(&manifest).unwrap();
-        let servers = backend.servers.lock().unwrap();
+        let servers = backend.servers.snapshot();
         assert_eq!(servers.len(), 1);
-        let server = servers.values().next().unwrap();
+        let server = servers.first().unwrap();
         assert_eq!(server.expert_offload, supported);
         assert_eq!(server.expert_cache_bytes, Some(0));
         drop(servers);
@@ -2042,8 +2040,8 @@ fn auto_native_experts_require_verified_text_adapter_and_preserve_explicit_limit
         let result = backend.prepare(&manifest);
         assert_eq!(result.is_ok(), succeeds, "{result:?}");
         if succeeds {
-            let servers = backend.servers.lock().unwrap();
-            assert!(!servers.values().next().unwrap().expert_offload);
+            let servers = backend.servers.snapshot();
+            assert!(!servers.first().unwrap().expert_offload);
         }
         drop(backend);
         drop(fixture);
@@ -2064,7 +2062,7 @@ fn api_options_validate_without_starting_an_omlx_worker() {
         .validate_api_options(&manifest, &request(), &options)
         .unwrap_err();
     assert!(error.to_string().contains("does not support logprobs"));
-    assert!(backend.servers.lock().unwrap().is_empty());
+    assert!(backend.servers.snapshot().is_empty());
     assert!(backend.model_probes.lock().unwrap().is_empty());
 }
 
@@ -2131,9 +2129,9 @@ fn api_reasoning_effort_toggles_each_request_without_changing_worker_defaults() 
                 assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], "high");
             }
         }
-        let servers = backend.servers.lock().unwrap();
+        let servers = backend.servers.snapshot();
         assert_eq!(servers.len(), 1);
-        let worker = servers.values().next().unwrap();
+        let worker = servers.first().unwrap();
         assert_eq!(worker.reasoning_effort, Some(OmlxReasoningEffort::High));
         assert_eq!(worker.thinking, Some(false));
         if let Some(first) = &first_worker {

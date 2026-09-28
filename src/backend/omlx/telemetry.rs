@@ -6,11 +6,7 @@ use std::time::Duration;
 pub(super) fn sample(backend: &OmlxBackend) -> Vec<BackendSnapshot> {
     // Clone references before I/O: monitoring never holds the worker registry
     // lock while a request is running or waits on generation locks.
-    let servers: Vec<_> = backend
-        .servers
-        .lock()
-        .map(|s| s.values().cloned().collect())
-        .unwrap_or_default();
+    let servers = backend.servers.snapshot();
     servers
         .into_iter()
         .take(8)

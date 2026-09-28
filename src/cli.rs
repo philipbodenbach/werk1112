@@ -263,6 +263,10 @@ impl From<KvCacheTypeArg> for LlamaKvCacheType {
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct LlamaRuntimeArgs {
+    #[arg(long, global = true, env = "WERK_LLAMA_PARALLEL", value_parser = clap::value_parser!(u32).range(1..),
+        help = "llama-server active sequence slots; default 1; each slot receives --ctx-size tokens")]
+    pub parallel: Option<u32>,
+
     #[arg(
         long,
         global = true,
@@ -276,7 +280,7 @@ pub struct LlamaRuntimeArgs {
         long,
         global = true,
         env = "WERK_LLAMA_CTX",
-        help = "llama.cpp context size; 0 uses the model default"
+        help = "llama.cpp context size per sequence; 0 uses the model default"
     )]
     pub ctx_size: Option<usize>,
 
@@ -371,6 +375,7 @@ pub struct LlamaRuntimeArgs {
 impl LlamaRuntimeArgs {
     fn to_options(&self) -> LlamaRuntimeOptions {
         LlamaRuntimeOptions {
+            parallel: self.parallel,
             fp4_kernel: self.fp4_kernel,
             ctx_size: self.ctx_size,
             batch_size: self.batch_size.map(|value| value as usize),
@@ -11761,6 +11766,15 @@ mod tests {
     use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_native_parallel_slots_without_conflating_cpu_threads() {
+        let cli =
+            Cli::try_parse_from(["werk", "--parallel", "4", "--threads", "2", "serve"]).unwrap();
+        assert_eq!(cli.llama.to_options().parallel, Some(4));
+        assert_eq!(cli.llama.to_options().threads, Some(2));
+        assert!(Cli::try_parse_from(["werk", "--parallel", "0", "serve"]).is_err());
+    }
 
     #[test]
     fn external_import_preserves_global_model_home_option() {

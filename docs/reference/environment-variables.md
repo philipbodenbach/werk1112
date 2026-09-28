@@ -93,7 +93,8 @@ The matching `werk serve` options override the resource-tuning variables.
 | --- | --- |
 | `WERK_LLAMA_SERVER_CUDA`, `WERK_LLAMA_SERVER_ROCM`, `WERK_LLAMA_SERVER_VULKAN`, `WERK_LLAMA_SERVER_METAL`, `WERK_LLAMA_SERVER_CPU` | Mode-specific `llama-server` executable. |
 | `WERK_LLAMA_SERVER` | Generic executable fallback after the mode-specific variable and before managed/PATH discovery. |
-| `WERK_LLAMA_CTX` | Context size; `0` asks the model/runtime default where supported. |
+| `WERK_LLAMA_PARALLEL` | Native llama-server slots (`--parallel`), default `1`; not an agent count. Each slot receives the configured per-sequence context; more slots increase memory. |
+| `WERK_LLAMA_CTX` | Context size per sequence; `0` asks the model/runtime default where supported. |
 | `WERK_LLAMA_BATCH`, `WERK_LLAMA_UBATCH` | Logical batch size and physical micro-batch size. |
 | `WERK_LLAMA_GPU_LAYERS`, `WERK_LLAMA_MAIN_GPU` | GPU offload layer count and main GPU index. |
 | `WERK_LLAMA_KV_CACHE_TYPE` | KV-cache type: `f16`, `f32`, or `q8-0`. |
@@ -142,7 +143,7 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_ONNX_RUNTIME_BUNDLE_CUDA`, `WERK_ONNX_RUNTIME_BUNDLE_ROCM`, `WERK_ONNX_RUNTIME_BUNDLE_CPU` | Mode-specific local bundle used to provision a managed ONNX runner. |
 | `WERK_ONNX_RUNTIME_BUNDLE` | Generic ONNX bundle fallback. |
 | `WERK_ONNX_GENAI_PYTHON`, `WERK_ONNX_RUNTIME_PYTHON` | Python interpreter fallbacks for the CPU `onnxruntime_genai` path, checked in that order. |
-| `WERK_ONNX_GENAI_MODEL_CACHE_SIZE` | Exact ONNX GenAI model/tokenizer entries retained by the Werk-owned resident CPU-fallback worker. Default: `1`; values are clamped to `0..8`; `0` disables this model cache. It does not affect an opaque external ONNX runner. |
+| `WERK_ONNX_GENAI_MODEL_CACHE_SIZE` | Independent exact-model ONNX GenAI CPU-fallback workers retained in a bounded LRU. Default: `1`; values are clamped to `0..8`; `0` disables this model cache. It does not affect an opaque external ONNX runner. |
 | `WERK_ONNX_EXPORTER` | Executable used by `werk artifacts build` before `optimum-cli` or Python module discovery. |
 | `WERK_MLX_PYTHON`, `WERK_MLX_MODULE`, `WERK_MLX_GENERATE` | MLX-LM interpreter, module (default `mlx_lm.generate`), and executable override. An explicit module takes precedence over the executable; an explicit Python alone uses its own default module. Model preflight and generation use the same resolved environment. |
 | `WERK_MLX_VLM_PYTHON`, `WERK_MLX_VLM_MODULE`, `WERK_MLX_VLM_GENERATE` | MLX-VLM equivalents; the default module is `mlx_vlm`. |
@@ -158,7 +159,13 @@ by setting the upstream variable explicitly. Werk does not set or recommend
 | `WERK_TRANSFORMERS_PYTHON` | Python interpreter containing PyTorch and Transformers for the compatibility backend. |
 | `WERK_TRANSFORMERS_DEVICE` | Device override; `auto` chooses CUDA, then MPS, then CPU. |
 | `WERK_TRANSFORMERS_DTYPE` | `auto`, `float32`/`fp32`/`f32`, `bfloat16`/`bf16`, or `float16`/`fp16`/`f16`/`half`. |
-| `WERK_TRANSFORMERS_MODEL_CACHE_SIZE` | Exact model/tokenizer entries retained by the Werk-owned Transformers compatibility worker. Default: `1`; values are clamped to `0..8`; `0` disables model caching without disabling the worker. |
+| `WERK_TRANSFORMERS_MODEL_CACHE_SIZE` | Independent exact-model Transformers compatibility workers retained in a bounded LRU. Default: `1`; values are clamped to `0..8`; `0` disables model caching without disabling the worker. |
+
+`WERK_BURN_MODEL_CACHE_SIZE` controls experimental Burn resident model capacity
+(default `1`, clamped to `1..8`). For ONNX/Transformers/Burn, configure capacity
+above one for overlapping different-model execution. Active entries cannot be
+evicted; a new distinct model fails with a capacity error when all entries are in
+use. See [inference concurrency](../concepts/inference-concurrency.md).
 
 The [local oMLX adapter](../backends.md#optional-local-omlx-backend) captures its
 launcher, Python environment and working directory for both preflight and

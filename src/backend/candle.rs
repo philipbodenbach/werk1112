@@ -12,7 +12,6 @@ use candle_transformers::{
     },
 };
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
 use std::{fs, path::PathBuf};
 use std::{
     sync::{Arc, Mutex},
@@ -41,7 +40,7 @@ use crate::{
 pub struct CandleBackend {
     store: ModelStore,
     device: Device,
-    cache: Arc<Mutex<HashMap<ModelRuntimeIdentity, Arc<Mutex<CachedModel>>>>>,
+    cache: Arc<super::runtime_cache::RuntimeCache<ModelRuntimeIdentity, Mutex<CachedModel>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +62,7 @@ impl CandleBackend {
         Ok(Self {
             store,
             device,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Default::default()),
         })
     }
 
@@ -78,41 +77,36 @@ impl CandleBackend {
 
     fn cached_model(&self, manifest: &ModelManifest) -> Result<(Arc<Mutex<CachedModel>>, f64)> {
         let cache_key = ModelRuntimeIdentity::from_manifest(manifest)?;
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow!("model cache mutex poisoned"))?
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok((cached, 0.0));
-        }
+        let (model, _, seconds) = self.cache.get_or_try_init(
+            cache_key,
+            |_| true,
+            || {
+                eprintln!(
+                    "Loading model '{}' ({:?}, architecture: {})",
+                    manifest.id,
+                    manifest.format,
+                    manifest.architecture.as_deref().unwrap_or("unknown")
+                );
+                let started = Instant::now();
+                let cache_release = super::model_file_cache::CacheReleaseGuard::prepare_manifest(
+                    &self.store,
+                    manifest,
+                );
+                // Native loading is not cancellable; do not block signal cleanup on it.
+                let tokenizer = load_tokenizer(&self.store, manifest)?;
+                let model = load_candle_model(&self.store, manifest, &self.device)?;
+                let load_seconds = started.elapsed().as_secs_f64();
+                eprintln!("Loaded model '{}' in {:.2}s", manifest.id, load_seconds);
 
-        eprintln!(
-            "Loading model '{}' ({:?}, architecture: {})",
-            manifest.id,
-            manifest.format,
-            manifest.architecture.as_deref().unwrap_or("unknown")
-        );
-        let started = Instant::now();
-        let cache_release =
-            super::model_file_cache::CacheReleaseGuard::prepare_manifest(&self.store, manifest);
-        // Native loading is not cancellable; do not block signal cleanup on it.
-        let tokenizer = load_tokenizer(&self.store, manifest)?;
-        let model = load_candle_model(&self.store, manifest, &self.device)?;
-        let load_seconds = started.elapsed().as_secs_f64();
-        eprintln!("Loaded model '{}' in {:.2}s", manifest.id, load_seconds);
-
-        let cached = Arc::new(Mutex::new(CachedModel {
-            tokenizer,
-            model,
-            _cache_release: cache_release,
-        }));
-        self.cache
-            .lock()
-            .map_err(|_| anyhow!("model cache mutex poisoned"))?
-            .insert(cache_key, cached.clone());
-        Ok((cached, load_seconds))
+                let cached = Mutex::new(CachedModel {
+                    tokenizer,
+                    model,
+                    _cache_release: cache_release,
+                });
+                Ok(cached)
+            },
+        )?;
+        Ok((model, seconds))
     }
 }
 

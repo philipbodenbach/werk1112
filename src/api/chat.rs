@@ -118,6 +118,7 @@ pub(super) async fn chat_completions_handler(
             prepared.explicit_runtime_options,
             prepared.include_usage,
         )
+        .await
     } else {
         complete_chat_response(
             prepared.state,
@@ -174,7 +175,7 @@ async fn complete_chat_response(
     }
 }
 
-fn stream_chat_response(
+async fn stream_chat_response(
     state: ApiState,
     manifest: ModelManifest,
     generate_request: GenerateRequest,
@@ -213,7 +214,8 @@ fn stream_chat_response(
         manifest,
         generate_request,
         explicit_runtime_options,
-    );
+    )
+    .await;
     let final_usage = Arc::new(Mutex::new(None));
     let body_usage = final_usage.clone();
     let body = body_stream.map(move |event| {

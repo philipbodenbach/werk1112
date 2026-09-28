@@ -173,17 +173,13 @@ impl LlamaRuntimeStateAdapter {
         let model_identity = ModelRuntimeIdentity::from_manifest(manifest).map_err(|_| {
             protocol_internal("llama.cpp runtime could not identify the requested model manifest")
         })?;
-        let servers = self
+        let mut candidates = self
             .backend
             .servers
-            .lock()
-            .map_err(|_| protocol_internal("llama.cpp runtime registry is unavailable"))?;
-        let mut candidates = servers
-            .values()
+            .snapshot()
+            .into_iter()
             .filter(|server| server.model_identity == model_identity)
-            .cloned()
             .collect::<Vec<_>>();
-        drop(servers);
         candidates.sort_by_key(|server| std::cmp::Reverse(server.pid));
         candidates
             .into_iter()
@@ -228,7 +224,7 @@ impl LlamaRuntimeStateAdapter {
         if !state.active.as_ref().is_some_and(|active| active.validated) {
             let probe_result = server
                 .state_gate
-                .lock()
+                .write()
                 .map_err(|_| protocol_internal("llama.cpp state operation gate is unavailable"))
                 .and_then(|_operation| {
                     functional_probe_llama_state(&server).map_err(|_| {
@@ -450,7 +446,7 @@ impl BackendRuntimeAdapter for LlamaRuntimeStateAdapter {
             .map_err(|_| protocol_unavailable("secure state allocation is unavailable"))?;
         let _operation = server
             .state_gate
-            .lock()
+            .write()
             .map_err(|_| protocol_internal("llama.cpp state operation gate is unavailable"))?;
         erase_slot_best_effort(&server);
         let prompt_tokens = match run_llama_prefill(&server, &request.input) {
@@ -571,7 +567,7 @@ impl BackendRuntimeAdapter for LlamaRuntimeStateAdapter {
         let _operation = record
             .server
             .state_gate
-            .lock()
+            .write()
             .map_err(|_| protocol_internal("llama.cpp state operation gate is unavailable"))?;
         let snapshot_bytes = validate_private_snapshot(&record.server, &record.snapshot_name, None)
             .map_err(|_| protocol_incompatible("llama.cpp state snapshot is unavailable"))?;
@@ -671,7 +667,7 @@ impl BackendRuntimeAdapter for LlamaRuntimeStateAdapter {
             .map_err(|_| protocol_incompatible("llama.cpp snapshot validation failed"))?;
         let operation_result = server
             .state_gate
-            .lock()
+            .write()
             .map_err(|_| protocol_internal("llama.cpp state operation gate is unavailable"))
             .and_then(|_operation| {
                 erase_slot_best_effort(&server);
@@ -2110,8 +2106,16 @@ fn ensure_real_directory(path: &Path, private: bool) -> Result<()> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path)
-                .with_context(|| "failed to create runtime-state working directory".to_string())?;
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Different model loads can create the common parent together.
+                    return ensure_real_directory(path, private);
+                }
+                Err(error) => {
+                    return Err(error).context("failed to create runtime-state working directory");
+                }
+            }
         }
         Err(error) => return Err(error.into()),
     }
@@ -3684,6 +3688,90 @@ mod tests {
         Ok(filename)
     }
 
+    #[test]
+    fn ordinary_inference_overlaps_but_excludes_slot_state_mutation() {
+        use crate::backend::{GenerateRequest, StreamGranularity};
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let process = Arc::new(test_process(
+            format!("http://{}", listener.local_addr().unwrap()),
+            directory.path().join("snapshots"),
+        ));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        // One server thread reads the first HTTP request, then accepts the second
+        // before replying to either. Releasing the first on timeout avoids hangs
+        // if a regression reintroduces an exclusive inference lock.
+        let http = thread::spawn(move || {
+            let mut first = listener.accept().unwrap().0;
+            read_fake_request(&mut first).unwrap();
+            entered_tx.send(()).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut second = None;
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    read_fake_request(&mut stream).unwrap();
+                    entered_tx.send(()).unwrap();
+                    second = Some(stream);
+                    break;
+                }
+                if release_rx.try_recv().is_ok() {
+                    break;
+                }
+                thread::yield_now();
+            }
+            let bytes = "data: {\"content\":\"ok\",\"stop\":true,\"tokens_predicted\":1,\"tokens_evaluated\":1}\n\ndata: [DONE]\n\n";
+            let respond = |stream: &mut TcpStream| {
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", bytes.len(), bytes).unwrap();
+            };
+            if second.is_some() {
+                release_rx.recv().unwrap();
+            }
+            respond(&mut first);
+            if let Some(mut stream) = second {
+                respond(&mut stream);
+            } else {
+                listener.set_nonblocking(false).unwrap();
+                let mut stream = listener.accept().unwrap().0;
+                read_fake_request(&mut stream).unwrap();
+                respond(&mut stream);
+            }
+        });
+        let request = GenerateRequest {
+            prompt: "test".into(),
+            messages: vec![],
+            image_urls: vec![],
+            max_tokens: 1,
+            temperature: None,
+            top_p: None,
+            stop: vec![],
+            seed: None,
+            stream_granularity: StreamGranularity::Token,
+            verbose: false,
+            debug: false,
+            tool_config: None,
+        };
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let (process, request) = (process.clone(), request.clone());
+                thread::spawn(move || process.complete(&request, None))
+            })
+            .collect();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second_entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        assert!(process.state_gate.try_write().is_err());
+        release_tx.send(()).unwrap();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        http.join().unwrap();
+        assert!(
+            second_entered.is_ok(),
+            "second inference must enter before first completes"
+        );
+        assert!(process.state_gate.try_write().is_ok());
+    }
+
     const TEST_PROCESS_CHILD_ENV: &str = "WERK_INTERNAL_LLAMA_TEST_PROCESS_CHILD";
     const TEST_PROCESS_CHILD_NAME: &str =
         "backend::llama_server::runtime_state::tests::test_process_child_waits_for_parent_stdin";
@@ -3730,7 +3818,7 @@ mod tests {
             mode: LlamaCppMode::Cpu,
             log_tail: Arc::new(Mutex::new(VecDeque::new())),
             log_readers: Mutex::new(Vec::new()),
-            state_gate: Mutex::new(()),
+            state_gate: std::sync::RwLock::new(()),
             startup_diagnostics: Vec::new(),
             startup_diagnostics_reported: std::sync::OnceLock::new(),
             state_runtime: LlamaProcessStateRuntime {
