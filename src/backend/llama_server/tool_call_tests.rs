@@ -383,7 +383,7 @@ fn native_api_reasoning_effort_preflight_accepts_native_strings_without_loading(
         );
         assert!(!error.details.contains_key("supported_values"));
     }
-    assert!(backend.servers.lock().unwrap().is_empty());
+    assert!(backend.servers.snapshot().is_empty());
 }
 
 #[test]

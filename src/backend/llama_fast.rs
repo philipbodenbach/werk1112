@@ -2,7 +2,6 @@
 mod imp {
     use anyhow::{Context, Result, anyhow, bail};
     use std::{
-        collections::HashMap,
         ffi::CString,
         os::raw::{c_char, c_void},
         path::PathBuf,
@@ -45,7 +44,7 @@ mod imp {
         store: ModelStore,
         mode: LlamaCppMode,
         runtime_options: LlamaRuntimeOptions,
-        models: Arc<Mutex<HashMap<String, Arc<LlamaFastModel>>>>,
+        models: Arc<crate::backend::runtime_cache::RuntimeCache<String, LlamaFastModel>>,
     }
 
     struct LlamaFastModel {
@@ -146,7 +145,7 @@ mod imp {
                 store,
                 mode,
                 runtime_options,
-                models: Arc::new(Mutex::new(HashMap::new())),
+                models: Arc::new(Default::default()),
             }
         }
 
@@ -220,52 +219,44 @@ mod imp {
                 params.main_gpu
             );
 
-            if let Some(model) = self
-                .models
-                .lock()
-                .map_err(|_| anyhow!("llama.cpp legacy FFI model cache mutex poisoned"))?
-                .get(&cache_key)
-                .cloned()
-            {
-                return Ok((model, 0.0));
-            }
+            let (model, _, seconds) = self.models.get_or_try_init(
+                cache_key,
+                |_| true,
+                || {
+                    if !compiled(self.mode) {
+                        bail!("{}", unavailable_message(self.mode));
+                    }
 
-            if !compiled(self.mode) {
-                bail!("{}", unavailable_message(self.mode));
-            }
+                    let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
+                    eprintln!(
+                        "Loading model '{}' with llama.cpp legacy FFI {}",
+                        manifest.id,
+                        display_name(self.mode)
+                    );
+                    let started = Instant::now();
+                    let stderr_guard = NativeStderrGuard::silence_if_needed();
+                    ensure_llama_backend();
+                    let cache_release =
+                        crate::backend::model_file_cache::CacheReleaseGuard::prepare_manifest(
+                            &self.store,
+                            manifest,
+                        );
+                    // Native loading is not cancellable; do not gate signal cleanup.
+                    let mut model = LlamaFastModel::load(&absolute_model_path, &params)?;
+                    model._cache_release = cache_release;
+                    drop(stderr_guard);
+                    let load_seconds = started.elapsed().as_secs_f64();
+                    eprintln!(
+                        "Loaded model '{}' with llama.cpp legacy FFI {} in {:.2}s",
+                        manifest.id,
+                        display_name(self.mode),
+                        load_seconds
+                    );
 
-            let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
-            eprintln!(
-                "Loading model '{}' with llama.cpp legacy FFI {}",
-                manifest.id,
-                display_name(self.mode)
-            );
-            let started = Instant::now();
-            let stderr_guard = NativeStderrGuard::silence_if_needed();
-            ensure_llama_backend();
-            let cache_release =
-                crate::backend::model_file_cache::CacheReleaseGuard::prepare_manifest(
-                    &self.store,
-                    manifest,
-                );
-            // Native loading is not cancellable; do not gate signal cleanup.
-            let mut model = LlamaFastModel::load(&absolute_model_path, &params)?;
-            model._cache_release = cache_release;
-            drop(stderr_guard);
-            let load_seconds = started.elapsed().as_secs_f64();
-            eprintln!(
-                "Loaded model '{}' with llama.cpp legacy FFI {} in {:.2}s",
-                manifest.id,
-                display_name(self.mode),
-                load_seconds
-            );
-
-            let model = Arc::new(model);
-            self.models
-                .lock()
-                .map_err(|_| anyhow!("llama.cpp legacy FFI model cache mutex poisoned"))?
-                .insert(cache_key, model.clone());
-            Ok((model, load_seconds))
+                    Ok(model)
+                },
+            )?;
+            Ok((model, seconds))
         }
 
         fn create_context(

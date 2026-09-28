@@ -43,7 +43,11 @@ struct ChatSessionCache {
 
 impl ChatSessionCache {
     fn get(&mut self, key: ChatSessionKey) -> Option<Arc<dyn ChatGenerationSession>> {
-        let session = self.entries.get(&key).cloned()?;
+        let session = self
+            .entries
+            .get(&key)
+            .filter(|session| session.is_available())
+            .cloned()?;
         self.touch(key);
         Some(session)
     }
@@ -53,13 +57,18 @@ impl ChatSessionCache {
         key: ChatSessionKey,
         session: Arc<dyn ChatGenerationSession>,
     ) -> Arc<dyn ChatGenerationSession> {
-        if let Some(existing) = self.entries.get(&key).cloned() {
+        if let Some(existing) = self
+            .entries
+            .get(&key)
+            .filter(|session| session.is_available())
+            .cloned()
+        {
             self.touch(key);
             return existing;
         }
 
         self.entries.insert(key, session.clone());
-        self.recency.push_back(key);
+        self.touch(key);
         while self.entries.len() > MAX_CHAT_SESSIONS {
             let Some(expired) = self.recency.pop_front() else {
                 break;
@@ -99,6 +108,7 @@ pub struct ApiState {
     pub(super) chat_context_size: usize,
     prompt_options_resolver: Option<PromptOptionsResolver>,
     chat_sessions: Arc<Mutex<ChatSessionCache>>,
+    chat_initializations: Arc<crate::backend::runtime_cache::KeyedLocks<ChatSessionKey>>,
     api_keys: Arc<Vec<String>>,
     principal_deriver: PrincipalDeriver,
     principal_derivation_gate: Arc<Semaphore>,
@@ -168,6 +178,7 @@ impl ApiState {
             chat_context_size: 4096,
             prompt_options_resolver,
             chat_sessions: Arc::new(Mutex::new(ChatSessionCache::default())),
+            chat_initializations: Arc::new(Default::default()),
             api_keys: Arc::new(Vec::new()),
             principal_deriver,
             principal_derivation_gate: Arc::new(Semaphore::new(MAX_PRINCIPAL_DERIVATIONS)),
@@ -366,6 +377,10 @@ impl ApiState {
             model: ModelRuntimeIdentity::from_manifest(manifest)?,
             seed,
         };
+        let gate = self.chat_initializations.get(key)?;
+        let _initializing = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chat session initialization poisoned"))?;
         if let Some(session) = self
             .chat_sessions
             .lock()

@@ -122,7 +122,17 @@ pub(super) async fn prepare(
         }
     };
 
-    let manifest = match state.store.get(model_id) {
+    let lookup_store = state.store.clone();
+    let lookup_id = model_id.to_string();
+    let manifest = match tokio::task::spawn_blocking(move || lookup_store.get(&lookup_id))
+        .await
+        .map_err(|error| {
+            GenerationError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("model lookup task failed: {error}"),
+                None,
+            )
+        })? {
         Ok(manifest) => manifest,
         Err(err) => {
             eprintln!("[werk serve] POST {endpoint} model={model_id} -> 404");
@@ -271,11 +281,25 @@ pub(super) async fn prepare(
         }
     }
     let requires_tool_calling = request.requires_tool_calling();
-    if requires_tool_calling
-        && !state
-            .backend
-            .supports_tool_calling(&manifest, !image_urls.is_empty())
-    {
+    let tool_transport_supported = if requires_tool_calling {
+        let backend = state.backend.clone();
+        let selected_model = manifest.clone();
+        let has_images = !image_urls.is_empty();
+        tokio::task::spawn_blocking(move || {
+            backend.supports_tool_calling(&selected_model, has_images)
+        })
+        .await
+        .map_err(|error| {
+            GenerationError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("tool routing task failed: {error}"),
+                None,
+            )
+        })?
+    } else {
+        true
+    };
+    if !tool_transport_supported {
         return Err(GenerationError::with_code(
             StatusCode::BAD_REQUEST,
             "the configured adapter does not provide chat tool transport for this request"
@@ -320,7 +344,15 @@ pub(super) async fn prepare(
             override_name: Some("model"),
         })
     } else {
-        state.prompt_options(&manifest, !image_urls.is_empty())
+        let prompt_state = state.clone();
+        let prompt_manifest = manifest.clone();
+        let has_images = !image_urls.is_empty();
+        tokio::task::spawn_blocking(move || {
+            prompt_state.prompt_options(&prompt_manifest, has_images)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("prompt routing task failed: {error}"))
+        .and_then(|result| result)
     } {
         Ok(options) => options,
         Err(err) => {
@@ -516,14 +548,14 @@ pub(super) async fn generate(
     explicit_runtime_options: bool,
 ) -> anyhow::Result<GenerateResponse> {
     let mut guard = state.telemetry.begin(&manifest.id);
-    let session = match select_session(&state, &manifest, &request, explicit_runtime_options) {
-        Ok(session) => session,
-        Err(error) => {
-            guard.error();
-            return Err(error);
-        }
-    };
     tokio::task::spawn_blocking(move || {
+        let session = match select_session(&state, &manifest, &request, explicit_runtime_options) {
+            Ok(session) => session,
+            Err(error) => {
+                guard.error();
+                return Err(error);
+            }
+        };
         let result = match session {
             Some(session) => session.generate(request),
             None => state.backend.generate(&manifest, request),
@@ -538,18 +570,27 @@ pub(super) async fn generate(
     .map_err(|e| anyhow::anyhow!("generation task failed: {e}"))?
 }
 
-pub(super) fn generate_stream(
+pub(super) async fn generate_stream(
     state: &ApiState,
     manifest: ModelManifest,
     request: GenerateRequest,
     explicit_runtime_options: bool,
 ) -> GenerateStream {
     let guard = state.telemetry.begin(&manifest.id);
-    let stream = match select_session(state, &manifest, &request, explicit_runtime_options) {
-        Ok(Some(session)) => session.generate_stream(request),
-        Ok(None) => state.backend.generate_stream(manifest, request),
-        Err(e) => Box::pin(tokio_stream::iter(vec![Err(e.to_string())])),
-    };
+    let state = state.clone();
+    let stream = tokio::task::spawn_blocking(move || -> GenerateStream {
+        match select_session(&state, &manifest, &request, explicit_runtime_options) {
+            Ok(Some(session)) => session.generate_stream(request),
+            Ok(None) => state.backend.generate_stream(manifest, request),
+            Err(error) => Box::pin(tokio_stream::iter(vec![Err(error.to_string())])),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Box::pin(tokio_stream::iter(vec![Err(format!(
+            "session preparation failed: {error}"
+        ))]))
+    });
     crate::observability::observe_stream(stream, guard)
 }
 fn select_session(

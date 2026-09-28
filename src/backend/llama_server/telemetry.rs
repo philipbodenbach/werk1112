@@ -6,11 +6,7 @@ use std::{io::Read, time::Duration};
 
 pub(super) fn sample(backend: &LlamaServerBackend) -> Vec<BackendSnapshot> {
     // Never hold the registry or generation/state gate during monitoring I/O.
-    let servers: Vec<_> = backend
-        .servers
-        .lock()
-        .map(|servers| servers.values().cloned().collect())
-        .unwrap_or_default();
+    let servers = backend.servers.snapshot();
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .no_proxy()

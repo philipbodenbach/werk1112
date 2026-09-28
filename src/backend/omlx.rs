@@ -4,13 +4,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     env,
     ffi::OsString,
     fs,
     hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read, Write},
-    net::TcpListener,
     path::{Component, Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex},
@@ -165,8 +164,9 @@ pub struct OmlxBackend {
     store: ModelStore,
     // Snapshot once. The same invocation is used for model preflight and startup.
     invocation: std::result::Result<OmlxInvocation, String>,
-    servers: Arc<Mutex<HashMap<String, Arc<OmlxProcess>>>>,
+    servers: Arc<super::runtime_cache::RuntimeCache<String, OmlxProcess>>,
     model_probes: Arc<Mutex<VecDeque<CachedModelProbe>>>,
+    probe_gates: Arc<super::runtime_cache::KeyedLocks<ModelRuntimeIdentity>>,
     // Native template control is request-local; toggling it reuses weights.
     request_thinking: Option<bool>,
     request_reasoning_effort: Option<OmlxReasoningEffort>,
@@ -358,8 +358,11 @@ impl OmlxBackend {
         Self {
             store,
             invocation: OmlxInvocation::discover().map_err(|error| format!("{error:#}")),
-            servers: Arc::new(Mutex::new(HashMap::new())),
+            servers: Arc::new(super::runtime_cache::RuntimeCache::retained(
+                MAX_CACHED_WORKERS,
+            )),
             model_probes: Arc::new(Mutex::new(VecDeque::new())),
+            probe_gates: Arc::new(Default::default()),
             request_thinking: None,
             request_reasoning_effort: None,
             #[cfg(test)]
@@ -451,6 +454,12 @@ impl OmlxBackend {
         invocation.verify_launcher()?;
         invocation.verify_import_paths(&directory)?;
         let key = ModelProbeKey::read(invocation, manifest, &directory)?;
+        let gate = self
+            .probe_gates
+            .get(ModelRuntimeIdentity::from_manifest(manifest)?)?;
+        let _probing = gate
+            .lock()
+            .map_err(|_| anyhow!("oMLX probe gate poisoned"))?;
         let mut probes = self
             .model_probes
             .lock()
@@ -473,8 +482,8 @@ impl OmlxBackend {
                 return Ok((directory, report));
             }
         }
-        // Serialize misses so concurrent first requests do not all import the
-        // same Python runtime. Failures and incomplete inventories are uncached.
+        drop(probes);
+        // Only this model waits for its probe. Failures remain uncached.
         let report = invocation
             .probe(Some(&directory))
             .with_context(|| format!("oMLX model '{}' is not verified compatible", manifest.id))?;
@@ -489,6 +498,10 @@ impl OmlxBackend {
                 .map(ProbeFileStamp::read)
                 .collect::<Result<Vec<_>>>()
         {
+            let mut probes = self
+                .model_probes
+                .lock()
+                .map_err(|_| anyhow!("oMLX model probe cache poisoned"))?;
             probes.push_back(CachedModelProbe {
                 key,
                 dependencies,
@@ -521,30 +534,17 @@ impl OmlxBackend {
             directory.display(),
             report.runtime
         );
-        // Serialize lookup + startup, so concurrent first requests cannot spawn
-        // duplicate multi-hundred-GB workers for the same model.
-        let mut servers = self
-            .servers
-            .lock()
-            .map_err(|_| anyhow!("oMLX worker registry is poisoned"))?;
-        if let Some(server) = servers.get(&key)
-            && server.is_running()
-        {
-            return Ok((server.clone(), 0.0));
-        }
-        servers.retain(|_, server| server.is_running());
-        if servers.len() >= MAX_CACHED_WORKERS {
-            bail!(
-                "oMLX has reached its limit of {MAX_CACHED_WORKERS} retained workers; restart the Werk server before selecting additional model or cache configurations"
-            );
-        }
-        let started = Instant::now();
-        let mut server = OmlxProcess::start(&self.store, invocation, &directory, report)?;
-        server.model_identity = Some(identity);
-        server.logical_model_id = Some(manifest.id.clone());
-        let server = Arc::new(server);
-        servers.insert(key, server.clone());
-        Ok((server, started.elapsed().as_secs_f64()))
+        self.servers.remove_if(|server| !server.is_running());
+        let (server, _, seconds) =
+            self.servers
+                .get_or_try_init(key, OmlxProcess::is_running, || {
+                    let mut server =
+                        OmlxProcess::start(&self.store, invocation, &directory, report)?;
+                    server.model_identity = Some(identity);
+                    server.logical_model_id = Some(manifest.id.clone());
+                    Ok(server)
+                })?;
+        Ok((server, seconds))
     }
 
     fn generate_inner(
@@ -689,13 +689,12 @@ impl GenerationBackend for OmlxBackend {
     }
 
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
-        let server = self.servers.lock().ok().and_then(|servers| {
-            let mut active = servers
-                .values()
-                .filter(|server| server.is_running() && self.matches_chat_configuration(server));
-            let first = active.next().cloned();
-            if active.next().is_some() { None } else { first }
-        });
+        let servers = self.servers.snapshot();
+        let mut active = servers
+            .iter()
+            .filter(|server| server.is_running() && self.matches_chat_configuration(server));
+        let first = active.next().cloned();
+        let server = if active.next().is_some() { None } else { first };
         Arc::new(experts::OmlxRuntimeAdapter::new(server, self.store.clone()))
     }
 
@@ -705,11 +704,8 @@ impl GenerationBackend for OmlxBackend {
     ) -> Result<Arc<dyn BackendRuntimeAdapter>> {
         let directory = resolve_model_dir(&self.store, manifest)?;
         let identity = ModelRuntimeIdentity::from_manifest(manifest)?;
-        let servers = self
-            .servers
-            .lock()
-            .map_err(|_| anyhow!("oMLX worker registry is poisoned"))?;
-        let mut matching = servers.values().filter(|server| {
+        let servers = self.servers.snapshot();
+        let mut matching = servers.iter().filter(|server| {
             server.model_dir == directory
                 && server.model_identity.as_ref() == Some(&identity)
                 && self.matches_chat_configuration(server)
@@ -784,9 +780,7 @@ impl GenerationBackend for OmlxBackend {
                 // An unsupported model cache must not leave a second large
                 // model alive when the caller resumes its ordinary chat path.
                 self.servers
-                    .lock()
-                    .map_err(|_| anyhow!("oMLX worker registry is poisoned"))?
-                    .retain(|_, candidate| !Arc::ptr_eq(candidate, &server));
+                    .remove_if(|candidate| std::ptr::eq(candidate, server.as_ref()));
                 drop(server);
                 inactive.map(|_| None)
             }
@@ -842,6 +836,9 @@ impl GenerationBackend for OmlxBackend {
 }
 
 impl ChatGenerationSession for OmlxChatSession {
+    fn is_available(&self) -> bool {
+        self.server.is_running()
+    }
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
         generate_with_tool_fallback(
             &self.manifest,
@@ -1756,7 +1753,8 @@ impl OmlxProcess {
         invocation.verify_launcher()?;
         invocation.verify_import_paths(model_dir)?;
         let instance_id = random_id()?;
-        let port = TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+        let startup_port = super::llama_process_lifecycle::StartupPort::reserve()?;
+        let port = startup_port.port();
         let api_key = random_id()?;
         // Auto is architecture/version gated by the metadata probe; unrelated
         // models keep the native loader. Explicit budgets remain strict.

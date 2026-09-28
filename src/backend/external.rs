@@ -3,10 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 #[cfg(unix)]
 use std::os::unix::{fs::DirBuilderExt, process::ExitStatusExt};
 #[cfg(feature = "llama-cpp")]
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use std::{
     env,
     ffi::OsString,
@@ -558,7 +555,7 @@ pub enum LlamaCppMode {
 pub struct LlamaCppBackend {
     store: ModelStore,
     mode: LlamaCppMode,
-    models: Arc<Mutex<HashMap<String, Arc<CachedLlamaCppModel>>>>,
+    models: Arc<super::runtime_cache::RuntimeCache<String, CachedLlamaCppModel>>,
 }
 
 #[cfg(feature = "llama-cpp")]
@@ -972,6 +969,7 @@ fn create_mlx_vlm_image_temp_dir() -> Result<PathBuf> {
 pub struct TransformersCompatBackend {
     store: ModelStore,
     client: CompanionClient,
+    workers: std::sync::Arc<super::runtime_cache::RuntimeCache<String, CompanionClient>>,
 }
 
 impl LlamaCppMode {
@@ -1066,7 +1064,7 @@ impl LlamaCppBackend {
         Self {
             store,
             mode,
-            models: Arc::new(Mutex::new(HashMap::new())),
+            models: Arc::new(Default::default()),
         }
     }
 
@@ -1091,49 +1089,44 @@ impl LlamaCppBackend {
             .context("GGUF manifest has no model_path")?;
         let cache_key = llama_cpp_model_cache_key(manifest, self.mode)?;
 
-        if let Some(model) = self
-            .models
-            .lock()
-            .map_err(|_| anyhow!("llama.cpp model cache mutex poisoned"))?
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok((model, 0.0));
-        }
+        let (model, _, seconds) = self.models.get_or_try_init(
+            cache_key,
+            |_| true,
+            || {
+                if !self.mode.compiled() {
+                    bail!("{}", self.mode.unavailable_message());
+                }
 
-        if !self.mode.compiled() {
-            bail!("{}", self.mode.unavailable_message());
-        }
+                let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
+                eprintln!(
+                    "Loading model '{}' with in-process llama.cpp {}",
+                    manifest.id,
+                    self.mode.display_name()
+                );
+                let started = Instant::now();
+                let cache_release = super::model_file_cache::CacheReleaseGuard::prepare_manifest(
+                    &self.store,
+                    manifest,
+                );
+                // Native loading is not cancellable; do not block signal cleanup on it.
+                let model = LlamaModel::load_from_file(&absolute_model_path, self.model_params())
+                    .map_err(|err| anyhow!("failed to load GGUF with llama.cpp: {err}"))?;
+                let load_seconds = started.elapsed().as_secs_f64();
+                eprintln!(
+                    "Loaded model '{}' with llama.cpp {} in {:.2}s",
+                    manifest.id,
+                    self.mode.display_name(),
+                    load_seconds
+                );
 
-        let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
-        eprintln!(
-            "Loading model '{}' with in-process llama.cpp {}",
-            manifest.id,
-            self.mode.display_name()
-        );
-        let started = Instant::now();
-        let cache_release =
-            super::model_file_cache::CacheReleaseGuard::prepare_manifest(&self.store, manifest);
-        // Native loading is not cancellable; do not block signal cleanup on it.
-        let model = LlamaModel::load_from_file(&absolute_model_path, self.model_params())
-            .map_err(|err| anyhow!("failed to load GGUF with llama.cpp: {err}"))?;
-        let load_seconds = started.elapsed().as_secs_f64();
-        eprintln!(
-            "Loaded model '{}' with llama.cpp {} in {:.2}s",
-            manifest.id,
-            self.mode.display_name(),
-            load_seconds
-        );
-
-        let model = Arc::new(CachedLlamaCppModel {
-            model,
-            _cache_release: cache_release,
-        });
-        self.models
-            .lock()
-            .map_err(|_| anyhow!("llama.cpp model cache mutex poisoned"))?
-            .insert(cache_key, model.clone());
-        Ok((model, load_seconds))
+                let model = CachedLlamaCppModel {
+                    model,
+                    _cache_release: cache_release,
+                };
+                Ok(model)
+            },
+        )?;
+        Ok((model, seconds))
     }
 
     fn model_params(&self) -> LlamaParams {
@@ -1759,7 +1752,13 @@ impl TransformersCompatBackend {
             "Werk embedded Transformers compatibility worker",
         )
         .with_resident_worker();
-        Self { store, client }
+        Self {
+            store,
+            client,
+            workers: std::sync::Arc::new(super::runtime_cache::RuntimeCache::bounded(
+                transformers_model_cache_capacity(),
+            )),
+        }
     }
 
     pub fn probe() -> Result<String> {
@@ -1825,8 +1824,23 @@ impl TransformersCompatBackend {
     ) -> Result<GenerateResponse> {
         let worker_request = self.request_for(manifest, &request)?;
         let started = Instant::now();
-        let response = self
-            .client
+        let key = worker_request["model_key"]
+            .as_str()
+            .context("missing Transformers model identity")?
+            .to_string();
+        let (worker, _, _) = self.workers.get_or_try_init(
+            key,
+            |_| true,
+            || {
+                Ok(self
+                    .client
+                    .clone()
+                    .without_resident_worker()
+                    .with_resident_worker())
+            },
+        )?;
+        let response = worker
+            .as_ref()
             .clone()
             .with_model_cache(&self.store, manifest)
             .request("execute", &worker_request)
@@ -2111,7 +2125,7 @@ impl GenerationBackend for TransformersCompatBackend {
             (
                 ModelResidencyStatus::Supported,
                 format!(
-                    "Werk keeps up to {capacity} exact Transformers model pipeline(s) resident in its managed Python worker"
+                    "Werk keeps up to {capacity} exact Transformers model pipeline(s) resident in independent managed Python workers"
                 ),
             )
         } else {
@@ -4265,6 +4279,7 @@ else:
                     manifest.format = ModelFormat::SafeTensors;
                     manifest.architecture = Some("chatglm".into());
                     Box::new(TransformersCompatBackend {
+                        workers: std::sync::Arc::new(Default::default()),
                         store,
                         client: CompanionClient::from_command(
                             &runner,

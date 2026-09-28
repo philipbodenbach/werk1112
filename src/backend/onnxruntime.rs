@@ -5,7 +5,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -425,13 +425,8 @@ pub enum OnnxRuntimeAvailability {
 pub struct OnnxRuntimeBackend {
     store: ModelStore,
     mode: OnnxRuntimeMode,
-    python_genai_worker: Arc<Mutex<Option<OnnxGenaiWorker>>>,
-}
-
-#[derive(Clone)]
-struct OnnxGenaiWorker {
-    python: PathBuf,
-    client: CompanionClient,
+    python_genai_workers:
+        Arc<super::runtime_cache::RuntimeCache<(PathBuf, ModelRuntimeIdentity), CompanionClient>>,
 }
 
 #[derive(Debug, Clone)]
@@ -455,7 +450,9 @@ impl OnnxRuntimeBackend {
         Self {
             store,
             mode,
-            python_genai_worker: Arc::new(Mutex::new(None)),
+            python_genai_workers: Arc::new(super::runtime_cache::RuntimeCache::bounded(
+                onnx_genai_model_cache_size(),
+            )),
         }
     }
 
@@ -769,32 +766,33 @@ impl OnnxRuntimeBackend {
             eprintln!("Python: {}", python.display());
             eprintln!("ONNX GenAI model: {}", model_dir.display());
         }
-        let client = self.python_genai_client(python)?;
+        let client = self.python_genai_client(python, manifest)?;
         self.generate_with_python_genai_client(manifest, request, total_started, model_dir, &client)
     }
 
-    fn python_genai_client(&self, python: &Path) -> Result<CompanionClient> {
-        let mut worker = self
-            .python_genai_worker
-            .lock()
-            .map_err(|_| anyhow!("ONNX GenAI resident worker registry is poisoned"))?;
-        if let Some(worker) = worker.as_ref()
-            && worker.python == python
-        {
-            return Ok(worker.client.clone());
-        }
-
-        let client = CompanionClient::from_embedded_python(
+    fn python_genai_client(
+        &self,
+        python: &Path,
+        manifest: &ModelManifest,
+    ) -> Result<Arc<CompanionClient>> {
+        let key = (
             python.to_path_buf(),
-            ONNX_GENAI_PYTHON_SCRIPT,
-            "Werk embedded ONNX GenAI worker",
-        )
-        .with_resident_worker();
-        *worker = Some(OnnxGenaiWorker {
-            python: python.to_path_buf(),
-            client: client.clone(),
-        });
-        Ok(client)
+            ModelRuntimeIdentity::from_manifest(manifest)?,
+        );
+        self.python_genai_workers
+            .get_or_try_init(
+                key,
+                |_| true,
+                || {
+                    Ok(CompanionClient::from_embedded_python(
+                        python.to_path_buf(),
+                        ONNX_GENAI_PYTHON_SCRIPT,
+                        "Werk embedded ONNX GenAI worker",
+                    )
+                    .with_resident_worker())
+                },
+            )
+            .map(|(client, _, _)| client)
     }
 
     fn generate_with_python_genai_client(
@@ -1011,7 +1009,7 @@ fn onnx_runtime_control_adapter(
         OnnxResidencyRoute::EmbeddedPython => (
             format!("{}-python-genai", mode.label()),
             ModelResidencyStatus::Supported,
-            "Werk's resident Python ONNX GenAI worker reuses the exact model and tokenizer with a bounded LRU; generator and prompt state remain request-local",
+            "Werk uses one serialized Python ONNX GenAI worker per exact model identity in a bounded LRU; different resident models have independent transports; generator and prompt state remain request-local",
         ),
         OnnxResidencyRoute::EmbeddedPythonCacheDisabled => (
             format!("{}-python-genai", mode.label()),
@@ -1739,6 +1737,29 @@ print(json.dumps({'text': '<tool_call>{"name":"lookup","arguments":{"id":7}}</to
                 }
             );
         }
+    }
+
+    #[test]
+    fn model_workers_are_reused_and_have_independent_transports() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ModelStore::resolve(Some(root.path().to_path_buf())).unwrap();
+        let mut backend = OnnxRuntimeBackend::new(store, OnnxRuntimeMode::Cpu);
+        backend.python_genai_workers =
+            Arc::new(super::super::runtime_cache::RuntimeCache::bounded(2));
+        let a = manifest_with_model_path("a", Some("a.onnx"));
+        let b = manifest_with_model_path("b", Some("b.onnx"));
+        let first = backend
+            .python_genai_client(Path::new("python"), &a)
+            .unwrap();
+        let same = backend
+            .python_genai_client(Path::new("python"), &a)
+            .unwrap();
+        let other = backend
+            .python_genai_client(Path::new("python"), &b)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(first.shares_resident_worker_with(&same));
+        assert!(!first.shares_resident_worker_with(&other));
     }
 
     #[test]

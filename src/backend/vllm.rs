@@ -2,13 +2,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
+#[cfg(test)]
+use std::net::TcpListener;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     env,
     ffi::OsStr,
     fs,
     io::{BufRead, BufReader, Read},
-    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -97,7 +98,7 @@ pub struct VllmBackend {
     store: ModelStore,
     accelerator: VllmAccelerator,
     automatic_prefix_caching: Option<bool>,
-    servers: Arc<Mutex<HashMap<String, Arc<VllmProcess>>>>,
+    servers: Arc<super::runtime_cache::RuntimeCache<String, VllmProcess>>,
     #[cfg(test)]
     test_server: Option<Arc<VllmProcess>>,
 }
@@ -249,7 +250,7 @@ impl VllmBackend {
             store,
             accelerator,
             automatic_prefix_caching: None,
-            servers: Arc::new(Mutex::new(HashMap::new())),
+            servers: Arc::new(Default::default()),
             #[cfg(test)]
             test_server: None,
         }
@@ -288,7 +289,7 @@ impl VllmBackend {
             store,
             accelerator: VllmAccelerator::Cuda,
             automatic_prefix_caching: None,
-            servers: Arc::new(Mutex::new(HashMap::new())),
+            servers: Arc::new(Default::default()),
             test_server: Some(Arc::new(server)),
         }
     }
@@ -422,32 +423,17 @@ impl VllmBackend {
             &discovery,
             &VllmCacheEnvironment::current(&configured_args),
         );
-        if let Some(server) = self
-            .servers
-            .lock()
-            .map_err(|_| anyhow!("vLLM server cache mutex poisoned"))?
-            .get(&key)
-            .cloned()
-            && server.is_running()
-        {
-            return Ok((server, true, 0.0));
-        }
-
-        let started = Instant::now();
-        let server = Arc::new(VllmProcess::start(
-            &self.store,
-            manifest,
-            &model_dir,
-            discovery,
-            self.accelerator,
-            configured_args,
-        )?);
-        let load_seconds = started.elapsed().as_secs_f64();
         self.servers
-            .lock()
-            .map_err(|_| anyhow!("vLLM server cache mutex poisoned"))?
-            .insert(key, server.clone());
-        Ok((server, false, load_seconds))
+            .get_or_try_init(key, VllmProcess::is_running, || {
+                VllmProcess::start(
+                    &self.store,
+                    manifest,
+                    &model_dir,
+                    discovery,
+                    self.accelerator,
+                    configured_args,
+                )
+            })
     }
 
     fn generate_inner(
@@ -655,6 +641,9 @@ impl GenerationBackend for VllmBackend {
 }
 
 impl ChatGenerationSession for VllmChatSession {
+    fn is_available(&self) -> bool {
+        self.server.child.is_none() || matches!(self.server.try_wait_status(), Ok(None))
+    }
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
         validate_vllm_image_request(self.architecture.as_deref(), &request)?;
         let total_started = Instant::now();
@@ -775,7 +764,8 @@ impl VllmProcess {
         let runtime_version = vllm_version(&command)
             .and_then(|version| sanitize_runtime_version(&version))
             .unwrap_or_else(|| "unknown".to_string());
-        let port = free_local_port()?;
+        let startup_port = super::llama_process_lifecycle::StartupPort::reserve()?;
+        let port = startup_port.port();
         let url = format!("http://127.0.0.1:{port}");
         let launch = vllm_launch_command(
             &command,
@@ -2822,11 +2812,6 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 
 fn vllm_executable_name() -> &'static str {
     if cfg!(windows) { "vllm.exe" } else { "vllm" }
-}
-
-fn free_local_port() -> Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    Ok(listener.local_addr()?.port())
 }
 
 fn spawn_log_tail_reader<R>(label: &'static str, reader: R, tail: Arc<Mutex<VecDeque<String>>>)

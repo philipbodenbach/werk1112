@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     env, fs,
     path::PathBuf,
     process::Command,
@@ -25,7 +24,13 @@ use crate::{
     runtime_control::{BackendRuntimeAdapter, ModelResidencyStatus, StaticRuntimeAdapter},
 };
 
-const BURN_MODEL_CACHE_CAPACITY: usize = 1;
+fn burn_model_cache_capacity() -> usize {
+    env::var("WERK_BURN_MODEL_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BurnMode {
@@ -53,7 +58,7 @@ impl BurnMode {
 pub struct BurnBackend {
     store: ModelStore,
     mode: BurnMode,
-    cache: Arc<Mutex<HashMap<ModelRuntimeIdentity, BurnPreparedModel>>>,
+    cache: Arc<super::runtime_cache::RuntimeCache<ModelRuntimeIdentity, Mutex<BurnPreparedModel>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +99,9 @@ impl BurnBackend {
         Self {
             store,
             mode,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(super::runtime_cache::RuntimeCache::bounded(
+                burn_model_cache_capacity(),
+            )),
         }
     }
 
@@ -340,24 +347,19 @@ impl BurnBackend {
         })
     }
 
-    fn ensure_model(&self, manifest: &ModelManifest) -> Result<()> {
+    fn cached_model(&self, manifest: &ModelManifest) -> Result<Arc<Mutex<BurnPreparedModel>>> {
         let key = ModelRuntimeIdentity::from_manifest(manifest)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow!("Burn model cache mutex poisoned"))?;
-        if cache.contains_key(&key) {
-            return Ok(());
-        }
+        self.cache
+            .get_or_try_init(
+                key,
+                |_| true,
+                || self.prepare_model(manifest).map(Mutex::new),
+            )
+            .map(|(model, _, _)| model)
+    }
 
-        // Burn's prepared runtime owns heavyweight model/device state. Keep a
-        // single exact entry and release it before loading a replacement so a
-        // normal model switch cannot retain every model used by the server.
-        cache.clear();
-        let model = self.prepare_model(manifest)?;
-        cache.insert(key, model);
-        debug_assert!(cache.len() <= BURN_MODEL_CACHE_CAPACITY);
-        Ok(())
+    fn ensure_model(&self, manifest: &ModelManifest) -> Result<()> {
+        self.cached_model(manifest).map(|_| ())
     }
 
     fn with_model<T>(
@@ -365,21 +367,11 @@ impl BurnBackend {
         manifest: &ModelManifest,
         f: impl FnOnce(&mut BurnPreparedModel) -> Result<T>,
     ) -> Result<T> {
-        let key = ModelRuntimeIdentity::from_manifest(manifest)?;
-        let mut guard = self
-            .cache
+        let model = self.cached_model(manifest)?;
+        let mut model = model
             .lock()
-            .map_err(|_| anyhow!("Burn model cache mutex poisoned"))?;
-        if !guard.contains_key(&key) {
-            guard.clear();
-            let model = self.prepare_model(manifest)?;
-            guard.insert(key, model);
-        }
-        debug_assert!(guard.len() <= BURN_MODEL_CACHE_CAPACITY);
-        let model = guard
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("Burn model cache lost the selected model"))?;
-        f(model)
+            .map_err(|_| anyhow!("Burn model mutex poisoned"))?;
+        f(&mut model)
     }
 
     fn generate_inner(
@@ -747,7 +739,8 @@ impl GenerationBackend for BurnBackend {
             (
                 ModelResidencyStatus::Supported,
                 format!(
-                    "Werk keeps one exact {} model resident in its bounded in-process cache",
+                    "Werk keeps up to {} exact {} models resident with per-model inference locks",
+                    burn_model_cache_capacity(),
                     self.mode.display()
                 ),
             )

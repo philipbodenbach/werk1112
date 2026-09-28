@@ -53,6 +53,9 @@ struct RuntimeRoutedChatSession {
 }
 
 impl ChatGenerationSession for RuntimeRoutedChatSession {
+    fn is_available(&self) -> bool {
+        self.session.is_available()
+    }
     fn generate(&self, request: GenerateRequest) -> anyhow::Result<GenerateResponse> {
         let response = self.session.generate(request)?;
         let _ = self

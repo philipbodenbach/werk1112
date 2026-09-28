@@ -3,6 +3,7 @@ mod api_options;
 mod automatic1111;
 mod chat;
 mod chat_options;
+mod concurrency;
 mod context_admission;
 mod cors;
 mod documents;

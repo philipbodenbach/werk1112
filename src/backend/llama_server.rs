@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::net::TcpListener;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     env, fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex, OnceLock},
@@ -82,7 +84,7 @@ pub struct LlamaServerBackend {
     store: ModelStore,
     mode: LlamaCppMode,
     runtime_options: LlamaRuntimeOptions,
-    servers: Arc<Mutex<HashMap<String, Arc<LlamaServerProcess>>>>,
+    servers: Arc<super::runtime_cache::RuntimeCache<String, LlamaServerProcess>>,
 }
 
 struct LlamaServerProcess {
@@ -105,7 +107,7 @@ struct LlamaServerProcess {
     mode: LlamaCppMode,
     log_tail: Arc<Mutex<VecDeque<String>>>,
     log_readers: Mutex<Vec<thread::JoinHandle<()>>>,
-    state_gate: Mutex<()>,
+    state_gate: std::sync::RwLock<()>,
     state_runtime: LlamaProcessStateRuntime,
     startup_diagnostics: Vec<String>,
     startup_diagnostics_reported: OnceLock<()>,
@@ -177,7 +179,7 @@ impl LlamaServerBackend {
             store,
             mode,
             runtime_options,
-            servers: Arc::new(Mutex::new(HashMap::new())),
+            servers: Arc::new(Default::default()),
         }
     }
 
@@ -372,33 +374,18 @@ impl LlamaServerBackend {
 
         let key = format!("{key}:{}", serde_json::to_string(&self.runtime_options)?);
 
-        if let Some(server) = self
-            .servers
-            .lock()
-            .map_err(|_| anyhow!("llama-server cache mutex poisoned"))?
-            .get(&key)
-            .cloned()
-            && server.is_running()
-        {
-            return Ok((server, true, 0.0));
-        }
-
-        let started = Instant::now();
-        let server = Arc::new(LlamaServerProcess::start(
-            &self.store,
-            self.mode,
-            manifest,
-            model_identity,
-            &absolute_model_path,
-            projector_path.as_deref(),
-            &self.runtime_options,
-        )?);
-        let load_seconds = started.elapsed().as_secs_f64();
         self.servers
-            .lock()
-            .map_err(|_| anyhow!("llama-server cache mutex poisoned"))?
-            .insert(key, server.clone());
-        Ok((server, false, load_seconds))
+            .get_or_try_init(key, LlamaServerProcess::is_running, || {
+                LlamaServerProcess::start(
+                    &self.store,
+                    self.mode,
+                    manifest,
+                    model_identity,
+                    &absolute_model_path,
+                    projector_path.as_deref(),
+                    &self.runtime_options,
+                )
+            })
     }
 
     fn generate_inner(
@@ -476,7 +463,7 @@ impl GenerationBackend for LlamaServerBackend {
         let (server, _, _) = self.cached_server(manifest, has_images)?;
         let _guard = server
             .state_gate
-            .lock()
+            .read()
             .map_err(|_| anyhow!("llama-server state operation mutex poisoned"))?;
         if request_has_images(&request) && server.projector_path.is_none() {
             bail!("visual input requires a multimodal projector");
@@ -620,6 +607,9 @@ impl GenerationBackend for LlamaServerBackend {
 }
 
 impl ChatGenerationSession for LlamaServerChatSession {
+    fn is_available(&self) -> bool {
+        self.server.is_running()
+    }
     fn preparation_diagnostics(&self) -> Vec<String> {
         let mut diagnostics = vec![format!(
             "llama.cpp worker startup duration: {:.6}s",
@@ -727,7 +717,8 @@ impl LlamaServerProcess {
             fp4::validate_runtime(&executable)?;
         }
         let execution = fp4::prepare(&executable, mode, runtime_options.fp4_kernel)?;
-        let port = free_local_port()?;
+        let startup_port = super::llama_process_lifecycle::StartupPort::reserve()?;
+        let port = startup_port.port();
         let url = format!("http://127.0.0.1:{port}");
         let inspection_started = Instant::now();
         let inspection = inspect_llama_executable(&executable).ok();
@@ -736,6 +727,20 @@ impl LlamaServerProcess {
             .map(|value| supported_args_from_help(&value.help))
             .unwrap_or_else(|| supported_args(&executable));
         let inspection_seconds = inspection_started.elapsed().as_secs_f64();
+        if runtime_options.parallel == Some(0) {
+            bail!("llama-server parallel slots must be greater than zero");
+        }
+        if runtime_options.parallel.is_some_and(|slots| slots > 1) && !supported.parallel {
+            bail!("the selected llama-server does not advertise --parallel support");
+        }
+        if runtime_options
+            .ctx_size
+            .unwrap_or(DEFAULT_CTX_SIZE)
+            .checked_mul(runtime_options.parallel.unwrap_or(1) as usize)
+            .is_none()
+        {
+            bail!("llama-server context capacity overflows with the requested parallel slots");
+        }
         if let Some(projector_path) = projector_path
             && !supported.mmproj
         {
@@ -839,7 +844,7 @@ impl LlamaServerProcess {
             mode,
             log_tail,
             log_readers: Mutex::new(log_readers),
-            state_gate: Mutex::new(()),
+            state_gate: std::sync::RwLock::new(()),
             state_runtime: LlamaProcessStateRuntime {
                 generation_id,
                 snapshot_dir,
@@ -899,10 +904,21 @@ impl LlamaServerProcess {
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
         persistence: Option<&LlamaChatPersistence>,
     ) -> Result<ServerCompletion> {
-        let _state_operation = self
-            .state_gate
-            .lock()
-            .map_err(|_| anyhow!("llama-server state operation mutex poisoned"))?;
+        // Native HTTP requests can share the worker. Snapshot restore/save
+        // manipulates a fixed slot and must exclude all ordinary inference.
+        let _exclusive = persistence
+            .map(|_| self.state_gate.write())
+            .transpose()
+            .map_err(|_| anyhow!("llama-server state operation lock poisoned"))?;
+        let _shared = if persistence.is_none() {
+            Some(
+                self.state_gate
+                    .read()
+                    .map_err(|_| anyhow!("llama-server state operation lock poisoned"))?,
+            )
+        } else {
+            None
+        };
         if request_has_images(request) && self.projector_path.is_none() {
             bail!(
                 "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
@@ -1165,6 +1181,7 @@ fn llama_server_args_with_state(
         runtime_options
             .ctx_size
             .unwrap_or(DEFAULT_CTX_SIZE)
+            .saturating_mul(runtime_options.parallel.unwrap_or(1) as usize)
             .to_string(),
         "-b".to_string(),
         runtime_options
@@ -1177,7 +1194,7 @@ fn llama_server_args_with_state(
             .unwrap_or(DEFAULT_UBATCH_SIZE)
             .to_string(),
         "-np".to_string(),
-        "1".to_string(),
+        runtime_options.parallel.unwrap_or(1).to_string(),
     ];
 
     if let Some(projector_path) = projector_path
@@ -3482,11 +3499,6 @@ fn default_executable_name() -> &'static str {
     }
 }
 
-fn free_local_port() -> Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    Ok(listener.local_addr()?.port())
-}
-
 fn send_stream_result(
     tx: mpsc::Sender<Result<GenerateStreamEvent, String>>,
     result: Result<GenerateResponse>,
@@ -3630,6 +3642,36 @@ mod tests {
     use super::*;
     use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parallel_slots_preserve_context_per_sequence_and_disable_single_slot_state() {
+        let options = LlamaRuntimeOptions {
+            parallel: Some(4),
+            ctx_size: Some(2048),
+            ..Default::default()
+        };
+        let model = Path::new("model.gguf");
+        let snapshots = Path::new("snapshots");
+        let args = llama_server_args_with_state(
+            LlamaCppMode::Cpu,
+            model,
+            None,
+            1234,
+            &options,
+            &SupportedArgs {
+                parallel: true,
+                slots: true,
+                ..Default::default()
+            },
+            false,
+            Some(snapshots),
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-np", "4"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c", "8192"]));
+        assert!(!llama_state_args_are_effective(
+            &args, snapshots, model, 1234
+        ));
+    }
 
     #[test]
     fn managed_cache_path_uses_requested_backend_name() {
