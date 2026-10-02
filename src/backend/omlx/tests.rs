@@ -1108,6 +1108,8 @@ fn server_prefix_cache_expert_variants_have_independent_managed_cache_directorie
 fn server_prefix_cache_unavailable_or_disabled_keeps_one_ordinary_worker() {
     for (version, enabled, active, expected_cache) in [
         ("0.6.4", false, true, false),
+        ("0.7.0", false, true, false),
+        ("0.7.0", true, true, true),
         ("0.6.5", true, true, false),
         ("0.6.4", true, false, true),
     ] {

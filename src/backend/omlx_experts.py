@@ -35,6 +35,15 @@ _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _MANAGER = None
 
 
+def resident_size_supports_ane(method):
+    """Accept the two validated pool contracts, including 0.7's ANE flag."""
+    parameters = tuple(inspect.signature(method).parameters)
+    legacy = ("self", "entry", "runtime_settings", "base_size")
+    if parameters not in (legacy, legacy + ("include_ane_reservation",)):
+        raise ValueError("unsupported oMLX memory admission API for expert streaming")
+    return parameters != legacy
+
+
 def _positive_int(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
@@ -818,7 +827,11 @@ class _ExpertMemoryGuard:
             (self.original_responses, ("self", "responses")),
             (self.original_preflight, ("self", "scheduler", "num_prompt_tokens", "request_id")),
         )
-        if any(tuple(inspect.signature(method).parameters) != signature
+        additions = {"_guard_prefill_chunk": ("gathered_core", "minimum_tokens"),
+                     "_adaptive_chunk_size": ("gathered_core",),
+                     "_record_chunk_transient": ("gathered_core",)}
+        if any(tuple(inspect.signature(method).parameters) not in
+               (signature, signature + additions.get(method.__name__, ()))
                for method, signature in contracts):
             raise ValueError("unsupported oMLX prefill accounting API for expert streaming")
 
@@ -919,7 +932,7 @@ class _ExpertMemoryGuard:
                              cached_tokens=kv_len, chunk=(1, kv_len), phase="decode")
         return result
 
-    def adaptive(self, scheduler, requested, *, request_id, loop_label, kv_len=0):
+    def adaptive(self, scheduler, requested, *, request_id, loop_label, kv_len=0, **kwargs):
         # Native adaptive sizing runs BEFORE the final chunk guard. Reclaim
         # weight caches here, or that earlier gate throttles against their old
         # residency and causes extra passes over the offloaded checkpoint.
@@ -927,22 +940,22 @@ class _ExpertMemoryGuard:
             self.prepare(scheduler, num_prompt_tokens=kv_len + requested + 1,
                          cached_tokens=kv_len, chunk=(requested, kv_len))
         return self.original_adaptive(scheduler, requested, request_id=request_id,
-                                      loop_label=loop_label, kv_len=kv_len)
+                                      loop_label=loop_label, kv_len=kv_len, **kwargs)
 
-    def guard(self, scheduler, n_tokens, *, kv_len, progress, loop_label, request_id=None):
+    def guard(self, scheduler, n_tokens, *, kv_len, progress, loop_label, request_id=None, **kwargs):
         if self.matches(scheduler):
             self.samples.pop(scheduler, None)
             self.prepare(scheduler, num_prompt_tokens=kv_len + n_tokens + 1,
                          cached_tokens=kv_len, chunk=(n_tokens, kv_len))
         n = self.original_guard(scheduler, n_tokens, kv_len=kv_len, progress=progress,
-                                loop_label=loop_label, request_id=request_id)
+                                loop_label=loop_label, request_id=request_id, **kwargs)
         if self.matches(scheduler):
             self.samples[scheduler] = (request_id, loop_label, n, self.cache_totals()[0],
                                        getattr(scheduler, "_last_mlx_active_memory_bytes", None))
         return n
 
     def record(self, scheduler, n_tokens, pre_bytes, post_bytes, *, request_id,
-               loop_label, kv_len=0, requested_step=None):
+               loop_label, kv_len=0, requested_step=None, **kwargs):
         sample = self.samples.pop(scheduler, None)
         if self.matches(scheduler) and sample is not None and sample[:3] == (request_id, loop_label, n_tokens):
             change = self.cache_totals()[0] - sample[3]
@@ -967,7 +980,7 @@ class _ExpertMemoryGuard:
             self.manager.prefill_samples_corrected += 1
         return self.original_record(scheduler, n_tokens, pre_bytes, post_bytes,
                                     request_id=request_id, loop_label=loop_label,
-                                    kv_len=kv_len, requested_step=requested_step)
+                                    kv_len=kv_len, requested_step=requested_step, **kwargs)
 
     def check(self, scheduler, request):
         self.prepare(scheduler, num_prompt_tokens=request.num_prompt_tokens,
@@ -1033,8 +1046,7 @@ def install(model_path, cache_bytes):
 
     original_load = model_loading.lm_load_compat
     original_size = EnginePool._entry_runtime_resident_size
-    if tuple(inspect.signature(original_size).parameters) != ("self", "entry", "runtime_settings", "base_size"):
-        raise ValueError("unsupported oMLX memory admission API for expert streaming")
+    supports_ane = resident_size_supports_ane(original_size)
     checkpoint = Checkpoint(model_path, cache_bytes)
     if checkpoint.cache_budget_mode == "auto":
         _configure_automatic_cache(checkpoint)
@@ -1050,9 +1062,11 @@ def install(model_path, cache_bytes):
         # oMLX's engine invokes this after its architecture/tokenizer patches.
         return _load_streamed_model(manager, **kwargs)
 
-    def resident_size(pool, entry, runtime_settings, *, base_size=None):
+    def resident_size(pool, entry, runtime_settings, *, base_size=None, **kwargs):
         if not matches(entry.model_path):
-            return original_size(pool, entry, runtime_settings, base_size=base_size)
+            return original_size(pool, entry, runtime_settings, base_size=base_size, **kwargs)
+        if set(kwargs) - ({"include_ane_reservation"} if supports_ane else set()):
+            raise ValueError("unsupported oMLX memory admission options")
         if pool._distributed_deployment_for_entry(entry) is not None:
             raise ValueError("expert streaming cannot be combined with distributed loading")
         manager.model_id = entry.model_id

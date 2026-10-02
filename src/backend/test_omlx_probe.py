@@ -847,6 +847,15 @@ def quantize(model, group_size=64, bits=4, mode="affine", class_predicate=None):
 
 
 class OmlxProbeTests(unittest.TestCase):
+    def test_unknown_runtime_does_not_automatically_enable_text_offload(self):
+        for version in ("0.6.5", "0.7.1"):
+            with self.subTest(version=version), self.runtime({"model_type": "qwen4_exp"}, version=version) as runtime:
+                with patch.object(probe_module, "prepare_runtime", side_effect=ValueError("native loader selected")):
+                    with self.assertRaisesRegex(ValueError, "native loader selected"):
+                        probe_module.probe({"launcher": str(runtime.launcher),
+                            "model_dir": str(runtime.model_dir), "expert_cache_bytes": 0,
+                            "ngram_cache_bytes": None})
+
     def test_default_budgets_keep_native_loader_for_supported_offload_models(self):
         for architecture in ("qwen4_exp", "glm5_next", "deepseek_v4"):
             with self.subTest(architecture=architecture), self.runtime({"model_type": architecture}) as runtime:
@@ -864,11 +873,12 @@ class OmlxProbeTests(unittest.TestCase):
             calls.append((path, experts, ngrams))
             return {"loader": "installed_native_text_port"}
         helper.inspect_model = inspect_model
-        for architecture in ("qwen4_exp", "glm5_next"):
+        for version, architecture in ((v, a) for v in ("0.6.4", "0.7.0")
+                                      for a in ("qwen4_exp", "glm5_next")):
             config = {"model_type": architecture, "text_config": {}}
             if architecture == "qwen4_exp":
                 config["model_file"] = "qwen4_exp.py"
-            with self.runtime(config) as runtime, patch.dict(sys.modules, {"_werk_omlx_text_offload": helper}):
+            with self.runtime(config, version=version) as runtime, patch.dict(sys.modules, {"_werk_omlx_text_offload": helper}):
                 (runtime.model_dir / "qwen4_exp.py").write_text("raise AssertionError('must never execute checkpoint code')")
                 modes = [(0, None), (None, 1024), (8192, 0)]
                 if architecture == "qwen4_exp":
@@ -917,7 +927,7 @@ class OmlxProbeTests(unittest.TestCase):
                     probe_module.launcher_module(path)
 
     @contextlib.contextmanager
-    def runtime(self, config=None):
+    def runtime(self, config=None, version="0.6.4"):
         with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules), patch.object(sys, "path", list(sys.path)):
             # Other native tests may already have installed architecture
             # patches. This fixture represents a fresh, unpatched interpreter.
@@ -927,7 +937,7 @@ class OmlxProbeTests(unittest.TestCase):
             runtime = Runtime(directory)
             runtime.install()
             runtime.write_model(config)
-            versions = {"omlx": "0.6.4", "mlx-lm": "0.31.3", "mlx": "0.32.0"}
+            versions = {"omlx": version, "mlx-lm": "0.31.3", "mlx": "0.32.0"}
             with patch.object(probe_module.importlib.metadata, "version", side_effect=lambda name: versions[name]):
                 yield runtime
             self.assertEqual(runtime.weight_loads, [])

@@ -9,7 +9,6 @@ from contextlib import contextmanager
 import copy
 import importlib
 import importlib.metadata
-import inspect
 import os
 from pathlib import Path
 import weakref
@@ -17,11 +16,11 @@ import weakref
 try:
     from _werk_omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature, expert_read_workers
     from _werk_omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
-    from _werk_omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
+    from _werk_omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget, resident_size_supports_ane
 except ImportError:  # Direct repository tests.
     from omlx_offload import Inventory, RangeReader, SharedCache, ExpertRetention, GiB, MiB, integer, signature, expert_read_workers
     from omlx_offload_runtime import WeightAccess, array_from_tensor, streamed_experts, streamed_embedding
-    from omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget
+    from omlx_experts import ExpertManager, _ExpertMemoryGuard, _WORKSPACE_BYTES, _ALLOCATOR_CACHE_BYTES, automatic_cache_budget, resident_size_supports_ane
 
 
 ARCHITECTURES = {"qwen4_exp", "glm5_next"}
@@ -104,8 +103,8 @@ def native_classes(config, model_path):
     architecture = config.get("model_type")
     if architecture not in ARCHITECTURES:
         raise ValueError("no native text offload adapter for this architecture")
-    if importlib.metadata.version("omlx") != "0.6.4":
-        raise ValueError("Qwen/GLM text offload requires oMLX 0.6.4")
+    if importlib.metadata.version("omlx") not in ("0.6.4", "0.7.0"):
+        raise ValueError("Qwen/GLM text offload requires oMLX 0.6.4 or 0.7.0")
     patch = importlib.import_module(f"omlx.patches.mlx_vlm_{architecture}_compat")
     getattr(patch, f"apply_mlx_vlm_{architecture}_compat_patch")()
     module = importlib.import_module(f"mlx_vlm.models.{architecture}")
@@ -120,6 +119,33 @@ def native_classes(config, model_path):
         values["vision_config"] = config_module.VisionConfig.from_dict(values.get("vision_config"))
     args = module.ModelConfig.from_dict(values)
     return module.Model, args
+
+
+def restore_native_array_cache(layer, native_class):
+    """Keep Qwen's window API after oMLX restores an mlx-lm ArraysCache.
+
+    The 0.7 SSD codec restores array payloads into mlx-lm's generic class.
+    New mlx-vlm models also need update_window/update_recurrent. Rewrap only
+    those known payloads, preserving batching metadata and SizedArraysCache's
+    token count. Native caches and the 0.6.4 path remain untouched.
+    """
+    if not hasattr(native_class, "update_window"):
+        return layer
+    kind = type(layer)
+    if kind.__name__ == "CacheList":
+        layer.caches = tuple(restore_native_array_cache(item, native_class)
+                             for item in layer.caches)
+    elif kind.__name__ == "SizedArraysCache" and kind.__module__ == "omlx.cache.type_handlers":
+        layer._inner = restore_native_array_cache(layer._inner, native_class)
+    elif kind.__name__ == "ArraysCache" and kind.__module__ == "mlx_lm.models.cache":
+        # mlx-lm 0.31.4 state includes (arrays, padding, lengths), whereas
+        # mlx-vlm's state is just arrays. Use their shared payload attribute.
+        converted = native_class(size=len(layer.cache))
+        converted.cache = list(layer.cache)
+        converted.left_padding = layer.left_padding
+        converted.lengths = layer.lengths
+        return converted
+    return layer
 
 
 def attention_fusion_bytes(inventory):
@@ -540,6 +566,8 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
     if manager.status()["active"]:
         raise ValueError("offloaded text model is already loaded")
     model_class, args = native_classes(cp.config, cp.path)
+    array_cache_class = importlib.import_module(
+        f"mlx_vlm.models.{current.architecture}.language").ArraysCache
     if current.architecture == "qwen4_exp":
         language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
         # Constructor arrays stay lazy and are replaced before any evaluation.
@@ -615,6 +643,9 @@ def load_text_model(manager, tokenizer_config=None, **kwargs):
                 return self.core.language_model.make_cache()
 
             def __call__(self, inputs, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for index, layer in enumerate(cache):
+                        cache[index] = restore_native_array_cache(layer, array_cache_class)
                 return self.core.language_model(inputs, cache=cache, inputs_embeds=input_embeddings).logits
 
         model = TextModel()
@@ -651,8 +682,7 @@ def install(path, expert_bytes, ngram_bytes=None):
     original_load = model_loading.lm_load_compat
     original_size = EnginePool._entry_runtime_resident_size
     original_detect = model_discovery.detect_model_type
-    if tuple(inspect.signature(original_size).parameters) != ("self", "entry", "runtime_settings", "base_size"):
-        raise ValueError("unsupported oMLX memory admission contract")
+    supports_ane = resident_size_supports_ane(original_size)
     manager = TextExpertManager(checkpoint)
     if checkpoint.inventory.architecture == "glm5_next":
         profile = os.environ.get("WERK_OMLX_GLM_PROFILE", "0")
@@ -679,9 +709,11 @@ def install(path, expert_bytes, ngram_bytes=None):
         # exact checkpoint. Other model discoveries retain the native result.
         return "llm" if matches(model_path) else original_detect(model_path)
 
-    def resident_size(pool, entry, runtime_settings, *, base_size=None):
+    def resident_size(pool, entry, runtime_settings, *, base_size=None, **kwargs):
         if not matches(entry.model_path):
-            return original_size(pool, entry, runtime_settings, base_size=base_size)
+            return original_size(pool, entry, runtime_settings, base_size=base_size, **kwargs)
+        if set(kwargs) - ({"include_ane_reservation"} if supports_ane else set()):
+            raise ValueError("unsupported oMLX memory admission options")
         if pool._distributed_deployment_for_entry(entry) is not None:
             raise ValueError("native text offload cannot use distributed loading")
         manager.model_id = entry.model_id

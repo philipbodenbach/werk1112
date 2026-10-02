@@ -29,7 +29,7 @@ _MAX_EXACT_TOKENS = 8192
 _COMMIT_TIMEOUT = 5.0
 _ALLOWED_CACHE_TYPES = {"KVCache", "RotatingKVCache", "PrefillReadyRotatingKVCache", "PoolingCache", "CacheList"}
 _HYBRID_CACHE_MODULES = {
-    "ArraysCache": {"mlx_lm.models.cache", "mlx_vlm.models.qwen4_exp.cache"},
+    "ArraysCache": {"mlx_lm.models.cache", "mlx_vlm.models.qwen4_exp.cache", "mlx_vlm.models.cache"},
     "SizedArraysCache": {"omlx.cache.type_handlers"},
     "QSAKVCache": {"mlx_vlm.models.qwen4_exp.language"},
 }
@@ -304,8 +304,8 @@ def install(model_path, cache_directory):
     if _MANAGER is not None:
         raise ValueError("native prefix persistence is already installed")
     versions = {name: importlib.metadata.version(name) for name in ("omlx", "mlx", "mlx-lm")}
-    if versions["omlx"] != "0.6.4":
-        raise ValueError("native prefix persistence currently requires oMLX 0.6.4")
+    if versions["omlx"] not in ("0.6.4", "0.7.0"):
+        raise ValueError("native prefix persistence requires oMLX 0.6.4 or 0.7.0")
     from omlx.scheduler import Scheduler
     original_init = Scheduler.__init__
     original_prepare = Scheduler._prepare_prefix_cache_for_request
