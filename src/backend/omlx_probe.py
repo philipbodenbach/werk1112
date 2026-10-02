@@ -265,6 +265,7 @@ def quantization_layouts(config, loader=None):
 # Executable AST contracts, not version or comment-based capability assertions.
 # oMLX v0.6.4: https://github.com/jundot/omlx/tree/v0.6.4/omlx
 # mlx-lm: ab1806e8f5d6aa035973af194a1b9198ab4754dc
+# Qwen/GLM tokenizer contracts also cover oMLX 0.7.0's mlx-lm 94cdcae13.
 # Only side-effect-sensitive functions are pinned; unrelated module edits and
 # comments/docstrings do not invalidate a verified implementation.
 CONTRACTS = {
@@ -284,12 +285,16 @@ CONTRACTS = {
     "deepseek_tokenizer_patch": {"a9cef3a580b1bc3d75764cb2bf15e11fcae9cfe001680464eafa6a607ccb60ed"},
     "deepseek_tokenizer": {"0d5b1b4229d30a1e279258be649e6671f4f1e61cded088301bad2a78685edfab"},
     "deepseek_parser": {"fe3ad579842a87f816d6def9992f900112ecadc9d7d50005eab3db32171b475f"},
-    "native_tokenizer": {"81805beafb00c4a23b60252397f3dbfdd16fb3312b409bcc02d6d5ccaa215d3b"},
+    "native_tokenizer": {"81805beafb00c4a23b60252397f3dbfdd16fb3312b409bcc02d6d5ccaa215d3b",
+                         "ae1f8001a3e5a394740e718d0d90fabe783f36fffa445af629995063088befa3"},
     "native_tokenizer_loader": {"5a54ff0969ea3e2766be98887f244b7f0cfa7f889dfed70df620700317c2eab2"},
-    "native_tool_inference": {"ce5386192baf92f6f8590e868ea81e748102ba5e773cfcc05134e16a4e54741c"},
+    "native_tool_inference": {"ce5386192baf92f6f8590e868ea81e748102ba5e773cfcc05134e16a4e54741c",
+                              "171f8e4d3e90ef993fa20cda6e77dcc7dee6f4f3636e9a148d945760e4d8934e"},
     # Entire module: parser, schema-based argument conversion and delimiters.
-    "glm47_parser_module": {"9dce4324772d04cb3fbf67474816785944c3c24cca38976dcdedcd078da2cef8"},
-    "qwen_coder_parser_module": {"f89e1b330159dc991c04595362c62eeec26f92de4dcea9a429da28031af41088"},
+    "glm47_parser_module": {"9dce4324772d04cb3fbf67474816785944c3c24cca38976dcdedcd078da2cef8",
+                            "c54fcb8d2e5b19d364f601d9ff5d3ff5526ecc6aaa5602ca578f42efa52ec827"},
+    "qwen_coder_parser_module": {"f89e1b330159dc991c04595362c62eeec26f92de4dcea9a429da28031af41088",
+                                "e8bf571dee39a0984c7e833edd6c0ddae9021425afa9c021e524424183514c52"},
 }
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
@@ -575,7 +580,21 @@ def supports_tools(config, tokenizer_config, root, utils):
                 template = source.read(MAX_JSON_BYTES + 1)
             if len(template) > MAX_JSON_BYTES:
                 return False
-        inferred = tokenizer._infer_tool_parser(template)
+        if tuple(inspect.signature(tokenizer._infer_tool_parser).parameters) == ("tokenizer",):
+            # New mlx-lm accepts a tokenizer object. Only the template route is
+            # verified here; never construct a tokenizer or infer from vocab.
+            class TemplateOnly:
+                chat_template = template
+
+                def get_vocab(self):
+                    raise ValueError("tool parser vocabulary fallback is unverified")
+
+            try:
+                inferred = tokenizer._infer_tool_parser(TemplateOnly())
+            except ValueError:
+                return False
+        else:
+            inferred = tokenizer._infer_tool_parser(template)
         selected = tokenizer_config.get("tool_parser_type", inferred)
         if inferred != expected_parser or selected != inferred:
             return False
@@ -718,7 +737,7 @@ def probe(payload):
         text_offload_requested |= config.get("model_type") == "qwen4_exp" and "ngram_cache_bytes" in payload and payload["ngram_cache_bytes"] is None
         text_offload_explicit = bool(payload.get("expert_cache_bytes") or payload.get("ngram_cache_bytes"))
         if (config.get("model_type") in ("qwen4_exp", "glm5_next") and text_offload_requested
-                and (runtime["omlx_version"] == "0.6.4" or text_offload_explicit)):
+                and (runtime["omlx_version"] in ("0.6.4", "0.7.0") or text_offload_explicit)):
             from _werk_omlx_text_offload import inspect_model
             result["runtime"]["expert_offload"] = inspect_model(root, payload.get("expert_cache_bytes"), payload.get("ngram_cache_bytes"))
             result["model_type"] = config["model_type"]

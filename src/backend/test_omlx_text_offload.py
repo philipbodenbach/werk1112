@@ -59,6 +59,9 @@ class GlmProfileIntegrationTests(unittest.TestCase):
             def _entry_runtime_resident_size(self, entry, runtime_settings, base_size=None):
                 return base_size
 
+            def _distributed_deployment_for_entry(self, entry):
+                return None
+
         modules = {name: ModuleType(name) for name in (
             "omlx", "omlx.utils", "omlx.utils.model_loading", "omlx.model_discovery",
             "omlx.engine_pool", "omlx.scheduler", "omlx.engine", "omlx.engine.batched")}
@@ -82,7 +85,53 @@ class GlmProfileIntegrationTests(unittest.TestCase):
                   patch.object(adapter.TextCheckpoint, "configure_auto"),
                   patch.object(adapter, "_ExpertMemoryGuard") as guard):
                 yield SimpleNamespace(path=path, loading=loading, guard=guard,
+                                      pool=EnginePool(),
                                       original_load=loading.lm_load_compat)
+
+    def test_cold_load_admits_minimum_working_set_and_preserves_cache_upper_budget(self):
+        for architecture in ("qwen4_exp", "glm5_next"):
+            with self.subTest(architecture=architecture), self.runtime(architecture) as runtime:
+                manager = adapter.install(runtime.path, 22528 * adapter.MiB)
+                cp = manager.checkpoint
+                # Reproduce the reported admission failure without allocating
+                # weights: a 22 GiB cache ceiling on a 17 GiB process ceiling.
+                cp.cache_bytes = 22 * adapter.GiB
+                cp.total_expert_bytes = 90 * adapter.GiB
+                cp.base_bytes = 6 * adapter.GiB
+                manager.effective_cache_bytes = cp.cache_bytes
+                entry = SimpleNamespace(model_path=runtime.path, model_id="files")
+                size = runtime.pool._entry_runtime_resident_size(entry, None)
+                self.assertEqual(size, cp.base_bytes + max(cp.expert_bytes.values())
+                                 + adapter._WORKSPACE_BYTES)
+                self.assertLess(size + 128 * adapter.MiB, 17 * adapter.GiB)
+                self.assertEqual(cp.cache_bytes, 22 * adapter.GiB)
+                self.assertEqual(manager.effective_cache_bytes, max(cp.expert_bytes.values()))
+                # Resampling load admission is stable. Insufficient base RAM
+                # still fails the native gate; no ceiling is changed here.
+                self.assertEqual(runtime.pool._entry_runtime_resident_size(entry, None), size)
+                self.assertGreater(size, 5 * adapter.GiB)
+                # Once loaded, accounting follows the cache grown by the
+                # scheduler and never resets a live model to its cold size.
+                model = type("Model", (), {})()
+                manager._model_ref = adapter.weakref.ref(model)
+                manager._resize_cache(8 * adapter.GiB)
+                self.assertEqual(runtime.pool._entry_runtime_resident_size(entry, None),
+                                 cp.base_bytes + 8 * adapter.GiB + adapter._WORKSPACE_BYTES)
+                self.assertEqual(manager.effective_cache_bytes, 8 * adapter.GiB)
+                other = SimpleNamespace(model_path=runtime.path / "other", model_id="other")
+                self.assertEqual(runtime.pool._entry_runtime_resident_size(
+                    other, None, base_size=1234), 1234)
+
+    def test_load_admission_keeps_resident_experts_and_ngram_reservation(self):
+        with self.runtime("qwen4_exp") as runtime:
+            manager = adapter.install(runtime.path, None)
+            cp = manager.checkpoint
+            entry = SimpleNamespace(model_path=runtime.path, model_id="files")
+            size = runtime.pool._entry_runtime_resident_size(entry, None)
+            self.assertFalse(cp.experts_enabled)
+            self.assertEqual(manager.effective_cache_bytes, 0)
+            self.assertEqual(size, cp.dense_bytes + cp.total_expert_bytes
+                             + cp.ngram_initial_cache_bytes + adapter._WORKSPACE_BYTES)
 
     def test_profiling_is_absent_by_default_and_qwen_ignores_glm_flag(self):
         for architecture, value in (("glm5_next", None), ("glm5_next", "0"),
@@ -206,6 +255,11 @@ class GlmThinkingTemplateTests(unittest.TestCase):
 
 
 class NamespaceTests(unittest.TestCase):
+    def test_unverified_runtime_is_rejected_before_architecture_import(self):
+        with patch.object(adapter.importlib.metadata, "version", return_value="0.7.1"):
+            with self.assertRaisesRegex(ValueError, "requires oMLX 0.6.4 or 0.7.0"):
+                adapter.native_classes({"model_type": "qwen4_exp"}, Path("/unused"))
+
     def test_quantization_modules_and_weights_share_native_namespace(self):
         self.assertEqual(adapter._canonical_name("lm_head"), "language_model.lm_head")
         self.assertEqual(adapter._canonical_name("lm_head.weight"), "language_model.lm_head.weight")
@@ -368,6 +422,7 @@ def tiny_config(architecture):
                       linear_conv_kernel_dim=4, head_dim=32, hc_count=2,
                       hc_lowrank=32, layer_types=["linear_attention", "full_attention"],
                       indexer_head_dim=32, indexer_n_heads=2, indexer_budget=8,
+                      indexer_kv_heads=1, indexer_compress_ratio=1,
                       ple_layer_ids=[1], ple_embed_dim=64, heads_per_ngram=1,
                       ngram_size=2, ngram_vocab_size_base=17,
                       make_ngram_vocab_size_divisible_by=32, split_ngram_parts=2,
@@ -378,9 +433,10 @@ def tiny_config(architecture):
                       patch_size=2, temporal_patch_size=1, spatial_merge_size=1)
     else:
         common.update(intermediate_size=64, n_shared_experts=1, n_routed_experts=4,
+                      num_key_value_heads=2,
                       routed_scaling_factor=1.0, kv_lora_rank=32, q_lora_rank=32,
-                      qk_rope_head_dim=16, v_head_dim=32, qk_nope_head_dim=32,
-                      first_k_dense_replace=1, index_topk=4, index_head_dim=32,
+                      qk_rope_head_dim=0, v_head_dim=32, qk_nope_head_dim=32,
+                      first_k_dense_replace=1, index_topk=4, index_kpool=1, index_head_dim=32,
                       index_n_heads=2, layer_types=["linear_attention", "full_attention"],
                       mlp_layer_types=["dense", "sparse"], hc_mult=4, eos_token_id=[0],
                       linear_attn_config={"num_heads":1,"head_dim":64,"short_conv_kernel_size":4})
@@ -391,6 +447,35 @@ def tiny_config(architecture):
 
 @unittest.skipUnless(os.getenv("WERK_TEST_MLX_EXPERTS") == "1", "native Metal opt-in")
 class NativeTextLoaderTests(unittest.TestCase):
+    def test_restored_array_cache_preserves_payload_padding_and_token_count(self):
+        import importlib
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        with tempfile.TemporaryDirectory() as directory:
+            adapter.native_classes(tiny_config("qwen4_exp"), Path(directory))
+        native = importlib.import_module("mlx_vlm.models.qwen4_exp.language").ArraysCache
+        source = ArraysCache(4)
+        source.cache = [mx.ones((2, 1, 8)), None, mx.zeros((2, 1)), mx.array([[3], [4]])]
+        source.left_padding = mx.array([1, 0])
+        source.lengths = mx.array([2, 3])
+        wrapped = SizedArraysCache(source, 17)
+        converted = adapter.restore_native_array_cache(wrapped, native)
+        self.assertIs(converted, wrapped)
+        self.assertEqual(converted.size(), 17)
+        if hasattr(native, "update_window"):
+            self.assertIsInstance(converted._inner, native)
+            self.assertEqual(len(converted._inner.cache), 4)
+            for left, right in zip(converted._inner.cache, source.cache):
+                self.assertIs(left, right)
+            self.assertIs(converted.left_padding, source.left_padding)
+            self.assertIs(converted.lengths, source.lengths)
+            inner = converted._inner
+            self.assertIs(adapter.restore_native_array_cache(inner, native), inner)
+        else:
+            self.assertIs(converted._inner, source)
+
     def test_resident_shards_preserve_dtypes_and_reject_changed_checkpoint(self):
         import mlx.core as mx
         from omlx_offload import signature
