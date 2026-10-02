@@ -273,6 +273,25 @@ class ExpertMemoryGuardTests(unittest.TestCase):
         self.manager, self.scheduler, self.guard, self.engine = memory_guard_fixture()
         self.mib, self.gib = 1024**2, 1024**3
 
+    def test_cold_load_cache_grows_under_native_prefill_guard(self):
+        cp = self.manager.checkpoint
+        cp.base_bytes = self.scheduler.base_bytes
+        self.manager._model_ref = None
+        size = self.manager.load_resident_size()
+        self.assertEqual(size, cp.base_bytes + max(cp.expert_bytes.values())
+                         + experts._WORKSPACE_BYTES)
+        self.assertEqual(cp.cache_bytes, 24 * self.gib)
+        self.manager._model_ref = weakref.ref(self.scheduler.model)
+        self.guard.prepare(self.scheduler, num_prompt_tokens=64)
+        self.assertEqual(self.manager.effective_cache_bytes, 24 * self.gib)
+        # A smaller native ceiling still shrinks the cache before admission.
+        self.scheduler._memory_hard_limit_bytes = 12 * self.gib
+        self.guard.prepare(self.scheduler, num_prompt_tokens=64)
+        self.assertLess(self.manager.effective_cache_bytes, 8 * self.gib)
+        self.assertIsNone(self.scheduler._preflight_memory_check(
+            SimpleNamespace(num_prompt_tokens=64, cached_tokens=0)))
+        self.assertTrue(self.scheduler._prefill_memory_guard)
+
     def test_modern_scheduler_options_are_preserved_for_target_and_other_models(self):
         manager, scheduler, guard, _ = memory_guard_fixture(modern=True)
         for target in (True, False):

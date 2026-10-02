@@ -276,6 +276,19 @@ class ExpertManager:
         self.forward_seconds = self.routing_seconds = 0.0
         self.allocator_cache_bytes = 0
 
+    def load_resident_size(self):
+        """Reserve the cold working set, not the optional expert cache ceiling.
+
+        No experts are read by the loader. Start with room for one demand
+        expert; the executor's prefill/decode guards grow the cache only after
+        accounting for live process usage and prompt workspace. Keep the
+        requested upper budget intact so later requests can use freed RAM.
+        """
+        with self._lock:
+            if self._model_ref is None or self._model_ref() is None:
+                self._resize_cache(0)
+            return self.checkpoint.base_bytes + self.effective_cache_bytes + _WORKSPACE_BYTES
+
     def status(self):
         with self._lock:
             result = self.checkpoint.summary()
@@ -1070,7 +1083,7 @@ def install(model_path, cache_bytes):
         if pool._distributed_deployment_for_entry(entry) is not None:
             raise ValueError("expert streaming cannot be combined with distributed loading")
         manager.model_id = entry.model_id
-        return checkpoint.resident_estimate_bytes
+        return manager.load_resident_size()
 
     model_loading.lm_load_compat = streamed_load
     EnginePool._entry_runtime_resident_size = resident_size

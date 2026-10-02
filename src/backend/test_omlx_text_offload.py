@@ -59,6 +59,9 @@ class GlmProfileIntegrationTests(unittest.TestCase):
             def _entry_runtime_resident_size(self, entry, runtime_settings, base_size=None):
                 return base_size
 
+            def _distributed_deployment_for_entry(self, entry):
+                return None
+
         modules = {name: ModuleType(name) for name in (
             "omlx", "omlx.utils", "omlx.utils.model_loading", "omlx.model_discovery",
             "omlx.engine_pool", "omlx.scheduler", "omlx.engine", "omlx.engine.batched")}
@@ -82,7 +85,53 @@ class GlmProfileIntegrationTests(unittest.TestCase):
                   patch.object(adapter.TextCheckpoint, "configure_auto"),
                   patch.object(adapter, "_ExpertMemoryGuard") as guard):
                 yield SimpleNamespace(path=path, loading=loading, guard=guard,
+                                      pool=EnginePool(),
                                       original_load=loading.lm_load_compat)
+
+    def test_cold_load_admits_minimum_working_set_and_preserves_cache_upper_budget(self):
+        for architecture in ("qwen4_exp", "glm5_next"):
+            with self.subTest(architecture=architecture), self.runtime(architecture) as runtime:
+                manager = adapter.install(runtime.path, 22528 * adapter.MiB)
+                cp = manager.checkpoint
+                # Reproduce the reported admission failure without allocating
+                # weights: a 22 GiB cache ceiling on a 17 GiB process ceiling.
+                cp.cache_bytes = 22 * adapter.GiB
+                cp.total_expert_bytes = 90 * adapter.GiB
+                cp.base_bytes = 6 * adapter.GiB
+                manager.effective_cache_bytes = cp.cache_bytes
+                entry = SimpleNamespace(model_path=runtime.path, model_id="files")
+                size = runtime.pool._entry_runtime_resident_size(entry, None)
+                self.assertEqual(size, cp.base_bytes + max(cp.expert_bytes.values())
+                                 + adapter._WORKSPACE_BYTES)
+                self.assertLess(size + 128 * adapter.MiB, 17 * adapter.GiB)
+                self.assertEqual(cp.cache_bytes, 22 * adapter.GiB)
+                self.assertEqual(manager.effective_cache_bytes, max(cp.expert_bytes.values()))
+                # Resampling load admission is stable. Insufficient base RAM
+                # still fails the native gate; no ceiling is changed here.
+                self.assertEqual(runtime.pool._entry_runtime_resident_size(entry, None), size)
+                self.assertGreater(size, 5 * adapter.GiB)
+                # Once loaded, accounting follows the cache grown by the
+                # scheduler and never resets a live model to its cold size.
+                model = type("Model", (), {})()
+                manager._model_ref = adapter.weakref.ref(model)
+                manager._resize_cache(8 * adapter.GiB)
+                self.assertEqual(runtime.pool._entry_runtime_resident_size(entry, None),
+                                 cp.base_bytes + 8 * adapter.GiB + adapter._WORKSPACE_BYTES)
+                self.assertEqual(manager.effective_cache_bytes, 8 * adapter.GiB)
+                other = SimpleNamespace(model_path=runtime.path / "other", model_id="other")
+                self.assertEqual(runtime.pool._entry_runtime_resident_size(
+                    other, None, base_size=1234), 1234)
+
+    def test_load_admission_keeps_resident_experts_and_ngram_reservation(self):
+        with self.runtime("qwen4_exp") as runtime:
+            manager = adapter.install(runtime.path, None)
+            cp = manager.checkpoint
+            entry = SimpleNamespace(model_path=runtime.path, model_id="files")
+            size = runtime.pool._entry_runtime_resident_size(entry, None)
+            self.assertFalse(cp.experts_enabled)
+            self.assertEqual(manager.effective_cache_bytes, 0)
+            self.assertEqual(size, cp.dense_bytes + cp.total_expert_bytes
+                             + cp.ngram_initial_cache_bytes + adapter._WORKSPACE_BYTES)
 
     def test_profiling_is_absent_by_default_and_qwen_ignores_glm_flag(self):
         for architecture, value in (("glm5_next", None), ("glm5_next", "0"),

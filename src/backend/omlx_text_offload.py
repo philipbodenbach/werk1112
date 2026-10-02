@@ -717,7 +717,7 @@ def install(path, expert_bytes, ngram_bytes=None):
         if pool._distributed_deployment_for_entry(entry) is not None:
             raise ValueError("native text offload cannot use distributed loading")
         manager.model_id = entry.model_id
-        return checkpoint.resident_estimate_bytes
+        return manager.load_resident_size()
 
     model_loading.lm_load_compat = load
     model_discovery.detect_model_type = detect
