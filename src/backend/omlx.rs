@@ -750,7 +750,7 @@ impl GenerationBackend for OmlxBackend {
         let (directory, report) = self.model_probe(manifest)?;
         // The ordinary path remains available on all previously supported
         // runtimes. Only the verified native-cache extension is version gated.
-        if report.version != "0.6.4" {
+        if !matches!(report.version.as_str(), "0.6.4" | "0.7.0") {
             return Ok(None);
         }
         let mut invocation = self.invocation()?.clone();
@@ -1253,7 +1253,7 @@ impl OmlxInvocation {
             .find_map(|line| serde_json::from_str(line).ok())
             .with_context(|| {
                 format!(
-                    "oMLX probe returned no JSON: {}",
+                    "oMLX probe returned no JSON ({status}): {}",
                     String::from_utf8_lossy(&stderr)
                 )
             })?;
@@ -1786,7 +1786,7 @@ impl OmlxProcess {
         // this cache inside its private base also gives each model/configuration
         // its own writer and the existing inherited cache-purge lifetime lock.
         let server_cache_directory = (invocation.server_prefix_cache
-            && report.version == "0.6.4"
+            && matches!(report.version.as_str(), "0.6.4" | "0.7.0")
             && invocation.persistence_dir.is_none())
         .then(|| base_path.join("cache").join("prefix-cache"));
         let persistence_directory = invocation

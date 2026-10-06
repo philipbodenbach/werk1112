@@ -45,8 +45,9 @@ export const commonMethods = {
   },
   loadOptions: {
     async getModels(this: ILoadOptionsFunctions) {
+      let client: WerkClient | undefined;
       try {
-        const client = await WerkClient.create(this);
+        client = await WerkClient.create(this);
         let task = String(this.getCurrentNodeParameter('task') ?? '');
         if (!task) {
           const type = this.getNode().type.split('.').pop();
@@ -60,7 +61,10 @@ export const commonMethods = {
           return !tasks.length || tasks.includes('text-generation') || tasks.includes('image-understanding');
         });
         return models.map(model => ({ name: `${model.id}${isText ? ' (chat readiness checked at execution)' : (info.available as string[]).includes(String(model.id)) ? '' : ' (unavailable)'}`, value: String(model.id) }));
-      } catch { return []; }
+      } catch (error) {
+        const message = client ? client.safeMessage(error) : safeMessage(error);
+        throw new Error(`WERK model discovery failed: ${message}. Check the WERK credential and server connection. You can still enter a model By ID.`);
+      }
     },
   },
 };
