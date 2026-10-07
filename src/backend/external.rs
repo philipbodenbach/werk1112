@@ -1098,7 +1098,7 @@ impl LlamaCppBackend {
                 }
 
                 let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
-                eprintln!(
+                crate::ui_eprintln!(
                     "Loading model '{}' with in-process llama.cpp {}",
                     manifest.id,
                     self.mode.display_name()
@@ -1112,7 +1112,7 @@ impl LlamaCppBackend {
                 let model = LlamaModel::load_from_file(&absolute_model_path, self.model_params())
                     .map_err(|err| anyhow!("failed to load GGUF with llama.cpp: {err}"))?;
                 let load_seconds = started.elapsed().as_secs_f64();
-                eprintln!(
+                crate::ui_eprintln!(
                     "Loaded model '{}' with llama.cpp {} in {:.2}s",
                     manifest.id,
                     self.mode.display_name(),

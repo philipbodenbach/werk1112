@@ -1,0 +1,5 @@
+# Architecture-specific inference, isolated from media and vLLM environments.
+torch>=2.6,<3
+transformers>=5.19,<6
+sentence-transformers[image]>=6.1,<7
+laya>=0.3.29,<0.4

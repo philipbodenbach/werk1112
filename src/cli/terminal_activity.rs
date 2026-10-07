@@ -48,14 +48,21 @@ impl ActivityKind {
         frames[index % (frames.len() - 1)]
     }
 
-    const fn template(self) -> &'static str {
-        match self {
-            Self::Spinner => "{spinner:.cyan} {msg}",
-            Self::Chat => "{spinner:.cyan} {msg} [{elapsed_precise}]",
-            Self::Image => "{spinner:.magenta} {msg} [{elapsed_precise}]",
-            Self::Video => "{spinner:.blue} {msg} [{elapsed_precise}]",
-            Self::Audio => "{spinner:.green} {msg} [{elapsed_precise}]",
-        }
+    fn template(self) -> String {
+        use crate::terminal::{self, Stream};
+        let tint = match self {
+            Self::Spinner | Self::Chat => terminal::CYAN,
+            Self::Image => terminal::PINK,
+            Self::Video => terminal::BLUE,
+            Self::Audio => terminal::VIOLET,
+        };
+        let colors = terminal::color(Stream::Err);
+        format!(
+            "{}  {} {{msg}} {}",
+            terminal::paint("│", terminal::VIOLET, false, colors),
+            terminal::paint("{spinner}", tint, true, colors),
+            terminal::paint("[{elapsed_precise}]", terminal::INDIGO, false, colors)
+        )
     }
 }
 
@@ -87,6 +94,10 @@ impl ActivitySpec {
         };
 
         match task {
+            InferenceTask::TextReranking | InferenceTask::TextClassification => Self {
+                kind: ActivityKind::Chat,
+                action: "Analyzing text with",
+            },
             TextGeneration => Self::chat(),
             TextEmbedding => Self {
                 kind: ActivityKind::Chat,
@@ -204,12 +215,12 @@ struct TerminalActivity {
 impl TerminalActivity {
     fn start(enabled: bool, kind: ActivityKind, message: impl Into<String>) -> Self {
         let progress = enabled.then(|| {
-            let progress = ProgressBar::new_spinner();
-            let style = ProgressStyle::with_template(kind.template())
+            let progress = crate::terminal::progress(ProgressBar::new_spinner());
+            let style = ProgressStyle::with_template(&kind.template())
                 .expect("terminal activity template is valid")
                 .tick_strings(kind.frames());
             progress.set_style(style);
-            progress.set_message(message.into());
+            progress.set_message(crate::terminal::clean(&message.into()));
             progress.enable_steady_tick(Duration::from_millis(110));
             progress
         });
@@ -282,7 +293,7 @@ mod tests {
             ActivityKind::Audio,
         ] {
             let frames = kind.frames();
-            let _style = ProgressStyle::with_template(kind.template())
+            let _style = ProgressStyle::with_template(&kind.template())
                 .unwrap()
                 .tick_strings(frames);
             assert!(frames.len() >= 3);

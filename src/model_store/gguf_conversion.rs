@@ -81,7 +81,7 @@ impl ModelStore {
         let main =
             inspect_gguf(&main_path).context("converter did not produce a complete valid GGUF")?;
         if options.verbose {
-            eprintln!("Validated {} GGUF tensors", main.tensor_count);
+            crate::ui_eprintln!("Validated {} GGUF tensors", main.tensor_count);
         }
         if !main.tensor_types.contains(&40) {
             bail!(
@@ -249,13 +249,18 @@ fn capture_tail(mut reader: impl Read, verbose: bool) -> std::io::Result<Vec<u8>
     const LIMIT: usize = 32 * 1024;
     let mut tail = Vec::new();
     let mut chunk = [0; 8192];
+    let mut report = crate::terminal::ReportWriter::new(crate::terminal::Stream::Err);
     loop {
         let n = reader.read(&mut chunk)?;
         if n == 0 {
             return Ok(tail);
         }
         if verbose {
-            let _ = std::io::stderr().write_all(&chunk[..n]);
+            if crate::terminal::interactive(crate::terminal::Stream::Err) {
+                let _ = report.write_all(&chunk[..n]);
+            } else {
+                let _ = std::io::stderr().write_all(&chunk[..n]);
+            }
         }
         tail.extend_from_slice(&chunk[..n]);
         if tail.len() > LIMIT {

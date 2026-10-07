@@ -48,14 +48,14 @@ pub fn render(s: &Snapshot) -> String {
         metric(
             &format!("werk_requests_{name}_total"),
             "counter",
-            "Chat generation requests since server start.",
+            "Generation and text-analysis requests since server start.",
             value as f64,
         );
     }
     metric(
         "werk_requests_active",
         "gauge",
-        "Chat generations currently active.",
+        "Generation and text-analysis requests currently active.",
         s.totals.active as f64,
     );
     for (name, value) in [
@@ -73,7 +73,7 @@ pub fn render(s: &Snapshot) -> String {
     metric(
         "werk_request_duration_seconds_total",
         "counter",
-        "Total observed chat generation duration including failed and cancelled requests.",
+        "Total observed inference duration including failed and cancelled requests.",
         s.totals.duration_seconds,
     );
     if let Some(time) = s.backend_observed_at_ms {
@@ -103,7 +103,9 @@ pub fn render(s: &Snapshot) -> String {
     }
     let mut latest = std::collections::BTreeMap::new();
     for request in &s.requests {
-        if request.output_tokens.is_some() {
+        if request.output_tokens.is_some()
+            || (request.analysis.is_some() && request.state == "done")
+        {
             latest.entry(&request.model).or_insert(request);
         }
     }
@@ -120,9 +122,23 @@ pub fn render(s: &Snapshot) -> String {
             "first_output_seconds",
             "Last completed request time to first output.",
         ),
+        ("duration_seconds", "Last completed request duration."),
         (
-            "duration_seconds",
-            "Last completed request generation duration.",
+            "load_seconds",
+            "Last completed text-analysis model load duration.",
+        ),
+        (
+            "inference_seconds",
+            "Last completed text-analysis inference duration.",
+        ),
+        (
+            "model_cache_hit",
+            "Last completed text-analysis model weight cache hit, not token cache.",
+        ),
+        ("results", "Last completed text-analysis result count."),
+        (
+            "worker_seconds",
+            "Last completed text-analysis worker duration.",
         ),
     ] {
         let name = format!("werk_last_request_{suffix}");
@@ -132,6 +148,19 @@ pub fn render(s: &Snapshot) -> String {
                 "decode_tokens_per_second" => request.decode_tokens_per_second,
                 "prefill_tokens_per_second" => request.prefill_tokens_per_second,
                 "first_output_seconds" => request.first_output_seconds,
+                "load_seconds" => request.analysis.as_ref().and_then(|a| a.load_seconds),
+                "inference_seconds" => request.analysis.as_ref().and_then(|a| a.inference_seconds),
+                "worker_seconds" => request.analysis.as_ref().and_then(|a| a.worker_seconds),
+                "model_cache_hit" => request
+                    .analysis
+                    .as_ref()
+                    .and_then(|a| a.model_cache_hit)
+                    .map(|hit| if hit { 1. } else { 0. }),
+                "results" => request
+                    .analysis
+                    .as_ref()
+                    .and_then(|a| a.results)
+                    .map(|n| n as f64),
                 _ => Some(request.elapsed_seconds),
             };
             if let Some(value) = value.filter(|v| v.is_finite()) {
@@ -189,6 +218,38 @@ pub fn render(s: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mixed_tasks_preserve_existing_metrics_and_omit_inapplicable_samples() {
+        let t = std::sync::Arc::new(super::super::Telemetry::default());
+        t.begin("generator").raw_complete(&serde_json::json!({
+            "usage":{"prompt_tokens":10,"completion_tokens":20},
+            "timings":{"predicted_n":20,"predicted_ms":1000}
+        }));
+        let mut analysis = t.begin("classifier");
+        analysis.analysis_begin("text-classification");
+        analysis.analysis_complete(&serde_json::json!({
+            "answers":{"a":{}}, "usage":{"input_tokens":47},
+            "werk":{"inference_seconds":0.4,"load_seconds":0.1,"total_seconds":0.5,"model_cache_hit":true}
+        }));
+        let text = render(&t.snapshot());
+        for sample in [
+            "werk_requests_completed_total 2",
+            "werk_requests_active 0",
+            "werk_prompt_tokens_total 57",
+            "werk_output_tokens_total 20",
+            "werk_last_request_decode_tokens_per_second{model=\"generator\"} 20",
+            "werk_last_request_inference_seconds{model=\"classifier\"} 0.4",
+            "werk_last_request_load_seconds{model=\"classifier\"} 0.1",
+            "werk_last_request_worker_seconds{model=\"classifier\"} 0.5",
+            "werk_last_request_model_cache_hit{model=\"classifier\"} 1",
+            "werk_last_request_results{model=\"classifier\"} 1",
+            "werk_last_request_duration_seconds{model=\"classifier\"}",
+        ] {
+            assert!(text.contains(sample), "missing {sample}: {text}");
+        }
+        assert!(!text.contains("werk_last_request_decode_tokens_per_second{model=\"classifier\"}"));
+        assert!(!text.contains("werk_last_request_inference_seconds{model=\"generator\"}"));
+    }
     #[test]
     fn labels_are_escaped_and_missing_values_omitted() {
         let t = super::super::Telemetry::default();

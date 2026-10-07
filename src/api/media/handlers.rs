@@ -213,7 +213,11 @@ pub(in crate::api) async fn capabilities_handler(
     let service = state.inference_service.clone();
     let generation_backend = state.backend.clone();
     match tokio::task::spawn_blocking(move || {
-        service.capabilities_with_generation_backend(generation_backend.as_ref())
+        service.capabilities_with_text_policy(
+            generation_backend.as_ref(),
+            &state.text_backend,
+            &state.text_policy,
+        )
     })
     .await
     {

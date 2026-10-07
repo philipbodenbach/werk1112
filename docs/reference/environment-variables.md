@@ -10,6 +10,13 @@ See [Backends, routing and platform support](../backends.md) for supported
 runtime combinations and [Models, manifests and the store](../concepts/models-manifests-and-store.md)
 for the managed directory layout.
 
+## Console presentation
+
+| Variable | Meaning |
+| --- | --- |
+| `NO_COLOR` | When set, disable colors in the banner, console panels, progress indicators, help and `top`; retain readable structure. |
+| `TERM` | `dumb` disables interactive console decoration. Redirected output and machine-readable JSON/JSONL stay plain regardless of terminal colors. |
+
 ## Core, serving and storage
 
 `WERK_DEPLOYMENTS` selects a server-owned deployment JSON file for `serve` (same

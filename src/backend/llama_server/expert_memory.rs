@@ -340,7 +340,7 @@ mod observability_tests {
             inventory_cpu_experts(Path::new(&model), CpuMoePlacement::FirstLayers(38)).unwrap();
         let resident = resident_bytes(&plan).unwrap();
         assert!(resident <= plan.total_bytes);
-        eprintln!(
+        crate::ui_eprintln!(
             "CPU experts: {:.3} GiB resident / {:.3} GiB weights; {:.3}s",
             resident as f64 / 1073741824.,
             plan.total_bytes as f64 / 1073741824.,

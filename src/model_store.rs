@@ -2705,7 +2705,8 @@ fn first_relative_by_extension(model_dir: &Path, files: &[PathBuf], ext: &str) -
 fn first_relative_by_name(model_dir: &Path, files: &[PathBuf], name: &str) -> Option<String> {
     files
         .iter()
-        .find(|path| path.file_name().and_then(OsStr::to_str) == Some(name))
+        .filter(|path| path.file_name().and_then(OsStr::to_str) == Some(name))
+        .min_by_key(|path| path.components().count())
         .and_then(|path| relative_string(model_dir, path))
 }
 
@@ -2963,6 +2964,44 @@ fn refresh_manifest_metadata(
     manifest.metadata.compatible_runtimes = compatible_runtimes_for_manifest(manifest);
 }
 
+fn analysis_model_task(config: Option<&Value>) -> Option<(&'static str, InferenceTask)> {
+    let config = config?;
+    let architecture = config.get("model_type")?.as_str()?;
+    match architecture {
+        "xlm-roberta"
+            if config
+                .get("architectures")
+                .and_then(Value::as_array)
+                .is_some_and(|names| {
+                    names
+                        .iter()
+                        .any(|name| name.as_str() == Some("XLMRobertaForSequenceClassification"))
+                }) =>
+        {
+            let labels = config
+                .get("num_labels")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    config
+                        .get("id2label")
+                        .and_then(Value::as_object)
+                        .map(|labels| labels.len() as u64)
+                });
+            Some((
+                "xlm-roberta",
+                if labels == Some(1) {
+                    InferenceTask::TextReranking
+                } else {
+                    InferenceTask::TextClassification
+                },
+            ))
+        }
+        "laya" => Some(("laya", InferenceTask::TextClassification)),
+        "embedding_gemma2" => Some(("embedding_gemma2", InferenceTask::TextEmbedding)),
+        _ => None,
+    }
+}
+
 fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
     manifest.metadata.schema_version = CURRENT_MANIFEST_SCHEMA_VERSION;
 
@@ -2970,6 +3009,29 @@ fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
         .and_then(|path| read_repository_json(model_dir, manifest, &path));
     let root_config = find_root_repository_file(manifest, "config.json")
         .and_then(|path| read_repository_json(model_dir, manifest, &path));
+    if let Some((architecture, task)) = analysis_model_task(root_config.as_ref()) {
+        // Authoritative config repairs stale catalog entries on every read, too.
+        manifest.config_path = find_root_repository_file(manifest, "config.json");
+        manifest.architecture = Some(architecture.to_string());
+        manifest.metadata.family = Some(architecture.to_string());
+        manifest.metadata.tasks = vec![task];
+        manifest.metadata.input_modalities = vec![InputModality::Text];
+        manifest.metadata.output_modalities = vec![task.output_modality()];
+        manifest.metadata.compatible_runtimes = vec!["transformers-pooling".into()];
+        if architecture == "xlm-roberta" {
+            manifest
+                .metadata
+                .compatible_runtimes
+                .push("candle-pooling".into());
+        }
+        if task != InferenceTask::TextClassification {
+            manifest
+                .metadata
+                .compatible_runtimes
+                .push("vllm-pooling".into());
+        }
+        manifest.backend = "text-analysis".into();
+    }
     let layout = detect_repository_layout(manifest);
 
     if manifest.metadata.repository_layout == RepositoryLayout::Custom {
@@ -3804,6 +3866,9 @@ fn infer_inference_tasks(
     model_index: Option<&Value>,
     root_config: Option<&Value>,
 ) -> Vec<InferenceTask> {
+    if let Some((_, task)) = analysis_model_task(root_config) {
+        return vec![task];
+    }
     if let Some(tasks) = native_flash_tasks(root_config) {
         return tasks;
     }
@@ -4289,7 +4354,9 @@ fn modalities_for_tasks(tasks: &[InferenceTask]) -> (Vec<InputModality>, Vec<Out
     let mut outputs = Vec::new();
     for task in tasks {
         match task {
-            InferenceTask::TextGeneration => {
+            InferenceTask::TextGeneration
+            | InferenceTask::TextReranking
+            | InferenceTask::TextClassification => {
                 push_unique(&mut inputs, InputModality::Text);
                 push_unique(&mut outputs, OutputModality::Text);
             }
@@ -4577,6 +4644,16 @@ fn copy_known_json_fields(
 }
 
 fn compatible_runtimes_for_manifest(manifest: &ModelManifest) -> Vec<String> {
+    if crate::backend::text_analysis::task_for(manifest).is_some() {
+        let mut runtimes = vec!["transformers-pooling".to_string()];
+        if manifest.architecture.as_deref() == Some("xlm-roberta") {
+            runtimes.push("candle-pooling".into());
+        }
+        if !manifest.supports_task(InferenceTask::TextClassification) {
+            runtimes.push("vllm-pooling".to_string());
+        }
+        return runtimes;
+    }
     let has_media_task = manifest.metadata.tasks.iter().copied().any(is_media_task);
     let mut compatible = if has_media_task
         && manifest
@@ -4677,6 +4754,8 @@ fn is_media_task(task: InferenceTask) -> bool {
         task,
         InferenceTask::TextGeneration
             | InferenceTask::TextEmbedding
+            | InferenceTask::TextReranking
+            | InferenceTask::TextClassification
             | InferenceTask::ImageUnderstanding
     )
 }
@@ -5633,6 +5712,71 @@ mod tests {
         assert!(persisted.get("schema_version").is_none());
 
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn text_analysis_architectures_are_detected_and_stale_manifests_repaired() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ModelStore::resolve(Some(root.path().join("store"))).unwrap();
+        let configs = [
+            (
+                serde_json::json!({"model_type":"xlm-roberta", "architectures":["XLMRobertaForSequenceClassification"], "id2label":{"0":"relevant"}}),
+                InferenceTask::TextReranking,
+            ),
+            (
+                serde_json::json!({"model_type":"xlm-roberta", "architectures":["XLMRobertaForSequenceClassification"], "id2label":{"0":"a","1":"b"}}),
+                InferenceTask::TextClassification,
+            ),
+            (
+                serde_json::json!({"model_type":"laya", "architectures":["LayaTypedDecisions"]}),
+                InferenceTask::TextClassification,
+            ),
+            (
+                serde_json::json!({"model_type":"embedding_gemma2", "architectures":["EmbeddingGemma2Model"], "vision_config":{}, "audio_config":{}}),
+                InferenceTask::TextEmbedding,
+            ),
+        ];
+        for (i, (config, task)) in configs.iter().enumerate() {
+            let source = root.path().join(format!("source-{i}"));
+            fs::create_dir_all(source.join("1_Pooling")).unwrap();
+            fs::write(
+                source.join("config.json"),
+                serde_json::to_vec(config).unwrap(),
+            )
+            .unwrap();
+            fs::write(source.join("1_Pooling/config.json"), b"{}").unwrap();
+            fs::write(source.join("model.safetensors"), b"fixture").unwrap();
+            let id = format!("unrelated-org/custom-finetune-{i}");
+            let mut manifest = store.import_path(&source, &id).unwrap();
+            assert_eq!(manifest.config_path.as_deref(), Some("files/config.json"));
+            assert_eq!(manifest.metadata.tasks, vec![*task]);
+            assert_eq!(manifest.backend, "text-analysis");
+            assert!(
+                !manifest
+                    .metadata
+                    .compatible_runtimes
+                    .iter()
+                    .any(|name| name == "candle-cuda" || name == "candle-cpu")
+            );
+            manifest.architecture = None;
+            manifest.metadata.tasks = vec![
+                InferenceTask::TextGeneration,
+                InferenceTask::ImageUnderstanding,
+            ];
+            manifest.metadata.family = Some("mistral".into());
+            manifest.config_path = Some("files/1_Pooling/config.json".into());
+            manifest.metadata.compatible_runtimes = vec!["candle-cuda".into()];
+            write_json_pretty(&store.model_dir(&id).join(MANIFEST_FILE), &manifest).unwrap();
+            let migrated = store.get(&id).unwrap();
+            assert_eq!(migrated.metadata.tasks, vec![*task]);
+            assert_eq!(migrated.config_path.as_deref(), Some("files/config.json"));
+            assert_eq!(
+                migrated.architecture.as_deref(),
+                config["model_type"].as_str()
+            );
+            assert_ne!(migrated.metadata.family.as_deref(), Some("mistral"));
+        }
+        assert!(analysis_model_task(Some(&serde_json::json!({"model_type":"xlm-roberta", "architectures":["XLMRobertaModel"]}))).is_none());
     }
 
     #[test]

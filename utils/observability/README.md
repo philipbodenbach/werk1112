@@ -33,6 +33,22 @@ client does not add endpoints to an already-running older server. Restart that
 server only when its existing work is finished. Neither dashboard launch nor
 monitoring starts, stops, unloads or reconfigures inference workers.
 
+Press `v` for the view/field picker: arrows select a field, Space toggles it, Enter
+applies a custom view, and Escape cancels edits. `R` restores the automatic
+task-appropriate layout. The picker starts with fields appropriate to the
+selected request and previews their current values. Unavailable fields show
+`n/a`. Use PageUp/PageDown to scroll a long custom view; arrows still select
+requests. Choices apply only to the current `top` session and do not change
+server collection, Prometheus exports or settings on disk.
+
+Custom fields appear as movable cards. `e` toggles placement mode: Tab/Shift-Tab
+select a card and arrows swap it with its neighbour. Enter/Escape finish placement.
+`c` cycles 1–3 columns, `r` switches row/column fill order, `s` cycles the request
+list between bottom/right/hidden, and `o` reverses field order. Narrow terminals
+automatically reduce columns and move a right split below the cards. Placement
+keeps the selected card visible; outside placement PageUp/PageDown scrolls cards.
+These keys are local view controls and never change inference settings.
+
 * `GET /werk/v1/observability`: Werk Protocol 1.0 envelope, schema version 1;
   requires the usual `x-werk-protocol-version: 1.0` and authentication.
 * `GET /metrics`: Prometheus text exposition 0.0.4; same API-key authentication,
@@ -57,9 +73,24 @@ already-running workers; unsupported values remain absent, not fabricated zeroes
   and extended responses, streaming, tool calls, backend errors and stream cancellation.
   These count generation attempts after request validation, not every HTTP call.
   Token totals come from final backend usage, **not from counting SSE chunks**.
+* Embedding, reranking and classification routes (including `/rerank` and
+  `/v1/systemone`) use the same request records, counters and durations.
+  The optional `requests[].analysis` fields describe task, runtime, device,
+  precision, model weight cache, load/inference/worker duration, result count
+  and runtime attempts. Existing schema-1 fields remain compatible. Generation
+  fields that do not apply remain null; no decode rate or output-token count
+  is invented for a classifier. Input token counts come from backend usage.
+  `top` adapts its panels to the selected request, including while it is active;
+  `serve --verbose` prints phase updates and a completion statistics panel.
+  Workers report load and inference durations after completion, so the live
+  phase is honestly labelled `loading / inference`. Request duration also
+  includes lock waiting, runtime probing and process startup. Synchronous
+  analysis keeps running after an HTTP disconnect and remains active until the
+  worker finishes. Invalid inputs rejected before admission and capacity
+  rejections do not count as inference attempts.
 * These common request/timing metrics work across text backends, including
   llama.cpp/CUDA and vLLM. Standalone `werk run`, media jobs and explicit Werk
-  prefill/decode routes are not included in these chat counters yet.
+  prefill/decode routes are not included in these inference counters yet.
 * Native **llama.cpp** workers (CUDA, Vulkan, Metal, ROCm and CPU) expose live
   decoded tokens, active slots, context occupancy and cached prompt tokens via
   `/slots`. Werk enables that endpoint on supported workers, including without
@@ -124,6 +155,16 @@ errors/cancellations, expert and n-gram caches, offload reads, host memory, budg
 reductions, prefix-reuse totals and sample freshness. Empty panels mean the
 selected backend does not supply that metric or no interval has been observed.
 An idle backend must not look like a guaranteed 100% hit rate.
+
+Text-analysis panels add `werk_last_request_load_seconds`,
+`werk_last_request_inference_seconds`, `werk_last_request_worker_seconds`,
+`werk_last_request_model_cache_hit` and `werk_last_request_results`. They keep
+the existing `{model="..."}` label convention. Existing metric names, label
+sets, dashboard panel IDs and queries remain unchanged; request totals now
+also include text analysis. Missing measurements produce no sample. These
+last-request gauges use the bounded recent history, not a histogram of every
+request. Import the updated dashboard to see the additional panels; the scrape
+path, authentication and Prometheus configuration do not change.
 
 ## Development and release toolchain
 

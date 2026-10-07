@@ -178,7 +178,7 @@ async fn complete_chat_response(
     match result {
         Ok(response) => {
             if verbose {
-                eprintln!(
+                crate::ui_eprintln!(
                     "[werk serve] complete model={} finish={} prompt_tokens={} completion_tokens={} total={} load={} eval_rate={}",
                     model,
                     response.finish_reason,
@@ -202,7 +202,7 @@ async fn complete_chat_response(
             Json(body).into_response()
         }
         Err(err) => {
-            eprintln!("[werk serve] complete model={model} -> error: {err}");
+            crate::ui_eprintln!("[werk serve] complete model={model} -> error: {err}");
             api_error(StatusCode::BAD_REQUEST, err.to_string(), None)
         }
     }
@@ -298,7 +298,7 @@ async fn stream_chat_response(
                         *body_usage.lock().expect("stream usage mutex poisoned") = Some(usage);
                     }
                     if verbose {
-                        eprintln!(
+                        crate::ui_eprintln!(
                             "[werk serve] stream model={} finish={} prompt_tokens={} completion_tokens={} total={} load={} eval_rate={}",
                             body_model_for_log,
                             finish_reason,
@@ -325,7 +325,7 @@ async fn stream_chat_response(
                     })
                 }
                 Err(message) => {
-                    eprintln!("[werk serve] stream model={} -> error: {message}", body_model_for_log);
+                    crate::ui_eprintln!("[werk serve] stream model={} -> error: {message}", body_model_for_log);
                     json!({
                         "error": {
                             "message": message,
@@ -388,7 +388,7 @@ fn log_generation_phases(prompt_tokens: usize, timings: crate::backend::Generati
     let Some(cached) = timings.cached_prompt_tokens.filter(|n| *n <= prompt_tokens) else {
         return;
     };
-    eprintln!(
+    crate::ui_eprintln!(
         "[werk serve] phases {}",
         json!({
             "first_token_seconds": timings.first_token_seconds,
@@ -402,7 +402,7 @@ fn log_generation_phases(prompt_tokens: usize, timings: crate::backend::Generati
 
 fn log_backend_diagnostics(diagnostics: &[String]) {
     for diagnostic in diagnostics {
-        eprintln!("[werk serve]   {diagnostic}");
+        crate::ui_eprintln!("[werk serve]   {diagnostic}");
     }
 }
 

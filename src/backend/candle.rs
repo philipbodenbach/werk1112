@@ -58,7 +58,7 @@ impl CandleBackend {
 
     pub fn new_with_device(store: ModelStore, device_mode: CandleDeviceMode) -> Result<Self> {
         let device = select_device(device_mode)?;
-        eprintln!("Using {} backend", candle_backend_name(&device));
+        crate::ui_eprintln!("Using {} backend", candle_backend_name(&device));
         Ok(Self {
             store,
             device,
@@ -81,7 +81,7 @@ impl CandleBackend {
             cache_key,
             |_| true,
             || {
-                eprintln!(
+                crate::ui_eprintln!(
                     "Loading model '{}' ({:?}, architecture: {})",
                     manifest.id,
                     manifest.format,
@@ -96,7 +96,7 @@ impl CandleBackend {
                 let tokenizer = load_tokenizer(&self.store, manifest)?;
                 let model = load_candle_model(&self.store, manifest, &self.device)?;
                 let load_seconds = started.elapsed().as_secs_f64();
-                eprintln!("Loaded model '{}' in {:.2}s", manifest.id, load_seconds);
+                crate::ui_eprintln!("Loaded model '{}' in {:.2}s", manifest.id, load_seconds);
 
                 let cached = Mutex::new(CachedModel {
                     tokenizer,
@@ -494,7 +494,7 @@ struct DecodeLoopProfile {
 
 impl DecodeLoopProfile {
     fn print(&self, tokens: usize) {
-        eprintln!(
+        crate::ui_eprintln!(
             "Candle decode profile\n\
              \n\
              tokens: {tokens}\n\
@@ -1084,7 +1084,7 @@ fn load_safetensors_model(
     }
 
     let dtype = safetensors_load_dtype(&config_path, device)?;
-    eprintln!("Loading safetensors weights as {dtype:?}");
+    crate::ui_eprintln!("Loading safetensors weights as {dtype:?}");
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, dtype, device)? };
 
     match architecture {

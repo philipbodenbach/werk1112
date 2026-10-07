@@ -206,7 +206,7 @@ impl JobManager {
     pub fn new(service: InferenceService) -> Self {
         let store = JobStore::new(service.store().home());
         if let Err(error) = store.recover_interrupted() {
-            eprintln!("warning: failed to recover persisted media jobs: {error:#}");
+            crate::ui_eprintln!("warning: failed to recover persisted media jobs: {error:#}");
         }
         Self { service, store }
     }

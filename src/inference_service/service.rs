@@ -469,12 +469,12 @@ impl InferenceService {
             Err(_) => note,
         };
         if let Some(note) = note {
-            eprintln!("{note}");
+            crate::ui_eprintln!("{note}");
         }
     }
 
     pub fn capabilities(&self) -> Result<Value> {
-        self.capabilities_with_optional_generation_backend(None)
+        self.capabilities_with_optional_generation_backend(None, None)
     }
 
     /// Returns media capabilities enriched with readiness from the chat
@@ -485,18 +485,52 @@ impl InferenceService {
         &self,
         generation_backend: &dyn GenerationBackend,
     ) -> Result<Value> {
-        self.capabilities_with_optional_generation_backend(Some(generation_backend))
+        self.capabilities_with_optional_generation_backend(Some(generation_backend), None)
+    }
+
+    pub fn capabilities_with_text_policy(
+        &self,
+        generation_backend: &dyn GenerationBackend,
+        text_backend: &crate::backend::text_analysis::TextAnalysisBackend,
+        policy: &crate::backend::text_analysis::Policy,
+    ) -> Result<Value> {
+        self.capabilities_with_optional_generation_backend(
+            Some(generation_backend),
+            Some((text_backend, policy)),
+        )
     }
 
     fn capabilities_with_optional_generation_backend(
         &self,
         generation_backend: Option<&dyn GenerationBackend>,
+        text: Option<(
+            &crate::backend::text_analysis::TextAnalysisBackend,
+            &crate::backend::text_analysis::Policy,
+        )>,
     ) -> Result<Value> {
+        let text_backend =
+            crate::backend::text_analysis::TextAnalysisBackend::new(self.store.clone());
+        let default_policy = crate::backend::text_analysis::Policy::default();
+        let (text_backend, text_policy) = text.unwrap_or((&text_backend, &default_policy));
         let models = self
             .store
             .list()?
             .into_iter()
             .map(|manifest| {
+                if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
+                    let report = text_policy.apply(Default::default()).and_then(|options| text_backend.diagnostics(&manifest, &options))
+                        .unwrap_or_else(|error| json!({"ready":false,"detail":sanitize_capability_detail(&format!("{error:#}"))}));
+                    let ready = report["ready"].as_bool() == Some(true);
+                    let task_key = serde_json::to_value(task).unwrap().as_str().unwrap().to_string();
+                    return json!({
+                        "id":manifest.id,"family":manifest.metadata.family,"layout":manifest.metadata.repository_layout,
+                        "tasks":[task],"available_tasks":if ready {vec![task]} else {vec![]},
+                        "input_modalities":manifest.metadata.input_modalities,"output_modalities":manifest.metadata.output_modalities,
+                        "endpoint":crate::backend::text_analysis::endpoint(task),
+                        "task_statuses":{task_key: {"status": if ready {"available"} else {"installable"},
+                            "detail":report["detail"],"adapter":"text-analysis", "install_command":"werk backend install text-analysis"}}
+                    });
+                }
                 let task_probes = manifest
                     .metadata
                     .tasks

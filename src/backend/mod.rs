@@ -10,6 +10,8 @@ mod omlx;
 mod onnxruntime;
 mod openai_transport;
 pub(crate) mod runtime_cache;
+pub mod text_analysis;
+mod text_analysis_candle;
 pub(crate) use openai_transport::ApiOptionError;
 mod qwen_tts;
 pub(crate) mod tool_calling;
@@ -66,6 +68,7 @@ pub const BACKEND_INSTALL_TARGETS: &[&str] = &[
     "onnx-cpu",
     "vllm",
     "qwen-tts",
+    "text-analysis",
 ];
 
 pub fn validated_backend_install_command(command: &str) -> Option<String> {
@@ -136,6 +139,9 @@ pub enum RuntimeId {
     CandleMetal,
     CandleCpu,
     TransformersCompat,
+    TransformersPooling,
+    VllmPooling,
+    CandlePooling,
     Mlx,
     MlxVlm,
     Omlx,
@@ -219,10 +225,11 @@ pub struct RuntimeDescriptor {
 impl RuntimeDescriptor {
     /// Native structured transport, independent of a model's ability to choose tools.
     pub fn supports_native_tool_calling(&self) -> bool {
-        matches!(
-            self.runtime,
-            BackendRuntime::LlamaServer | BackendRuntime::Vllm | BackendRuntime::Omlx
-        )
+        self.capabilities.text_generation
+            && matches!(
+                self.runtime,
+                BackendRuntime::LlamaServer | BackendRuntime::Vllm | BackendRuntime::Omlx
+            )
     }
 
     /// Chat and vision adapters expose native or generic structured tool calls.
@@ -755,6 +762,89 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         install_target: None,
     },
     RuntimeDescriptor {
+        id: RuntimeId::TransformersPooling,
+        runtime: BackendRuntime::TransformersCompat,
+        display_name: "Transformers pooling / decisions",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: &["xlm-roberta", "embedding_gemma2", "laya"],
+        supported_tasks: &[
+            InferenceTask::TextEmbedding,
+            InferenceTask::TextReranking,
+            InferenceTask::TextClassification,
+        ],
+        supported_layouts: TRANSFORMERS_LAYOUTS,
+        accelerators: &[BackendAccelerator::Cuda, BackendAccelerator::Cpu],
+        parameter_support: &[],
+        capabilities: RuntimeCapabilities {
+            text_generation: false,
+            vision_language: false,
+            embeddings: true,
+            streaming: false,
+        },
+        supports_offloading: false,
+        supports_quantization: false,
+        supports_compile: false,
+        supports_batching: true,
+        priority: 840,
+        implemented: true,
+        install_target: Some("text-analysis"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::CandlePooling,
+        runtime: BackendRuntime::Candle,
+        display_name: "Candle sequence classification",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: &["xlm-roberta"],
+        supported_tasks: &[
+            InferenceTask::TextReranking,
+            InferenceTask::TextClassification,
+        ],
+        supported_layouts: TRANSFORMERS_LAYOUTS,
+        accelerators: if cfg!(feature = "candle-cuda") {
+            &[BackendAccelerator::Cuda, BackendAccelerator::Cpu]
+        } else {
+            &[BackendAccelerator::Cpu]
+        },
+        parameter_support: &[],
+        capabilities: RuntimeCapabilities {
+            text_generation: false,
+            vision_language: false,
+            embeddings: false,
+            streaming: false,
+        },
+        supports_offloading: false,
+        supports_quantization: false,
+        supports_compile: false,
+        supports_batching: true,
+        priority: 500,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::VllmPooling,
+        runtime: BackendRuntime::Vllm,
+        display_name: "vLLM pooling",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: &["xlm-roberta", "embedding_gemma2"],
+        supported_tasks: &[InferenceTask::TextEmbedding, InferenceTask::TextReranking],
+        supported_layouts: TRANSFORMERS_LAYOUTS,
+        accelerators: &[BackendAccelerator::Cuda],
+        parameter_support: &[],
+        capabilities: RuntimeCapabilities {
+            text_generation: false,
+            vision_language: false,
+            embeddings: true,
+            streaming: false,
+        },
+        supports_offloading: false,
+        supports_quantization: false,
+        supports_compile: true,
+        supports_batching: true,
+        priority: 950,
+        implemented: true,
+        install_target: Some("vllm"),
+    },
+    RuntimeDescriptor {
         id: RuntimeId::VllmCuda,
         runtime: BackendRuntime::Vllm,
         display_name: "vLLM CUDA",
@@ -967,10 +1057,14 @@ pub fn runtime_static_model_support(
         // Each backend probes its captured Python/module/launcher environment.
         return StaticModelSupport::RequiresProbe;
     }
-    let architectures = match (descriptor.runtime, format) {
-        (BackendRuntime::Candle, ModelFormat::Gguf) => CANDLE_GGUF_ARCHES,
-        (BackendRuntime::Candle, ModelFormat::SafeTensors) => CANDLE_SAFETENSORS_ARCHES,
-        _ => descriptor.supported_architectures,
+    let architectures = if descriptor.id == RuntimeId::CandlePooling {
+        descriptor.supported_architectures
+    } else {
+        match (descriptor.runtime, format) {
+            (BackendRuntime::Candle, ModelFormat::Gguf) => CANDLE_GGUF_ARCHES,
+            (BackendRuntime::Candle, ModelFormat::SafeTensors) => CANDLE_SAFETENSORS_ARCHES,
+            _ => descriptor.supported_architectures,
+        }
     };
     if architectures.is_empty() {
         return StaticModelSupport::Supported;

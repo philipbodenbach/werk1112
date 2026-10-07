@@ -272,7 +272,7 @@ fn log_completion(
     timings: crate::backend::GenerationTimings,
     diagnostics: &[String],
 ) {
-    eprintln!(
+    crate::ui_eprintln!(
         "[werk serve] anthropic {}",
         serde_json::json!({"model":model,"finish_reason":finish_reason,
         "prompt_tokens":prompt_tokens,"completion_tokens":completion_tokens,"timings":timings,

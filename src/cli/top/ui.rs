@@ -12,11 +12,14 @@ const BG: Color = Color::Rgb(9, 13, 23);
 const PANEL: Color = Color::Rgb(15, 21, 35);
 const TEXT: Color = Color::Rgb(224, 230, 248);
 const MUTED: Color = Color::Rgb(129, 143, 174);
-const CYAN: Color = Color::Rgb(0, 220, 255);
-const BLUE: Color = Color::Rgb(59, 130, 246);
-const INDIGO: Color = Color::Rgb(99, 102, 241);
-const VIOLET: Color = Color::Rgb(139, 92, 246);
-const PINK: Color = Color::Rgb(255, 79, 195);
+const fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
+const CYAN: Color = rgb(crate::terminal::CYAN);
+const BLUE: Color = rgb(crate::terminal::BLUE);
+const INDIGO: Color = rgb(crate::terminal::INDIGO);
+const VIOLET: Color = rgb(crate::terminal::VIOLET);
+const PINK: Color = rgb(crate::terminal::PINK);
 const BRAND: [Color; 5] = [CYAN, BLUE, INDIGO, VIOLET, PINK];
 
 fn panel(title: &str, color: Color) -> Block<'static> {
@@ -46,7 +49,13 @@ fn live_panel(title: &str, color: Color, app: &App) -> Block<'static> {
 fn number(value: Option<f64>, unit: &str) -> String {
     value
         .filter(|v| v.is_finite())
-        .map(|v| format!("{v:.1} {unit}"))
+        .map(|v| {
+            if unit == "s" || unit.starts_with("s ") {
+                format!("{v:.2} {unit}")
+            } else {
+                format!("{v:.1} {unit}")
+            }
+        })
         .unwrap_or_else(|| "n/a".into())
 }
 fn tokens(v: Option<u64>) -> String {
@@ -69,12 +78,158 @@ fn llama(app: &App) -> bool {
         .is_some_and(|b| b.backend.starts_with("llama.cpp"))
 }
 
+fn analysis_request(app: &App) -> Option<&crate::observability::RequestSnapshot> {
+    app.snapshot
+        .as_ref()?
+        .requests
+        .get(app.selected)
+        .filter(|r| r.analysis.is_some())
+}
+
+fn task_label(task: &str) -> &str {
+    match task {
+        "text-classification" => "classify",
+        "text-reranking" => "rerank",
+        "text-embedding" => "embed",
+        other => other,
+    }
+}
+
+fn analysis_card(frame: &mut Frame, area: Rect, app: &App, kind: usize) {
+    let Some(request) = analysis_request(app) else {
+        return;
+    };
+    let analysis = request.analysis.as_ref().unwrap();
+    let cache = match analysis.model_cache_hit {
+        Some(true) => "hit",
+        Some(false) => "miss",
+        None => "pending",
+    };
+    let (title, tint, text) = match kind {
+        0 => (
+            "TEXT ANALYSIS",
+            CYAN,
+            format!(
+                "Task       {}\nState      {}\nRuntime    {}\nDevice     {}\nPrecision  {}\nAttempts   {}",
+                clean(&analysis.task),
+                clean(&request.state),
+                clean(analysis.runtime.as_deref().unwrap_or("pending")),
+                clean(analysis.device.as_deref().unwrap_or("pending")),
+                clean(analysis.dtype.as_deref().unwrap_or("pending")),
+                analysis.attempts
+            ),
+        ),
+        1 => (
+            "TIMINGS",
+            VIOLET,
+            format!(
+                "Request    {}\nWorker     {}\nLoad       {}\nInference  {}\n\nRequest includes waiting and runtime startup.",
+                number(Some(request.elapsed_seconds), "s"),
+                number(analysis.worker_seconds, "s"),
+                number(analysis.load_seconds, "s"),
+                number(analysis.inference_seconds, "s")
+            ),
+        ),
+        2 => (
+            "RESULTS",
+            BLUE,
+            format!(
+                "Input tokens  {}\nResults       {}\n\n{}\nNo generated text tokens.",
+                tokens(request.prompt_tokens),
+                tokens(analysis.results),
+                match analysis.task.as_str() {
+                    "text-classification" => "Results = decisions / classified texts.",
+                    "text-reranking" => "Results = returned ranked documents.",
+                    _ => "Results = embedding vectors.",
+                }
+            ),
+        ),
+        _ => (
+            "MODEL CACHE / HOST",
+            PINK,
+            format!(
+                "Model weights  {cache}\nHost free      {}\nHost swap      {}\n\nWeight reuse, not prompt-token caching.",
+                number(
+                    app.snapshot
+                        .as_ref()
+                        .and_then(|s| s.host_memory_free_bytes)
+                        .map(|b| b as f64 / 1073741824.),
+                    "GiB"
+                ),
+                number(
+                    app.snapshot
+                        .as_ref()
+                        .and_then(|s| s.host_swap_used_bytes)
+                        .map(|b| b as f64 / 1073741824.),
+                    "GiB"
+                )
+            ),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .block(panel(title, tint)),
+        area,
+    );
+}
+
+fn analysis_panels(frame: &mut Frame, body: Rect, app: &App) {
+    if body.height < 14 {
+        let rows = Layout::vertical([Constraint::Length(5), Constraint::Min(2)]).split(body);
+        let request = analysis_request(app).unwrap();
+        let analysis = request.analysis.as_ref().unwrap();
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} · {} · {}\nRuntime {} / {}\nInput {} · Results {} · Total {}",
+                task_label(&analysis.task),
+                clean(&request.state),
+                number(analysis.inference_seconds, "s inference"),
+                clean(analysis.runtime.as_deref().unwrap_or("pending")),
+                clean(analysis.device.as_deref().unwrap_or("pending")),
+                tokens(request.prompt_tokens),
+                tokens(analysis.results),
+                number(Some(request.elapsed_seconds), "s")
+            ))
+            .block(panel("TEXT ANALYSIS", CYAN)),
+            rows[0],
+        );
+        requests(frame, rows[1], app);
+    } else {
+        let height = if body.height >= 20 { 8 } else { 5 };
+        let rows = Layout::vertical([
+            Constraint::Length(height),
+            Constraint::Length(height),
+            Constraint::Min(3),
+        ])
+        .split(body);
+        for (row_index, row) in rows[..2].iter().enumerate() {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(*row);
+            for (column, area) in columns.iter().enumerate() {
+                analysis_card(frame, *area, app, row_index * 2 + column);
+            }
+        }
+        requests(frame, rows[2], app);
+    }
+}
+
 fn duration(seconds: f64) -> String {
     let s = seconds.max(0.) as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
 pub(super) fn draw(frame: &mut Frame, app: &App) {
+    draw_colored(frame, app);
+    if std::env::var_os("NO_COLOR").is_some() {
+        for cell in &mut frame.buffer_mut().content {
+            cell.set_fg(Color::Reset).set_bg(Color::Reset);
+        }
+    }
+}
+
+fn draw_colored(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(Style::default().bg(BG).fg(TEXT)),
@@ -99,7 +254,11 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
         .split(area);
     header(frame, sections[0], app);
     let body = sections[1];
-    if body.height < 14 {
+    if app.fields.applied.is_some() {
+        custom_fields(frame, body, app);
+    } else if analysis_request(app).is_some() {
+        analysis_panels(frame, body, app);
+    } else if body.height < 14 {
         let parts = Layout::vertical([Constraint::Length(4), Constraint::Min(2)]).split(body);
         let text = if llama(app) {
             format!(
@@ -187,7 +346,7 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
             ),
             Line::from(vec![
                 Span::styled(" q ", Style::default().fg(BG).bg(CYAN)),
-                Span::raw(" quit  "),
+                Span::raw(" quit  v view  e place  R auto  "),
                 Span::styled("Space", Style::default().fg(PINK)),
                 Span::raw(" pause  ↑↓ select  Tab details  b worker  a animation"),
             ]),
@@ -197,6 +356,141 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
     if app.details {
         details(frame, app);
     }
+    if app.fields.draft.is_some() {
+        field_picker(frame, app);
+    }
+}
+
+fn custom_fields(frame: &mut Frame, area: Rect, app: &App) {
+    let selection = &app.fields;
+    let (grid, request_area) = if selection.split == 2 {
+        (area, None)
+    } else if selection.split == 1 && area.width >= 80 {
+        let parts = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        (parts[0], Some(parts[1]))
+    } else {
+        let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(area);
+        (parts[0], Some(parts[1]))
+    };
+    let title = if selection.placement {
+        "CUSTOM FIELDS · PLACEMENT"
+    } else {
+        "CUSTOM FIELDS"
+    };
+    let block = panel(title, if selection.placement { PINK } else { CYAN });
+    let inner = block.inner(grid);
+    frame.render_widget(block, grid);
+    let parts = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+    let help = if selection.placement {
+        "Tab field · arrows move · Enter finish\nc columns · r rows/cols · s split · o reverse"
+    } else {
+        "v fields · e place · c columns · r rows/cols\ns split · o reverse · PgUp/Dn scroll · R auto"
+    };
+    frame.render_widget(
+        Paragraph::new(help).style(Style::default().fg(MUTED)),
+        parts[0],
+    );
+    let available = parts[1];
+    let visible = selection.visible();
+    if visible.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No fields selected. Press v to choose fields."),
+            available,
+        );
+    } else {
+        let columns = selection.effective_columns(available.width);
+        let rows = visible.len().div_ceil(columns);
+        let page_rows = (usize::from(available.height) / 3).max(1);
+        let selected = selection.selected.min(visible.len() - 1);
+        let selected_row = selection.coordinates(selected, visible.len(), columns).1;
+        let start = if selection.placement {
+            selected_row.saturating_sub(page_rows - 1)
+        } else {
+            usize::from(selection.scroll).min(rows.saturating_sub(page_rows))
+        };
+        for (slot, index) in visible.iter().enumerate() {
+            let (column, row) = selection.coordinates(slot, visible.len(), columns);
+            if row < start || row >= start + page_rows {
+                continue;
+            }
+            let left = available.width as usize * column / columns;
+            let right = available.width as usize * (column + 1) / columns;
+            let top = ((row - start) * 3) as u16;
+            let cell = Rect::new(
+                available.x + left as u16,
+                available.y + top,
+                (right - left) as u16,
+                3.min(available.height.saturating_sub(top)),
+            );
+            let selected = selection.placement && slot == selected;
+            let title = format!(
+                "{}{}",
+                if selected { "▶ " } else { "" },
+                super::fields::LABELS[*index]
+            );
+            frame.render_widget(
+                Paragraph::new(super::fields::value(app, *index))
+                    .style(Style::default().fg(if selected { CYAN } else { TEXT }))
+                    .block(panel(
+                        &title,
+                        if selected {
+                            PINK
+                        } else {
+                            BRAND[*index % BRAND.len()]
+                        },
+                    )),
+                cell,
+            );
+        }
+    }
+    if let Some(area) = request_area {
+        requests(frame, area, app);
+    }
+}
+
+fn field_picker(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(2).min(86);
+    let height = area.height.saturating_sub(2).min(29);
+    let popup = Rect::new(
+        (area.width - width) / 2,
+        (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = panel("FIELDS · this session only", PINK).style(Style::default().bg(PANEL));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(inner);
+    frame.render_widget(Paragraph::new("↑↓ select · Space toggle · Enter apply\nEsc cancel · R automatic view\nn/a = unavailable for this request").style(Style::default().fg(CYAN)), parts[0]);
+    let draft = app.fields.draft.as_ref().unwrap();
+    let rows = super::fields::LABELS
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            Row::new(vec![
+                if draft[index] {
+                    "[x]".into()
+                } else {
+                    "[ ]".into()
+                },
+                label.to_string(),
+                super::fields::value(app, index),
+            ])
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Length(23),
+            Constraint::Min(1),
+        ],
+    )
+    .row_highlight_style(Style::default().fg(CYAN).bg(Color::Rgb(32, 35, 62)).bold());
+    let mut state = TableState::default().with_selected(Some(app.fields.cursor));
+    frame.render_stateful_widget(table, parts[1], &mut state);
 }
 fn header(frame: &mut Frame, area: Rect, app: &App) {
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -237,10 +531,12 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
         .snapshot
         .as_ref()
         .and_then(|s| {
-            s.backends
-                .get(app.worker)
-                .map(|b| format!("{}  /  {}", clean(&b.model), clean(&b.backend)))
-                .or_else(|| s.requests.first().map(|r| clean(&r.model)))
+            analysis_request(app).map(|r| clean(&r.model)).or_else(|| {
+                s.backends
+                    .get(app.worker)
+                    .map(|b| format!("{}  /  {}", clean(&b.model), clean(&b.backend)))
+                    .or_else(|| s.requests.first().map(|r| clean(&r.model)))
+            })
         })
         .unwrap_or_else(|| "Inference Router · live observability".into());
     let rail = (0..area.width)
@@ -672,6 +968,7 @@ fn graph(frame: &mut Frame, area: Rect, history: &VecDeque<Option<f64>>, color: 
 }
 fn requests(frame: &mut Frame, area: Rect, app: &App) {
     let wide = area.width >= 80;
+    let analysis_mode = analysis_request(app).is_some();
     let entries = app
         .snapshot
         .as_ref()
@@ -680,24 +977,76 @@ fn requests(frame: &mut Frame, area: Rect, app: &App) {
     let rows = entries.iter().map(|r| {
         let mut cells = vec![
             r.id.to_string(),
-            clean(&r.state),
+            r.analysis
+                .as_ref()
+                .map(|a| format!("{} / {}", task_label(&a.task), clean(&r.state)))
+                .unwrap_or_else(|| clean(&r.state)),
             tokens(r.prompt_tokens),
-            tokens(r.output_tokens),
-            duration(r.elapsed_seconds),
+            if analysis_mode {
+                r.analysis
+                    .as_ref()
+                    .map(|a| tokens(a.results))
+                    .unwrap_or_else(|| format!("{} tok", tokens(r.output_tokens)))
+            } else {
+                tokens(r.output_tokens)
+            },
+            number(Some(r.elapsed_seconds), "s"),
         ];
         if wide {
-            cells.insert(3, tokens(r.cached_tokens));
-            cells.push(number(r.decode_tokens_per_second, "tok/s"));
+            cells.insert(
+                3,
+                if analysis_mode {
+                    r.analysis
+                        .as_ref()
+                        .map(|a| {
+                            match a.model_cache_hit {
+                                Some(true) => "model hit",
+                                Some(false) => "model miss",
+                                None => "pending",
+                            }
+                            .into()
+                        })
+                        .unwrap_or_else(|| format!("{} tok", tokens(r.cached_tokens)))
+                } else {
+                    tokens(r.cached_tokens)
+                },
+            );
+            cells.push(if analysis_mode {
+                r.analysis
+                    .as_ref()
+                    .and_then(|a| a.runtime.as_deref())
+                    .map(clean)
+                    .unwrap_or_else(|| number(r.decode_tokens_per_second, "tok/s"))
+            } else {
+                number(r.decode_tokens_per_second, "tok/s")
+            });
         }
         Row::new(cells).style(Style::default().fg(if r.state == "error" {
             PINK
-        } else if r.state == "streaming" {
+        } else if r.state == "streaming"
+            || matches!(
+                r.state.as_str(),
+                "preparing" | "waiting for model" | "resolving runtime" | "loading / inference"
+            )
+        {
             CYAN
         } else {
             TEXT
         }))
     });
-    let headers = if wide {
+    let headers = if analysis_mode && wide {
+        vec![
+            "#",
+            "Task / state",
+            "Input",
+            "Cache",
+            "Results",
+            "Elapsed",
+            "Runtime / rate",
+        ]
+    } else if analysis_mode {
+        vec!["#", "Task / state", "Input", "Results", "Elapsed"]
+    } else if wide {
         vec![
             "#", "State", "Prompt", "Cached", "Output", "Elapsed", "Decode",
         ]
@@ -742,7 +1091,14 @@ fn requests(frame: &mut Frame, area: Rect, app: &App) {
 fn details(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let width = area.width.saturating_sub(4).min(76);
-    let height = area.height.saturating_sub(4).min(15);
+    let height = area
+        .height
+        .saturating_sub(4)
+        .min(if analysis_request(app).is_some() {
+            20
+        } else {
+            15
+        });
     let popup = Rect::new(
         (area.width - width) / 2,
         (area.height - height) / 2,
@@ -753,7 +1109,15 @@ fn details(frame: &mut Frame, app: &App) {
         .snapshot
         .as_ref()
         .and_then(|s| s.requests.get(app.selected));
-    let text=selected.map(|r|format!("Model     {}\nState     {}\nPrompt    {} tokens\nCached    {} tokens\nOutput    {} tokens\nElapsed   {}\nFirst output {}\nDecode    {}\nPrefill   {}\n\nTab / Enter closes details",clean(&r.model),r.state,tokens(r.prompt_tokens),tokens(r.cached_tokens),tokens(r.output_tokens),duration(r.elapsed_seconds),number(r.first_output_seconds,"s"),number(r.decode_tokens_per_second,"tok/s"),number(r.prefill_tokens_per_second,"tok/s"))).unwrap_or_else(||"No request selected\n\nTab closes details".into());
+    let text=selected.map(|r| {
+        if let Some(a) = &r.analysis {
+            return format!("Model      {}\nTask       {}\nState      {}\nRuntime    {}\nDevice     {}\nPrecision  {}\nInput      {} tokens\nResults    {}\nModel cache {}\nAttempts   {}\nRequest    {}\nWorker     {}\nLoad       {}\nInference  {}\n\nTab / Enter closes details",
+                clean(&r.model), clean(&a.task), clean(&r.state), clean(a.runtime.as_deref().unwrap_or("pending")), clean(a.device.as_deref().unwrap_or("pending")), clean(a.dtype.as_deref().unwrap_or("pending")),
+                tokens(r.prompt_tokens), tokens(a.results), match a.model_cache_hit { Some(true) => "hit", Some(false) => "miss", None => "pending" }, a.attempts,
+                number(Some(r.elapsed_seconds),"s"), number(a.worker_seconds,"s"), number(a.load_seconds,"s"), number(a.inference_seconds,"s"));
+        }
+        format!("Model     {}\nState     {}\nPrompt    {} tokens\nCached    {} tokens\nOutput    {} tokens\nElapsed   {}\nFirst output {}\nDecode    {}\nPrefill   {}\n\nTab / Enter closes details",clean(&r.model),r.state,tokens(r.prompt_tokens),tokens(r.cached_tokens),tokens(r.output_tokens),number(Some(r.elapsed_seconds),"s"),number(r.first_output_seconds,"s"),number(r.decode_tokens_per_second,"tok/s"),number(r.prefill_tokens_per_second,"tok/s"))
+    }).unwrap_or_else(||"No request selected\n\nTab closes details".into());
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(text)
@@ -767,6 +1131,114 @@ fn details(frame: &mut Frame, app: &App) {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn observability_analysis_panels_follow_selected_request_and_resize() {
+        let args = super::super::TopArgs {
+            url: "http://localhost:11434".into(),
+            api_key: None,
+            interval_ms: 2000,
+            once: false,
+            json: false,
+            no_animation: true,
+            demo: false,
+        };
+        for task in ["text-classification", "text-reranking", "text-embedding"] {
+            let mut app = App::new(&args);
+            let mut snapshot = super::super::demo(3.);
+            snapshot.requests[0].analysis = Some(crate::observability::AnalysisSnapshot {
+                task: task.into(),
+                runtime: Some("transformers".into()),
+                device: Some("cuda".into()),
+                dtype: Some("bfloat16".into()),
+                inference_seconds: Some(0.4),
+                load_seconds: Some(2.),
+                results: Some(2),
+                model_cache_hit: Some(true),
+                attempts: 1,
+                ..Default::default()
+            });
+            snapshot.requests[0].state = "done".into();
+            app.update(snapshot);
+            for (width, height) in [(40, 16), (80, 24), (140, 36)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| draw(f, &app)).unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("TEXT ANALYSIS"), "{width}x{height}: {text}");
+                assert!(!text.contains("EXPERT CACHE"));
+                assert!(!text.contains("OFFLOAD"));
+                if width == 140 {
+                    for expected in [
+                        task,
+                        "TIMINGS",
+                        "Input tokens",
+                        "MODEL CACHE / HOST",
+                        "transformers",
+                        "cuda",
+                    ] {
+                        assert!(text.contains(expected), "missing {expected}: {text}");
+                    }
+                }
+                app.details = true;
+                terminal.draw(|f| draw(f, &app)).unwrap();
+                app.details = false;
+                app.fields
+                    .handle(crossterm::event::KeyCode::Char('v'), true);
+                terminal.draw(|f| draw(f, &app)).unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("FIELDS"));
+                app.fields.handle(crossterm::event::KeyCode::Enter, true);
+                terminal.draw(|f| draw(f, &app)).unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("CUSTOM FIELDS"));
+                assert!(!text.contains("Decode rate"));
+                for columns in 1..=3 {
+                    app.fields.columns = columns;
+                    for split in 0..=2 {
+                        app.fields.split = split;
+                        for column_major in [false, true] {
+                            app.fields.column_major = column_major;
+                            app.fields.placement = true;
+                            app.fields.selected = app.fields.visible().len() - 1;
+                            terminal.draw(|f| draw(f, &app)).unwrap();
+                        }
+                    }
+                }
+                app.fields
+                    .handle(crossterm::event::KeyCode::Char('R'), true);
+            }
+            // Generative requests in the same snapshot retain their existing layout.
+            app.selected = 1;
+            let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("EXPERT CACHE"));
+            assert!(!text.contains("TEXT ANALYSIS"));
+        }
+    }
     #[test]
     fn observability_llama_panels_show_context_memory_and_placement() {
         let args = super::super::TopArgs {

@@ -13,7 +13,24 @@ pub const BANNER: &str = concat!(
 
 pub fn print_banner() {
     let mut stdout = io::stdout().lock();
-    let _ = stdout.write_all(BANNER.as_bytes());
+    let colored = crate::terminal::color(crate::terminal::Stream::Out);
+    let width = console::Term::stdout().size().1;
+    let banner = if width < 64 {
+        format!(
+            "\n{}\n",
+            crate::terminal::paint(
+                "WERK1112 · Inference Router",
+                crate::terminal::CYAN,
+                true,
+                colored
+            )
+        )
+    } else if colored {
+        BANNER.to_string()
+    } else {
+        console::strip_ansi_codes(BANNER).into_owned()
+    };
+    let _ = stdout.write_all(banner.as_bytes());
     let _ = stdout.flush();
 }
 

@@ -54,4 +54,5 @@ pub mod observability;
 pub mod openai;
 pub mod runtime_control;
 pub mod runtime_planner;
+pub mod terminal;
 pub mod werk_protocol;

@@ -15,9 +15,15 @@ const HEADERS: [&str; 7] = [
 ];
 
 pub(super) fn print(store: &ModelStore, manifests: &[ModelManifest]) -> Result<()> {
-    let width = usize::from(Term::stdout().size().1);
+    let interactive = crate::terminal::interactive(crate::terminal::Stream::Out);
+    let width =
+        usize::from(Term::stdout().size().1).saturating_sub(if interactive { 3 } else { 0 });
     let output = format(store, manifests, width)?;
-    std::io::stdout().lock().write_all(output.as_bytes())?;
+    if interactive {
+        crate::ui_println!("{}", output.trim_end());
+    } else {
+        std::io::stdout().lock().write_all(output.as_bytes())?;
+    }
     Ok(())
 }
 

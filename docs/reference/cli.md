@@ -14,6 +14,34 @@ werk --help
 werk COMMAND --help
 ```
 
+## Terminal presentation
+
+Interactive commands share the Werk logo palette: cyan for commands and ready
+states, blue for table headers and fields, indigo for timing, violet for borders
+and activity, and pink for titles, warnings and errors. Help, model/backend lists,
+installation, downloads, diagnostics, media reports, chat and `top` use the same
+theme. Normal commands use scrollback-friendly panels; `top` is the full-screen
+dashboard. Narrow terminals use a compact banner and wrap diagnostic prose.
+
+`serve` displays its actual bound address, default model, authentication status
+and a `werk top --url …` command. Its interactive request feed shows HTTP status
+and time to response headers; this is not the duration of a streamed generation.
+Health and monitoring polls are omitted. Request bodies and credentials are not
+included in that feed.
+
+Set `NO_COLOR=1` to remove colors while retaining layout. `TERM=dumb` and redirected
+streams use plain output. JSON/JSONL, `inspect`, protocol commands and `temp path`
+remain unadorned even in a terminal. Streamed model content is not rewritten.
+Backend installer output is streamed through the same presentation; failures
+retain nonzero exit codes and their diagnostic details.
+
+For a local regression check without model downloads or package installation:
+
+```bash
+cargo build
+python3 scripts/smoke-console.py target/debug/werk
+```
+
 ## Global options
 
 Global options precede the subcommand:
@@ -966,5 +994,11 @@ with the updated binary; opening the dashboard never restarts them.
 
 Keys: `q`/Escape/Ctrl-C quit; Space pauses the display; arrows select a request;
 Tab/Enter toggles details; `b` selects a native worker; `a` toggles animation. The dashboard is read-only.
+`v` opens the session-local field picker (Space toggles, Enter applies, Escape
+cancels). `e` enables placement: Tab/Shift-Tab selects a field and arrows move it;
+Enter/Escape finishes. `c` cycles columns, `r` toggles row/column order, `s` cycles
+the request-list split, `o` reverses field order, and `R` restores the automatic
+view. PageUp/PageDown scroll custom cards. The automatic view adapts to generation,
+embedding, reranking or classification requests; unavailable metrics stay absent.
 See [observability](../../utils/observability/README.md) for metrics, backend
 coverage, Prometheus setup and the importable Grafana dashboard.

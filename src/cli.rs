@@ -1,4 +1,5 @@
 mod chat_persistence;
+mod diagnostics;
 mod media_diagnostics;
 mod model_list;
 mod run_inference;
@@ -7,7 +8,7 @@ mod top;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -113,6 +114,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 #[command(
     name = "werk",
     version,
+    styles = crate::terminal::clap_styles(),
     about = "Local inference router, compatible APIs and live terminal monitoring",
     long_about = "Werk1112 imports local or Hugging Face models, routes inference across installed runtimes, serves OpenAI-compatible and Anthropic Messages API subsets, and provides a live terminal dashboard with werk top."
 )]
@@ -423,6 +425,8 @@ pub enum BackendInstallArg {
     Vllm,
     #[value(name = "qwen-tts")]
     QwenTts,
+    #[value(name = "text-analysis")]
+    TextAnalysis,
 }
 
 impl BackendInstallArg {
@@ -435,7 +439,12 @@ impl BackendInstallArg {
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaMetal => Some(LlamaCppMode::Metal),
             Self::LlamaCpu => Some(LlamaCppMode::Cpu),
-            Self::OnnxCuda | Self::OnnxRocm | Self::OnnxCpu | Self::Vllm | Self::QwenTts => None,
+            Self::OnnxCuda
+            | Self::OnnxRocm
+            | Self::OnnxCpu
+            | Self::Vllm
+            | Self::QwenTts
+            | Self::TextAnalysis => None,
         }
     }
 
@@ -669,7 +678,10 @@ pub enum Commands {
         #[arg(long, default_value_t = 11434, help = "Port to bind")]
         port: u16,
 
-        #[arg(long, help = "Default chat model for API requests that omit model")]
+        #[arg(
+            long,
+            help = "Default model for chat or text-analysis API requests that omit model"
+        )]
         model: Option<String>,
 
         #[arg(
@@ -1539,11 +1551,72 @@ pub enum HuggingFaceAuthCommands {
 }
 
 pub async fn run_from_env() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let (title, machine) = console_command(&matches);
+    let cli = Cli::from_arg_matches(&matches)?;
+    crate::terminal::init(!machine, title.clone());
     let shutdown = crate::backend::llama_process_lifecycle::install_shutdown_handler()?;
     let result = run(cli).await;
     shutdown.abort();
+    if result.is_ok() && title != "top" {
+        crate::terminal::finish();
+    }
     result
+}
+
+fn console_command(matches: &clap::ArgMatches) -> (String, bool) {
+    let mut path = Vec::new();
+    let mut node = matches;
+    let mut json = false;
+    loop {
+        json |= node
+            .try_get_one::<bool>("json")
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false);
+        if let Some((name, child)) = node.subcommand() {
+            path.push(name);
+            node = child;
+        } else {
+            break;
+        }
+    }
+    let parameter_json = path.first() == Some(&"parameters")
+        && ["example", "sources"].iter().any(|flag| {
+            node.try_get_one::<bool>(flag)
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false)
+        });
+    let machine = json
+        || parameter_json
+        || matches!(
+            path.first().copied(),
+            Some("gpus" | "deployment-plan" | "inspect" | "runtime")
+        )
+        || path == ["temp", "path"]
+        || path.first() == Some(&"top")
+            && !node
+                .try_get_one::<bool>("once")
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false);
+    (
+        if path.is_empty() {
+            "serve".into()
+        } else {
+            path.join(" · ")
+        },
+        machine,
+    )
+}
+
+/// Render actionable CLI errors without putting ANSI escapes into shared errors.
+pub fn print_error(error: &anyhow::Error) {
+    diagnostics::print_error(error);
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -1581,13 +1654,16 @@ pub async fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    if should_print_startup_banner(&command) {
+    if should_print_startup_banner(&command)
+        && crate::terminal::interactive(crate::terminal::Stream::Out)
+    {
         print_banner();
     }
+    crate::terminal::session_heading();
 
     match command {
         Commands::Gpus => {
-            println!(
+            std::println!(
                 "{}",
                 serde_json::to_string_pretty(
                     &crate::inference_service::devices::Inventory::detect()?
@@ -1603,7 +1679,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             };
             let plans =
                 crate::deployments::Configuration::load(&config)?.resolve(&store, &inventory)?;
-            println!("{}", serde_json::to_string_pretty(&plans)?);
+            std::println!("{}", serde_json::to_string_pretty(&plans)?);
             Ok(())
         }
         Commands::Serve {
@@ -1622,6 +1698,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             store.ensure()?;
             let api_keys = resolve_api_keys(api_key, api_keys, allow_unauthenticated)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
+            let text_policy = text_analysis_policy(backend_override);
             let ip: IpAddr = host.parse()?;
             let addr = SocketAddr::new(ip, port);
             // Reserve the port before preparing a potentially very large model.
@@ -1666,9 +1743,35 @@ pub async fn run(cli: Cli) -> Result<()> {
                 with_terminal_spinner(
                     terminal_spinner_enabled(false),
                     format!("Loading default model '{model}'..."),
-                    || backend.prepare(&manifest),
+                    || {
+                        if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
+                            let options = text_policy.apply(Default::default())?;
+                            let diagnostics =
+                                crate::backend::text_analysis::TextAnalysisBackend::new(
+                                    store.clone(),
+                                )
+                                .diagnostics(&manifest, &options)?;
+                            if diagnostics["ready"].as_bool() != Some(true) {
+                                return Err(diagnostics::RuntimeSetupRequired {
+                                    detail: diagnostics["detail"]
+                                        .as_str()
+                                        .unwrap_or("Text-analysis runtime unavailable")
+                                        .to_string(),
+                                    backend: options.backend.clone(),
+                                }
+                                .into());
+                            }
+                            crate::ui_println!(
+                                "Text-analysis model: use {}; weights load on the first request",
+                                crate::backend::text_analysis::endpoint(task)
+                            );
+                            Ok(())
+                        } else {
+                            backend.prepare(&manifest)
+                        }
+                    },
                 )?;
-                println!("Default model available: {model}");
+                crate::ui_println!("Default model available: {model}");
             }
             if let Some(image_model) = image_model.as_deref() {
                 let manifest = store.get(image_model)?;
@@ -1678,7 +1781,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         manifest.id
                     );
                 }
-                println!("Default image model available: {image_model}");
+                crate::ui_println!("Default image model available: {image_model}");
             }
             let server_persistence_summary = format_server_persistence_config(&server_persistence);
             let mut api_state = ApiState::new_with_default_model_prompt_options_and_verbose(
@@ -1692,6 +1795,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             .with_default_image_model(image_model)
             .with_chat_context_size(llama_options.ctx_size)
             .with_api_keys(api_keys)
+            .with_text_policy(text_policy)
             .with_cors_origins(cors_origins);
             if let Some(path) = &cli.deployments {
                 let inventory = crate::inference_service::devices::Inventory::detect()?;
@@ -1700,7 +1804,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 api_state = api_state.with_deployments(plans, &inventory)?;
             }
             if let Some(summary) = server_persistence_summary {
-                println!("{summary}");
+                crate::ui_println!("{summary}");
             }
             serve_with_listener(listener, api_state).await
         }
@@ -1758,6 +1862,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
+            if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
+                bail!(
+                    "Model '{}' performs {}, not chat generation. Start werk serve --model '{}' and send a request to {}. Use werk doctor --model '{}' to inspect runtime readiness.",
+                    manifest.id,
+                    task,
+                    manifest.id,
+                    crate::backend::text_analysis::endpoint(task),
+                    manifest.id
+                );
+            }
             let persistence = persistence.open(&store, &manifest.id)?;
             let has_images = !images.is_empty()
                 || persistence
@@ -1860,7 +1974,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let _effective = service.resolve(request.clone())?;
                 let report = service.estimate(request)?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    std::println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
                     print_workload_estimate(&report, verbose);
                 }
@@ -1872,7 +1986,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     detect_system_memory(),
                 )?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    std::println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
                     print_estimate_report(&report, verbose);
                 }
@@ -1915,7 +2029,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 selection_options,
             )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                std::println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print_bench_report(&report, print_native_info);
             }
@@ -1965,24 +2079,27 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 ..Default::default()
                             },
                         )?;
-                        println!(
+                        crate::ui_println!(
                             "Installed {} llama-server: {}",
                             display_llama_mode(mode),
                             executable.display()
                         );
                     } else if let Some(mode) = target.onnx_mode() {
                         let executable = install_managed_onnx_runtime(&store, mode)?;
-                        println!(
+                        crate::ui_println!(
                             "Installed {} runner: {}",
                             mode.display(),
                             executable.display()
                         );
                     } else if target == BackendInstallArg::Vllm {
                         let python = install_managed_vllm(&store)?;
-                        println!("Installed vLLM backend: {}", python.display());
+                        crate::ui_println!("Installed vLLM backend: {}", python.display());
                     } else if target == BackendInstallArg::QwenTts {
                         let python = install_managed_qwen_tts(&store)?;
-                        println!("Installed Qwen-TTS backend: {}", python.display());
+                        crate::ui_println!("Installed Qwen-TTS backend: {}", python.display());
+                    } else if target == BackendInstallArg::TextAnalysis {
+                        let python = crate::backend::text_analysis::install(&store)?;
+                        crate::ui_println!("Installed text-analysis backend: {}", python.display());
                     }
                     Ok(())
                 }
@@ -2026,8 +2143,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                             None => prompt_huggingface_token()?,
                         };
                         let path = store.save_huggingface_token(&token)?;
-                        println!("Saved Hugging Face token for Werk: {}", path.display());
-                        println!(
+                        crate::ui_println!("Saved Hugging Face token for Werk: {}", path.display());
+                        crate::ui_println!(
                             "For gated models, also accept the model conditions on Hugging Face before pulling."
                         );
                         Ok(())
@@ -2035,9 +2152,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     HuggingFaceAuthCommands::Status => {
                         let status = store.huggingface_auth_status()?;
                         if let Some(source) = status.source {
-                            println!("Hugging Face token: configured ({source})");
+                            crate::ui_println!("Hugging Face token: configured ({source})");
                         } else {
-                            println!(
+                            crate::ui_println!(
                                 "Hugging Face token: not configured. Run `werk auth huggingface login` or set HF_TOKEN."
                             );
                         }
@@ -2045,9 +2162,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     HuggingFaceAuthCommands::Logout => {
                         if store.delete_huggingface_token()? {
-                            println!("Removed Werk-stored Hugging Face token.");
+                            crate::ui_println!("Removed Werk-stored Hugging Face token.");
                         } else {
-                            println!("No Werk-stored Hugging Face token was found.");
+                            crate::ui_println!("No Werk-stored Hugging Face token was found.");
                         }
                         Ok(())
                     }
@@ -2059,10 +2176,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                         .map(Ok)
                         .unwrap_or_else(api_keys::default_api_keys_path)?;
                     let entry = api_keys::write_api_keys_file(&path, &name, force)?;
-                    println!("Created Werk API keys file: {}", path.display());
-                    println!("Name: {}", entry.name);
-                    println!("API key: {}", entry.key);
-                    println!(
+                    crate::ui_println!("Created Werk API keys file: {}", path.display());
+                    crate::ui_println!("Name: {}", entry.name);
+                    crate::ui_println!("API key: {}", entry.key);
+                    crate::ui_println!(
                         "Use this value as the OpenAI API key, sent as Authorization: Bearer <key>."
                     );
                     Ok(())
@@ -2073,16 +2190,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             let store = ModelStore::resolve(model_home)?;
             match command {
                 TempCommands::List => {
-                    println!("{}", format_temp_list(&store.list_tmp()?));
+                    crate::ui_println!("{}", format_temp_list(&store.list_tmp()?));
                     Ok(())
                 }
                 TempCommands::Purge { dry_run } => {
                     let summary = store.purge_tmp(dry_run)?;
-                    println!("{}", format_temp_purge_summary(&summary, dry_run));
+                    crate::ui_println!("{}", format_temp_purge_summary(&summary, dry_run));
                     Ok(())
                 }
                 TempCommands::Path => {
-                    println!("{}", store.tmp_dir().display());
+                    std::println!("{}", store.tmp_dir().display());
                     Ok(())
                 }
             }
@@ -2098,7 +2215,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     if json {
                         print_runtime_json(&inventory)
                     } else {
-                        println!("{}", format_cache_list(&inventory));
+                        crate::ui_println!("{}", format_cache_list(&inventory));
                         Ok(())
                     }
                 }
@@ -2122,7 +2239,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     if json {
                         print_runtime_json(&report)?;
                     } else {
-                        println!("{}", format_cache_purge(&report));
+                        crate::ui_println!("{}", format_cache_purge(&report));
                         if matches!(
                             selection,
                             CacheSelection::All {
@@ -2130,7 +2247,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 include_history: false
                             }
                         ) {
-                            println!(
+                            crate::ui_println!(
                                 "Saved chat histories were retained; select a chat-history ID or add --include-history to remove them."
                             );
                         }
@@ -2219,14 +2336,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             for manifest in &manifests {
                 print_manifest_summary(action, manifest);
                 if link {
-                    println!(
+                    crate::ui_println!(
                         "External path: {}",
                         store.model_location(manifest).display()
                     );
                 }
             }
             if all {
-                println!("{action} {} models.", manifests.len());
+                crate::ui_println!("{action} {} models.", manifests.len());
             }
             Ok(())
         }
@@ -2269,7 +2386,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Remove { id } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.remove(&id)?;
-            println!(
+            crate::ui_println!(
                 "Removed {} ({:?}) from {}",
                 manifest.id,
                 manifest.format,
@@ -2304,7 +2421,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             if json {
-                println!("{}", serde_json::to_string_pretty(&manifests)?);
+                std::println!("{}", serde_json::to_string_pretty(&manifests)?);
                 return Ok(());
             }
             model_list::print(&store, &manifests)
@@ -2338,13 +2455,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                     serde_json::to_value(crate::inference_service::detect_host_resources())?,
                 );
             }
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            std::println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         Commands::SelectFile { id, file } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.set_model_file(&id, &file)?;
-            println!(
+            crate::ui_println!(
                 "Selected {} for {}",
                 manifest.model_path.as_deref().unwrap_or("unknown"),
                 manifest.id
@@ -3055,7 +3172,8 @@ fn execute_media_request(
                 request,
                 |effective, estimate, plan| {
                     if debug {
-                        let mut stderr = io::stderr().lock();
+                        let mut stderr =
+                            crate::terminal::ReportWriter::new(crate::terminal::Stream::Err);
                         let _ = write_media_routing_debug(&mut stderr, effective, estimate, plan);
                     }
                 },
@@ -3070,7 +3188,8 @@ fn execute_media_request(
             if verbose || debug {
                 let attempts = attempts.borrow();
                 if !attempts.is_empty() {
-                    let mut stderr = io::stderr().lock();
+                    let mut stderr =
+                        crate::terminal::ReportWriter::new(crate::terminal::Stream::Err);
                     let _ = write_media_failed_attempts(&mut stderr, &attempts, service_seconds);
                 }
             }
@@ -3093,16 +3212,16 @@ fn execute_media_request(
         publication_seconds: publication_started.elapsed().as_secs_f64(),
     };
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        std::println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         print_inference_result(&result, false);
     }
     if verbose {
-        let mut stderr = io::stderr().lock();
+        let mut stderr = crate::terminal::ReportWriter::new(crate::terminal::Stream::Err);
         write_media_verbose_stats(&mut stderr, &result, timings)?;
     }
     if debug {
-        let mut stderr = io::stderr().lock();
+        let mut stderr = crate::terminal::ReportWriter::new(crate::terminal::Stream::Err);
         write_media_backend_debug(&mut stderr, &result)?;
     }
     Ok(())
@@ -3454,7 +3573,7 @@ fn resolve_primary_text(
             return Ok(Some(value.to_string()));
         }
     } else if required {
-        print!("{label}> ");
+        print!("{}", crate::terminal::prompt(label));
         io::stdout().flush()?;
         let mut value = String::new();
         io::stdin().read_line(&mut value)?;
@@ -4053,15 +4172,18 @@ fn normalize_media_parameter_path(task: InferenceTask, path: &str) -> String {
 
 fn print_inference_result(result: &InferenceResult, managed: bool) {
     if managed {
-        println!(
+        crate::ui_println!(
             "{} {} via {} ({})",
-            result.task, result.model, result.runtime, result.id
+            result.task,
+            result.model,
+            result.runtime,
+            result.id
         );
     } else {
-        println!("{} {} via {}", result.task, result.model, result.runtime);
+        crate::ui_println!("{} {} via {}", result.task, result.model, result.runtime);
     }
     for output in &result.outputs {
-        println!("output> {}", output.path);
+        crate::ui_println!("output> {}", output.path);
         let details = format!(
             "mime={} size={}{}{}{}",
             output.mime_type,
@@ -4080,13 +4202,13 @@ fn print_inference_result(result: &InferenceResult, managed: bool) {
                 .unwrap_or_default(),
         );
         if managed {
-            println!("  id={} {details}", output.id);
+            crate::ui_println!("  id={} {details}", output.id);
         } else {
-            println!("  {details}");
+            crate::ui_println!("  {details}");
         }
     }
     for warning in &result.warnings {
-        eprintln!("warning: {warning}");
+        crate::ui_eprintln!("warning: {warning}");
     }
 }
 
@@ -4182,14 +4304,14 @@ fn estimate_inputs_for_task(task: InferenceTask) -> Vec<InferenceInput> {
         | AudioEnhancement
         | AudioEditing => vec![placeholder(InputModality::Audio, "input_audio")],
         VoiceConversion => vec![placeholder(InputModality::Audio, "input_audio")],
-        TextGeneration | TextEmbedding | ImageGeneration | VideoGeneration | AudioGeneration
-        | MusicGeneration | TextToSpeech => Vec::new(),
+        TextGeneration | TextEmbedding | TextReranking | TextClassification | ImageGeneration
+        | VideoGeneration | AudioGeneration | MusicGeneration | TextToSpeech => Vec::new(),
     }
 }
 
 fn print_workload_estimate(report: &WorkloadEstimate, verbose: bool) {
-    println!("Task: {}", report.task);
-    println!(
+    crate::ui_println!("Task: {}", report.task);
+    crate::ui_println!(
         "Fit: {} (confidence: {})",
         format!("{:?}", report.fit).to_ascii_lowercase(),
         format!("{:?}", report.confidence).to_ascii_lowercase()
@@ -4201,7 +4323,7 @@ fn print_workload_estimate(report: &WorkloadEstimate, verbose: bool) {
         ("Host peak", report.host_peak_bytes),
         ("Output", report.output_size_bytes),
     ] {
-        println!(
+        crate::ui_println!(
             "{label}: {}",
             value
                 .map(format_bytes)
@@ -4209,14 +4331,14 @@ fn print_workload_estimate(report: &WorkloadEstimate, verbose: bool) {
         );
     }
     for warning in &report.warnings {
-        println!("Warning: {warning}");
+        crate::ui_println!("Warning: {warning}");
     }
     for recommendation in &report.recommendations {
-        println!("Recommendation: {recommendation}");
+        crate::ui_println!("Recommendation: {recommendation}");
     }
     if verbose {
         for assumption in &report.assumptions {
-            println!("Assumption: {assumption}");
+            crate::ui_println!("Assumption: {assumption}");
         }
     }
 }
@@ -4361,17 +4483,21 @@ fn print_parameters(
             "example": example.then_some(&example_request),
             "sources": resolved.as_ref().map(|request| &request.parameters),
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        std::println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
-    println!("Parameters for {task}");
-    println!(
+    crate::ui_println!("Parameters for {task}");
+    crate::ui_println!(
         "{:<34} {:<12} {:<16} {:<18} {:<15} DEFAULT",
-        "PATH", "TYPE", "CATEGORY", "CLI FLAG", "SUPPORT"
+        "PATH",
+        "TYPE",
+        "CATEGORY",
+        "CLI FLAG",
+        "SUPPORT"
     );
     for descriptor in descriptors {
-        println!(
+        crate::ui_println!(
             "{:<34} {:<12} {:<16} {:<18} {:<15} {}",
             descriptor.path,
             format!("{:?}", descriptor.value_type).to_ascii_lowercase(),
@@ -4396,19 +4522,19 @@ fn print_parameters(
 }
 
 fn print_task_readiness(readiness: &TaskReadiness) {
-    println!(
+    crate::ui_println!(
         "Task readiness: {}",
         task_readiness_status_label(readiness.status)
     );
-    println!("  {}", readiness.detail);
+    crate::ui_println!("  {}", readiness.detail);
     if let Some(adapter) = readiness.adapter.as_deref() {
-        println!("  Adapter: {adapter}");
+        crate::ui_println!("  Adapter: {adapter}");
     }
     if let Some(backend) = readiness.required_backend.as_deref() {
-        println!("  Required backend: {backend}");
+        crate::ui_println!("  Required backend: {backend}");
     }
     if !readiness.missing_dependencies.is_empty() {
-        println!(
+        crate::ui_println!(
             "  Missing dependencies: {}",
             readiness.missing_dependencies.join(", ")
         );
@@ -4420,7 +4546,7 @@ fn print_task_readiness(readiness: &TaskReadiness) {
             .map(|route| route.all_of.join(" + "))
             .collect::<Vec<_>>()
             .join(" OR ");
-        println!(
+        crate::ui_println!(
             "  Missing dependency choice ({}): {alternatives}",
             group.purpose
         );
@@ -4431,9 +4557,11 @@ fn print_task_readiness(readiness: &TaskReadiness) {
             .as_deref()
             .and_then(validated_backend_install_command)
     {
-        println!("  Recommendation: {command}");
+        crate::ui_println!("  Recommendation: {command}");
     } else if readiness.status == TaskReadinessStatus::NotImplemented {
-        println!("  Recommendation: choose a supported task/model or add a dedicated adapter");
+        crate::ui_println!(
+            "  Recommendation: choose a supported task/model or add a dedicated adapter"
+        );
     }
 }
 
@@ -4455,11 +4583,11 @@ fn print_inference_doctor(
     runtime: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
-    println!("Werk runtime diagnostics");
+    crate::ui_println!("Werk runtime diagnostics");
     print_backend_doctor(store, false);
 
     let report = CompanionClient::discover_doctor_report();
-    println!(
+    crate::ui_println!(
         "Media companion: {} ({})",
         if report.available {
             "available"
@@ -4469,7 +4597,7 @@ fn print_inference_doctor(
         report.summary
     );
     if let Some(launcher) = report.launcher.as_deref() {
-        println!("Companion launcher: {launcher}");
+        crate::ui_println!("Companion launcher: {launcher}");
     }
     let runtime_lower = runtime.map(str::to_ascii_lowercase);
     for check in report.checks.iter().filter(|check| {
@@ -4485,7 +4613,7 @@ fn print_inference_doctor(
         } else {
             "optional"
         };
-        println!("{:<12} {:<24} {}", status, check.name, check.detail);
+        crate::ui_println!("{:<12} {:<24} {}", status, check.name, check.detail);
     }
 
     if let Some(task) = task {
@@ -4495,7 +4623,7 @@ fn print_inference_doctor(
             .filter(|manifest| manifest.supports_task(task))
             .map(|manifest| manifest.id)
             .collect::<Vec<_>>();
-        println!(
+        crate::ui_println!(
             "Task {task}: {} installed model(s){}",
             compatible.len(),
             if compatible.is_empty() {
@@ -4511,6 +4639,30 @@ fn print_inference_doctor(
         let selected_task = task
             .or_else(|| manifest.metadata.tasks.first().copied())
             .ok_or_else(|| anyhow!("model '{model}' does not declare an inference task"))?;
+        if let Some(analysis_task) = crate::backend::text_analysis::task_for(&manifest) {
+            anyhow::ensure!(
+                selected_task == analysis_task,
+                "Model '{}' supports {}; use {}",
+                manifest.id,
+                analysis_task,
+                crate::backend::text_analysis::endpoint(analysis_task)
+            );
+            let options = text_analysis_policy(backend).apply(Default::default())?;
+            let worker = crate::backend::text_analysis::TextAnalysisBackend::new(store.clone());
+            crate::ui_println!(
+                "Model {}: task={}, endpoint={}, backend={}, device={}; resident architecture-specific worker, compatible CPU fallback for auto",
+                manifest.id,
+                analysis_task,
+                crate::backend::text_analysis::endpoint(analysis_task),
+                options.backend,
+                options.device
+            );
+            match worker.diagnostics(&manifest, &options) {
+                Ok(probe) => crate::ui_println!("Text-analysis environment: {probe}"),
+                Err(error) => crate::ui_println!("Text-analysis unavailable: {error:#}"),
+            }
+            return Ok(());
+        }
         if selected_task == InferenceTask::TextGeneration {
             let requested = match runtime {
                 Some(runtime) => runtime_registry()
@@ -4537,7 +4689,7 @@ fn print_inference_doctor(
                 SelectionOptions::default(),
             ) {
                 Ok(route) => {
-                    println!(
+                    crate::ui_println!(
                         "Model {}: task={}, runtime={}",
                         manifest.id,
                         selected_task,
@@ -4545,21 +4697,25 @@ fn print_inference_doctor(
                     );
                     if let Some(selection) = &route.selection {
                         for rejection in &selection.rejection_reasons {
-                            println!(
+                            crate::ui_println!(
                                 "  {:<24} rejected: {}",
-                                rejection.display_name, rejection.reason
+                                rejection.display_name,
+                                rejection.reason
                             );
                         }
-                        println!(
+                        crate::ui_println!(
                             "  {:<24} selected: {}",
-                            selection.display_name, selection.reason
+                            selection.display_name,
+                            selection.reason
                         );
                     }
                     if let Some(note) = route.fallback_note() {
-                        eprintln!("{note}");
+                        crate::ui_eprintln!("{note}");
                     }
                 }
-                Err(error) => println!("Model {}: diagnostic warning: {error:#}", manifest.id),
+                Err(error) => {
+                    crate::ui_println!("Model {}: diagnostic warning: {error:#}", manifest.id)
+                }
             }
             return Ok(());
         }
@@ -4576,7 +4732,7 @@ fn print_inference_doctor(
         }
         match InferenceService::new(store.clone()).plan(request) {
             Ok((_, estimate, plan)) => {
-                println!(
+                crate::ui_println!(
                     "Model {}: task={}, layout={}, fit={:?}, runtime={}",
                     manifest.id,
                     selected_task,
@@ -4588,7 +4744,7 @@ fn print_inference_doctor(
                     print_task_readiness(readiness);
                 }
                 for candidate in plan.candidates {
-                    println!(
+                    crate::ui_println!(
                         "  {:<24} {:?}: {}",
                         candidate.runtime_id,
                         candidate.status,
@@ -4600,7 +4756,9 @@ fn print_inference_doctor(
                     );
                 }
             }
-            Err(error) => println!("Model {}: diagnostic warning: {error:#}", manifest.id),
+            Err(error) => {
+                crate::ui_println!("Model {}: diagnostic warning: {error:#}", manifest.id)
+            }
         }
     }
     Ok(())
@@ -5496,7 +5654,7 @@ fn estimate_source_url(manifest: &ModelManifest) -> Option<String> {
 }
 
 fn print_estimate_report(report: &EstimateReport, verbose: bool) {
-    print!("{}", format_estimate_report(report, verbose));
+    crate::ui_println!("{}", format_estimate_report(report, verbose).trim_end());
 }
 
 fn format_estimate_report(report: &EstimateReport, verbose: bool) -> String {
@@ -6447,7 +6605,7 @@ impl ChatInputReader {
                 let mut input = String::new();
                 let n = stdin.read_line(&mut input)?;
                 if n == 0 {
-                    println!();
+                    crate::ui_println!();
                     return Ok(None);
                 }
 
@@ -6485,17 +6643,17 @@ impl TerminalLineReader {
 
             match byte {
                 b'\r' | b'\n' => {
-                    println!();
+                    crate::ui_println!();
                     let input = line.as_string();
                     self.push_history(&input);
                     return Ok(Some(input));
                 }
                 0x04 if line.is_empty() => {
-                    println!();
+                    crate::ui_println!();
                     return Ok(None);
                 }
                 0x03 => {
-                    println!("^C");
+                    crate::ui_println!("^C");
                     return Ok(None);
                 }
                 0x01 => redraw = line.move_home(),
@@ -6969,7 +7127,17 @@ impl AssistantPendingSpinner {
         self.visible = true;
 
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\r\x1b[2Kassistant> {frame} Werk is thinking...")?;
+        write!(
+            stdout,
+            "\r\x1b[2K{}{} Werk is thinking...",
+            crate::terminal::prompt("assistant"),
+            crate::terminal::paint(
+                frame,
+                crate::terminal::CYAN,
+                false,
+                crate::terminal::color(crate::terminal::Stream::Out)
+            )
+        )?;
         stdout.flush()?;
         Ok(())
     }
@@ -6981,7 +7149,7 @@ impl AssistantPendingSpinner {
 
         self.visible = false;
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\r\x1b[2Kassistant> ")?;
+        write!(stdout, "\r\x1b[2K{}", crate::terminal::prompt("assistant"))?;
         stdout.flush()?;
         Ok(())
     }
@@ -7038,16 +7206,16 @@ async fn chat_loop(
         None => (None, Vec::new()),
     };
     if let Some(storage) = persistence.as_ref() {
-        eprintln!(
+        crate::ui_eprintln!(
             "[werk {command_label}] persistence enabled: {} saved messages{}",
             archive.len(),
             if storage.resumed() { " restored" } else { "" }
         );
         if let Some(path) = storage.path() {
-            eprintln!("[werk {command_label}] conversation: {}", path.display());
+            crate::ui_eprintln!("[werk {command_label}] conversation: {}", path.display());
         }
         if let Some(notice) = storage.notice() {
-            eprintln!("[werk {command_label}] {notice}");
+            crate::ui_eprintln!("[werk {command_label}] {notice}");
         }
     }
     let has_images = !images.is_empty()
@@ -7073,7 +7241,9 @@ async fn chat_loop(
             Ok(session) => session,
             Err(error) if LlamaServerBackend::is_startup_error(&error) => return Err(error),
             Err(error) => {
-                eprintln!("[werk {command_label}] native KV cache unavailable: {error:#}");
+                crate::ui_eprintln!(
+                    "[werk {command_label}] native KV cache unavailable: {error:#}"
+                );
                 None
             }
         }
@@ -7081,7 +7251,7 @@ async fn chat_loop(
         None
     };
     if persistence.is_some() {
-        eprintln!(
+        crate::ui_eprintln!(
             "[werk {command_label}] {}",
             if run.as_ref().is_some_and(|run| run.server) {
                 "conversation persistence active; live KV cache managed by werk serve (no client snapshot restore)"
@@ -7113,7 +7283,7 @@ async fn chat_loop(
     ));
 
     if interactive {
-        println!(
+        crate::ui_println!(
             "Chatting with {}. Type /exit or /quit to stop.",
             manifest.id
         );
@@ -7125,7 +7295,7 @@ async fn chat_loop(
         let new_messages = if let Some(run) = run.as_mut() {
             std::mem::take(&mut run.messages)
         } else {
-            let Some(input) = input_reader.read_line("you> ")? else {
+            let Some(input) = input_reader.read_line(&crate::terminal::prompt("you"))? else {
                 break;
             };
             let input = input.trim();
@@ -7155,7 +7325,7 @@ async fn chat_loop(
             messages.clone_from(&request_messages);
         }
         if removed_messages > 0 {
-            eprintln!(
+            crate::ui_eprintln!(
                 "[werk {command_label}] context window: removed {removed_messages} old message(s) to fit {} tokens",
                 context_size.unwrap_or_default()
             );
@@ -7210,7 +7380,7 @@ async fn chat_loop(
         };
 
         if interactive {
-            print!("assistant> ");
+            print!("{}", crate::terminal::prompt("assistant"));
             io::stdout().flush()?;
         }
 
@@ -7265,7 +7435,7 @@ async fn chat_loop(
                     }
                     if stream_output {
                         if json_output {
-                            println!("{}", json!({"type": "text_delta", "text": chunk}));
+                            std::println!("{}", json!({"type": "text_delta", "text": chunk}));
                         } else {
                             print!("{chunk}");
                         }
@@ -7282,7 +7452,7 @@ async fn chat_loop(
                 Ok(GenerateStreamEvent::ToolCallDelta(deltas)) => {
                     pending_spinner.clear()?;
                     if stream_output && json_output {
-                        println!(
+                        crate::ui_println!(
                             "{}",
                             json!({"type": "tool_call_delta", "tool_calls": deltas})
                         );
@@ -7345,7 +7515,7 @@ async fn chat_loop(
             if !interactive {
                 bail!("{error}");
             }
-            println!("\nerror: {error}");
+            crate::ui_println!("\nerror: {error}");
             if persistence.is_some() {
                 messages.clone_from(&archive);
             }
@@ -7361,7 +7531,7 @@ async fn chat_loop(
             tool_call_id: None,
         };
         if json_output {
-            println!(
+            std::println!(
                 "{}",
                 serde_json::to_string(&json!({
                     "type": "completion", "model": manifest.id,
@@ -7373,12 +7543,12 @@ async fn chat_loop(
             );
         } else {
             if stream_output {
-                println!();
+                crate::ui_println!();
             } else {
-                println!("{}", assistant.trim());
+                std::println!("{}", assistant.trim());
             }
             if let Some(calls) = assistant_message.tool_calls.as_ref() {
-                println!(
+                std::println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({"tool_calls": calls}))?
                 );
@@ -7388,15 +7558,19 @@ async fn chat_loop(
         if matches!(finish_reason.as_str(), "length" | "max_new_tokens")
             && !assistant.trim().is_empty()
         {
-            eprintln!(
+            crate::ui_eprintln!(
                 "note: response reached --max-tokens ({max_tokens}) and may be incomplete; rerun with a larger --max-tokens value for more."
             );
         }
         if verbose && let Some(timings) = timings {
             let mut output: Box<dyn Write> = if interactive {
-                Box::new(io::stdout())
+                Box::new(crate::terminal::ReportWriter::new(
+                    crate::terminal::Stream::Out,
+                ))
             } else {
-                Box::new(io::stderr())
+                Box::new(crate::terminal::ReportWriter::new(
+                    crate::terminal::Stream::Err,
+                ))
             };
             writeln!(output)?;
             write_verbose_stats(
@@ -7753,7 +7927,15 @@ fn prompt_diagnostics(
 }
 
 fn prompt_huggingface_token() -> Result<String> {
-    print!("Hugging Face token: ");
+    print!(
+        "{}",
+        crate::terminal::paint(
+            "Hugging Face token › ",
+            crate::terminal::CYAN,
+            true,
+            crate::terminal::color(crate::terminal::Stream::Out)
+        )
+    );
     io::stdout().flush()?;
     let mut token = String::new();
     io::stdin().read_line(&mut token)?;
@@ -8057,32 +8239,36 @@ fn benchmark_llama_choices(mode: LlamaCppMode, compare: BenchCompareArg) -> Vec<
 }
 
 fn print_bench_report(report: &BenchReport, print_native_info: bool) {
-    println!("Benchmark: {}", report.model);
-    println!(
+    crate::ui_println!("Benchmark: {}", report.model);
+    crate::ui_println!(
         "runs: {}, warmups: {}, max tokens: {}, temperature: {}, seed: {}",
-        report.runs, report.warmups, report.max_tokens, report.temperature, report.seed
+        report.runs,
+        report.warmups,
+        report.max_tokens,
+        report.temperature,
+        report.seed
     );
     for result in &report.results {
-        println!();
-        println!("backend: {}", result.backend);
+        crate::ui_println!();
+        crate::ui_println!("backend: {}", result.backend);
         if print_native_info && let Some(runtime) = &result.runtime {
             print_runtime_report(runtime);
         }
         if let Some(error) = &result.error {
-            println!("error: {error}");
+            crate::ui_println!("error: {error}");
             continue;
         }
         if let Some(rate) = result.median_eval_tokens_per_second {
-            println!("median eval rate: {rate:.2} tokens/s");
+            crate::ui_println!("median eval rate: {rate:.2} tokens/s");
         }
         if let Some(total) = result.median_total_seconds {
-            println!("median total: {}", format_duration(total));
+            crate::ui_println!("median total: {}", format_duration(total));
         }
         if let Some(first_token) = result.median_first_token_seconds {
-            println!("median first token: {}", format_duration(first_token));
+            crate::ui_println!("median first token: {}", format_duration(first_token));
         }
         for (index, sample) in result.samples.iter().enumerate() {
-            println!(
+            crate::ui_println!(
                 "  run {:>2}: {:>7.2} tok/s, {} token(s), first {}, total {}",
                 index + 1,
                 sample.eval_tokens_per_second,
@@ -8115,20 +8301,20 @@ fn print_perf_doctor(
 ) -> Result<()> {
     let selected =
         selected_backend_for_request(store, backend_choice, manifest, false, selection_options)?;
-    println!("Werk1112 performance diagnostics");
-    println!("model: {}", manifest.id);
-    println!("format: {:?}", manifest.format);
-    println!(
+    crate::ui_println!("Werk1112 performance diagnostics");
+    crate::ui_println!("model: {}", manifest.id);
+    crate::ui_println!("format: {:?}", manifest.format);
+    crate::ui_println!(
         "architecture: {}",
         manifest.architecture.as_deref().unwrap_or("unknown")
     );
-    println!("selected backend: {}", backend_label(selected));
+    crate::ui_println!("selected backend: {}", backend_label(selected));
 
     if let Some(report) = runtime_report_for_choice(selected, runtime_options) {
         print_runtime_report(&report);
     } else {
-        println!("runtime: {}", backend_label(selected));
-        println!(
+        crate::ui_println!("runtime: {}", backend_label(selected));
+        crate::ui_println!(
             "note: detailed legacy FFI diagnostics are available only for llama-legacy backends"
         );
     }
@@ -8137,10 +8323,25 @@ fn print_perf_doctor(
 }
 
 fn print_backend_list(store: &ModelStore) {
-    println!("llama-server discovery");
-    println!(
+    if crate::terminal::interactive(crate::terminal::Stream::Out) {
+        crate::terminal::panel(
+            crate::terminal::Stream::Out,
+            "Text analysis",
+            "RUNTIME                 DEVICE\ntransformers-pooling     CUDA / CPU\nvllm-pooling             CUDA\ncandle-pooling           native XLM-RoBERTa\n\nINSTALL\nwerk backend install text-analysis\n\nCHECK A MODEL\nwerk doctor --model MODEL",
+        );
+        crate::terminal::heading(crate::terminal::Stream::Out, "Runtime discovery");
+    } else {
+        crate::ui_println!(
+            "Text analysis: transformers-pooling (CUDA/CPU), vllm-pooling (CUDA), candle-pooling (native XLM-RoBERTa); install Python dependencies with werk backend install text-analysis. Model-specific readiness: werk doctor --model MODEL"
+        );
+    }
+    crate::ui_println!("llama-server discovery");
+    crate::ui_println!(
         "{:<8} {:<16} {:<7} {:<7} PATH",
-        "BACKEND", "SOURCE", "EXISTS", "HELP"
+        "BACKEND",
+        "SOURCE",
+        "EXISTS",
+        "HELP"
     );
     for mode in [
         LlamaCppMode::Cuda,
@@ -8155,19 +8356,22 @@ fn print_backend_list(store: &ModelStore) {
 
     #[cfg(feature = "burn-experimental")]
     {
-        println!();
-        println!("Burn runtime");
-        println!("{:<8} {:<16} {:<7} DETAIL", "BACKEND", "SOURCE", "READY");
+        crate::ui_println!();
+        crate::ui_println!("Burn runtime");
+        crate::ui_println!("{:<8} {:<16} {:<7} DETAIL", "BACKEND", "SOURCE", "READY");
         for mode in [BurnMode::Cuda, BurnMode::Cpu] {
             print_burn_discovery(store, mode);
         }
     }
 
-    println!();
-    println!("ONNX Runtime discovery");
-    println!(
+    crate::ui_println!();
+    crate::ui_println!("ONNX Runtime discovery");
+    crate::ui_println!(
         "{:<8} {:<16} {:<7} {:<7} PATH",
-        "BACKEND", "SOURCE", "EXISTS", "HELP"
+        "BACKEND",
+        "SOURCE",
+        "EXISTS",
+        "HELP"
     );
     for mode in [
         OnnxRuntimeMode::Cuda,
@@ -8177,8 +8381,8 @@ fn print_backend_list(store: &ModelStore) {
         print_onnxruntime_discovery(store, mode);
     }
 
-    println!();
-    println!("vLLM discovery");
+    crate::ui_println!();
+    crate::ui_println!("vLLM discovery");
     let discovery = VllmBackend::discover(store);
     let health = VllmBackend::health(store);
     let vllm_path = discovery
@@ -8195,28 +8399,38 @@ fn print_backend_list(store: &ModelStore) {
         })
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| managed_vllm_dir(store).join("venv").display().to_string());
-    println!(
+    crate::ui_println!(
         "{:<8} {:<16} {:<10} {:<18} PATH",
-        "BACKEND", "SOURCE", "INSTALLED", "HEALTH"
+        "BACKEND",
+        "SOURCE",
+        "INSTALLED",
+        "HEALTH"
     );
-    println!(
+    crate::ui_println!(
         "{:<8} {:<16} {:<10} {:<18} {}",
-        "vLLM", discovery.source, health.installed_label, health.health_label, vllm_path
+        "vLLM",
+        discovery.source,
+        health.installed_label,
+        health.health_label,
+        vllm_path
     );
 
-    println!();
-    println!("oMLX discovery (model compatibility is checked per request)");
+    crate::ui_println!();
+    crate::ui_println!("oMLX discovery (model compatibility is checked per request)");
     print_omlx_discovery();
 
-    println!();
-    println!(
+    crate::ui_println!();
+    crate::ui_println!(
         "{:<24} {:<12} {:<12} {:<8} INSTALL",
-        "RUNTIME", "STATE", "ACCEL", "VLM"
+        "RUNTIME",
+        "STATE",
+        "ACCEL",
+        "VLM"
     );
     for runtime in runtime_registry().iter().filter(|runtime| {
         cfg!(feature = "burn-experimental") || runtime.runtime != BackendRuntime::Burn
     }) {
-        println!(
+        crate::ui_println!(
             "{:<24} {:<12} {:<12} {:<8} {}",
             runtime.display_name,
             if runtime.implemented {
@@ -8267,7 +8481,7 @@ fn runtime_install_target_for_platform<'a>(
 fn print_burn_discovery(store: &ModelStore, mode: BurnMode) {
     let _ = store;
     let status = BurnBackend::runtime_status(mode);
-    println!(
+    crate::ui_println!(
         "{:<8} {:<16} {:<7} {}",
         match mode {
             BurnMode::Cuda => "CUDA",
@@ -8298,7 +8512,7 @@ fn print_backend_discovery(discovery: &LlamaServerDiscovery) {
         .as_deref()
         .map(llama_server_help_ok)
         .unwrap_or(false);
-    println!(
+    crate::ui_println!(
         "{:<8} {:<16} {:<7} {:<7} {}",
         display_llama_mode(discovery.mode),
         discovery.source,
@@ -8328,7 +8542,7 @@ fn print_onnxruntime_discovery(store: &ModelStore, mode: OnnxRuntimeMode) {
         .find(|attempt| attempt.usable)
         .map(|attempt| attempt.usable)
         .unwrap_or(false);
-    println!(
+    crate::ui_println!(
         "{:<8} {:<16} {:<7} {:<7} {}",
         match mode {
             OnnxRuntimeMode::Cuda => "CUDA",
@@ -8343,30 +8557,30 @@ fn print_onnxruntime_discovery(store: &ModelStore, mode: OnnxRuntimeMode) {
 }
 
 fn print_backend_doctor(store: &ModelStore, debug: bool) {
-    println!("Werk1112 backend diagnostics");
-    println!(
+    crate::ui_println!("Werk1112 backend diagnostics");
+    crate::ui_println!(
         "executable: {}",
         env::current_exe()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|err| format!("unknown ({err})"))
     );
-    println!("compiled runtimes: {}", compiled_runtime_summary());
-    println!("managed cache: {}", store.home().join("backends").display());
-    println!(
+    crate::ui_println!("compiled runtimes: {}", compiled_runtime_summary());
+    crate::ui_println!("managed cache: {}", store.home().join("backends").display());
+    crate::ui_println!(
         "CUDA cache: {}",
         managed_backend_dir(store, LlamaCppMode::Cuda).display()
     );
-    println!(
+    crate::ui_println!(
         "ROCm cache: {}",
         managed_backend_dir(store, LlamaCppMode::Rocm).display()
     );
-    println!(
+    crate::ui_println!(
         "Metal cache: {}",
         managed_backend_dir(store, LlamaCppMode::Metal).display()
     );
-    println!();
+    crate::ui_println!();
     for check in backend_doctor_checks(store) {
-        println!(
+        crate::ui_println!(
             "{:<24} {:<7} {}",
             check.name,
             doctor_check_status(&check),
@@ -8374,7 +8588,7 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
         );
     }
     for check in vllm_doctor_checks(store) {
-        println!(
+        crate::ui_println!(
             "{:<24} {:<7} {}",
             check.name,
             doctor_check_status(&check),
@@ -8383,20 +8597,20 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
     }
     #[cfg(feature = "burn-experimental")]
     for check in burn_doctor_checks() {
-        println!(
+        crate::ui_println!(
             "{:<24} {:<7} {}",
             check.name,
             if check.ok { "ok" } else { "missing" },
             check.detail
         );
     }
-    println!();
-    println!("{:<24} {:<12} DETAIL", "RUNTIME", "STATUS");
+    crate::ui_println!();
+    crate::ui_println!("{:<24} {:<12} DETAIL", "RUNTIME", "STATUS");
     print_omlx_discovery();
     #[cfg(feature = "burn-experimental")]
     for mode in [BurnMode::Cuda, BurnMode::Cpu] {
         let status = BurnBackend::runtime_status(mode);
-        println!(
+        crate::ui_println!(
             "{:<24} {:<12} {}",
             mode.display(),
             if status.available {
@@ -8407,7 +8621,7 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
             status.detail
         );
         if debug {
-            println!(
+            crate::ui_println!(
                 "  Burn {} is an in-process probe-gated runtime",
                 mode.label()
             );
@@ -8436,7 +8650,7 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
                 OnnxRuntimeBackend::unavailable_reason(store, mode)
             }
         };
-        println!("{:<24} {:<12} {}", mode.display(), status, detail);
+        crate::ui_println!("{:<24} {:<12} {}", mode.display(), status, detail);
         if debug {
             print_onnxruntime_debug_details(store, mode);
         }
@@ -8448,7 +8662,7 @@ fn print_omlx_discovery() {
         Ok(detail) => ("installed", detail),
         Err(error) => ("unavailable", compact_reason(&format!("{error:#}"))),
     };
-    println!("{:<24} {:<12} {}", "oMLX", status, detail);
+    crate::ui_println!("{:<24} {:<12} {}", "oMLX", status, detail);
 }
 
 fn compiled_runtime_summary() -> String {
@@ -8479,35 +8693,40 @@ fn compiled_runtime_summary() -> String {
 }
 
 fn print_runtime_report(report: &LlamaFastRuntimeReport) {
-    println!("runtime: {} {}", report.runtime, report.native_commit);
-    println!("compiled: {}", report.compiled);
-    println!("modern sampler: {}", report.modern_sampler);
-    println!("flash attention supported: {}", report.flash_attn_supported);
+    crate::ui_println!("runtime: {} {}", report.runtime, report.native_commit);
+    crate::ui_println!("compiled: {}", report.compiled);
+    crate::ui_println!("modern sampler: {}", report.modern_sampler);
+    crate::ui_println!("flash attention supported: {}", report.flash_attn_supported);
     if let Some(requested) = report.flash_attn_requested {
-        println!("flash attention requested: {requested}");
+        crate::ui_println!("flash attention requested: {requested}");
     }
     if let Some(cap) = &report.cuda_compute_cap {
-        println!("CUDA_COMPUTE_CAP: {cap}");
+        crate::ui_println!("CUDA_COMPUTE_CAP: {cap}");
     }
-    println!(
+    crate::ui_println!(
         "ctx/batch/ubatch: {}/{}/{}",
-        report.ctx_size, report.batch_size, report.ubatch_size
+        report.ctx_size,
+        report.batch_size,
+        report.ubatch_size
     );
-    println!(
+    crate::ui_println!(
         "threads: generation {}, batch {}",
-        report.threads, report.threads_batch
+        report.threads,
+        report.threads_batch
     );
-    println!(
+    crate::ui_println!(
         "gpu layers/main gpu: {}/{}",
-        report.gpu_layers, report.main_gpu
+        report.gpu_layers,
+        report.main_gpu
     );
-    println!(
+    crate::ui_println!(
         "KV cache: {}, offload: {}",
-        report.kv_cache_type, report.kv_offload
+        report.kv_cache_type,
+        report.kv_offload
     );
-    println!("warmup tokens: {}", report.warmup_tokens);
+    crate::ui_println!("warmup tokens: {}", report.warmup_tokens);
     for warning in &report.warnings {
-        println!("warning: {warning}");
+        crate::ui_println!("warning: {warning}");
     }
 }
 
@@ -8812,7 +9031,7 @@ impl RoutedBackend {
             return;
         }
         if let Some(note) = self.fallback_note() {
-            eprintln!("{note}");
+            crate::ui_eprintln!("{note}");
         }
     }
 }
@@ -9931,6 +10150,25 @@ fn preferred_burn_mode() -> BurnMode {
     }
 }
 
+fn text_analysis_policy(backend: BackendArg) -> crate::backend::text_analysis::Policy {
+    use crate::backend::text_analysis::Policy;
+    match backend {
+        BackendArg::Auto => Policy::default(),
+        BackendArg::Cuda => Policy {
+            backend: None,
+            device: Some("cuda".into()),
+        },
+        BackendArg::Cpu => Policy {
+            backend: None,
+            device: Some("cpu".into()),
+        },
+        other => Policy {
+            backend: Some(other.to_possible_value().unwrap().get_name().to_string()),
+            device: None,
+        },
+    }
+}
+
 fn resolve_backend(
     backend: BackendArg,
     device_override: Option<DeviceArg>,
@@ -10072,6 +10310,9 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::VllmCuda => Some(BackendChoice::Vllm),
         RuntimeId::VllmRocm => Some(BackendChoice::VllmRocm),
         RuntimeId::MediaCompanionCuda
+        | RuntimeId::TransformersPooling
+        | RuntimeId::VllmPooling
+        | RuntimeId::CandlePooling
         | RuntimeId::MediaCompanionRocm
         | RuntimeId::MediaCompanionMetal
         | RuntimeId::MediaCompanionCpu => None,
@@ -10950,19 +11191,19 @@ fn print_routing_debug(
     let capabilities = request_capabilities(has_images);
     let requested_backend = requested_backend_for_choice(backend_arg_to_choice(requested));
 
-    eprintln!("requested backend: {}", requested_backend_label(requested));
-    eprintln!("model format: {:?}", manifest.format);
-    eprintln!(
+    crate::ui_eprintln!("requested backend: {}", requested_backend_label(requested));
+    crate::ui_eprintln!("model format: {:?}", manifest.format);
+    crate::ui_eprintln!(
         "architecture: {}",
         manifest.architecture.as_deref().unwrap_or("unknown")
     );
-    eprintln!("artifact: {}", artifact_debug_label(store, manifest));
-    eprintln!("request capabilities:");
-    eprintln!("  text_generation: yes");
-    eprintln!("  image_input: {}", yes_no(capabilities.image_input));
-    eprintln!("  embeddings: {}", yes_no(capabilities.embeddings));
-    eprintln!("  streaming: {}", yes_no(capabilities.streaming));
-    eprintln!("candidate runtimes:");
+    crate::ui_eprintln!("artifact: {}", artifact_debug_label(store, manifest));
+    crate::ui_eprintln!("request capabilities:");
+    crate::ui_eprintln!("  text_generation: yes");
+    crate::ui_eprintln!("  image_input: {}", yes_no(capabilities.image_input));
+    crate::ui_eprintln!("  embeddings: {}", yes_no(capabilities.embeddings));
+    crate::ui_eprintln!("  streaming: {}", yes_no(capabilities.streaming));
+    crate::ui_eprintln!("candidate runtimes:");
     for decision in selected
         .selection
         .iter()
@@ -10974,14 +11215,15 @@ fn print_routing_debug(
             RuntimeDecisionStatus::Rejected => "rejected",
         };
         let role = runtime_role(manifest, requested_backend, decision.runtime_id);
-        eprintln!(
+        crate::ui_eprintln!(
             "candidate: {} ({role}) -> {status}: {}",
-            decision.display_name, decision.reason
+            decision.display_name,
+            decision.reason
         );
         if decision.status == RuntimeDecisionStatus::Rejected
             && let Some(target) = runtime_install_target_for_current_host(descriptor.install_target)
         {
-            eprintln!("  install hint: werk backend install {target}");
+            crate::ui_eprintln!("  install hint: werk backend install {target}");
         }
         #[cfg(feature = "burn-experimental")]
         if matches!(
@@ -11011,14 +11253,14 @@ fn print_routing_debug(
         }
     }
     if let Some(planned) = &selected.selection {
-        eprintln!("selected runtime: {}", planned.display_name);
-        eprintln!(
+        crate::ui_eprintln!("selected runtime: {}", planned.display_name);
+        crate::ui_eprintln!(
             "selected role: {}",
             runtime_role(manifest, requested_backend, planned.runtime_id)
         );
-        eprintln!("reason: {}", planned.reason);
+        crate::ui_eprintln!("reason: {}", planned.reason);
     } else {
-        eprintln!(
+        crate::ui_eprintln!(
             "selected runtime: {}",
             verbose_backend_label(selected.choice)
         );
@@ -11044,7 +11286,7 @@ fn runtime_role(
 #[cfg(feature = "burn-experimental")]
 fn print_burn_debug_details(store: &ModelStore, manifest: &ModelManifest, mode: BurnMode) {
     let report = BurnBackend::probe_report(store, manifest, mode);
-    eprintln!(
+    crate::ui_eprintln!(
         "  status: {}",
         if report.available {
             "available"
@@ -11052,11 +11294,11 @@ fn print_burn_debug_details(store: &ModelStore, manifest: &ModelManifest, mode: 
             "unavailable"
         }
     );
-    eprintln!("  reason: {}", report.reason);
-    eprintln!("  architecture: {}", report.architecture);
-    eprintln!("  checks:");
+    crate::ui_eprintln!("  reason: {}", report.reason);
+    crate::ui_eprintln!("  architecture: {}", report.architecture);
+    crate::ui_eprintln!("  checks:");
     for check in report.checks {
-        eprintln!(
+        crate::ui_eprintln!(
             "  - {}: {} ({})",
             check.name,
             if check.ok { "ok" } else { "failed" },
@@ -11078,18 +11320,18 @@ fn print_onnxruntime_debug_details(store: &ModelStore, mode: OnnxRuntimeMode) {
         OnnxRuntimeAvailability::Installable => "bundled runner can be installed".to_string(),
         OnnxRuntimeAvailability::Unavailable => OnnxRuntimeBackend::unavailable_reason(store, mode),
     };
-    eprintln!("  status: {status}");
-    eprintln!("  reason: {reason}");
-    eprintln!("  tried:");
+    crate::ui_eprintln!("  status: {status}");
+    crate::ui_eprintln!("  reason: {reason}");
+    crate::ui_eprintln!("  tried:");
     for attempt in discovery.attempts {
         match attempt.path {
-            Some(path) => eprintln!(
+            Some(path) => crate::ui_eprintln!(
                 "  - {}: {} ({})",
                 attempt.label,
                 path.display(),
                 attempt.detail
             ),
-            None => eprintln!("  - {}: {}", attempt.label, attempt.detail),
+            None => crate::ui_eprintln!("  - {}: {}", attempt.label, attempt.detail),
         }
     }
 }
@@ -11349,19 +11591,19 @@ fn artifact_debug_label(store: &ModelStore, manifest: &ModelManifest) -> String 
 }
 
 fn print_manifest_summary(action: &str, manifest: &ModelManifest) {
-    println!(
+    crate::ui_println!(
         "{action} {} ({:?}, architecture: {})",
         manifest.id,
         manifest.format,
         manifest.architecture.as_deref().unwrap_or("unknown")
     );
-    println!(
+    crate::ui_println!(
         "  family={} layout={} tasks={}",
         manifest.metadata.family.as_deref().unwrap_or("unknown"),
         manifest.metadata.repository_layout,
         join_display(&manifest.metadata.tasks)
     );
-    println!(
+    crate::ui_println!(
         "  components={} size={} precision={} quantization={}",
         manifest.metadata.components.len(),
         format_bytes(
@@ -11374,7 +11616,7 @@ fn print_manifest_summary(action: &str, manifest: &ModelManifest) {
         manifest.metadata.precision.as_deref().unwrap_or("unknown"),
         manifest.metadata.quantization.as_deref().unwrap_or("none")
     );
-    println!(
+    crate::ui_println!(
         "  compatible runtimes={}",
         if manifest.metadata.compatible_runtimes.is_empty() {
             "unknown".to_string()
@@ -11385,7 +11627,7 @@ fn print_manifest_summary(action: &str, manifest: &ModelManifest) {
 }
 
 fn print_artifact_result(action: &str, model: &str, artifact: &ModelArtifact) {
-    println!(
+    crate::ui_println!(
         "{action} {:?} artifact for {}: {} ({})",
         artifact.kind,
         model,
@@ -11393,18 +11635,18 @@ fn print_artifact_result(action: &str, model: &str, artifact: &ModelArtifact) {
         artifact_status_label(artifact.status.clone())
     );
     if let Some(detail) = artifact.detail.as_deref() {
-        println!("{detail}");
+        crate::ui_println!("{detail}");
     }
 }
 
 fn print_artifact_list(model: &str, artifacts: &[ModelArtifact]) {
     if artifacts.is_empty() {
-        println!("No artifacts for {model}");
+        crate::ui_println!("No artifacts for {model}");
         return;
     }
-    println!("{:<12} {:<8} {:<32} DETAIL", "KIND", "STATUS", "PATH");
+    crate::ui_println!("{:<12} {:<8} {:<32} DETAIL", "KIND", "STATUS", "PATH");
     for artifact in artifacts {
-        println!(
+        crate::ui_println!(
             "{:<12} {:<8} {:<32} {}",
             format!("{:?}", artifact.kind).to_lowercase(),
             artifact_status_label(artifact.status.clone()),
@@ -11422,14 +11664,32 @@ fn artifact_status_label(status: ArtifactStatus) -> &'static str {
 }
 
 fn pull_progress_bar() -> ProgressBar {
-    let progress = ProgressBar::new(100);
+    let progress = crate::terminal::progress(ProgressBar::new(100));
     progress.enable_steady_tick(Duration::from_millis(120));
     progress.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:32.cyan/blue}] {pos:>3}% {msg}",
-        )
+        ProgressStyle::with_template(&format!(
+            "{}  {} [{}] {{pos:>3}}% {{msg}}",
+            crate::terminal::paint(
+                "│",
+                crate::terminal::VIOLET,
+                false,
+                crate::terminal::color(crate::terminal::Stream::Err)
+            ),
+            crate::terminal::paint(
+                "{spinner}",
+                crate::terminal::PINK,
+                true,
+                crate::terminal::color(crate::terminal::Stream::Err)
+            ),
+            crate::terminal::paint(
+                "{bar:24}",
+                crate::terminal::CYAN,
+                false,
+                crate::terminal::color(crate::terminal::Stream::Err)
+            )
+        ))
         .unwrap()
-        .progress_chars("=> "),
+        .progress_chars("━━─"),
     );
     progress
 }
@@ -11708,7 +11968,7 @@ fn format_server_persistence_config(config: &ServerPersistenceConfig) -> Option<
 }
 
 fn print_runtime_json(value: &impl Serialize) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    std::println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 

@@ -864,7 +864,7 @@ impl LlamaServerProcess {
             })
             .flatten();
 
-        eprintln!("Using llama.cpp server {} backend", display_name(mode));
+        crate::ui_eprintln!("Using llama.cpp server {} backend", display_name(mode));
         #[cfg(target_os = "linux")]
         let model_file_cache =
             model_file_cache::CacheReleaseGuard::prepare(model_path, projector_path, &args);
@@ -881,7 +881,8 @@ impl LlamaServerProcess {
         command.args(&args);
         execution.apply(&mut command);
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
-        if env_true("WERK_LLAMA_LOG") {
+        if env_true("WERK_LLAMA_LOG") && !crate::terminal::interactive(crate::terminal::Stream::Err)
+        {
             command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         } else {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -900,7 +901,8 @@ impl LlamaServerProcess {
         };
         let mut child_process = child.lock().unwrap_or_else(|e| e.into_inner());
         let mut log_readers = Vec::new();
-        if !env_true("WERK_LLAMA_LOG") {
+        if !env_true("WERK_LLAMA_LOG") || crate::terminal::interactive(crate::terminal::Stream::Err)
+        {
             if let Some(stdout) = child_process.stdout.take() {
                 log_readers.push(spawn_log_tail_reader("stdout", stdout, log_tail.clone()));
             }
@@ -1015,9 +1017,9 @@ impl LlamaServerProcess {
         // preparation once when verbose output is requested, before entering
         // native inference, so a slow first request also has useful evidence.
         if request.verbose && self.startup_diagnostics_reported.set(()).is_ok() {
-            eprintln!("[werk llama.cpp] prepared worker PID: {}", self.pid);
+            crate::ui_eprintln!("[werk llama.cpp] prepared worker PID: {}", self.pid);
             for diagnostic in &self.startup_diagnostics {
-                eprintln!("[werk llama.cpp] {diagnostic}");
+                crate::ui_eprintln!("[werk llama.cpp] {diagnostic}");
             }
         }
         let started = Instant::now();
@@ -1156,28 +1158,28 @@ impl LlamaServerProcess {
         if !request.debug {
             return;
         }
-        eprintln!("selected backend: {}", label(self.mode));
-        eprintln!(
+        crate::ui_eprintln!("selected backend: {}", label(self.mode));
+        crate::ui_eprintln!(
             "actual engine: llama.cpp server {} backend",
             display_name(self.mode)
         );
-        eprintln!(
+        crate::ui_eprintln!(
             "llama-server executable path: {}",
             self.executable.display()
         );
-        eprintln!("discovery source: {}", self.discovery_source);
-        eprintln!("full llama-server args: {}", shell_join(&self.args));
-        eprintln!("model path: {}", self.model_path.display());
-        eprintln!(
+        crate::ui_eprintln!("discovery source: {}", self.discovery_source);
+        crate::ui_eprintln!("full llama-server args: {}", shell_join(&self.args));
+        crate::ui_eprintln!("model path: {}", self.model_path.display());
+        crate::ui_eprintln!(
             "multimodal projector path: {}",
             self.projector_path
                 .as_deref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<none>".to_string())
         );
-        eprintln!("server PID: {}", self.pid);
-        eprintln!("server URL: {}", self.url);
-        eprintln!("reused existing server: {reused}");
+        crate::ui_eprintln!("server PID: {}", self.pid);
+        crate::ui_eprintln!("server URL: {}", self.url);
+        crate::ui_eprintln!("reused existing server: {reused}");
     }
 }
 
@@ -2309,7 +2311,7 @@ pub fn install_managed_llama_server_with_options(
             );
         }
         if options.verbose {
-            eprintln!("Cloning llama.cpp into {}", source_dir.display());
+            crate::ui_eprintln!("Cloning llama.cpp into {}", source_dir.display());
         }
         run_command(
             Command::new("git")
@@ -2322,7 +2324,7 @@ pub fn install_managed_llama_server_with_options(
             options.verbose,
         )?;
     } else if options.verbose {
-        eprintln!(
+        crate::ui_eprintln!(
             "Using existing llama.cpp checkout at {}",
             source_dir.display()
         );
@@ -2330,7 +2332,7 @@ pub fn install_managed_llama_server_with_options(
 
     if build_dir.join("CMakeCache.txt").is_file() {
         if options.verbose {
-            eprintln!(
+            crate::ui_eprintln!(
                 "Resetting previous llama.cpp build cache at {}",
                 build_dir.display()
             );
@@ -2344,7 +2346,7 @@ pub fn install_managed_llama_server_with_options(
     }
 
     if options.verbose {
-        eprintln!("Configuring llama.cpp {} build", display_name(mode));
+        crate::ui_eprintln!("Configuring llama.cpp {} build", display_name(mode));
     }
     let mut configure = if options.cuda_nvfp4 {
         fp4::build_command()
@@ -2371,7 +2373,7 @@ pub fn install_managed_llama_server_with_options(
             configure.arg("-DGGML_CUDA=ON");
             if let Some(nvcc) = cuda_compiler() {
                 if options.verbose {
-                    eprintln!("Using CUDA compiler {}", nvcc.display());
+                    crate::ui_eprintln!("Using CUDA compiler {}", nvcc.display());
                 }
                 configure.arg(format!("-DCMAKE_CUDA_COMPILER={}", nvcc.display()));
             }
@@ -2381,13 +2383,13 @@ pub fn install_managed_llama_server_with_options(
                 cuda_architecture()
             } {
                 if options.verbose {
-                    eprintln!("Using CUDA architecture {arch}");
+                    crate::ui_eprintln!("Using CUDA architecture {arch}");
                 }
                 configure.arg(format!("-DCMAKE_CUDA_ARCHITECTURES={arch}"));
             }
             if let Some(host_compiler) = cuda_host_compiler() {
                 if options.verbose {
-                    eprintln!("Using CUDA host compiler {}", host_compiler.display());
+                    crate::ui_eprintln!("Using CUDA host compiler {}", host_compiler.display());
                 }
                 configure.arg(format!(
                     "-DCMAKE_CUDA_HOST_COMPILER={}",
@@ -2403,13 +2405,13 @@ pub fn install_managed_llama_server_with_options(
             configure.arg("-DGGML_HIP=ON");
             if let Some(target) = rocm_gpu_targets() {
                 if options.verbose {
-                    eprintln!("Using ROCm GPU target {target}");
+                    crate::ui_eprintln!("Using ROCm GPU target {target}");
                 }
                 configure.arg(format!("-DGPU_TARGETS={target}"));
             }
             if let Some(no_vmm) = rocm_hip_no_vmm() {
                 if options.verbose {
-                    eprintln!(
+                    crate::ui_eprintln!(
                         "HIP virtual-memory manager disabled: {}",
                         if no_vmm { "yes" } else { "no" }
                     );
@@ -2435,7 +2437,7 @@ pub fn install_managed_llama_server_with_options(
     )?;
 
     if options.verbose {
-        eprintln!("Building llama-server");
+        crate::ui_eprintln!("Building llama-server");
     }
     let mut build = if options.cuda_nvfp4 {
         fp4::build_command()
@@ -2878,7 +2880,8 @@ fn managed_path_file(store: &ModelStore, mode: LlamaCppMode) -> PathBuf {
 
 fn run_command(command: &mut Command, context: &str, verbose: bool) -> Result<()> {
     if verbose {
-        let status = command.status().with_context(|| context.to_string())?;
+        let status =
+            crate::terminal::command_status(command).with_context(|| context.to_string())?;
         if !status.success() {
             bail!("{context}; command exited with {status}");
         }
@@ -3492,6 +3495,11 @@ where
     thread::spawn(move || {
         let reader = BufReader::new(reader);
         for line in reader.lines().map_while(Result::ok) {
+            if env_true("WERK_LLAMA_LOG")
+                && crate::terminal::interactive(crate::terminal::Stream::Err)
+            {
+                crate::ui_eprintln!("[llama.cpp] {line}");
+            }
             if let Ok(mut tail) = tail.lock() {
                 if tail.len() >= 80 {
                     tail.pop_front();

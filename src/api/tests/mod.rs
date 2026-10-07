@@ -11,5 +11,6 @@ mod generic_tools;
 mod media;
 mod observability;
 mod support;
+mod text_analysis;
 mod tools;
 mod vllm_tools;

@@ -17,6 +17,7 @@ mod observability;
 mod response;
 mod router;
 mod state;
+mod text_analysis;
 mod tools;
 mod werk;
 

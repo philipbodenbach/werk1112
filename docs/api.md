@@ -22,8 +22,8 @@ of truth.
 
 Current surface:
 
-- 39 unique paths
-- 43 method/path operations
+- 44 unique paths
+- 48 method/path operations
 - JSON requests, multipart file uploads and raw file/output downloads
 - server-sent events only for chat streaming
 - persisted asynchronous jobs for video, generated audio and the native job API
@@ -1258,7 +1258,6 @@ different trust domains.
 
 The following are not currently implemented:
 
-- <code>POST /v1/embeddings</code>
 - OpenAI Responses API
 - legacy text Completions API
 - multipart image edits, transcriptions and translations
@@ -1298,7 +1297,7 @@ execution success.
 ## Observability
 
 `GET /werk/v1/observability` returns a Werk Protocol 1.0 envelope containing
-schema-versioned server-wide chat telemetry, bounded recent/active request rows,
+schema-versioned server-wide inference telemetry, bounded recent/active request rows,
 physical memory observations and available native worker metrics. It requires
 normal Werk authentication and `x-werk-protocol-version: 1.0`.
 
@@ -1307,4 +1306,79 @@ It requires normal API-key authentication, without the Werk protocol header.
 Both endpoints share a two-second backend sampling cache and never load or
 reconfigure models. These operational endpoints expose model IDs and aggregate
 activity across server clients, but no prompts, generated content or credentials.
+Generation and text-analysis requests share the same record type. The optional
+`requests[].analysis` object adds task/runtime/device/precision, weight-cache hit,
+load/inference/worker durations, result count and attempt count. Non-applicable
+generation fields remain null. Analysis is visible while executing and contributes
+to existing request counters; additional Prometheus gauges use the existing
+per-model label convention. `werk top` view customizations affect only the client.
 See [metric semantics and coverage](../utils/observability/README.md).
+
+## Text-analysis endpoints
+
+These routes use the normal `werk serve` authentication and installed model store.
+They cannot be used through chat deployment profiles (`--deployments`). A request
+can provide `model`, or use the server's `--model` default. The model's architecture
+and task must match the endpoint. Sending a pooling/decision model to chat returns
+an error naming the correct endpoint.
+
+| Endpoint | Contract | Main input |
+| --- | --- | --- |
+| `POST /v1/embeddings` | OpenAI-compatible float embedding subset | `input`: string or string array |
+| `POST /v1/rerank`, `POST /rerank` | Reranking scores, descending relevance | `query`, `documents`: strings or `{ "text": "..." }` objects |
+| `POST /v1/classifications`, `POST /v1/systemone` | Werk-native classification; Laya-compatible question structure | Laya: `state`, `questions`; XLM-RoBERTa classifier: `input` |
+
+Embedding input is text only. `encoding_format` must be `float`; token-ID arrays
+and base64 output are not supported. EmbeddingGemma `input_type` is `query` or
+`document` (default); Werk applies the corresponding search/document prefix.
+`dimensions` supports 128, 256, 512 or 768 (default). Truncated vectors are
+renormalized in FP32. The response has `object`, `data`, `model`, `usage` and `werk`.
+
+Reranking accepts `top_n` and `return_documents`. `results` contains original
+`index` and normalized `relevance_score`; ties preserve input order. `texts` is an
+alias for `documents`. These endpoints return scores, not generated text.
+
+Laya accepts typed `noul`, `choice` and `score` questions. For `choice`, `criteria`
+is an object mapping labels to descriptions; for `score`, it is an ordered list
+of descriptions. Each question requires `instructions`. `werk.checkpoint` may be
+`auto`, `english`, `multilingual` or `typed-decisions`. Auto prefers a local
+multilingual subfolder when present, otherwise the root checkpoint; it does not
+change checkpoints based on request language. Standalone local fine-tunes work
+without the original bundle's repository name.
+
+~~~bash
+curl http://localhost:11434/v1/rerank \
+  -H "Authorization: Bearer $WERK_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"BAAI/bge-reranker-v2-m3","query":"Rust installieren",
+       "documents":["cargo install installiert Rust-Programme.","Tomaten brauchen Licht."]}'
+
+curl http://localhost:11434/v1/embeddings \
+  -H "Authorization: Bearer $WERK_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"google/embeddinggemma-2","input":["Rust installieren"],
+       "input_type":"query","dimensions":256}'
+
+curl http://localhost:11434/v1/classifications \
+  -H "Authorization: Bearer $WERK_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"convaiinnovations/laya","state":{"text":"Die Rechnung wurde doppelt abgebucht."},
+       "questions":{"billing":{"type":"noul","instructions":"Geht es um eine Zahlung?"}}}'
+~~~
+
+Optional `werk` request fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `backend` | `auto` | `auto`, `transformers`, `vllm`, `candle`; server constraints take precedence |
+| `device` | `auto` | CUDA when available, otherwise CPU; explicit `cuda`/`cpu` are hard constraints |
+| `fallback_policy` | `compatible` | Compatible runtime retries; `none` disables retries |
+| `batch_size` | 16 | 1–128; reduce after out-of-memory errors |
+| `max_length` | 512 | 8–8192 tokens, bounded by the checkpoint's context |
+| `truncate` | false | Explicit opt-in to input truncation; vLLM requires inputs to fit without truncation |
+| `checkpoint` | `auto` | Laya checkpoint selection only |
+
+Bodies are limited to 1 MiB. Embeddings/classifiers accept at most 128 texts;
+rerankers accept at most 128 documents; Laya accepts 1–32 questions. Invalid input
+returns 400, missing models 404, capacity exhaustion 429 and runtime failures 503.
+Failure messages include the attempted runtime and mitigation, such as installing
+`text-analysis`, selecting the correct Python, reducing batches or freeing VRAM.
+`werk.diagnostics` records fallbacks, while `werk.runtime`, `device`, `dtype`,
+`model_cache_hit` and timings identify the actual successful execution.

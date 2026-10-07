@@ -155,7 +155,7 @@ pub(super) async fn prepare(
         })? {
         Ok(manifest) => manifest,
         Err(err) => {
-            eprintln!("[werk serve] POST {endpoint} model={model_id} -> 404");
+            crate::ui_eprintln!("[werk serve] POST {endpoint} model={model_id} -> 404");
             return Err(GenerationError::new(
                 StatusCode::NOT_FOUND,
                 err.to_string(),
@@ -168,7 +168,14 @@ pub(super) async fn prepare(
         && !manifest.supports_task(InferenceTask::TextGeneration)
         && !manifest.supports_task(InferenceTask::ImageUnderstanding)
     {
-        let message = if manifest.supports_task(InferenceTask::ImageGeneration) {
+        let message = if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
+            format!(
+                "model '{}' performs {} and cannot generate chat responses; use {} instead",
+                manifest.id,
+                task,
+                crate::backend::text_analysis::endpoint(task)
+            )
+        } else if manifest.supports_task(InferenceTask::ImageGeneration) {
             format!(
                 "model '{}' is an image-generation model and cannot be used with {endpoint}; use /v1/images/generations instead",
                 manifest.id
@@ -253,7 +260,7 @@ pub(super) async fn prepare(
         0
     };
     if removed_messages > 0 {
-        eprintln!(
+        crate::ui_eprintln!(
             "[werk serve] chat context model={} removed_messages={} context_size={} max_tokens={}",
             manifest.id,
             removed_messages,
@@ -376,7 +383,7 @@ pub(super) async fn prepare(
     } {
         Ok(options) => options,
         Err(err) => {
-            eprintln!(
+            crate::ui_eprintln!(
                 "[werk serve] POST {endpoint} model={} -> routing error: {err}",
                 manifest.id
             );

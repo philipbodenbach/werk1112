@@ -92,7 +92,9 @@ impl Drop for ManagedResultCleanup {
             return;
         };
         if let Err(error) = self.output_store.remove_result(&result_id) {
-            eprintln!("warning: failed to clean up streamed media result '{result_id}': {error:#}");
+            crate::ui_eprintln!(
+                "warning: failed to clean up streamed media result '{result_id}': {error:#}"
+            );
         }
     }
 }

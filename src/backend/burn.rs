@@ -763,7 +763,7 @@ impl GenerationBackend for BurnBackend {
 
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.ensure_model(manifest)?;
-        eprintln!("Using {} backend", self.mode.display());
+        crate::ui_eprintln!("Using {} backend", self.mode.display());
         Ok(())
     }
 

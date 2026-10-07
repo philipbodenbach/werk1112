@@ -74,7 +74,7 @@
     },
     {
       "id": 2,
-      "title": "Active chat requests",
+      "title": "Active inference requests",
       "description": "",
       "type": "timeseries",
       "datasource": {
@@ -417,7 +417,7 @@
     },
     {
       "id": 9,
-      "title": "Chat completions / second",
+      "title": "Inference completions / second",
       "description": "",
       "type": "timeseries",
       "datasource": {
@@ -466,7 +466,7 @@
     },
     {
       "id": 10,
-      "title": "Chat errors / second",
+      "title": "Inference errors / second",
       "description": "",
       "type": "timeseries",
       "datasource": {
@@ -515,7 +515,7 @@
     },
     {
       "id": 11,
-      "title": "Chat cancellations / second",
+      "title": "Inference cancellations / second",
       "description": "",
       "type": "timeseries",
       "datasource": {
@@ -979,6 +979,251 @@
       "fieldConfig": {
         "defaults": {
           "unit": "suffix:tok/s",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#00DCFF"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Text analysis \u00b7 Model load",
+      "description": "Last completed text-analysis request per model in the bounded recent history. Missing values are unavailable. Weight cache hits do not measure prompt-token reuse.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "werk_last_request_load_seconds{job=\"werk\"}",
+          "legendFormat": "{{instance}} {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#00DCFF"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "Text analysis \u00b7 Inference",
+      "description": "Last completed text-analysis request per model in the bounded recent history. Missing values are unavailable. Weight cache hits do not measure prompt-token reuse.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "werk_last_request_inference_seconds{job=\"werk\"}",
+          "legendFormat": "{{instance}} {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#00DCFF"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "title": "Text analysis \u00b7 Worker total",
+      "description": "Last completed text-analysis request per model in the bounded recent history. Missing values are unavailable. Weight cache hits do not measure prompt-token reuse.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 77
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "werk_last_request_worker_seconds{job=\"werk\"}",
+          "legendFormat": "{{instance}} {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#00DCFF"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "title": "Text analysis \u00b7 Model weight cache hit",
+      "description": "Last completed text-analysis request per model in the bounded recent history. Missing values are unavailable. Weight cache hits do not measure prompt-token reuse.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 77
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "werk_last_request_model_cache_hit{job=\"werk\"}",
+          "legendFormat": "{{instance}} {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bool",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#00DCFF"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "title": "Text analysis \u00b7 Result count",
+      "description": "Last completed text-analysis request per model in the bounded recent history. Missing values are unavailable. Weight cache hits do not measure prompt-token reuse.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 84
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "werk_last_request_results{job=\"werk\"}",
+          "legendFormat": "{{instance}} {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
           "color": {
             "mode": "fixed",
             "fixedColor": "#00DCFF"

@@ -543,6 +543,25 @@ fn typed_runtime_candidate_ids(
     requested_backend: RequestedBackend,
     task: InferenceTask,
 ) -> Vec<RuntimeId> {
+    if crate::backend::text_analysis::task_for(manifest) == Some(task) {
+        return [
+            RuntimeId::VllmPooling,
+            RuntimeId::TransformersPooling,
+            RuntimeId::CandlePooling,
+        ]
+        .into_iter()
+        .filter(|id| {
+            let descriptor = runtime_descriptor(*id);
+            descriptor.supports_task(task)
+                && runtime_supports_model(
+                    descriptor,
+                    &manifest.format,
+                    manifest.architecture.as_deref(),
+                )
+                && requested_backend_matches_descriptor(requested_backend, descriptor)
+        })
+        .collect();
+    }
     if !is_media_task(task) {
         return runtime_candidate_ids(manifest, requested_backend)
             .into_iter()
@@ -573,6 +592,8 @@ fn is_media_task(task: InferenceTask) -> bool {
         task,
         InferenceTask::TextGeneration
             | InferenceTask::TextEmbedding
+            | InferenceTask::TextReranking
+            | InferenceTask::TextClassification
             | InferenceTask::ImageUnderstanding
     )
 }
