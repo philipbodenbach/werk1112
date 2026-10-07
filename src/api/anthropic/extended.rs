@@ -28,7 +28,11 @@ pub(super) async fn handle(
     request_id: &str,
     tool_names: Vec<String>,
 ) -> Response {
-    let model = prepared.manifest.id.clone();
+    let model = prepared
+        .state
+        .requested_alias
+        .clone()
+        .unwrap_or_else(|| prepared.manifest.id.clone());
     let matched_requested = prepared.api_options.contains_key("__werk_matched_stop");
     if prepared.stream {
         let matched = Arc::new(Mutex::new(None));

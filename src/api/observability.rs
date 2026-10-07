@@ -52,13 +52,14 @@ async fn collect(state: &ApiState) -> Snapshot {
                 return current(state);
             }
             let backend = state.backend.clone();
+            let deployments = state.deployments.clone();
             let Ok((_gate, mut backends, swap, host_free)) =
                 tokio::task::spawn_blocking(move || {
                     let mut system = sysinfo::System::new();
                     system.refresh_memory();
                     (
                         gate,
-                        backend.telemetry(),
+                        deployments.map_or_else(|| backend.telemetry(), |r| r.telemetry()),
                         sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.used_swap()),
                         sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.free_memory()),
                     )

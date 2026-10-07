@@ -42,7 +42,7 @@ impl BackendRuntimeAdapter for VllmRuntimeControlAdapter {
             single_runtime_value(&processes, |process| process.runtime_version.as_str());
         let instance_id =
             single_runtime_value(&processes, |process| process.runtime_instance_id.as_str());
-        BackendRuntimeDescriptor {
+        let mut descriptor = BackendRuntimeDescriptor {
             backend: self.backend.accelerator.backend_label().to_string(),
             backend_version: runtime_version.unwrap_or_else(|| {
                 if processes.is_empty() {
@@ -60,7 +60,11 @@ impl BackendRuntimeAdapter for VllmRuntimeControlAdapter {
                 active_model_residency_capability(&processes),
                 prefix_cache_capability(status, detail),
             ],
+        };
+        if let Some(deployment) = &self.backend.deployment {
+            descriptor.capabilities.push(deployment.plan.capability());
         }
+        descriptor
     }
 }
 

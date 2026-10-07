@@ -1,5 +1,11 @@
 # Backends, routing and platform support
 
+Optional [single-host deployment profiles](concepts/single-host-deployments.md)
+bind llama.cpp and vLLM workers to explicit CUDA UUID groups, native executables,
+context/concurrency settings and memory budgets. This includes aliases and
+replicas, and allows stock and offload binaries to coexist. See the
+[dated runtime review](multi-gpu-runtime-review.md) for source pins and limitations.
+
 Werk1112 separates the stable inference contract from concrete execution
 runtimes. A model can be installed and classified without every backend being
 present, and one model may have several eligible runtime candidates.

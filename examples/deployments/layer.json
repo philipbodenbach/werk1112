@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "assistant-0",
+      "alias": "assistant",
+      "model": "REPLACE_INSTALLED_MODEL_ID",
+      "runtime": "llama_cuda",
+      "executable": "/absolute/path/to/llama-server",
+      "build": "REPLACE_SOURCE_REVISION",
+      "gpus": [
+        "GPU-REPLACE-0",
+        "GPU-REPLACE-1"
+      ],
+      "strategy": "layer",
+      "context": 4096,
+      "batch": 512,
+      "parallel": 1,
+      "cpu_threads": 8,
+      "memory": [
+        {
+          "weights": 12884901888,
+          "replicated": 0,
+          "kv": 1073741824,
+          "experts": 0,
+          "compute": 1073741824,
+          "overhead": 536870912,
+          "reserve": 1073741824
+        },
+        {
+          "weights": 12884901888,
+          "replicated": 0,
+          "kv": 1073741824,
+          "experts": 0,
+          "compute": 1073741824,
+          "overhead": 536870912,
+          "reserve": 1073741824
+        }
+      ],
+      "host_bytes": 21474836480,
+      "split": [
+        1,
+        1
+      ]
+    }
+  ]
+}

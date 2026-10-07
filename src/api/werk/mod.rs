@@ -46,6 +46,10 @@ pub(super) fn routes() -> Router<ApiState> {
 }
 
 async fn info_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -57,6 +61,10 @@ async fn info_handler(State(state): State<ApiState>, headers: HeaderMap) -> Resp
 }
 
 async fn capabilities_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -68,6 +76,10 @@ async fn capabilities_handler(State(state): State<ApiState>, headers: HeaderMap)
 }
 
 async fn memory_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -83,6 +95,10 @@ async fn list_states_handler(
     headers: HeaderMap,
     query: Result<Query<StateListFilter>, QueryRejection>,
 ) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -103,6 +119,10 @@ async fn state_action_handler(
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<StateActionRequest>, JsonRejection>,
 ) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -130,6 +150,10 @@ async fn prune_states_handler(
     headers: HeaderMap,
     body: Result<Json<PruneStatesRequest>, JsonRejection>,
 ) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -149,6 +173,10 @@ async fn list_experts_handler(
     headers: HeaderMap,
     query: Result<Query<ExpertListFilter>, QueryRejection>,
 ) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -168,6 +196,10 @@ async fn expert_action_handler(
     headers: HeaderMap,
     body: Result<Json<ExpertActionRequest>, JsonRejection>,
 ) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -187,6 +219,10 @@ async fn prefill_handler(
     headers: HeaderMap,
     body: Result<Json<WirePrefillRequest>, JsonRejection>,
 ) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -283,6 +319,10 @@ async fn decode_handler(
     headers: HeaderMap,
     body: Result<Json<DecodeRequest>, JsonRejection>,
 ) -> Response {
+    let state = match super::deployments::control_state(state, &headers) {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
     let (request_id, context) = match request_context(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,

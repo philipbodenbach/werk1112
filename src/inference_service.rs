@@ -5,10 +5,11 @@
 
 mod backend;
 mod companion;
+pub mod devices;
 mod helpers;
 mod jobs;
 mod output;
-mod resources;
+pub(crate) mod resources;
 mod service;
 mod tools;
 mod types;

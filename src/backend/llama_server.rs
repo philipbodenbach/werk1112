@@ -84,11 +84,13 @@ pub struct LlamaServerBackend {
     store: ModelStore,
     mode: LlamaCppMode,
     runtime_options: LlamaRuntimeOptions,
+    deployment: Option<crate::deployments::Execution>,
     servers: Arc<super::runtime_cache::RuntimeCache<String, LlamaServerProcess>>,
 }
 
 struct LlamaServerProcess {
     child: super::llama_process_lifecycle::ManagedChild,
+    _reservation: Mutex<Option<crate::inference_service::resources::Reservation>>,
     // Fields drop in declaration order, after Drop has reaped the native worker.
     #[cfg(target_os = "linux")]
     _model_file_cache: Option<model_file_cache::CacheReleaseGuard>,
@@ -179,8 +181,43 @@ impl LlamaServerBackend {
             store,
             mode,
             runtime_options,
+            deployment: None,
             servers: Arc::new(Default::default()),
         }
+    }
+
+    pub(crate) fn with_deployment(mut self, deployment: crate::deployments::Execution) -> Self {
+        self.deployment = Some(deployment);
+        self
+    }
+
+    pub(crate) fn validate_deployment_offload(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        profile: &crate::deployments::Profile,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let crate::deployments::Offload::CpuExperts { layers } = profile.offload {
+            let path = manifest
+                .model_path
+                .as_deref()
+                .context("CPU expert placement requires a GGUF model path")?;
+            let inventory = model_prefetch::inventory_cpu_experts(
+                &store.absolute_model_file(manifest, path),
+                model_prefetch::CpuMoePlacement::FirstLayers(layers),
+            )?;
+            anyhow::ensure!(
+                inventory.total_bytes > 0,
+                "requested CPU expert placement matches no expert tensors"
+            );
+            anyhow::ensure!(
+                inventory.total_bytes <= profile.host_bytes,
+                "CPU expert weights alone exceed declared host RAM budget"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (store, manifest, profile);
+        Ok(())
     }
 
     pub fn probe(store: &ModelStore, mode: LlamaCppMode) -> Result<String> {
@@ -372,7 +409,18 @@ impl LlamaServerBackend {
                 .unwrap_or_else(|| gpu_layers(self.mode))
         );
 
-        let key = format!("{key}:{}", serde_json::to_string(&self.runtime_options)?);
+        let key = format!(
+            "{key}:{}:{}",
+            serde_json::to_string(&self.runtime_options)?,
+            self.deployment
+                .as_ref()
+                .map_or("", |d| d.plan.fingerprint.as_str())
+        );
+        if let Some(deployment) = &self.deployment {
+            if deployment.plan.model_identity != model_identity.to_string() {
+                bail!("deployment model identity changed; reload profiles");
+            }
+        }
 
         self.servers
             .get_or_try_init(key, LlamaServerProcess::is_running, || {
@@ -384,6 +432,7 @@ impl LlamaServerBackend {
                     &absolute_model_path,
                     projector_path.as_deref(),
                     &self.runtime_options,
+                    self.deployment.as_ref(),
                 )
             })
     }
@@ -703,9 +752,24 @@ impl LlamaServerProcess {
         model_path: &Path,
         projector_path: Option<&Path>,
         runtime_options: &LlamaRuntimeOptions,
+        deployment: Option<&crate::deployments::Execution>,
     ) -> Result<Self> {
-        let discovery =
-            require_llama_server_for_model(store, mode, manifest, runtime_options.fp4_kernel)?;
+        let reservation = deployment
+            .map(crate::deployments::Execution::reserve)
+            .transpose()?;
+        let discovery = if let Some(deployment) = deployment {
+            LlamaServerDiscovery {
+                mode,
+                path: Some(deployment.plan.profile.executable.clone()),
+                source: format!(
+                    "deployment {} / {}",
+                    deployment.plan.profile.id, deployment.plan.profile.build
+                ),
+                attempts: Vec::new(),
+            }
+        } else {
+            require_llama_server_for_model(store, mode, manifest, runtime_options.fp4_kernel)?
+        };
         let executable = discovery
             .path
             .clone()
@@ -716,7 +780,10 @@ impl LlamaServerProcess {
         {
             fp4::validate_runtime(&executable)?;
         }
-        let execution = fp4::prepare(&executable, mode, runtime_options.fp4_kernel)?;
+        let mut execution = fp4::prepare(&executable, mode, runtime_options.fp4_kernel)?;
+        if let Some(deployment) = deployment {
+            execution.bind_deployment(&deployment.plan);
+        }
         let startup_port = super::llama_process_lifecycle::StartupPort::reserve()?;
         let port = startup_port.port();
         let url = format!("http://127.0.0.1:{port}");
@@ -753,7 +820,7 @@ impl LlamaServerProcess {
         }
         let (generation_id, snapshot_dir) =
             prepare_llama_state_snapshot_dir(store, &supported).unwrap_or((None, None));
-        let args = llama_server_args_with_state(
+        let mut args = llama_server_args_with_state(
             mode,
             model_path,
             projector_path,
@@ -763,6 +830,24 @@ impl LlamaServerProcess {
             llama_server_non_thinking(manifest),
             snapshot_dir.as_deref(),
         );
+        if let Some(deployment) = deployment {
+            // Raw global arguments were rejected at resolution and must not be
+            // introduced afterwards by library callers either.
+            if !env::var("WERK_LLAMA_ARGS")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                bail!("WERK_LLAMA_ARGS conflicts with deployment plan");
+            }
+            args.extend(deployment.plan.args.clone());
+            if inspection
+                .as_ref()
+                .is_some_and(|i| help_has_exact_option(&i.help, "--fit"))
+            {
+                args.extend(["--fit".into(), "off".into()]);
+            }
+        }
         let state_args_effective = generation_id.is_some()
             && snapshot_dir.is_some()
             && llama_state_args_are_effective(
@@ -827,6 +912,7 @@ impl LlamaServerProcess {
         drop(child_process);
         let mut process = Self {
             child,
+            _reservation: Mutex::new(reservation),
             #[cfg(target_os = "linux")]
             _model_file_cache: model_file_cache,
             #[cfg(target_os = "linux")]
@@ -1018,7 +1104,15 @@ impl LlamaServerProcess {
     }
 
     fn is_running(&self) -> bool {
-        matches!(self.try_wait_status(), Ok(None))
+        let running = matches!(self.try_wait_status(), Ok(None));
+        if !running {
+            let mut reservation = self._reservation.lock().unwrap_or_else(|e| e.into_inner());
+            if reservation.is_some() {
+                self.child.terminate();
+                reservation.take();
+            }
+        }
+        running
     }
 
     fn try_wait_status(&self) -> Result<Option<ExitStatus>> {

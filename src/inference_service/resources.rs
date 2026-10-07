@@ -10,6 +10,98 @@ use crate::backend::current_host_is_strix_halo;
 use crate::backend::current_selected_rocm_device_is_strix_halo;
 use crate::inference::{HostResources, MemoryTopology, RuntimeAccelerator};
 
+/// Admission ledger shared by the service's configured native workers.
+/// Live GPU allocations are already present in `free_bytes`; never subtract
+/// their budgets from that measurement a second time. GPU ownership is exclusive.
+pub(crate) struct Reservations {
+    state: std::sync::Mutex<std::collections::BTreeMap<String, (Vec<String>, u64)>>,
+    host_capacity: u64,
+}
+
+pub(crate) struct Reservation {
+    owner: std::sync::Arc<Reservations>,
+    id: String,
+}
+
+impl Reservations {
+    pub(crate) fn new(host_capacity: u64) -> Self {
+        Self {
+            state: Default::default(),
+            host_capacity,
+        }
+    }
+    pub(crate) fn acquire(
+        self: &std::sync::Arc<Self>,
+        plan: &crate::deployments::Plan,
+        inventory: &super::devices::Inventory,
+    ) -> anyhow::Result<Reservation> {
+        let mut entries = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource ledger poisoned"))?;
+        anyhow::ensure!(
+            !entries.contains_key(&plan.profile.id),
+            "deployment already has a resident worker"
+        );
+        let reserved_host = entries.values().try_fold(0u64, |a, (_, b)| {
+            a.checked_add(*b)
+                .ok_or_else(|| anyhow::anyhow!("host reservations overflow"))
+        })?;
+        anyhow::ensure!(
+            reserved_host
+                .checked_add(plan.profile.host_bytes)
+                .is_some_and(|b| b <= self.host_capacity),
+            "host admission budget exhausted"
+        );
+        anyhow::ensure!(
+            inventory
+                .host_available_bytes
+                .is_some_and(|b| b >= plan.profile.host_bytes),
+            "host free RAM no longer fits new worker"
+        );
+        for (device, budget) in plan.devices.iter().zip(&plan.profile.memory) {
+            anyhow::ensure!(
+                !entries.values().any(|(ids, _)| ids.contains(&device.id)),
+                "GPU {} is reserved by another worker",
+                device.id
+            );
+            let measured = inventory
+                .devices
+                .iter()
+                .find(|d| d.id == device.id && d.visible_index.is_some())
+                .ok_or_else(|| anyhow::anyhow!("GPU {} disappeared from visibility", device.id))?;
+            anyhow::ensure!(
+                measured
+                    .free_bytes
+                    .is_some_and(|b| b >= budget.total().unwrap_or(u64::MAX)),
+                "GPU {} no longer fits new worker",
+                device.id
+            );
+        }
+        entries.insert(
+            plan.profile.id.clone(),
+            (
+                plan.devices.iter().map(|d| d.id.clone()).collect(),
+                plan.profile.host_bytes,
+            ),
+        );
+        Ok(Reservation {
+            owner: self.clone(),
+            id: plan.profile.id.clone(),
+        })
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.owner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 const NVIDIA_DEVICE_PATHS: [&str; 2] = ["/dev/nvidiactl", "/dev/nvidia0"];
 

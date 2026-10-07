@@ -1,0 +1,1355 @@
+{
+  "schema": 1,
+  "parameters": {
+    "werk": "target/debug/werk",
+    "config": "/tmp/werk-mgpu-single.json",
+    "out": "/tmp/werk-mgpu-single-results.json",
+    "repetitions": 3,
+    "tokens": 16,
+    "prompt": "Return the integer result of 17 + 25, with no explanation.",
+    "required_gpus": 1,
+    "timeout": 600
+  },
+  "inventory_before": {
+    "devices": [
+      {
+        "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+        "physical_index": 0,
+        "vendor": "nvidia",
+        "name": "NVIDIA GeForce RTX 3090",
+        "architecture": "sm_86",
+        "runtime": "cuda",
+        "pci_bus_id": "00000000:03:00.0",
+        "total_bytes": 25769803776,
+        "free_bytes": 21704474624,
+        "numa_node": null,
+        "pcie_link": null,
+        "visible_index": 0
+      }
+    ],
+    "host_available_bytes": 96888598528,
+    "topology": null,
+    "warnings": []
+  },
+  "werk_revision": "8d8ee73a002e8473818d1e86099e0a21b3b51d23",
+  "dirty_diff": " .gitignore                                |   3 +-\n src/api.rs                                |   1 +\n src/api/chat.rs                           |  44 ++++++++++--\n src/api/extended.rs                       |  22 ++++--\n src/api/generation.rs                     |  26 ++++++-\n src/api/observability.rs                  |   3 +-\n src/api/router.rs                         |   1 +\n src/api/state.rs                          |  48 +++++++++++++\n src/api/werk/mod.rs                       |  40 +++++++++++\n src/backend/llama_process_lifecycle.rs    |  34 +++++++--\n src/backend/llama_server.rs               |  77 ++++++++++++++++++--\n src/backend/llama_server/fp4.rs           |   8 +++\n src/backend/llama_server/runtime_state.rs | 116 ++++++++++++++++--------------\n src/backend/vllm.rs                       |  76 +++++++++++++++++++-\n src/backend/vllm/runtime_control.rs       |   6 +-\n src/cli.rs                                |  59 ++++++++++++++-\n src/inference_service.rs                  |   3 +-\n src/inference_service/resources.rs        |  92 ++++++++++++++++++++++++\n src/lib.rs                                |   1 +\n 19 files changed, 574 insertions(+), 86 deletions(-)\n",
+  "cold_definition": "fresh worker; OS page cache not flushed",
+  "samples": [
+    {
+      "alias": "qwen-gpu",
+      "session": "validation-qwen-gpu",
+      "ttft_seconds": 28.105974994999997,
+      "total_seconds": 28.28231289299947,
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 29,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 32
+      },
+      "text": "42",
+      "repetition": 0,
+      "worker_state": "cold"
+    },
+    {
+      "alias": "qwen-gpu",
+      "session": "validation-qwen-gpu",
+      "ttft_seconds": 0.8999330920014472,
+      "total_seconds": 1.022885390000738,
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 29,
+        "prompt_tokens_details": {
+          "cached_tokens": 25
+        },
+        "total_tokens": 32
+      },
+      "text": "42",
+      "repetition": 1,
+      "worker_state": "warm"
+    },
+    {
+      "alias": "qwen-gpu",
+      "session": "validation-qwen-gpu",
+      "ttft_seconds": 0.5221091950006667,
+      "total_seconds": 0.609684594997816,
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 29,
+        "prompt_tokens_details": {
+          "cached_tokens": 25
+        },
+        "total_tokens": 32
+      },
+      "text": "42",
+      "repetition": 2,
+      "worker_state": "warm"
+    }
+  ],
+  "hardware_cases": {
+    "single": "configured",
+    "two_equal": "requires explicit config and >=2 GPUs",
+    "two_unequal": "requires explicit config and >=2 unequal GPUs",
+    "independent": "requires explicit config and >=2 GPUs",
+    "mixed": "requires explicit config and >=3 GPUs",
+    "replicas": "requires explicit config and >=2 GPUs"
+  },
+  "plans": [
+    {
+      "profile": {
+        "id": "qwen-gpu",
+        "alias": "multi-gpu-smoke",
+        "model": "qwen3.8-27b-ud-q4_k_xl",
+        "runtime": "llama_cuda",
+        "executable": "/home/philipbodenbach/.local/share/werk1112/backends/llama-cuda/upstream-ec928150501c/build/bin/llama-server",
+        "build": "ec928150501c",
+        "gpus": [
+          "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9"
+        ],
+        "strategy": "single",
+        "tensor_parallel": 1,
+        "pipeline_parallel": 1,
+        "split": [],
+        "context": 2048,
+        "batch": 256,
+        "parallel": 1,
+        "cpu_threads": 8,
+        "offload": {
+          "kind": "none"
+        },
+        "kv_cpu": false,
+        "memory": [
+          {
+            "weights": 18500000000,
+            "replicated": 0,
+            "kv": 268435456,
+            "experts": 0,
+            "compute": 536870912,
+            "overhead": 268435456,
+            "reserve": 536870912
+          }
+        ],
+        "host_bytes": 24000000000,
+        "native_args": [
+          "--no-warmup"
+        ]
+      },
+      "model_identity": "sha256:1352bb293f26ccf8ee2fd8d226093eff8357e5eac21f078dca9f0e8bc2f6f071",
+      "executable_sha256": "236d00dc1c71b01bd15a13b229edeac2e4b05a9ac740d33aadc14fe6f71287b6",
+      "devices": [
+        {
+          "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+          "physical_index": 0,
+          "vendor": "nvidia",
+          "name": "NVIDIA GeForce RTX 3090",
+          "architecture": "sm_86",
+          "runtime": "cuda",
+          "pci_bus_id": "00000000:03:00.0",
+          "total_bytes": 25769803776,
+          "free_bytes": 21721251840,
+          "numa_node": null,
+          "pcie_link": null,
+          "visible_index": 0
+        }
+      ],
+      "strategy": "single",
+      "args": [
+        "--device",
+        "CUDA0",
+        "--split-mode",
+        "none",
+        "--main-gpu",
+        "0",
+        "--no-warmup"
+      ],
+      "environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+        "OMP_NUM_THREADS": "8"
+      },
+      "fingerprint": "5878014b255b22aa490568d6cf78ad3db30a2c28be70b60414154c5fac06090a",
+      "reasons": [
+        "Exclusive GPU ownership; component budgets are declared estimates, not measured usage or hard allocator limits.",
+        "Unknown P2P/NVLink is not treated as a prerequisite; no throughput prediction was made."
+      ]
+    }
+  ],
+  "telemetry": [
+    {
+      "protocol": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req_N3AIu3d25fQByRw6V5ws_A",
+      "data": {
+        "host_swap_used_bytes": 0,
+        "host_memory_free_bytes": 73435750400,
+        "schema_version": 1,
+        "observed_at_ms": 1791310703333,
+        "server_started_ms": 1791310672545,
+        "uptime_seconds": 30.78783743,
+        "totals": {
+          "started": 1,
+          "completed": 1,
+          "errors": 0,
+          "cancelled": 0,
+          "active": 0,
+          "prompt_tokens": 29,
+          "output_tokens": 3,
+          "cached_tokens": 0,
+          "duration_seconds": 27.999049124
+        },
+        "requests": [
+          {
+            "id": 1,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791310675215,
+            "elapsed_seconds": 27.999049124,
+            "prompt_tokens": 29,
+            "cached_tokens": 0,
+            "output_tokens": 3,
+            "first_output_seconds": 0.432180295,
+            "decode_tokens_per_second": 16.981676770764345,
+            "prefill_tokens_per_second": 67.7033844688436
+          }
+        ],
+        "backends": [
+          {
+            "backend": "deployment",
+            "instance": "qwen-gpu",
+            "model": "multi-gpu-smoke",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "gpu_budget_bytes_estimate": 20110612736.0,
+              "gpu_count": 1.0,
+              "host_budget_bytes_estimate": 24000000000.0,
+              "queue_capacity": 0.0,
+              "slots_available": 1.0
+            }
+          },
+          {
+            "backend": "llama.cpp / CUDA",
+            "instance": "llama-55319-http://127.0.0.1:43411",
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "active_cached_tokens": 0.0,
+              "active_output_tokens": 0.0,
+              "active_prompt_tokens": 0.0,
+              "context_capacity_tokens": 2048.0,
+              "context_used_tokens": 31.0,
+              "gpu_layers_requested": 999.0,
+              "process_resident_bytes": 1456742400.0,
+              "requests_active": 0.0,
+              "slots_total": 1.0
+            }
+          }
+        ],
+        "memory": {
+          "observed_at_unix_ms": 1791310703332,
+          "overall_pressure": "hard",
+          "topology": "discrete",
+          "host": {
+            "capacity_bytes": 105469059072,
+            "available_bytes": 99107876864,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "accelerator": {
+            "capacity_bytes": 25769803776,
+            "available_bytes": 3666870272,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "hard"
+          },
+          "last_action_unix_ms": null,
+          "counters": {
+            "active_reservations": 0,
+            "backend_cleanup_failures": 0,
+            "backend_cleanup_latched": 0,
+            "completed_demotions": 0,
+            "completed_evictions": 0,
+            "failed_releases": 0,
+            "managed_allocations": 0,
+            "orphaned_release_bytes": 0,
+            "pressure_actions_in_flight": 0
+          }
+        },
+        "backend_observed_at_ms": 1791310703226
+      }
+    },
+    {
+      "protocol": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req_YrEnM1zfFIBa5ZmYF6yRcA",
+      "data": {
+        "host_swap_used_bytes": 0,
+        "host_memory_free_bytes": 73435750400,
+        "schema_version": 1,
+        "observed_at_ms": 1791310704360,
+        "server_started_ms": 1791310672545,
+        "uptime_seconds": 31.81538422,
+        "totals": {
+          "started": 2,
+          "completed": 2,
+          "errors": 0,
+          "cancelled": 0,
+          "active": 0,
+          "prompt_tokens": 58,
+          "output_tokens": 6,
+          "cached_tokens": 25,
+          "duration_seconds": 28.721183016999998
+        },
+        "requests": [
+          {
+            "id": 2,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791310703634,
+            "elapsed_seconds": 0.722133893,
+            "prompt_tokens": 29,
+            "cached_tokens": 25,
+            "output_tokens": 3,
+            "first_output_seconds": 0.597317795,
+            "decode_tokens_per_second": 24.646527715020415,
+            "prefill_tokens_per_second": 14.992447554544398
+          },
+          {
+            "id": 1,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791310675215,
+            "elapsed_seconds": 27.999049124,
+            "prompt_tokens": 29,
+            "cached_tokens": 0,
+            "output_tokens": 3,
+            "first_output_seconds": 0.432180295,
+            "decode_tokens_per_second": 16.981676770764345,
+            "prefill_tokens_per_second": 67.7033844688436
+          }
+        ],
+        "backends": [
+          {
+            "backend": "deployment",
+            "instance": "qwen-gpu",
+            "model": "multi-gpu-smoke",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "gpu_budget_bytes_estimate": 20110612736.0,
+              "gpu_count": 1.0,
+              "host_budget_bytes_estimate": 24000000000.0,
+              "queue_capacity": 0.0,
+              "slots_available": 1.0
+            }
+          },
+          {
+            "backend": "llama.cpp / CUDA",
+            "instance": "llama-55319-http://127.0.0.1:43411",
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "active_cached_tokens": 0.0,
+              "active_output_tokens": 0.0,
+              "active_prompt_tokens": 0.0,
+              "context_capacity_tokens": 2048.0,
+              "context_used_tokens": 31.0,
+              "gpu_layers_requested": 999.0,
+              "process_resident_bytes": 1456742400.0,
+              "requests_active": 0.0,
+              "slots_total": 1.0
+            }
+          }
+        ],
+        "memory": {
+          "observed_at_unix_ms": 1791310703332,
+          "overall_pressure": "hard",
+          "topology": "discrete",
+          "host": {
+            "capacity_bytes": 105469059072,
+            "available_bytes": 99107876864,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "accelerator": {
+            "capacity_bytes": 25769803776,
+            "available_bytes": 3666870272,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "hard"
+          },
+          "last_action_unix_ms": null,
+          "counters": {
+            "active_reservations": 0,
+            "backend_cleanup_failures": 0,
+            "backend_cleanup_latched": 0,
+            "completed_demotions": 0,
+            "completed_evictions": 0,
+            "failed_releases": 0,
+            "managed_allocations": 0,
+            "orphaned_release_bytes": 0,
+            "pressure_actions_in_flight": 0
+          }
+        },
+        "backend_observed_at_ms": 1791310703226
+      }
+    },
+    {
+      "protocol": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req_gKKEOPaOr_xOFM0eWMRN7Q",
+      "data": {
+        "host_swap_used_bytes": 0,
+        "host_memory_free_bytes": 73435750400,
+        "schema_version": 1,
+        "observed_at_ms": 1791310704974,
+        "server_started_ms": 1791310672545,
+        "uptime_seconds": 32.429616115,
+        "totals": {
+          "started": 3,
+          "completed": 3,
+          "errors": 0,
+          "cancelled": 0,
+          "active": 0,
+          "prompt_tokens": 87,
+          "output_tokens": 9,
+          "cached_tokens": 50,
+          "duration_seconds": 29.058667313999997
+        },
+        "requests": [
+          {
+            "id": 3,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791310704634,
+            "elapsed_seconds": 0.337484297,
+            "prompt_tokens": 29,
+            "cached_tokens": 25,
+            "output_tokens": 3,
+            "first_output_seconds": 0.247440297,
+            "decode_tokens_per_second": 34.326906573602606,
+            "prefill_tokens_per_second": 16.313479828382192
+          },
+          {
+            "id": 2,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791310703634,
+            "elapsed_seconds": 0.722133893,
+            "prompt_tokens": 29,
+            "cached_tokens": 25,
+            "output_tokens": 3,
+            "first_output_seconds": 0.597317795,
+            "decode_tokens_per_second": 24.646527715020415,
+            "prefill_tokens_per_second": 14.992447554544398
+          },
+          {
+            "id": 1,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791310675215,
+            "elapsed_seconds": 27.999049124,
+            "prompt_tokens": 29,
+            "cached_tokens": 0,
+            "output_tokens": 3,
+            "first_output_seconds": 0.432180295,
+            "decode_tokens_per_second": 16.981676770764345,
+            "prefill_tokens_per_second": 67.7033844688436
+          }
+        ],
+        "backends": [
+          {
+            "backend": "deployment",
+            "instance": "qwen-gpu",
+            "model": "multi-gpu-smoke",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "gpu_budget_bytes_estimate": 20110612736.0,
+              "gpu_count": 1.0,
+              "host_budget_bytes_estimate": 24000000000.0,
+              "queue_capacity": 0.0,
+              "slots_available": 1.0
+            }
+          },
+          {
+            "backend": "llama.cpp / CUDA",
+            "instance": "llama-55319-http://127.0.0.1:43411",
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "active_cached_tokens": 0.0,
+              "active_output_tokens": 0.0,
+              "active_prompt_tokens": 0.0,
+              "context_capacity_tokens": 2048.0,
+              "context_used_tokens": 31.0,
+              "gpu_layers_requested": 999.0,
+              "process_resident_bytes": 1456742400.0,
+              "requests_active": 0.0,
+              "slots_total": 1.0
+            }
+          }
+        ],
+        "memory": {
+          "observed_at_unix_ms": 1791310703332,
+          "overall_pressure": "hard",
+          "topology": "discrete",
+          "host": {
+            "capacity_bytes": 105469059072,
+            "available_bytes": 99107876864,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "accelerator": {
+            "capacity_bytes": 25769803776,
+            "available_bytes": 3666870272,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "hard"
+          },
+          "last_action_unix_ms": null,
+          "counters": {
+            "active_reservations": 0,
+            "backend_cleanup_failures": 0,
+            "backend_cleanup_latched": 0,
+            "completed_demotions": 0,
+            "completed_evictions": 0,
+            "failed_releases": 0,
+            "managed_allocations": 0,
+            "orphaned_release_bytes": 0,
+            "pressure_actions_in_flight": 0
+          }
+        },
+        "backend_observed_at_ms": 1791310703226
+      }
+    }
+  ],
+  "diagnostics_after": {
+    "deployments": {
+      "profiles": [
+        {
+          "available_slots": 1,
+          "plan": {
+            "args": [
+              "--device",
+              "CUDA0",
+              "--split-mode",
+              "none",
+              "--main-gpu",
+              "0",
+              "--no-warmup"
+            ],
+            "devices": [
+              {
+                "architecture": "sm_86",
+                "free_bytes": 21701328896,
+                "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+                "name": "NVIDIA GeForce RTX 3090",
+                "numa_node": null,
+                "pci_bus_id": "00000000:03:00.0",
+                "pcie_link": null,
+                "physical_index": 0,
+                "runtime": "cuda",
+                "total_bytes": 25769803776,
+                "vendor": "nvidia",
+                "visible_index": 0
+              }
+            ],
+            "environment": {
+              "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+              "CUDA_VISIBLE_DEVICES": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+              "OMP_NUM_THREADS": "8"
+            },
+            "executable_sha256": "236d00dc1c71b01bd15a13b229edeac2e4b05a9ac740d33aadc14fe6f71287b6",
+            "fingerprint": "5878014b255b22aa490568d6cf78ad3db30a2c28be70b60414154c5fac06090a",
+            "model_identity": "sha256:1352bb293f26ccf8ee2fd8d226093eff8357e5eac21f078dca9f0e8bc2f6f071",
+            "profile": {
+              "alias": "multi-gpu-smoke",
+              "batch": 256,
+              "build": "ec928150501c",
+              "context": 2048,
+              "cpu_threads": 8,
+              "executable": "/home/philipbodenbach/.local/share/werk1112/backends/llama-cuda/upstream-ec928150501c/build/bin/llama-server",
+              "gpus": [
+                "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9"
+              ],
+              "host_bytes": 24000000000,
+              "id": "qwen-gpu",
+              "kv_cpu": false,
+              "memory": [
+                {
+                  "compute": 536870912,
+                  "experts": 0,
+                  "kv": 268435456,
+                  "overhead": 268435456,
+                  "replicated": 0,
+                  "reserve": 536870912,
+                  "weights": 18500000000
+                }
+              ],
+              "model": "qwen3.8-27b-ud-q4_k_xl",
+              "native_args": [
+                "--no-warmup"
+              ],
+              "offload": {
+                "kind": "none"
+              },
+              "parallel": 1,
+              "pipeline_parallel": 1,
+              "runtime": "llama_cuda",
+              "split": [],
+              "strategy": "single",
+              "tensor_parallel": 1
+            },
+            "reasons": [
+              "Exclusive GPU ownership; component budgets are declared estimates, not measured usage or hard allocator limits.",
+              "Unknown P2P/NVLink is not treated as a prerequisite; no throughput prediction was made."
+            ],
+            "strategy": "single"
+          },
+          "queue_capacity": 0,
+          "queue_policy": "reject",
+          "workers": [
+            {
+              "available": true,
+              "backend": "llama.cpp / CUDA",
+              "counters": {},
+              "gauges": {
+                "active_cached_tokens": 0.0,
+                "active_output_tokens": 0.0,
+                "active_prompt_tokens": 0.0,
+                "context_capacity_tokens": 2048.0,
+                "context_used_tokens": 31.0,
+                "gpu_layers_requested": 999.0,
+                "process_resident_bytes": 1777864704.0,
+                "requests_active": 0.0,
+                "slots_total": 1.0
+              },
+              "instance": "llama-55319-http://127.0.0.1:43411",
+              "model": "qwen3.8-27b-ud-q4_k_xl"
+            }
+          ]
+        }
+      ]
+    },
+    "inventory": {
+      "devices": [
+        {
+          "architecture": "sm_86",
+          "free_bytes": 3665821696,
+          "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+          "name": "NVIDIA GeForce RTX 3090",
+          "numa_node": null,
+          "pci_bus_id": "00000000:03:00.0",
+          "pcie_link": null,
+          "physical_index": 0,
+          "runtime": "cuda",
+          "total_bytes": 25769803776,
+          "vendor": "nvidia",
+          "visible_index": 0
+        }
+      ],
+      "host_available_bytes": 98737479680,
+      "topology": null,
+      "warnings": []
+    }
+  },
+  "status": "passed_transport",
+  "correctness": "Outputs retained for reference comparison; transport success alone is not numerical equivalence.",
+  "latency_seconds": {
+    "median": 1.022885390000738,
+    "min": 0.609684594997816,
+    "max": 28.28231289299947
+  },
+  "gpu_memory_samples": [
+    {
+      "time": 1791310671.8969424,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3630
+      }
+    },
+    {
+      "time": 1791310672.225934,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3631
+      }
+    },
+    {
+      "time": 1791310672.4870093,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3630
+      }
+    },
+    {
+      "time": 1791310672.8416502,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3630
+      }
+    },
+    {
+      "time": 1791310673.197757,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3630
+      }
+    },
+    {
+      "time": 1791310673.5710483,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3627
+      }
+    },
+    {
+      "time": 1791310673.8688893,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3627
+      }
+    },
+    {
+      "time": 1791310674.1955836,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3627
+      }
+    },
+    {
+      "time": 1791310674.4791298,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3611
+      }
+    },
+    {
+      "time": 1791310674.8079202,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3611
+      }
+    },
+    {
+      "time": 1791310675.1492622,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3611
+      }
+    },
+    {
+      "time": 1791310675.443096,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3630
+      }
+    },
+    {
+      "time": 1791310675.760475,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3594
+      }
+    },
+    {
+      "time": 1791310676.0578268,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3582
+      }
+    },
+    {
+      "time": 1791310676.3220139,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3582
+      }
+    },
+    {
+      "time": 1791310676.621218,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3582
+      }
+    },
+    {
+      "time": 1791310676.922904,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3579
+      }
+    },
+    {
+      "time": 1791310677.2035596,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3579
+      }
+    },
+    {
+      "time": 1791310677.4833865,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3828
+      }
+    },
+    {
+      "time": 1791310677.7914257,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3828
+      }
+    },
+    {
+      "time": 1791310678.0940368,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3828
+      }
+    },
+    {
+      "time": 1791310678.4024944,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3808
+      }
+    },
+    {
+      "time": 1791310678.7108943,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3808
+      }
+    },
+    {
+      "time": 1791310679.0195198,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3808
+      }
+    },
+    {
+      "time": 1791310679.347412,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310679.6337242,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310679.9132907,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310680.2052531,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3832
+      }
+    },
+    {
+      "time": 1791310680.4969625,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3832
+      }
+    },
+    {
+      "time": 1791310680.813862,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3832
+      }
+    },
+    {
+      "time": 1791310681.1200705,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3832
+      }
+    },
+    {
+      "time": 1791310681.423507,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3829
+      }
+    },
+    {
+      "time": 1791310681.7087007,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3829
+      }
+    },
+    {
+      "time": 1791310682.005145,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3829
+      }
+    },
+    {
+      "time": 1791310682.3147168,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3817
+      }
+    },
+    {
+      "time": 1791310682.594912,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3808
+      }
+    },
+    {
+      "time": 1791310682.912368,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3808
+      }
+    },
+    {
+      "time": 1791310683.1892512,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3829
+      }
+    },
+    {
+      "time": 1791310683.4984498,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310683.8298628,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310684.1298654,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310684.4265084,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310684.7078326,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310685.0110886,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3827
+      }
+    },
+    {
+      "time": 1791310685.2994068,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310685.5955067,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3815
+      }
+    },
+    {
+      "time": 1791310685.8916354,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3815
+      }
+    },
+    {
+      "time": 1791310686.166403,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3815
+      }
+    },
+    {
+      "time": 1791310686.4718328,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3798
+      }
+    },
+    {
+      "time": 1791310686.7653434,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3798
+      }
+    },
+    {
+      "time": 1791310687.0515077,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3798
+      }
+    },
+    {
+      "time": 1791310687.3542106,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310687.6472058,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310687.9369843,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310688.2411027,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310688.5463123,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310688.8478608,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310689.1358032,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310689.4517727,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3815
+      }
+    },
+    {
+      "time": 1791310689.7327318,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3815
+      }
+    },
+    {
+      "time": 1791310690.0316496,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3815
+      }
+    },
+    {
+      "time": 1791310690.3278577,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3815
+      }
+    },
+    {
+      "time": 1791310690.6243236,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3798
+      }
+    },
+    {
+      "time": 1791310690.933005,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3798
+      }
+    },
+    {
+      "time": 1791310691.2641292,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3819
+      }
+    },
+    {
+      "time": 1791310691.5741293,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310691.8691149,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310692.186784,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310692.487885,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310692.791309,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310693.1209695,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310693.432175,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3806
+      }
+    },
+    {
+      "time": 1791310693.7457733,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3806
+      }
+    },
+    {
+      "time": 1791310694.0516665,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3806
+      }
+    },
+    {
+      "time": 1791310694.3558247,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3798
+      }
+    },
+    {
+      "time": 1791310694.6548727,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3765
+      }
+    },
+    {
+      "time": 1791310694.9615197,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3765
+      }
+    },
+    {
+      "time": 1791310695.2582846,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3819
+      }
+    },
+    {
+      "time": 1791310695.5773604,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310695.8786674,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310696.1902933,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310696.4865985,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310696.7907069,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310697.0913463,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 3818
+      }
+    },
+    {
+      "time": 1791310697.421734,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 7530
+      }
+    },
+    {
+      "time": 1791310697.720855,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 17694
+      }
+    },
+    {
+      "time": 1791310698.042727,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19526
+      }
+    },
+    {
+      "time": 1791310698.348709,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19526
+      }
+    },
+    {
+      "time": 1791310698.6549509,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19485
+      }
+    },
+    {
+      "time": 1791310698.9521852,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19576
+      }
+    },
+    {
+      "time": 1791310699.2469497,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19630
+      }
+    },
+    {
+      "time": 1791310699.5440297,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19629
+      }
+    },
+    {
+      "time": 1791310699.8376126,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19544
+      }
+    },
+    {
+      "time": 1791310700.1330543,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19544
+      }
+    },
+    {
+      "time": 1791310700.440118,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 19544
+      }
+    },
+    {
+      "time": 1791310700.7313569,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20774
+      }
+    },
+    {
+      "time": 1791310701.0290723,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20774
+      }
+    },
+    {
+      "time": 1791310701.3358054,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20774
+      }
+    },
+    {
+      "time": 1791310701.6319585,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20762
+      }
+    },
+    {
+      "time": 1791310701.9587486,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20762
+      }
+    },
+    {
+      "time": 1791310702.3046784,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20794
+      }
+    },
+    {
+      "time": 1791310702.6156003,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20754
+      }
+    },
+    {
+      "time": 1791310702.9082682,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20762
+      }
+    },
+    {
+      "time": 1791310703.213853,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20831
+      }
+    },
+    {
+      "time": 1791310703.5285246,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20830
+      }
+    },
+    {
+      "time": 1791310703.8378172,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20830
+      }
+    },
+    {
+      "time": 1791310704.1606662,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20830
+      }
+    },
+    {
+      "time": 1791310704.4745414,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20830
+      }
+    },
+    {
+      "time": 1791310704.7817285,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20830
+      }
+    },
+    {
+      "time": 1791310705.0675876,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20830
+      }
+    },
+    {
+      "time": 1791310705.678738,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20822
+      }
+    }
+  ],
+  "gpu_peak_used_mib_including_other_processes": {
+    "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 20831
+  },
+  "unavailable_measurements": [
+    "PCIe transfers",
+    "pinned RAM",
+    "per-worker GPU allocation",
+    "logit/logprob equivalence"
+  ],
+  "installed_llama_revision": "ec928150501c2572fec05cb949061672bb424914"
+}

@@ -91,6 +91,7 @@ pub(super) async fn count_tokens_handler(
             Err(error) => return response::error(error.status, error.message, &request_id),
         };
         match tokio::task::spawn_blocking(move || {
+            let _permit = prepared.state.deployment_permit;
             prepared
                 .state
                 .backend
@@ -210,7 +211,11 @@ async fn handle_request(
         Ok(prepared) => prepared,
         Err(error) => return response::error(error.status, error.message, request_id),
     };
-    let model = prepared.manifest.id.clone();
+    let model = prepared
+        .state
+        .requested_alias
+        .clone()
+        .unwrap_or_else(|| prepared.manifest.id.clone());
     if !prepared.api_options.is_empty() {
         return extended::handle(prepared, id, request_id, tool_names).await;
     }

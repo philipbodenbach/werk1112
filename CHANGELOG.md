@@ -5,6 +5,10 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Add a manual GitHub release workflow with patch/minor/major version bumps,
+  synchronized product metadata, dated changelog notes, annotated tags and
+  optional draft releases. Platform builds and artifact uploads remain manual.
+
 - Support Qwen/GLM text offload and native prefix persistence on oMLX 0.7.0
   while retaining 0.6.4 support. Preserve the newer memory-guard options and
   tokenizer/parser contracts, and restore native array-cache methods after

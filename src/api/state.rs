@@ -94,6 +94,9 @@ pub type PromptOptionsResolver = Arc<
 
 #[derive(Clone)]
 pub struct ApiState {
+    pub(super) deployments: Option<Arc<super::deployments::Registry>>,
+    pub(super) deployment_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    pub(super) requested_alias: Option<String>,
     pub(super) telemetry: Arc<crate::observability::Telemetry>,
     pub(super) telemetry_cache: Arc<super::observability::SampleCache>,
     pub(super) store: Arc<ModelStore>,
@@ -120,6 +123,9 @@ pub struct ApiState {
 }
 
 impl ApiState {
+    pub(crate) fn model_store(&self) -> &ModelStore {
+        &self.store
+    }
     pub fn new(store: ModelStore, backend: Arc<dyn GenerationBackend>) -> Self {
         Self::new_with_default_model(store, backend, None)
     }
@@ -164,6 +170,9 @@ impl ApiState {
         let local_control = LocalWerkControl::new(store.clone(), runtime_adapter);
         let principal_deriver = local_control.principal_deriver();
         Self {
+            deployments: None,
+            deployment_permit: None,
+            requested_alias: None,
             telemetry: Arc::new(crate::observability::Telemetry::default()),
             telemetry_cache: Arc::new(super::observability::SampleCache::default()),
             files: crate::file_store::FileStore::new(store.home()),
@@ -193,6 +202,54 @@ impl ApiState {
     pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Self {
         self.api_keys = Arc::new(api_keys);
         self
+    }
+
+    pub fn with_deployments(
+        mut self,
+        plans: Vec<crate::deployments::Plan>,
+        inventory: &crate::inference_service::devices::Inventory,
+    ) -> anyhow::Result<Self> {
+        let resources = Arc::new(crate::inference_service::resources::Reservations::new(
+            inventory.host_available_bytes.unwrap_or(0),
+        ));
+        let mut instances = Vec::new();
+        for plan in plans {
+            let plan = Arc::new(plan);
+            let execution = crate::deployments::Execution {
+                plan: plan.clone(),
+                resources: resources.clone(),
+                #[cfg(test)]
+                inventory: None,
+            };
+            let mut child = Self::new(
+                self.store.as_ref().clone(),
+                execution.backend(self.store.as_ref().clone()),
+            )
+            .with_chat_context_size(Some(plan.profile.context))
+            .with_server_persistence(self.server_persistence.clone());
+            child.api_keys = self.api_keys.clone();
+            child.telemetry = self.telemetry.clone();
+            child.verbose = self.verbose;
+            // Both supported profile adapters own their native chat templates,
+            // matching the normal CLI routing decision for these backends.
+            child.prompt_options_resolver = Some(Arc::new(|_, _, _| {
+                Ok(ChatTemplateOptions {
+                    default_source: crate::openai::ChatTemplateSource::Model,
+                    model_template_preferred: true,
+                    override_name: None,
+                })
+            }));
+            instances.push((plan, child));
+        }
+        let registry = super::deployments::Registry::new(instances)?;
+        if let Some(default) = &self.default_model {
+            anyhow::ensure!(
+                registry.contains(default),
+                "default model must name a configured deployment alias or ID"
+            );
+        }
+        self.deployments = Some(Arc::new(registry));
+        Ok(self)
     }
 
     /// Replaces the local Werk control implementation. Primarily useful for

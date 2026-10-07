@@ -77,6 +77,7 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
             post(super::anthropic::messages_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
         )
         .route("/v1/models", get(models_handler))
+        .route("/werk/v1/deployments", get(super::deployments::diagnostics))
         .route("/v1/models/{id}", get(model_handler))
         .route(
             "/v1/chat/completions",
@@ -154,6 +155,8 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
             header::ACCEPT,
             HeaderName::from_static(PROTOCOL_VERSION_HEADER),
             HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("x-werk-session-id"),
+            HeaderName::from_static("x-werk-deployment"),
             HeaderName::from_static("anthropic-version"),
             HeaderName::from_static("anthropic-beta"),
             HeaderName::from_static("openai-organization"),

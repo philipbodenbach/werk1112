@@ -38,6 +38,14 @@ pub(super) struct Execution {
     policy: Option<Fp4Kernel>,
 }
 impl Execution {
+    pub(super) fn bind_deployment(&mut self, plan: &crate::deployments::Plan) {
+        self.environment
+            .extend(plan.environment.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.environment.push((
+            "WERK_DEPLOYMENT_FINGERPRINT".into(),
+            plan.fingerprint.clone(),
+        ));
+    }
     #[cfg(test)]
     pub(super) fn test_identity(policy: Fp4Kernel, build_fingerprint: &str) -> Self {
         Self {

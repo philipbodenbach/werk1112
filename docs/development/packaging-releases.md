@@ -281,7 +281,61 @@ whose entries are not exactly `werk`, `README.md`, and `LICENSE`.
 The packaging scripts only create local files. They do not create a Git tag,
 create a GitHub release or upload artifacts.
 
+## Manual GitHub release workflow
+
+Open **Actions → Release → Run workflow**, select the repository's default
+branch and choose `patch`, `minor` or `major`. For example, starting at `1.6.0`,
+these produce `1.6.1`, `1.7.0` or `2.0.0`. The workflow must first be merged into
+the default branch to appear in GitHub's manual workflow menu.
+
+The workflow uses `Cargo.toml` as its version source and checks that the latest
+stable `v<VERSION>` tag and all product version files agree. It updates Cargo,
+Media Companion, ComfyUI and both n8n package metadata files, moves `Unreleased`
+into a release section dated in Europe/Berlin, and updates the changelog links.
+It commits these changes, pushes the commit and annotated tag atomically, then
+creates the GitHub release using the changelog entry as release notes. Empty
+release notes, inconsistent versions and duplicate tags stop the release.
+The selected commit must still be the default branch tip when pushed; if the
+branch advances meanwhile, start a new run from its latest commit.
+
+**Keep release as a draft** is enabled by default. Build the platform artifacts
+from the generated tag, upload the archives and their `.sha256` files to the
+draft, then publish it. This keeps the previous release available to installers
+until the new downloads are ready. Disable the draft option only when you want
+to publish immediately, before manually attaching artifacts.
+
+The workflow does not build binaries, upload assets, run the full product test
+suites, publish to npm, or publish to the ComfyUI Registry. README release
+highlights and versioned documentation examples remain editorial work; review
+them before releasing. Protocol, dependency and node schema versions are not
+changed by the product SemVer increment.
+
+The built-in `GITHUB_TOKEN` supplies `contents: write`; no additional secret is
+needed. Repository rules must allow that token to push the release commit to
+the default branch and create release tags. A protected branch that requires
+pull requests may reject the push; the workflow does not bypass these rules.
+Changes pushed with this token do not automatically trigger the repository's
+other push workflows, so complete the normal validation before releasing.
+
+If the commit and tag were pushed but GitHub release creation failed, **do not
+start a new version bump**. Recover the existing tag through GitHub's release
+UI or `gh release create v<VERSION> --verify-tag --draft --title
+"Werk1112 v<VERSION>" --notes-file release-notes.md`, with notes copied from its
+dated changelog entry. No tag needs to be deleted or moved.
+
+Release preparation can be checked locally with Python 3.12:
+
+~~~bash
+python3 -m unittest discover -s scripts/tests -p 'test_prepare_release.py'
+~~~
+
 ## Maintainer release checklist
+
+With the manual GitHub workflow, prepare and validate the `Unreleased` notes
+and editorial documentation first, then dispatch the workflow with draft mode
+enabled. It handles the version synchronization, dated changelog and tag in
+steps 1, 2 and 6 below. Check out that tag on each build host before packaging;
+publish the draft only after uploading and checking the artifacts.
 
 1. Synchronize the intended product version in `Cargo.toml`, the root package
    entry in `Cargo.lock`, `COMPANION_VERSION` in

@@ -29,6 +29,23 @@ pub(super) async fn models_handler(State(state): State<ApiState>, headers: Heade
     if let Err(response) = state.authorize(&headers) {
         return response;
     }
+    if let Some(registry) = &state.deployments {
+        let data = registry
+            .models()
+            .into_iter()
+            .filter_map(|(alias, model)| {
+                state.store.get(&model).ok().map(|mut manifest| {
+                    manifest.id = alias;
+                    model_object(manifest)
+                })
+            })
+            .collect();
+        return Json(ModelListResponse {
+            object: "list",
+            data,
+        })
+        .into_response();
+    }
     match state.store.list() {
         Ok(manifests) => {
             state.log_verbose(format!(
@@ -54,8 +71,21 @@ pub(super) async fn model_handler(
     if let Err(response) = state.authorize(&headers) {
         return response;
     }
-    match state.store.get(&id) {
-        Ok(manifest) => Json(model_object(manifest)).into_response(),
+    let model_id = state
+        .deployments
+        .as_ref()
+        .and_then(|r| {
+            r.models()
+                .into_iter()
+                .find(|(alias, _)| alias == &id)
+                .map(|(_, model)| model)
+        })
+        .unwrap_or_else(|| id.clone());
+    match state.store.get(&model_id) {
+        Ok(mut manifest) => {
+            manifest.id = id;
+            Json(model_object(manifest)).into_response()
+        }
         Err(error) => api_error(
             StatusCode::NOT_FOUND,
             error.to_string(),
@@ -137,7 +167,10 @@ async fn complete_chat_response(
     explicit_runtime_options: bool,
 ) -> Response {
     let verbose = state.verbose;
-    let model = manifest.id.clone();
+    let model = state
+        .requested_alias
+        .clone()
+        .unwrap_or_else(|| manifest.id.clone());
     let result =
         super::generation::generate(state, manifest, generate_request, explicit_runtime_options)
             .await;
@@ -182,7 +215,10 @@ async fn stream_chat_response(
     explicit_runtime_options: bool,
     include_usage: bool,
 ) -> Response {
-    let model = manifest.id.clone();
+    let model = state
+        .requested_alias
+        .clone()
+        .unwrap_or_else(|| manifest.id.clone());
     let created = unix_ts();
     let id = format!("chatcmpl-{created}");
 

@@ -14,7 +14,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fmt,
     io::{ErrorKind, Read, Write},
-    net::{Ipv6Addr, Shutdown, TcpStream, ToSocketAddrs},
+    net::{Ipv6Addr, TcpStream, ToSocketAddrs},
     time::{Duration, Instant},
 };
 
@@ -29,6 +29,7 @@ pub struct WerkProtocolClient {
     host: String,
     port: u16,
     api_key: Option<String>,
+    deployment: Option<String>,
     timeout: Duration,
 }
 
@@ -119,6 +120,7 @@ impl WerkProtocolClient {
             host,
             port,
             api_key,
+            deployment: None,
             timeout: Duration::from_secs(30),
         })
     }
@@ -126,6 +128,23 @@ impl WerkProtocolClient {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    pub fn with_deployment(mut self, deployment: Option<String>) -> Result<Self, ClientError> {
+        if deployment.as_ref().is_some_and(|id| {
+            id.is_empty()
+                || id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        }) {
+            return Err(ClientError::Transport(
+                "invalid deployment ID; use 1..128 ASCII letters, digits, dot, dash or underscore"
+                    .into(),
+            ));
+        }
+        self.deployment = deployment;
+        Ok(self)
     }
 
     pub fn info(&self) -> Result<RuntimeInfo, ClientError> {
@@ -267,12 +286,18 @@ impl WerkProtocolClient {
             request.push_str(api_key);
             request.push_str("\r\n");
         }
+        if let Some(deployment) = &self.deployment {
+            request.push_str("X-Werk-Deployment: ");
+            request.push_str(deployment);
+            request.push_str("\r\n");
+        }
         request.push_str("\r\n");
 
         let mut stream = connect_with_deadline(&self.host, self.port, deadline)?;
         write_all_with_deadline(&mut stream, request.as_bytes(), deadline)?;
         write_all_with_deadline(&mut stream, &body, deadline)?;
-        let _ = stream.shutdown(Shutdown::Write);
+        // Content-Length frames the request. Half-closing here can make Hyper
+        // cancel an asynchronous handler before it writes a response.
         let response = read_response_with_deadline(&mut stream, deadline)?;
         if response.len() > MAX_RESPONSE_BYTES {
             return Err(ClientError::InvalidResponse(
@@ -894,6 +919,14 @@ mod tests {
 
     #[test]
     fn client_parses_envelope_and_sends_bearer_without_leaking_it() {
+        for invalid in ["", "worker\r\nInjected: yes", "worker with spaces"] {
+            assert!(
+                WerkProtocolClient::new("http://127.0.0.1:11434", None)
+                    .unwrap()
+                    .with_deployment(Some(invalid.into()))
+                    .is_err()
+            );
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
@@ -903,6 +936,7 @@ mod tests {
             let request = String::from_utf8_lossy(&request[..read]);
             assert!(request.starts_with("GET /werk/v1/info HTTP/1.1"));
             assert!(request.contains("Authorization: Bearer secret"));
+            assert!(request.contains("X-Werk-Deployment: worker-1"));
             assert!(request.contains("Accept: application/json"));
             assert!(request.contains(&format!("{PROTOCOL_VERSION_HEADER}: 1.0")));
             let body = serde_json::json!({
@@ -936,6 +970,8 @@ mod tests {
             &format!("http://127.0.0.1:{port}"),
             Some("secret".to_string()),
         )
+        .unwrap()
+        .with_deployment(Some("worker-1".into()))
         .unwrap();
         let info: RuntimeInfo = client.get("/werk/v1/info").unwrap();
         assert_eq!(info.active_backend, "test");

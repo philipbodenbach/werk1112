@@ -96,6 +96,26 @@ pub(super) async fn prepare(
     endpoint: &str,
     headers: &axum::http::HeaderMap,
 ) -> Result<Prepared, GenerationError> {
+    if let Some(registry) = state.deployments.clone() {
+        let alias = request
+            .model
+            .as_deref()
+            .or(state.default_model.as_deref())
+            .unwrap_or_default();
+        let (selected, model) = registry.select(alias, headers).map_err(|error| {
+            GenerationError::new(
+                if error.to_string().contains("deployment busy") {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                error.to_string(),
+                Some("model".into()),
+            )
+        })?;
+        state = selected;
+        request.model = Some(model);
+    }
     if let Err(error) =
         super::extended::validate(&request.extra, endpoint.starts_with("/v1/messages"))
     {
@@ -576,6 +596,7 @@ pub(super) async fn generate_stream(
     request: GenerateRequest,
     explicit_runtime_options: bool,
 ) -> GenerateStream {
+    let permit = state.deployment_permit.clone();
     let guard = state.telemetry.begin(&manifest.id);
     let state = state.clone();
     let stream = tokio::task::spawn_blocking(move || -> GenerateStream {
@@ -591,7 +612,10 @@ pub(super) async fn generate_stream(
             "session preparation failed: {error}"
         ))]))
     });
-    crate::observability::observe_stream(stream, guard)
+    Box::pin(super::deployments::AdmittedStream {
+        stream: crate::observability::observe_stream(stream, guard),
+        _permit: permit,
+    })
 }
 fn select_session(
     state: &ApiState,

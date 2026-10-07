@@ -133,8 +133,11 @@ struct DeferredCleanupQueue {
 
 impl LlamaRuntimeStateAdapter {
     pub(super) fn new(backend: LlamaServerBackend) -> Self {
-        let discovered_identity = discover_llama_server(&backend.store, backend.mode)
-            .path
+        let discovered_identity = backend
+            .deployment
+            .as_ref()
+            .map(|d| d.plan.profile.executable.clone())
+            .or_else(|| discover_llama_server(&backend.store, backend.mode).path)
             .as_deref()
             .and_then(|path| probe_llama_executable_identity(path).ok());
         Self {
@@ -267,58 +270,64 @@ const LLAMA_STATE_PREREQUISITES_DETAIL: &str = "the exact llama.cpp binary/proce
 
 impl BackendRuntimeAdapter for LlamaRuntimeStateAdapter {
     fn descriptor(&self) -> BackendRuntimeDescriptor {
-        let Ok(mut state) = self.lock_state() else {
-            return unavailable_llama_descriptor(
-                self.backend.mode,
-                self.discovered_identity.as_ref(),
-                self.unavailable_instance_id.clone(),
-                "llama.cpp runtime-state adapter synchronization failed",
-            );
-        };
-        let dead = state
-            .active
-            .as_ref()
-            .is_some_and(|active| !active.server.is_running());
-        if dead {
-            cleanup_adapter_state(&mut state);
-            state.active = None;
+        let mut descriptor = (|| {
+            let Ok(mut state) = self.lock_state() else {
+                return unavailable_llama_descriptor(
+                    self.backend.mode,
+                    self.discovered_identity.as_ref(),
+                    self.unavailable_instance_id.clone(),
+                    "llama.cpp runtime-state adapter synchronization failed",
+                );
+            };
+            let dead = state
+                .active
+                .as_ref()
+                .is_some_and(|active| !active.server.is_running());
+            if dead {
+                cleanup_adapter_state(&mut state);
+                state.active = None;
+            }
+            let Some(active) = state.active.as_ref().filter(|active| active.validated) else {
+                return unavailable_llama_descriptor(
+                    self.backend.mode,
+                    self.discovered_identity.as_ref(),
+                    self.unavailable_instance_id.clone(),
+                    "runtime state requires an already-running, functionally validated llama.cpp model process",
+                );
+            };
+            let Some(identity) = active.server.state_runtime.identity.as_ref() else {
+                return unavailable_llama_descriptor(
+                    self.backend.mode,
+                    self.discovered_identity.as_ref(),
+                    self.unavailable_instance_id.clone(),
+                    "the active llama.cpp process has no exact runtime identity",
+                );
+            };
+            let Some(instance_id) = active.server.state_runtime.generation_id.clone() else {
+                return unavailable_llama_descriptor(
+                    self.backend.mode,
+                    self.discovered_identity.as_ref(),
+                    self.unavailable_instance_id.clone(),
+                    "the active llama.cpp process has no generation identity",
+                );
+            };
+            BackendRuntimeDescriptor {
+                backend: label(self.backend.mode).to_string(),
+                backend_version: llama_process_version(identity),
+                adapter_version: env!("CARGO_PKG_VERSION").to_string(),
+                accelerator_family: llama_accelerator_family(self.backend.mode).to_string(),
+                instance_id,
+                capabilities: llama_runtime_capabilities(
+                    llama_state_capabilities(true, ""),
+                    ModelResidencyStatus::Supported,
+                    "Werk keeps this exact llama.cpp model process resident and enables automatic prompt-cache reuse",
+                ),
+            }
+        })();
+        if let Some(deployment) = &self.backend.deployment {
+            descriptor.capabilities.push(deployment.plan.capability());
         }
-        let Some(active) = state.active.as_ref().filter(|active| active.validated) else {
-            return unavailable_llama_descriptor(
-                self.backend.mode,
-                self.discovered_identity.as_ref(),
-                self.unavailable_instance_id.clone(),
-                "runtime state requires an already-running, functionally validated llama.cpp model process",
-            );
-        };
-        let Some(identity) = active.server.state_runtime.identity.as_ref() else {
-            return unavailable_llama_descriptor(
-                self.backend.mode,
-                self.discovered_identity.as_ref(),
-                self.unavailable_instance_id.clone(),
-                "the active llama.cpp process has no exact runtime identity",
-            );
-        };
-        let Some(instance_id) = active.server.state_runtime.generation_id.clone() else {
-            return unavailable_llama_descriptor(
-                self.backend.mode,
-                self.discovered_identity.as_ref(),
-                self.unavailable_instance_id.clone(),
-                "the active llama.cpp process has no generation identity",
-            );
-        };
-        BackendRuntimeDescriptor {
-            backend: label(self.backend.mode).to_string(),
-            backend_version: llama_process_version(identity),
-            adapter_version: env!("CARGO_PKG_VERSION").to_string(),
-            accelerator_family: llama_accelerator_family(self.backend.mode).to_string(),
-            instance_id,
-            capabilities: llama_runtime_capabilities(
-                llama_state_capabilities(true, ""),
-                ModelResidencyStatus::Supported,
-                "Werk keeps this exact llama.cpp model process resident and enables automatic prompt-cache reuse",
-            ),
-        }
+        descriptor
     }
 
     fn compatibility(
@@ -3800,6 +3809,7 @@ mod tests {
         )
         .unwrap();
         LlamaServerProcess {
+            _reservation: Mutex::new(None),
             #[cfg(target_os = "linux")]
             _model_file_cache: None,
             #[cfg(target_os = "linux")]
