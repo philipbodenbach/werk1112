@@ -238,9 +238,25 @@ test('chat uses installed/declaration checks without a false MediaBackend availa
   assert.ok(options.results.every(option => option.name.includes('chat readiness checked')));
 });
 
-test('offline model picker returns empty without invalidating editable ID/expressions', async () => {
-  const result = await commonMethods.listSearch.searchModels.call({ getCredentials: async () => { throw new Error('offline'); } });
-  assert.deepEqual(result, { results: [] });
+test('offline model picker reports discovery failure and keeps manual IDs available', async () => {
+  await assert.rejects(commonMethods.listSearch.searchModels.call({
+    getCredentials: async () => { throw new Error('offline'); },
+  }), /WERK model discovery failed: offline.*By ID/);
+  const { modelProperty } = require('../dist/shared/common');
+  assert.ok(modelProperty().modes.some(mode => mode.name === 'id' && mode.type === 'string'));
+});
+
+test('model picker distinguishes empty discovery from failure and redacts credential secrets', async () => {
+  const { ctx } = context([{ body: { data: [] } }, { body: { models: [] } }]);
+  ctx.getCurrentNodeParameter = () => '';
+  assert.deepEqual(await commonMethods.listSearch.searchModels.call(ctx), { results: [] });
+  const { ctx: failing } = context([new Error(`connection failed with ${secret}`)]);
+  failing.getCurrentNodeParameter = () => '';
+  await assert.rejects(commonMethods.listSearch.searchModels.call(failing), error => {
+    assert.match(error.message, /WERK model discovery failed/);
+    assert.ok(!error.message.includes(secret));
+    return true;
+  });
 });
 
 test('official binary helpers support an external reference and prepare real n8n binary outputs', async () => {

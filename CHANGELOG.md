@@ -9,6 +9,11 @@ All notable changes to Werk1112 are documented in this file. The project uses
   synchronized product metadata, dated changelog notes, annotated tags and
   optional draft releases. Platform builds and artifact uploads remain manual.
 
+- Support Qwen/GLM text offload and native prefix persistence on oMLX 0.7.0
+  while retaining 0.6.4 support. Preserve the newer memory-guard options and
+  tokenizer/parser contracts, and restore native array-cache methods after
+  SSD prefix reuse. Include process exit status in failed compatibility probes.
+
 - Preserve native llama.cpp and oMLX timing metadata in extended chat API
   responses and streams so completed requests in `werk top` retain decode and
   prefill rates. Keep timings across separate usage and completion chunks.

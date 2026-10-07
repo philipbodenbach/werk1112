@@ -229,7 +229,8 @@ system service, or connect to an external oMLX server. `omlx` is not a
 Werk captures the executable and its Python environment together. Recognized
 Python console entry points can be verified; opaque custom wrappers fail with
 an explanation. The same captured installation is used for model preflight and
-execution. The integration is based on upstream v0.6.4 loader and API behavior;
+execution. The integration retains upstream v0.6.4 loader and API support and
+supports the Qwen/GLM text adapters on v0.7.0 as well;
 a package version string alone is not proof of model compatibility.
 Inherited upstream `OMLX_*` settings are excluded from the private worker;
 see the [environment-variable reference](reference/environment-variables.md)
@@ -276,7 +277,7 @@ text or tool-call fragments have been emitted never trigger another generation.
 oMLX's internal caches do not imply Werk named Prefill, KV snapshot or restore
 support.
 
-On oMLX 0.6.4, `werk serve --persistence` enables the same verified short
+On oMLX 0.6.4 and 0.7.0, `werk serve --persistence` enables the same verified short
 exact-prefix helper used by persistent CLI chat. It applies with persistence
 mode `auto` or `disk` and reuse other than `disabled`, including when `auto`
 routing selects oMLX. Configuration is applied before model preparation and
@@ -296,7 +297,7 @@ TTL, pinning and `required` reuse retain their named Prefill policy meaning;
 ordinary OpenAI chat requests with a cold cache still perform normal prefill.
 
 `werk chat --persistence` separately saves portable conversation messages for
-every backend. On oMLX 0.6.4 it also enables an optional durable native SSD
+every backend. On oMLX 0.6.4 and 0.7.0 it also enables an optional durable native SSD
 prefix cache in a private namespace tied to the exact checkpoint, tokenizer,
 runtime and chat settings. The worker is still stopped on chat exit; compatible native
 cache files remain for the next invocation. Werk's additional exact-prefix
@@ -388,7 +389,7 @@ existing runtime compatibility checks.
 
 ### Qwen and GLM text offload
 
-The additional private oMLX 0.6.4 text adapters support stacked affine experts
+The additional private oMLX 0.6.4 and 0.7.0 text adapters support stacked affine experts
 for `qwen4_exp` and `glm5_next`, preserving each installed architecture's
 activation, routing, normalization and cache implementation. They do not execute
 checkpoint Python files. Mixed 2/4/8-bit projections retain their own metadata;

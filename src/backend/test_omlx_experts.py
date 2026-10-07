@@ -156,7 +156,7 @@ class CheckpointTests(unittest.TestCase):
         self.assertNotEqual(first, experts.inspect_model(self.path, 8192)["fingerprint"])
 
 
-def memory_guard_fixture(cache_bytes=24 * 1024**3):
+def memory_guard_fixture(cache_bytes=24 * 1024**3, modern=False):
     """An isolated scheduler class with the validated 0.6.4 hook contracts.
 
     The fake owns admission/rejection, just as the native runtime does. These
@@ -240,6 +240,27 @@ def memory_guard_fixture(cache_bytes=24 * 1024**3):
         async def _preflight_or_raise_with_eviction(self, scheduler, *, num_prompt_tokens, request_id):
             return (scheduler, num_prompt_tokens, request_id)
 
+    if modern:
+        legacy = Scheduler
+
+        class Scheduler(legacy):
+            def _adaptive_chunk_size(self, requested, *, request_id, loop_label, kv_len=0, gathered_core=False):
+                self.modern_adaptive = gathered_core
+                return super()._adaptive_chunk_size(requested, request_id=request_id,
+                                                    loop_label=loop_label, kv_len=kv_len)
+
+            def _guard_prefill_chunk(self, n_tokens, *, kv_len, progress, loop_label,
+                                     request_id=None, gathered_core=False, minimum_tokens=0):
+                self.modern_guard = (gathered_core, minimum_tokens)
+                return super()._guard_prefill_chunk(n_tokens, kv_len=kv_len, progress=progress,
+                                                   loop_label=loop_label, request_id=request_id)
+
+            def _record_chunk_transient(self, n_tokens, pre_bytes, post_bytes, *, request_id,
+                                        loop_label, kv_len=0, requested_step=None, gathered_core=False):
+                self.modern_record = gathered_core
+                return super()._record_chunk_transient(n_tokens, pre_bytes, post_bytes,
+                    request_id=request_id, loop_label=loop_label, kv_len=kv_len, requested_step=requested_step)
+
     scheduler = Scheduler()
     manager._model_ref = weakref.ref(scheduler.model)
     guard = experts._ExpertMemoryGuard(manager, Scheduler, Engine)
@@ -251,6 +272,43 @@ class ExpertMemoryGuardTests(unittest.TestCase):
     def setUp(self):
         self.manager, self.scheduler, self.guard, self.engine = memory_guard_fixture()
         self.mib, self.gib = 1024**2, 1024**3
+
+    def test_cold_load_cache_grows_under_native_prefill_guard(self):
+        cp = self.manager.checkpoint
+        cp.base_bytes = self.scheduler.base_bytes
+        self.manager._model_ref = None
+        size = self.manager.load_resident_size()
+        self.assertEqual(size, cp.base_bytes + max(cp.expert_bytes.values())
+                         + experts._WORKSPACE_BYTES)
+        self.assertEqual(cp.cache_bytes, 24 * self.gib)
+        self.manager._model_ref = weakref.ref(self.scheduler.model)
+        self.guard.prepare(self.scheduler, num_prompt_tokens=64)
+        self.assertEqual(self.manager.effective_cache_bytes, 24 * self.gib)
+        # A smaller native ceiling still shrinks the cache before admission.
+        self.scheduler._memory_hard_limit_bytes = 12 * self.gib
+        self.guard.prepare(self.scheduler, num_prompt_tokens=64)
+        self.assertLess(self.manager.effective_cache_bytes, 8 * self.gib)
+        self.assertIsNone(self.scheduler._preflight_memory_check(
+            SimpleNamespace(num_prompt_tokens=64, cached_tokens=0)))
+        self.assertTrue(self.scheduler._prefill_memory_guard)
+
+    def test_modern_scheduler_options_are_preserved_for_target_and_other_models(self):
+        manager, scheduler, guard, _ = memory_guard_fixture(modern=True)
+        for target in (True, False):
+            with self.subTest(target=target):
+                if not target:
+                    manager._model_ref = None
+                result = scheduler._adaptive_chunk_size(32, request_id="r", loop_label="external",
+                                                        gathered_core=True)
+                self.assertEqual(result, 32)
+                self.assertTrue(scheduler.modern_adaptive)
+                result = scheduler._guard_prefill_chunk(32, kv_len=0, progress=0, loop_label="external",
+                    request_id="r", gathered_core=True, minimum_tokens=16)
+                self.assertEqual(result, 32)
+                self.assertEqual(scheduler.modern_guard, (True, 16))
+                scheduler._record_chunk_transient(32, 1, 2, request_id="r", loop_label="external",
+                                                   gathered_core=True)
+                self.assertTrue(scheduler.modern_record)
 
     def guard_chunk(self, n=49, request_id="first", label="external"):
         return self.scheduler._guard_prefill_chunk(
@@ -583,7 +641,7 @@ class NativePrefillMemoryAccountingTests(unittest.TestCase):
         self.scheduler._prefill_memory_guard = True
         self.scheduler._memory_hard_limit_bytes = 36 * self.gib
         self.scheduler.memory_monitor = SimpleNamespace(
-            estimate_chunk_transient_bytes=lambda n, kv: 32 * self.mib,
+            estimate_chunk_transient_bytes=lambda n, kv, **kwargs: 32 * self.mib,
             estimate_prompt_kv_bytes=lambda n: n * 1024,
             estimate_resident_kv_bytes=lambda n, chunk_tokens: n * 1024)
         self.scheduler._current_usage_bytes = lambda: 29 * self.gib
