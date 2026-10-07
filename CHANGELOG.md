@@ -5,6 +5,12 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-07
+
+### Changes
+
+- fix(): install + uninstall fix (`31825f4034ee`)
+
 ## [1.7.0] - 2026-10-07
 
 - Add a one-button GitHub release workflow with automatic SemVer selection
@@ -439,7 +445,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.7.1...HEAD
+[1.7.1]: https://github.com/philipbodenbach/werk1112/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/philipbodenbach/werk1112/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/philipbodenbach/werk1112/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/philipbodenbach/werk1112/compare/v1.5.0...v1.5.1

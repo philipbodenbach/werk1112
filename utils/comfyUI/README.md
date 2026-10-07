@@ -4,7 +4,7 @@
 > This integration is currently in beta. Node inputs, outputs, and discovery
 > behavior may still change before the first stable release.
 
-The Werk ComfyUI package is version **1.7.0**, synchronized with Werk Core,
+The Werk ComfyUI package is version **1.7.1**, synchronized with Werk Core,
 Werk Media Companion and the n8n package. This synchronized versioning does
 not change the integration's beta status.
 
