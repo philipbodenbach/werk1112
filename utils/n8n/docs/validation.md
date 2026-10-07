@@ -1,6 +1,6 @@
 # Beta validation scope
 
-Release reference: `release/v1-6-0`, with Werk Core, Media Companion,
+Release reference: `v1.6.0`, with Werk Core, Media Companion,
 ComfyUI and the n8n package at **1.6.0**. Server contracts are based on the
 actual Rust DTOs/tests and ComfyUI client in the repository. Werk Protocol
 remains **1.0**, and all n8n node versions remain **1**.

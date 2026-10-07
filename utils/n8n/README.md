@@ -50,8 +50,8 @@ npm run lint
 npm test
 ```
 
-During release preparation, use `git switch release/v1-6-0` in place of the
-tag checkout.
+The manual GitHub Release workflow creates this tag and updates the package
+version automatically. Build from that tag after the workflow finishes.
 
 The npm version is intentional: npm 11.6.2 rejected its own generated
 dependency lock during a clean install; the pinned newer npm is used for

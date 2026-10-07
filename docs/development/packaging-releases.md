@@ -283,78 +283,111 @@ create a GitHub release or upload artifacts.
 
 ## Manual GitHub release workflow
 
-Open **Actions → Release → Run workflow**, select the repository's default
-branch and choose `patch`, `minor` or `major`. For example, starting at `1.6.0`,
-these produce `1.6.1`, `1.7.0` or `2.0.0`. The workflow must first be merged into
-the default branch to appear in GitHub's manual workflow menu.
+After merging feature and fix changes, open **Actions → Release → Run workflow**
+on the default branch and keep the default `auto` version mode. No manually
+prepared release PR or local preparation command is needed. The workflow updates
+the product version files and lockfiles, dates the changelog, generates the README
+release section and updates current documentation references. It creates and
+merges a release PR automatically, then tags the actual merge commit as
+`v<VERSION>` and creates the GitHub release from those notes. The workflow must
+first be merged into the default branch to appear in GitHub's manual workflow menu.
 
-The workflow uses `Cargo.toml` as its version source and checks that the latest
-stable `v<VERSION>` tag and all product version files agree. It updates Cargo,
-Media Companion, ComfyUI and both n8n package metadata files, moves `Unreleased`
-into a release section dated in Europe/Berlin, and updates the changelog links.
-It commits these changes, pushes the commit and annotated tag atomically, then
-creates the GitHub release using the changelog entry as release notes. Empty
-release notes, inconsistent versions and duplicate tags stop the release.
-The selected commit must still be the default branch tip when pushed; if the
-branch advances meanwhile, start a new run from its latest commit.
+### Automatic version and notes
+
+`auto` examines non-merge commits since the latest stable tag:
+
+- A Conventional Commit with `!` before the colon, or a `BREAKING CHANGE:` /
+  `BREAKING-CHANGE:` footer, selects the next major version.
+- A `feat:` or `feat(scope):` commit (including this repository's `feat():`
+  form) selects the next minor version.
+- Other changes select the next patch version.
+
+Commit messages therefore determine the automatic compatibility classification.
+The optional `patch`, `minor` and `major` selections override it. If product
+metadata already contains an untagged newer version, `auto` validates and uses
+that prepared version instead. If there are no commits after the latest release
+tag, `auto` reuses that release instead of creating another version.
+
+Existing `Unreleased` changelog bullets become the release notes. If that
+section is empty, the workflow generates notes from commit subjects and hashes.
+A curated `### Highlights` section is used for the README when present;
+otherwise it copies the first five change bullets. Neither a highlights section
+nor a manually prepared changelog entry is required to start a release.
+
+The workflow synchronizes Cargo, Media Companion, ComfyUI and n8n versions.
+It also updates installation examples, artifact filename examples, protocol
+service-version examples, integration READMEs, parity references and the current
+validation reference. Historical results and dependency/protocol/schema versions
+are preserved. Content-specific API explanations and actual test evidence still
+belong with their feature changes; commit subjects are not an inferred technical
+summary of the source code.
+
+### Artifacts and publication
 
 **Keep release as a draft** is enabled by default. Build the platform artifacts
 from the generated tag, upload the archives and their `.sha256` files to the
 draft, then publish it. This keeps the previous release available to installers
-until the new downloads are ready. Disable the draft option only when you want
-to publish immediately, before manually attaching artifacts.
+until the new downloads are ready. Disable the draft option to publish immediately
+and attach artifacts afterward. The workflow does not build binaries, upload
+assets, publish to npm or publish to the ComfyUI Registry.
 
-The workflow does not build binaries, upload assets, run the full product test
-suites, publish to npm, or publish to the ComfyUI Registry. README release
-highlights and versioned documentation examples remain editorial work; review
-them before releasing. Protocol, dependency and node schema versions are not
-changed by the product SemVer increment.
+The release-tool tests and metadata validation run in this workflow. Complete
+normal feature validation before releasing; the full product suites and native
+platform smoke tests are separate. A push made with `GITHUB_TOKEN` does not
+trigger the other push workflows.
 
-The built-in `GITHUB_TOKEN` supplies `contents: write`; no additional secret is
-needed. Repository rules must allow that token to push the release commit to
-the default branch and create release tags. A protected branch that requires
-pull requests may reject the push; the workflow does not bypass these rules.
-Changes pushed with this token do not automatically trigger the repository's
-other push workflows, so complete the normal validation before releasing.
+### Repository permissions and retries
 
-If the commit and tag were pushed but GitHub release creation failed, **do not
-start a new version bump**. Recover the existing tag through GitHub's release
-UI or `gh release create v<VERSION> --verify-tag --draft --title
-"Werk1112 v<VERSION>" --notes-file release-notes.md`, with notes copied from its
-dated changelog entry. No tag needs to be deleted or moved.
+The workflow uses the built-in `GITHUB_TOKEN` with `contents: write` and
+`pull-requests: write`. In **Settings → Actions → General → Workflow permissions**,
+enable **Allow GitHub Actions to create and approve pull requests**. The workflow
+creates PRs but does not approve them, force-push, or bypass branch protection.
+The current `main` protection requires a PR with zero mandatory approvals and
+no required status checks, so the bot can merge its release PR without a manual
+step. If mandatory reviews/checks are added later, they must be satisfied before
+the release can proceed. Pushes and PRs created with `GITHUB_TOKEN` do not trigger
+other workflows automatically; required checks would need explicit orchestration.
 
-Release preparation can be checked locally with Python 3.12:
+The default branch is checked out at job start, including on retries. If it
+advances before the release PR is merged, the workflow stops; start it again on
+the latest branch. Its release branch includes the base commit identifier and
+is reused only when its tree matches the generated files. Existing open PRs
+for that branch are reused. If a merge or tag push succeeded but a later step
+failed, run again with `auto` before merging more commits. It reuses the prepared
+version, tag and notes. An existing GitHub release is left intact, including its
+assets, notes and draft/publication state. A repeated click never publishes an
+existing draft implicitly.
+
+If newer feature commits have already landed after a partial release, recover
+its existing tag through GitHub's release UI or `gh release create v<VERSION>
+--verify-tag --draft --title "Werk1112 v<VERSION>" --notes-file release-notes.md`,
+using that tag's dated changelog entry. Do not move or delete the tag.
+
+### Optional local preview
+
+For a local preview on a clean checkout with all release tags fetched:
 
 ~~~bash
+python3 scripts/prepare-release.py auto --notes-file /tmp/werk-release-notes.md
+~~~
+
+This only edits files; it does not commit, tag, push or publish. `check` validates
+an untagged prepared version without changing tracked files:
+
+~~~bash
+python3 scripts/prepare-release.py check --notes-file /tmp/werk-release-notes.md
 python3 -m unittest discover -s scripts/tests -p 'test_prepare_release.py'
 ~~~
 
 ## Maintainer release checklist
 
-With the manual GitHub workflow, prepare and validate the `Unreleased` notes
-and editorial documentation first, then dispatch the workflow with draft mode
-enabled. It handles the version synchronization, dated changelog and tag in
-steps 1, 2 and 6 below. Check out that tag on each build host before packaging;
-publish the draft only after uploading and checking the artifacts.
-
-1. Synchronize the intended product version in `Cargo.toml`, the root package
-   entry in `Cargo.lock`, `COMPANION_VERSION` in
-   `runtime/werk_media_companion.py`, `utils/comfyUI/pyproject.toml`, and the
-   root package entries in `utils/n8n/package.json` and its lockfile. Dependency,
-   protocol and schema versions follow their own compatibility rules.
-2. Move the completed changes from `Unreleased` into the dated release section
-   in `CHANGELOG.md`, update its comparison links, the README release highlights
-   and versioned installation examples. Run the Rust, Python probe, companion,
-   ComfyUI and n8n checks described in [Building from source](build.md) and the
-   [n8n validation guide](https://github.com/philipbodenbach/werk1112/blob/main/utils/n8n/docs/validation.md). Validate and pack
-   the ComfyUI Registry archive; keep the integrations' Beta status explicit.
-3. Build/package every target on its matching host.
-4. Inspect archive contents and verify every checksum.
-5. Smoke-test the extracted binary on the target operating system.
-6. Create the matching `v<VERSION>` release tag.
-7. Upload all five archives and their five checksum files to the GitHub
-   release.
-8. Test each public installer against that release.
+1. Merge validated feature and fix changes normally.
+2. Run **Actions → Release**, normally using `auto` and draft mode.
+3. Check out the generated tag on each matching native build host.
+4. Build/package each target, inspect archive contents and verify checksums.
+5. Smoke-test the extracted binary on its target operating system.
+6. Upload the five platform archives and their checksum files to the draft.
+7. Publish the draft and test the public installers against that release.
 
 ComfyUI Registry publication is a separate manual workflow dispatch on the
 default branch, after its validation and archive checks pass. The n8n package
