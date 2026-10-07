@@ -1,12 +1,12 @@
 # WERK native n8n nodes (Beta)
 
-`n8n-nodes-werk1112` **1.6.0** is a **manually installed Beta**
-integration included with Werk **1.6.0**. Werk remains the inference/runtime
+`n8n-nodes-werk1112` **1.7.0** is a **manually installed Beta**
+integration included with Werk **1.7.0**. Werk remains the inference/runtime
 server; n8n owns workflows, item expressions, credentials and binary storage.
 This package does not install Werk, models, backends, Python or media codecs.
 It uses the repository's [Elastic License 2.0](LICENSE).
 
-Core, Media Companion, ComfyUI and this package share release version **1.6.0**.
+Core, Media Companion, ComfyUI and this package share release version **1.7.0**.
 Compatibility is checked through required endpoints and Werk Protocol 1.0,
 not equality with the package version. All internal n8n node versions start at
 **1**; saved node/operation/parameter IDs are stable contracts.
@@ -35,14 +35,14 @@ The supported validation target is **Node.js 24.12.0**, **npm 11.19.1** and
 in `package-lock.json`, including `@n8n/node-cli` **0.46.4**. Other n8n majors
 and node-loading mechanisms require separate validation.
 
-Build from the Werk **1.6.0** release checkout using Node.js 24. After the
+Build from the Werk **1.7.0** release checkout using Node.js 24. After the
 release tag is available:
 
 ```bash
 npm install --global npm@11.19.1
 git clone https://github.com/philipbodenbach/werk1112.git
 cd werk1112
-git switch --detach v1.6.0
+git switch --detach v1.7.0
 cd utils/n8n
 npm ci
 npm run build
@@ -50,7 +50,7 @@ npm run lint
 npm test
 ```
 
-During release preparation, use `git switch release/v1-6-0` in place of the
+During release preparation, use `git switch release/v1-7-0` in place of the
 tag checkout.
 
 The npm version is intentional: npm 11.6.2 rejected its own generated
@@ -426,7 +426,7 @@ the loader smoke. It has read-only repository permissions and no publishing.
 | Runtime capability failure | Inspect exact capability/reason and explicit experimental opt-in. Unsupported or metadata-only is a valid result. |
 | Job wait times out | Use the reported job ID with Get/Wait; increase the job budget independently of HTTP/inference limits. |
 
-The Werk 1.6.0 release keeps these nodes in Beta with manual installation.
+The Werk 1.7.0 release keeps these nodes in Beta with manual installation.
 The package remains private; the release does not publish it to npm or change
 the saved node, operation or parameter IDs.
 

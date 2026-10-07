@@ -196,20 +196,20 @@ release workflow.
 
 ## Local output layout
 
-For package version `1.6.0`, the generated tree is:
+For package version `1.7.0`, the generated tree is:
 
 ~~~text
 releases/
-├── werk1112-v1.6.0-linux-x86_64.tar.gz
-├── werk1112-v1.6.0-linux-x86_64.tar.gz.sha256
-├── werk1112-v1.6.0-linux-x86_64-amd-strix-halo.tar.gz
-├── werk1112-v1.6.0-linux-x86_64-amd-strix-halo.tar.gz.sha256
-├── werk1112-v1.6.0-linux-aarch64-dgx-spark.tar.gz
-├── werk1112-v1.6.0-linux-aarch64-dgx-spark.tar.gz.sha256
-├── werk1112-v1.6.0-windows-x86_64.zip
-├── werk1112-v1.6.0-windows-x86_64.zip.sha256
-├── werk1112-v1.6.0-macos-aarch64.tar.gz
-└── werk1112-v1.6.0-macos-aarch64.tar.gz.sha256
+├── werk1112-v1.7.0-linux-x86_64.tar.gz
+├── werk1112-v1.7.0-linux-x86_64.tar.gz.sha256
+├── werk1112-v1.7.0-linux-x86_64-amd-strix-halo.tar.gz
+├── werk1112-v1.7.0-linux-x86_64-amd-strix-halo.tar.gz.sha256
+├── werk1112-v1.7.0-linux-aarch64-dgx-spark.tar.gz
+├── werk1112-v1.7.0-linux-aarch64-dgx-spark.tar.gz.sha256
+├── werk1112-v1.7.0-windows-x86_64.zip
+├── werk1112-v1.7.0-windows-x86_64.zip.sha256
+├── werk1112-v1.7.0-macos-aarch64.tar.gz
+└── werk1112-v1.7.0-macos-aarch64.tar.gz.sha256
 ~~~
 
 Staging directories are recreated below `target/package/<platform>`. Existing
@@ -283,20 +283,23 @@ create a GitHub release or upload artifacts.
 
 ## Manual GitHub release workflow
 
-Open **Actions → Release → Run workflow**, select the repository's default
-branch and choose `patch`, `minor` or `major`. For example, starting at `1.6.0`,
-these produce `1.6.1`, `1.7.0` or `2.0.0`. The workflow must first be merged into
-the default branch to appear in GitHub's manual workflow menu.
+Prepare a release pull request (for example, `release/v1-7-0`) with the intended
+version in all product version files, a dated changelog section and comparison
+links, README highlights and updated installation examples. Complete validation
+and merge the PR into the default branch before starting the release workflow.
 
-The workflow uses `Cargo.toml` as its version source and checks that the latest
-stable `v<VERSION>` tag and all product version files agree. It updates Cargo,
-Media Companion, ComfyUI and both n8n package metadata files, moves `Unreleased`
-into a release section dated in Europe/Berlin, and updates the changelog links.
-It commits these changes, pushes the commit and annotated tag atomically, then
-creates the GitHub release using the changelog entry as release notes. Empty
-release notes, inconsistent versions and duplicate tags stop the release.
-The selected commit must still be the default branch tip when pushed; if the
-branch advances meanwhile, start a new run from its latest commit.
+Open **Actions → Release → Run workflow** and select the default branch.
+The workflow reads the already prepared version from `Cargo.toml`; it does not
+increment versions or create another commit. It checks that Cargo.lock, Media
+Companion, ComfyUI and both n8n metadata files agree, that the version is newer
+than the latest stable release tag, and that its dated changelog entry contains
+release notes and correct comparison links. The tag must not already exist.
+
+The workflow creates an annotated `v<VERSION>` tag on the exact commit selected
+when the run was dispatched, then creates a GitHub release with the prepared
+changelog entry as its notes. Repository files and the default branch are not
+modified by the workflow. The workflow must be present on the default branch
+before it appears in GitHub's manual workflow menu.
 
 **Keep release as a draft** is enabled by default. Build the platform artifacts
 from the generated tag, upload the archives and their `.sha256` files to the
@@ -304,38 +307,69 @@ draft, then publish it. This keeps the previous release available to installers
 until the new downloads are ready. Disable the draft option only when you want
 to publish immediately, before manually attaching artifacts.
 
-The workflow does not build binaries, upload assets, run the full product test
-suites, publish to npm, or publish to the ComfyUI Registry. README release
-highlights and versioned documentation examples remain editorial work; review
-them before releasing. Protocol, dependency and node schema versions are not
-changed by the product SemVer increment.
+The workflow runs release-tool tests and metadata checks. It does not build
+binaries, upload assets, run the full product test suites, publish to npm, or
+publish to the ComfyUI Registry. Protocol, dependency and node schema versions
+follow their own compatibility rules.
 
 The built-in `GITHUB_TOKEN` supplies `contents: write`; no additional secret is
-needed. Repository rules must allow that token to push the release commit to
-the default branch and create release tags. A protected branch that requires
-pull requests may reject the push; the workflow does not bypass these rules.
-Changes pushed with this token do not automatically trigger the repository's
-other push workflows, so complete the normal validation before releasing.
+needed. Repository rules must permit it to create release tags. The workflow
+does not push to the protected default branch or bypass tag protection rules.
 
-If the commit and tag were pushed but GitHub release creation failed, **do not
-start a new version bump**. Recover the existing tag through GitHub's release
-UI or `gh release create v<VERSION> --verify-tag --draft --title
-"Werk1112 v<VERSION>" --notes-file release-notes.md`, with notes copied from its
-dated changelog entry. No tag needs to be deleted or moved.
+If the tag was pushed but GitHub release creation failed, recover the existing
+tag through GitHub's release UI or `gh release create v<VERSION> --verify-tag
+--draft --title "Werk1112 v<VERSION>" --notes-file release-notes.md`, using the
+notes from its dated changelog entry. Do not move or delete the tag.
 
-Release preparation can be checked locally with Python 3.12:
+The local helper prepares the release PR files from a clean checkout whose
+current version matches the latest stable tag. Maintain the changes under
+`Unreleased` in `CHANGELOG.md`, including a short `### Highlights` section:
+
+~~~markdown
+## [Unreleased]
+
+### Highlights
+
+- Describe a user-facing change and its relevant limitations.
+
+### Fixed
+
+- Describe other fixes that belong in the full release notes.
+~~~
+
+Commit these notes on the release branch, then run:
 
 ~~~bash
+python3 scripts/prepare-release.py minor --notes-file /tmp/werk-release-notes.md
+~~~
+
+Use `patch`, `minor` or `major` as appropriate. The helper synchronizes all
+product versions and lockfiles, creates the dated changelog section, and
+rebuilds the README's "What's new" section from those highlights. It also
+updates the current release references in installation instructions, artifact
+names, protocol examples, integration READMEs, parity documentation and the
+validation page's release reference. The rest of the README, historical
+changelog entries and recorded validation results remain intact.
+
+Review and commit the generated files in the release PR, then merge it.
+Content-specific API documentation and fresh validation evidence still need
+to be maintained with the corresponding feature changes; the script does not
+infer behavior or claim new test results. Missing highlights or stale current
+documentation versions abort preparation before any tracked file is written.
+`check` also verifies the README version/changelog link and current documentation
+references before publication. It does not change tracked files and accepts an
+uncommitted release PR worktree:
+
+~~~bash
+python3 scripts/prepare-release.py check --notes-file /tmp/werk-release-notes.md
 python3 -m unittest discover -s scripts/tests -p 'test_prepare_release.py'
 ~~~
 
 ## Maintainer release checklist
 
-With the manual GitHub workflow, prepare and validate the `Unreleased` notes
-and editorial documentation first, then dispatch the workflow with draft mode
-enabled. It handles the version synchronization, dated changelog and tag in
-steps 1, 2 and 6 below. Check out that tag on each build host before packaging;
-publish the draft only after uploading and checking the artifacts.
+Prepare steps 1 and 2 in the release PR and merge it. The manual workflow then
+handles step 6 and creates a draft. Check out that tag on each build host before
+packaging; publish the draft only after uploading and checking the artifacts.
 
 1. Synchronize the intended product version in `Cargo.toml`, the root package
    entry in `Cargo.lock`, `COMPANION_VERSION` in

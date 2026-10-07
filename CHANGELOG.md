@@ -5,9 +5,25 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
-- Add a manual GitHub release workflow with patch/minor/major version bumps,
-  synchronized product metadata, dated changelog notes, annotated tags and
-  optional draft releases. Platform builds and artifact uploads remain manual.
+## [1.7.0] - 2026-10-07
+
+- Add a manual GitHub release workflow that validates the version and changelog
+  prepared in a release PR, then creates an annotated tag and optional draft
+  release. A local helper prepares patch/minor/major changes across product
+  metadata and current documentation references, and generates README release
+  highlights from the changelog. Validate documentation versions before
+  publication; platform builds and artifact uploads remain manual.
+
+- Add opt-in single-host deployment profiles for llama.cpp and vLLM with model
+  aliases, explicit CUDA GPU groups, resource admission, replica selection and
+  session affinity. Support llama.cpp layer placement and validated native vLLM
+  parallelism configurations. Real deployment smoke tests cover a single RTX
+  3090 and CPU-layer offload; multi-GPU hardware runs remain unverified.
+
+- Coordinate concurrent cold starts by runtime identity, reuse owned workers,
+  and narrow registry locks so unrelated model loads can proceed independently.
+  Permit native backend request overlap while retaining per-model mutable-state
+  gates and exclusive persistent-state operations.
 
 - Support Qwen/GLM text offload and native prefix persistence on oMLX 0.7.0
   while retaining 0.6.4 support. Preserve the newer memory-guard options and
@@ -52,7 +68,6 @@ All notable changes to Werk1112 are documented in this file. The project uses
   chat accounting across OpenAI/Anthropic and native oMLX cache/offload telemetry.
   Ship Prometheus/Grafana assets in release bundles and add headless cross-platform
   observability checks. Monitoring never changes running worker configuration.
-
 
 - Retain the existing Linux CUDA CPU-expert prefault mappings for the active
   worker lifetime, including initially cached pages. This prevents cache-only
@@ -201,6 +216,17 @@ All notable changes to Werk1112 are documented in this file. The project uses
   alongside the previously supported entry-point formats.
 - oMLX timing statistics use the runtime's prompt and generation durations
   when available, so hidden reasoning is no longer reported as prompt work.
+
+### Compatibility notes
+
+- Synchronize Werk Core, Media Companion, ComfyUI and n8n at `1.7.0`.
+  ComfyUI and n8n remain Beta; n8n stays private and manually installed.
+- Werk Protocol remains `1.0`; product release numbering does not change
+  dependency, transport, persisted-state or n8n node schema versions.
+- Single-host deployment profiles initially target discrete CUDA on Linux/WSL.
+  Quantized vLLM multi-GPU profiles remain rejected until their model/build
+  combination is validated. Runtime availability and platform artifact smoke
+  tests remain host-specific.
 
 ## [1.6.0] - 2026-09-07
 
@@ -413,7 +439,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/philipbodenbach/werk1112/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/philipbodenbach/werk1112/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/philipbodenbach/werk1112/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/philipbodenbach/werk1112/compare/v1.4.0...v1.5.0

@@ -1,18 +1,9 @@
 name: Release
-run-name: Release (${{ inputs.bump }})${{ inputs.draft && ' — draft' || '' }}
+run-name: Release prepared version${{ inputs.draft && ' — draft' || '' }}
 
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: SemVer increment from the current product version
-        type: choice
-        required: true
-        default: patch
-        options:
-          - patch
-          - minor
-          - major
       draft:
         description: Keep release as a draft until manual artifacts are uploaded
         type: boolean
@@ -57,25 +48,19 @@ jobs:
       - name: Test release preparation
         run: python -m unittest discover -s scripts/tests -p 'test_prepare_release.py'
 
-      - name: Prepare synchronized versions and changelog
+      - name: Validate prepared version and extract release notes
         id: prepare
-        env:
-          BUMP: ${{ inputs.bump }}
-        run: python scripts/prepare-release.py "$BUMP" --notes-file "$RUNNER_TEMP/release-notes.md"
+        run: python scripts/prepare-release.py check --notes-file "$RUNNER_TEMP/release-notes.md"
 
-      - name: Commit versions and atomically push commit and tag
+      - name: Tag the reviewed release commit
         env:
           RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.toml Cargo.lock runtime/werk_media_companion.py \
-            utils/comfyUI/pyproject.toml utils/n8n/package.json \
-            utils/n8n/package-lock.json CHANGELOG.md
-          git diff --cached --check
-          git commit -m "release(): $RELEASE_TAG"
+          git diff --exit-code
           git tag -a "$RELEASE_TAG" -m "Werk1112 $RELEASE_TAG"
-          git push --atomic origin "HEAD:refs/heads/$DEFAULT_BRANCH" "refs/tags/$RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"
 
       - name: Create GitHub release
         env:
