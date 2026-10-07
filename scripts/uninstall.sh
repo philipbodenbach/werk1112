@@ -55,7 +55,7 @@ binary_path="$install_dir/werk"
 model_store_kept=0
 api_keys_kept=0
 
-if [ -e "$binary_path" ]; then
+if [ -e "$binary_path" ] || [ -L "$binary_path" ]; then
     rm -f "$binary_path"
     printf 'Removed %s\n' "$binary_path"
 else

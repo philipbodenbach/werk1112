@@ -160,7 +160,14 @@ validate_archive_listing() {
     fi
     sorted_entries=$(printf '%s\n' "$archive_entries" | LC_ALL=C sort)
     expected_entries=$(printf '%s\n' LICENSE README.md werk)
-    [ "$sorted_entries" = "$expected_entries" ] || die "release archive contains unexpected entries"
+    # Older releases contain only these three files. Current packages also
+    # include the observability examples; keep both layouts explicit.
+    expected_entries_with_observability=$(printf '%s\n' LICENSE README.md \
+        observability/ observability/README.md observability/grafana-dashboard.json \
+        observability/prometheus.yml werk)
+    [ "$sorted_entries" = "$expected_entries" ] || \
+        [ "$sorted_entries" = "$expected_entries_with_observability" ] || \
+        die "release archive contains unexpected entries"
 }
 
 validate_extracted_archive() {
@@ -280,7 +287,8 @@ printf 'Verifying %s\n' "$artifact_name"
 verify_checksum "$tmp_dir" "$checksum_name" || die "checksum verification failed for $artifact_name"
 validate_archive_listing "$archive_path"
 
-tar -xzf "$archive_path" -C "$tmp_dir"
+# The CLI installer needs only these files, not the bundled examples.
+tar -xzf "$archive_path" -C "$tmp_dir" werk README.md LICENSE
 validate_extracted_archive "$tmp_dir"
 
 mkdir -p "$install_dir"
