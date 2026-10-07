@@ -104,27 +104,35 @@ werk doctor --model MODEL --task TASK
 The detailed support levels and known gaps are documented rather than hidden
 behind an “all models supported” claim.
 
-## What’s new in v1.6.0
+## What’s new in v1.7.0
 
-Werk Core, Media Companion, ComfyUI and the new n8n package now share release
-version **1.6.0**. ComfyUI and n8n remain Beta integrations.
+Werk Core, Media Companion, ComfyUI and n8n share release version **1.7.0**.
+ComfyUI and n8n remain Beta integrations.
 
-- Optional local oMLX on Apple Silicon supports text, chat, streaming and
-  verified native tool calls. Compatible MLX-LM remains preferred; use
-  `--backend omlx` to select oMLX explicitly. Model preflight checks the
-  installed oMLX patches, including DeepSeek V4 support, before loading weights.
-- Eight native n8n nodes cover discovery, inference, jobs and runtime control,
-  with binary media, example workflows and manual custom-directory installation.
-- MLX-LM preflight checks the actual loader, architecture and quantization
-  metadata, including supported MXFP4 layouts. Routing preserves explicit
-  backend/device choices and explains compatible fallbacks.
+- Add a one-button GitHub release workflow with automatic SemVer selection
+  from commit messages, synchronized product versions and documentation, README
+  highlights, dated changelog notes, an automatically created and merged release
+  PR, annotated tag and optional draft release. Preserve branch protection and
+  reuse already prepared versions and existing releases on retry;
+  platform builds and artifact uploads remain manual.
+- Add opt-in single-host deployment profiles for llama.cpp and vLLM with model
+  aliases, explicit CUDA GPU groups, resource admission, replica selection and
+  session affinity. Support llama.cpp layer placement and validated native vLLM
+  parallelism configurations. Real deployment smoke tests cover a single RTX
+  3090 and CPU-layer offload; multi-GPU hardware runs remain unverified.
+- Coordinate concurrent cold starts by runtime identity, reuse owned workers,
+  and narrow registry locks so unrelated model loads can proceed independently.
+  Permit native backend request overlap while retaining per-model mutable-state
+  gates and exclusive persistent-state operations.
+- Support Qwen/GLM text offload and native prefix persistence on oMLX 0.7.0
+  while retaining 0.6.4 support. Preserve the newer memory-guard options and
+  tokenizer/parser contracts, and restore native array-cache methods after
+  SSD prefix reuse. Include process exit status in failed compatibility probes.
+- Preserve native llama.cpp and oMLX timing metadata in extended chat API
+  responses and streams so completed requests in `werk top` retain decode and
+  prefill rates. Keep timings across separate usage and completion chunks.
 
-See the [v1.6.0 changelog](CHANGELOG.md#160---2026-09-07),
-[oMLX backend guide](docs/backends.md#optional-local-omlx-backend),
-[n8n integration](utils/n8n/README.md) and
-[runtime persistence and memory architecture](docs/concepts/runtime-persistence-and-memory.md)
-for support boundaries. The oMLX tests use source fixtures and mock servers;
-real Apple Silicon and Vontra-checkpoint inference remains to be validated.
+See the [v1.7.0 changelog](CHANGELOG.md#170---2026-10-07) for all changes and compatibility notes.
 
 ## Install
 
