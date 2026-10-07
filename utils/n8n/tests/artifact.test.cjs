@@ -7,7 +7,9 @@ const root = path.resolve(__dirname, '..');
 
 test('private Beta package registers all eight version-one nodes and one credential with complete dist', () => {
   assert.equal(pkg.private, true);
-  assert.equal(pkg.version, '1.6.0');
+  const cargo = fs.readFileSync(path.join(root, '../../Cargo.toml'), 'utf8');
+  const productVersion = cargo.match(/\[package\][\s\S]*?^version = "([^"]+)"/m)[1];
+  assert.equal(pkg.version, productVersion);
   assert.match(pkg.description, /Beta/);
   assert.equal(pkg.license, 'Elastic-2.0');
   assert.equal(pkg.n8n.n8nNodesApiVersion, 1);

@@ -5,6 +5,10 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Add a manual GitHub release workflow with patch/minor/major version bumps,
+  synchronized product metadata, dated changelog notes, annotated tags and
+  optional draft releases. Platform builds and artifact uploads remain manual.
+
 - Preserve native llama.cpp and oMLX timing metadata in extended chat API
   responses and streams so completed requests in `werk top` retain decode and
   prefill rates. Keep timings across separate usage and completion chunks.
