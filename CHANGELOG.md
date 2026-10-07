@@ -5,14 +5,12 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
-## [1.7.0] - 2026-10-07
-
-- Add a manual GitHub release workflow that validates the version and changelog
-  prepared in a release PR, then creates an annotated tag and optional draft
-  release. A local helper prepares patch/minor/major changes across product
-  metadata and current documentation references, and generates README release
-  highlights from the changelog. Validate documentation versions before
-  publication; platform builds and artifact uploads remain manual.
+- Add a one-button GitHub release workflow with automatic SemVer selection
+  from commit messages, synchronized product versions and documentation, README
+  highlights, dated changelog notes, an automatically created and merged release
+  PR, annotated tag and optional draft release. Preserve branch protection and
+  reuse already prepared versions and existing releases on retry;
+  platform builds and artifact uploads remain manual.
 
 - Add opt-in single-host deployment profiles for llama.cpp and vLLM with model
   aliases, explicit CUDA GPU groups, resource admission, replica selection and
@@ -219,7 +217,7 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ### Compatibility notes
 
-- Synchronize Werk Core, Media Companion, ComfyUI and n8n at `1.7.0`.
+- Keep Werk Core, Media Companion, ComfyUI and n8n versions synchronized.
   ComfyUI and n8n remain Beta; n8n stays private and manually installed.
 - Werk Protocol remains `1.0`; product release numbering does not change
   dependency, transport, persisted-state or n8n node schema versions.
@@ -439,8 +437,7 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.7.0...HEAD
-[1.7.0]: https://github.com/philipbodenbach/werk1112/compare/v1.6.0...v1.7.0
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.6.0...HEAD
 [1.6.0]: https://github.com/philipbodenbach/werk1112/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/philipbodenbach/werk1112/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/philipbodenbach/werk1112/compare/v1.4.0...v1.5.0

@@ -61,21 +61,6 @@ cargo +stable check --locked --all-targets
 cargo +stable test --locked
 ~~~
 
-During v1.7.0 preparation on Linux/WSL, the default test run aborted with a
-stack overflow in `cli::tests::parses_cli_commands`. Increasing the test thread
-stack allowed the suite to run, but its parallel execution reported nine
-file/session-lock failures. Use the following command to reproduce the serial
-release check; a successful serial run does not establish that the parallel
-suite is clean:
-
-~~~bash
-RUST_MIN_STACK=16777216 cargo +stable test --locked -- --test-threads=1
-~~~
-
-The serial v1.7.0 run passed **1,252 tests**, with **4 ignored**. Rust formatting
-and `cargo +stable check --locked --all-targets` also passed. These are local
-backend-neutral checks; they do not replace native platform artifact smoke tests.
-
 Python companion and ComfyUI tests are independent of the Rust build:
 
 ~~~bash

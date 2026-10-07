@@ -105,7 +105,6 @@ class ReleaseTests(unittest.TestCase):
                 self.assertIn(f"werk1112-v{version}-linux-x86_64.tar.gz", (self.root / "docs/development/packaging-releases.md").read_text())
                 n8n_readme = (self.root / "utils/n8n/README.md").read_text()
                 self.assertIn(f"git switch --detach v{version}", n8n_readme)
-                self.assertIn(f"release/v{version.replace('.', '-')}", n8n_readme)
                 self.assertIn("npm@11.19.1", n8n_readme)
 
     def test_mismatched_version_is_rejected(self):
@@ -124,11 +123,16 @@ class ReleaseTests(unittest.TestCase):
         self.git("tag", "v0.0.0")
         self.assert_rejected_without_changes("differs from package version")
 
-    def test_empty_changelog_is_rejected(self):
+    def test_empty_unreleased_uses_commit_notes(self):
         path = self.root / "CHANGELOG.md"
-        path.write_text(f"# Changelog\n\n## [Unreleased]\n\n## [{self.current}] - 2026-01-01\n\n- Old.\n")
+        text = path.read_text()
+        end = text.index(f"## [{self.current}]")
+        path.write_text("# Changelog\n\n## [Unreleased]\n\n" + text[end:])
         self.commit()
-        self.assert_rejected_without_changes("nonempty Unreleased notes")
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("- Fixture (`", (self.root / "notes.md").read_text())
+        self.assertIn("- Fixture (`", (self.root / "README.md").read_text())
 
     def test_dirty_checkout_is_rejected(self):
         with (self.root / "Cargo.toml").open("a") as stream:
@@ -215,11 +219,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue(readme.read_text().endswith("\nCustom footer stays intact.\n"))
         self.assertIn("## Install", readme.read_text())
 
-    def test_missing_highlights_aborts_before_modifying_any_files(self):
+    def test_missing_highlights_uses_existing_change_bullets(self):
         path = self.root / "CHANGELOG.md"
         path.write_text(path.read_text().replace("### Highlights", "### Changes", 1))
         self.commit()
-        self.assert_rejected_without_changes("### Highlights section")
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("- Release test change.", (self.root / "README.md").read_text())
 
     def test_check_rejects_stale_readme(self):
         tag = self.prepared_checkout()
@@ -232,6 +238,56 @@ class ReleaseTests(unittest.TestCase):
         path = self.root / "docs/getting-started.md"
         path.write_text(path.read_text().replace(f"WERK_VERSION={tag[1:]}", "WERK_VERSION=0.0.0"))
         self.assert_rejected_without_changes("stale release version in docs/getting-started.md", "check")
+
+    def test_auto_infers_semver_from_commit_messages(self):
+        major, minor, patch = map(int, self.current.split("."))
+        cases = [
+            ("fix(): repair cache", f"v{major}.{minor}.{patch + 1}"),
+            ("feat(router): add deployment", f"v{major}.{minor + 1}.0"),
+            ("feat(): match repository style", f"v{major}.{minor + 1}.0"),
+            ("feat!: remove legacy API", f"v{major + 1}.0.0"),
+            ("refactor(api): update contract\n\nBREAKING CHANGE: remove field", f"v{major + 1}.0.0"),
+            ("Update documentation", f"v{major}.{minor}.{patch + 1}"),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.git("reset", "--hard", f"v{self.current}")
+                self.git("commit", "--allow-empty", "-qm", message)
+                result = self.run_release("auto")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_auto_keeps_prepared_version_without_another_bump(self):
+        tag = self.prepared_checkout()
+        self.commit()
+        before = {name: (self.root / name).read_bytes() for name in FILES}
+        result = self.run_release("auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), tag)
+        self.assertEqual(before, {name: (self.root / name).read_bytes() for name in FILES})
+
+    def test_auto_reuses_tag_after_successful_or_partial_run(self):
+        tag = self.prepared_checkout()
+        self.commit()
+        self.git("tag", "-a", tag, "-m", "Release")
+        before = {name: (self.root / name).read_bytes() for name in FILES}
+        result = self.run_release("auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), tag)
+        self.assertEqual(before, {name: (self.root / name).read_bytes() for name in FILES})
+
+    def test_auto_next_release_after_previous_tag(self):
+        tag = self.prepared_checkout()
+        self.commit()
+        self.git("tag", tag)
+        self.git("commit", "--allow-empty", "-qm", "fix: follow-up")
+        result = self.run_release("auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        major, minor, _ = tag[1:].split(".")
+        self.assertEqual(result.stdout.strip(), f"v{major}.{minor}.1")
+        notes = (self.root / "notes.md").read_text()
+        self.assertIn("fix: follow-up", notes)
+        self.assertNotIn("Release test change", notes)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a release PR locally, or check its version and notes for publication."""
+"""Prepare release metadata automatically, or validate it before publication."""
 
 import argparse
 from datetime import datetime
@@ -14,26 +14,24 @@ from zoneinfo import ZoneInfo
 
 VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 DOC_VERSION = r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"
-DOC_BRANCH = r"release/v(?P<version>[0-9]+-[0-9]+-[0-9]+)"
 # Explicit current-release fields: do not rewrite historical validation results,
 # dependency versions, protocol versions, or arbitrary prose throughout docs/.
 DOC_FIELDS = {
     "docs/getting-started.md": [r'WERK_VERSION(?:=| = ")' + DOC_VERSION],
     "docs/development/packaging-releases.md": [
-        r"(?:For package version `|werk1112-v)" + DOC_VERSION, DOC_BRANCH,
+        r"(?:For package version `|werk1112-v)" + DOC_VERSION,
     ],
     "docs/reference/werk-protocol-v1.md": [r'"service_version": "' + DOC_VERSION],
     "utils/comfyUI/README.md": [r"package is version \*\*" + DOC_VERSION],
     "utils/n8n/README.md": [
         r"(?:`n8n-nodes-werk1112` \*\*|Werk \*\*|share release version \*\*|git switch --detach v|The Werk )" + DOC_VERSION,
-        DOC_BRANCH,
     ],
     "utils/n8n/examples/README.md": [r"(?:package|Werk) \*\*" + DOC_VERSION],
     "utils/n8n/docs/comfyui-parity.md": [r"Werk/ComfyUI \*\*" + DOC_VERSION],
     "utils/n8n/docs/validation.md": [
         r"ComfyUI and the n8n package at \*\*" + DOC_VERSION,
         r"The package remains private and manually installed for Werk \*\*" + DOC_VERSION,
-        r"Release reference: `" + DOC_BRANCH,
+        r"Release reference: `v" + DOC_VERSION,
     ],
 }
 
@@ -41,9 +39,8 @@ DOC_FIELDS = {
 def update_doc_fields(files, current, next_version):
     for path, patterns in DOC_FIELDS.items():
         for pattern in patterns:
-            branch = "release/v" in pattern
-            expected = current.replace(".", "-") if branch else current
-            replacement = next_version.replace(".", "-") if branch else next_version
+            expected = current
+            replacement = next_version
             matches = list(re.finditer(pattern, files[path]))
             if not matches or any(match["version"] != expected for match in matches):
                 raise ValueError(f"Missing or stale release version in {path}: expected {expected}")
@@ -65,15 +62,21 @@ def readme_section(text, version):
 
 def update_readme(text, current, next_version, date, notes):
     highlights = re.search(r'^### Highlights\n(.*?)(?=^### |\Z)', notes, re.M | re.S)
-    if not highlights or not re.search(r'^- \S', highlights[1], re.M):
-        raise ValueError("Add a nonempty ### Highlights section under Unreleased for the README")
+    if highlights and re.search(r'^- \S', highlights[1], re.M):
+        summary = highlights[1].strip()
+    else:
+        # Preserve multiline bullets; a summary is copied, never invented.
+        bullets = re.findall(r'^- \S[^\n]*(?:\n[ \t]+[^\n]+)*', notes, re.M)
+        summary = "\n".join(bullets[:5])
+        if not summary:
+            raise ValueError("Release notes must contain at least one bullet for the README")
     section = readme_section(text, current)
     anchor = next_version.replace(".", "") + "---" + str(date)
     new_section = (
         f"## What’s new in v{next_version}\n\n"
         f"Werk Core, Media Companion, ComfyUI and n8n share release version **{next_version}**.\n"
         "ComfyUI and n8n remain Beta integrations.\n\n"
-        f"{highlights[1].strip()}\n\n"
+        f"{summary}\n\n"
         f"See the [v{next_version} changelog](CHANGELOG.md#{anchor}) "
         "for all changes and compatibility notes.\n\n"
     )
@@ -91,7 +94,34 @@ def replace_once(text, pattern, replacement):
     return result
 
 
-def prepare(root, bump, date):
+def commits_since(tag):
+    revisions = git("rev-list", "--reverse", "--no-merges", f"{tag}..HEAD").splitlines()
+    return [(revision, git("show", "-s", "--format=%B", revision)) for revision in revisions]
+
+
+def inferred_bump(commits):
+    for _, message in commits:
+        if re.match(r"^[a-zA-Z][\w-]*(?:\([^\n)]*\))?!:", message) or re.search(
+            r"^BREAKING[ -]CHANGE:", message, re.M
+        ):
+            return "major"
+    if any(re.match(r"^feat(?:\([^\n)]*\))?:", message) for _, message in commits):
+        return "minor"
+    return "patch"
+
+
+def commit_notes(commits):
+    # Escape Markdown/HTML syntax in commit subjects; never interpolate into a shell.
+    bullets = []
+    for revision, message in commits:
+        subject = message.splitlines()[0]
+        subject = subject.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        subject = re.sub(r"([\\`*_\[\]])", r"\\\1", subject)
+        bullets.append(f"- {subject} (`{revision[:12]}`)")
+    return "### Changes\n\n" + "\n".join(bullets) + "\n"
+
+
+def prepare(root, bump, date, allow_existing=False):
     paths = [
         "Cargo.toml", "Cargo.lock", "runtime/werk_media_companion.py",
         "utils/comfyUI/pyproject.toml", "utils/n8n/package.json",
@@ -118,6 +148,23 @@ def prepare(root, bump, date):
         if value != current:
             raise ValueError(f"{name} version {value} differs from Cargo.toml {current}")
 
+    tags = git("tag", "--list").splitlines()
+    stable_tags = [t for t in tags if re.fullmatch("v" + VERSION, t)]
+    if not stable_tags:
+        raise ValueError("No existing stable release tag found")
+    latest = max(stable_tags, key=lambda t: tuple(map(int, t[1:].split("."))))
+    if bump == "auto":
+        if tuple(map(int, current.split("."))) > tuple(map(int, latest[1:].split("."))):
+            # Transition from a manually prepared release, including v1.7.0.
+            return prepare(root, "check", date)
+        if latest != f"v{current}":
+            raise ValueError(f"Latest stable tag {latest} differs from package version v{current}")
+        commits = commits_since(latest)
+        if not commits:
+            # A new dispatch after a partial/successful run reuses its tag/notes.
+            return prepare(root, "check", date, allow_existing=True)
+        bump = inferred_bump(commits)
+
     major, minor, patch = map(int, current.split("."))
     next_version = {
         "patch": f"{major}.{minor}.{patch + 1}",
@@ -126,13 +173,13 @@ def prepare(root, bump, date):
         "check": current,
     }[bump]
     tag = f"v{next_version}"
-    tags = git("tag", "--list").splitlines()
     if tag in tags:
-        raise ValueError(f"Tag {tag} already exists")
-    stable_tags = [t for t in tags if re.fullmatch("v" + VERSION, t)]
-    if not stable_tags:
-        raise ValueError("No existing stable release tag found")
-    latest = max(stable_tags, key=lambda t: tuple(map(int, t[1:].split("."))))
+        if not allow_existing or git("rev-parse", f"{tag}^{{commit}}") != git("rev-parse", "HEAD"):
+            raise ValueError(f"Tag {tag} already exists")
+        previous_tags = [t for t in stable_tags if t != tag]
+        if not previous_tags:
+            raise ValueError("Cannot recover a release without a previous stable tag")
+        latest = max(previous_tags, key=lambda t: tuple(map(int, t[1:].split("."))))
     if bump == "check":
         if tuple(map(int, current.split("."))) <= tuple(map(int, latest[1:].split("."))):
             raise ValueError(f"Prepared version v{current} must be newer than {latest}")
@@ -192,9 +239,15 @@ def prepare(root, bump, date):
 
     changelog = files["CHANGELOG.md"]
     unreleased = re.search(r'^## \[Unreleased\]\n(.*?)(?=^## \[)', changelog, re.M | re.S)
-    if not unreleased or not re.search(r'^- \S', unreleased[1], re.M):
-        raise ValueError("CHANGELOG.md must contain nonempty Unreleased notes")
-    notes = unreleased[1].strip() + "\n"
+    if not unreleased:
+        raise ValueError("CHANGELOG.md must contain an Unreleased section")
+    if re.search(r'^- \S', unreleased[1], re.M):
+        notes = unreleased[1].strip() + "\n"
+    else:
+        commits = commits_since(latest)
+        if not commits:
+            raise ValueError("No changes since the latest release")
+        notes = commit_notes(commits)
     changelog = changelog[:unreleased.start()] + (
         f"## [Unreleased]\n\n## [{next_version}] - {date}\n\n{notes}\n"
     ) + changelog[unreleased.end():]
@@ -213,8 +266,8 @@ def prepare(root, bump, date):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bump", choices=["patch", "minor", "major", "check"],
-                        help="Prepare a version bump locally, or check the already prepared release")
+    parser.add_argument("bump", choices=["auto", "patch", "minor", "major", "check"],
+                        help="Infer SemVer from commits, choose a bump, or check prepared metadata")
     parser.add_argument("--notes-file", type=Path, required=True)
     args = parser.parse_args()
     if args.bump != "check" and git("status", "--porcelain", "--untracked-files=no"):

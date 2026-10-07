@@ -1,9 +1,19 @@
 name: Release
-run-name: Release prepared version${{ inputs.draft && ' — draft' || '' }}
+run-name: Release (${{ inputs.bump }})${{ inputs.draft && ' — draft' || '' }}
 
 on:
   workflow_dispatch:
     inputs:
+      bump:
+        description: Version increment (auto uses commit messages or a prepared version)
+        type: choice
+        required: true
+        default: auto
+        options:
+          - auto
+          - patch
+          - minor
+          - major
       draft:
         description: Keep release as a draft until manual artifacts are uploaded
         type: boolean
@@ -11,6 +21,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: werk-product-release
@@ -34,11 +45,12 @@ jobs:
             exit 1
           fi
 
-      - name: Check out the requested commit and all release tags
+      # Use the current branch tip on retries, including an already pushed release commit.
+      - name: Check out the default branch and all release tags
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -48,18 +60,71 @@ jobs:
       - name: Test release preparation
         run: python -m unittest discover -s scripts/tests -p 'test_prepare_release.py'
 
-      - name: Validate prepared version and extract release notes
+      - name: Prepare versions, README, documentation and release notes
         id: prepare
-        run: python scripts/prepare-release.py check --notes-file "$RUNNER_TEMP/release-notes.md"
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: python scripts/prepare-release.py "$BUMP" --notes-file "$RUNNER_TEMP/release-notes.md"
 
-      - name: Tag the reviewed release commit
+      - name: Create and merge the release preparation PR
         env:
           RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git diff --exit-code
-          git tag -a "$RELEASE_TAG" -m "Werk1112 $RELEASE_TAG"
+          git diff --check
+          git add --update
+          if ! git diff --cached --quiet; then
+            base_sha=$(git rev-parse HEAD)
+            branch="release/auto-$RELEASE_TAG-${base_sha:0:12}"
+            remote_ref=$(git ls-remote --heads origin "refs/heads/$branch")
+            if [[ -n "$remote_ref" ]]; then
+              git fetch origin "refs/heads/$branch"
+              if [[ "$(git write-tree)" != "$(git rev-parse 'FETCH_HEAD^{tree}')" ]]; then
+                echo "::error::Existing release branch differs from this preparation: $branch"
+                exit 1
+              fi
+              release_sha=$(git rev-parse FETCH_HEAD)
+              git reset --hard "$release_sha"
+            else
+              git commit -m "release(): $RELEASE_TAG"
+              release_sha=$(git rev-parse HEAD)
+              git push origin "HEAD:refs/heads/$branch"
+            fi
+            pr=$(gh pr list --head "$branch" --base "$DEFAULT_BRANCH" --state open \
+              --json number --jq '.[0].number // empty')
+            if [[ -z "$pr" ]]; then
+              cat > "$RUNNER_TEMP/release-pr.md" <<'BODY'
+          Automatically synchronize product versions, changelog, README and current
+          documentation for this release. Platform artifacts are built and uploaded
+          manually after the tag is available. Release preparation tests passed.
+          BODY
+              pr=$(gh pr create --head "$branch" --base "$DEFAULT_BRANCH" \
+                --title "release(): $RELEASE_TAG" --body-file "$RUNNER_TEMP/release-pr.md")
+            fi
+            # Do not silently incorporate commits merged during release preparation.
+            remote_head=$(git ls-remote --heads origin "refs/heads/$DEFAULT_BRANCH")
+            if [[ "${remote_head%%[[:space:]]*}" != "$base_sha" ]]; then
+              echo "::error::Default branch advanced. Restart Release from the latest branch."
+              exit 1
+            fi
+            gh pr merge "$pr" --merge --match-head-commit "$release_sha"
+            merged_sha=$(gh pr view "$pr" --json mergeCommit --jq '.mergeCommit.oid')
+            test -n "$merged_sha" && test "$merged_sha" != null
+            git fetch origin "$DEFAULT_BRANCH"
+            git checkout --detach "$merged_sha"
+          fi
+
+      - name: Validate and tag the merged release
+        env:
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+        run: |
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+          else
+            python scripts/prepare-release.py check --notes-file "$RUNNER_TEMP/release-notes.md"
+            git tag -a "$RELEASE_TAG" -m "Werk1112 $RELEASE_TAG"
+          fi
           git push origin "refs/tags/$RELEASE_TAG"
 
       - name: Create GitHub release
@@ -71,11 +136,17 @@ jobs:
           if [[ "$DRAFT" == "true" ]]; then
             args+=(--draft)
           fi
-          gh release create "$RELEASE_TAG" "${args[@]}"
+          if gh release view "$RELEASE_TAG" --json url --jq .url; then
+            echo "Release already exists; keeping its assets, notes and publication state."
+          else
+            gh release create "$RELEASE_TAG" "${args[@]}"
+          fi
           {
             echo "### Werk1112 $RELEASE_TAG"
             echo
-            echo "Release created (draft: $DRAFT). Build from tag \`$RELEASE_TAG\`."
+            gh release view "$RELEASE_TAG" --json url,isDraft \
+              --jq '"Release: " + .url + " (draft: " + (.isDraft | tostring) + ")"'
+            echo "Build from tag \`$RELEASE_TAG\`."
             echo "Upload platform archives and their .sha256 files manually."
             echo "See docs/development/packaging-releases.md for the release checklist."
           } >> "$GITHUB_STEP_SUMMARY"

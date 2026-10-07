@@ -104,35 +104,27 @@ werk doctor --model MODEL --task TASK
 The detailed support levels and known gaps are documented rather than hidden
 behind an “all models supported” claim.
 
-## What’s new in v1.7.0
+## What’s new in v1.6.0
 
-Werk Core, Media Companion, ComfyUI and n8n share release version **1.7.0**.
-ComfyUI and n8n remain Beta integrations.
+Werk Core, Media Companion, ComfyUI and the new n8n package now share release
+version **1.6.0**. ComfyUI and n8n remain Beta integrations.
 
-- Opt-in single-host deployment profiles bind model aliases to native llama.cpp
-  or vLLM workers and explicit CUDA GPU groups, with placement plans, resource
-  admission, replicas and session affinity. Multi-GPU execution remains subject
-  to the documented runtime and hardware validation limits.
-- `werk top` adds a live terminal dashboard for requests, native token timings,
-  context and memory use, alongside Prometheus metrics and Grafana assets.
-- Concurrent inference reuses workers by runtime configuration and permits
-  backend-supported overlap while protecting mutable model and session state.
-- Chat and vision adapters expose function tool calling; authenticated
-  `/v1/tools` and `/v1/tools/call` extend tool dispatch to media inference and jobs.
-- `werk run` shares persistent conversations with `chat`, supports structured
-  media requests and can connect to an existing server with `--server`.
-- Native llama.cpp and oMLX persistence, prefix caching and expert-memory
-  handling improve reuse across requests. oMLX compatibility includes 0.7.0
-  alongside 0.6.4; GGUF shard downloads and external model imports improve
-  large-model storage workflows.
+- Optional local oMLX on Apple Silicon supports text, chat, streaming and
+  verified native tool calls. Compatible MLX-LM remains preferred; use
+  `--backend omlx` to select oMLX explicitly. Model preflight checks the
+  installed oMLX patches, including DeepSeek V4 support, before loading weights.
+- Eight native n8n nodes cover discovery, inference, jobs and runtime control,
+  with binary media, example workflows and manual custom-directory installation.
+- MLX-LM preflight checks the actual loader, architecture and quantization
+  metadata, including supported MXFP4 layouts. Routing preserves explicit
+  backend/device choices and explains compatible fallbacks.
 
-See the [v1.7.0 changelog](CHANGELOG.md#170---2026-10-07),
-[deployment profiles](docs/concepts/single-host-deployments.md),
-[inference concurrency](docs/concepts/inference-concurrency.md) and
-[runtime persistence](docs/concepts/runtime-persistence-and-memory.md).
-The recorded deployment smoke tests cover one RTX 3090 and CPU-layer offload;
-real multi-GPU runs and platform-specific release artifacts need separate
-validation on the matching hardware.
+See the [v1.6.0 changelog](CHANGELOG.md#160---2026-09-07),
+[oMLX backend guide](docs/backends.md#optional-local-omlx-backend),
+[n8n integration](utils/n8n/README.md) and
+[runtime persistence and memory architecture](docs/concepts/runtime-persistence-and-memory.md)
+for support boundaries. The oMLX tests use source fixtures and mock servers;
+real Apple Silicon and Vontra-checkpoint inference remains to be validated.
 
 ## Install
 
