@@ -1,5 +1,12 @@
 # HTTP API reference and coverage
 
+With [deployment profiles](concepts/single-host-deployments.md), chat `model`
+selects a configured alias or exact instance ID. `x-werk-session-id` binds a
+conversation to a replica; busy profiles return HTTP 429 with a zero-capacity
+queue policy. `GET /werk/v1/deployments` provides authenticated inventory, plans,
+slot counts and worker diagnosis. Runtime-control routes require an exact
+`x-werk-deployment` header in this mode.
+
 Werk1112 exposes OpenAI-compatible and Anthropic Messages subsets together with Werk-native media,
 discovery, output and job contracts. It also provides small compatibility
 surfaces for ComfyUI's hosted OpenAI nodes and AUTOMATIC1111 clients.
@@ -15,8 +22,8 @@ of truth.
 
 Current surface:
 
-- 38 unique paths
-- 42 method/path operations
+- 39 unique paths
+- 43 method/path operations
 - JSON requests, multipart file uploads and raw file/output downloads
 - server-sent events only for chat streaming
 - persisted asynchronous jobs for video, generated audio and the native job API

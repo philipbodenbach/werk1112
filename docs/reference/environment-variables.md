@@ -12,6 +12,11 @@ for the managed directory layout.
 
 ## Core, serving and storage
 
+`WERK_DEPLOYMENTS` selects a server-owned deployment JSON file for `serve` (same
+as `--deployments`). It binds individual native binaries and CUDA UUID groups.
+Profile mode rejects global `WERK_LLAMA_ARGS` / `WERK_VLLM_ARGS`; use the validated
+per-profile options. [Deployment configuration](../concepts/single-host-deployments.md).
+
 | Variable | Meaning |
 | --- | --- |
 | `WERK_HOME` | Managed store root. A global `--model-home` value wins. Runtime-state data is stored beneath `runtime-state/v1` and its private namespace-HMAC key beneath `auth`. See the [store resolution order](../concepts/models-manifests-and-store.md#store-root). |

@@ -120,6 +120,13 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        env = "WERK_DEPLOYMENTS",
+        help = "Server-owned deployment profiles JSON (serve only)"
+    )]
+    pub deployments: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
         env = "WERK_HOME",
         help = "Model store directory; defaults to WERK_HOME, XDG_DATA_HOME/werk1112, or ~/.local/share/werk1112"
     )]
@@ -641,6 +648,17 @@ impl From<ServePersistenceReuseArg> for ReuseMode {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
+    #[command(about = "Print physical GPU inventory and inherited visibility as JSON")]
+    Gpus,
+    #[command(about = "Resolve deployment profiles without loading weights or starting workers")]
+    DeploymentPlan {
+        config: PathBuf,
+        #[arg(
+            long,
+            help = "Read an inventory JSON fixture instead of probing hardware (dry-run only)"
+        )]
+        inventory: Option<PathBuf>,
+    },
     #[command(about = "Live Werk dashboard with inference, memory and cache telemetry")]
     Top(top::TopArgs),
     #[command(about = "Start the OpenAI-compatible HTTP server")]
@@ -984,6 +1002,12 @@ pub enum Commands {
 
     #[command(about = "Inspect and control a running Werk runtime")]
     Runtime {
+        #[arg(
+            long,
+            global = true,
+            help = "Exact deployment instance for runtime control in profile mode"
+        )]
+        deployment: Option<String>,
         #[arg(
             long,
             default_value = "http://127.0.0.1:11434",
@@ -1551,11 +1575,37 @@ pub async fn run(cli: Cli) -> Result<()> {
     let selection_options =
         selection_options.with_backend_install_output(command_backend_install_verbose(&command));
 
+    if cli.deployments.is_some() && !matches!(&command, Commands::Serve { .. }) {
+        bail!(
+            "--deployments / WERK_DEPLOYMENTS applies only to serve; use deployment-plan <file> for diagnostics"
+        );
+    }
+
     if should_print_startup_banner(&command) {
         print_banner();
     }
 
     match command {
+        Commands::Gpus => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &crate::inference_service::devices::Inventory::detect()?
+                )?
+            );
+            Ok(())
+        }
+        Commands::DeploymentPlan { config, inventory } => {
+            let store = ModelStore::resolve(model_home)?;
+            let inventory = match inventory {
+                Some(path) => serde_json::from_slice(&fs::read(path)?)?,
+                None => crate::inference_service::devices::Inventory::detect()?,
+            };
+            let plans =
+                crate::deployments::Configuration::load(&config)?.resolve(&store, &inventory)?;
+            println!("{}", serde_json::to_string_pretty(&plans)?);
+            Ok(())
+        }
         Commands::Serve {
             host,
             port,
@@ -1611,7 +1661,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     },
                 )
             };
-            if let Some(model) = model.as_deref() {
+            if let Some(model) = model.as_deref().filter(|_| cli.deployments.is_none()) {
                 let manifest = store.get(model)?;
                 with_terminal_spinner(
                     terminal_spinner_enabled(false),
@@ -1631,7 +1681,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("Default image model available: {image_model}");
             }
             let server_persistence_summary = format_server_persistence_config(&server_persistence);
-            let api_state = ApiState::new_with_default_model_prompt_options_and_verbose(
+            let mut api_state = ApiState::new_with_default_model_prompt_options_and_verbose(
                 store,
                 backend,
                 model,
@@ -1643,6 +1693,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             .with_chat_context_size(llama_options.ctx_size)
             .with_api_keys(api_keys)
             .with_cors_origins(cors_origins);
+            if let Some(path) = &cli.deployments {
+                let inventory = crate::inference_service::devices::Inventory::detect()?;
+                let plans = crate::deployments::Configuration::load(path)?
+                    .resolve(api_state.model_store(), &inventory)?;
+                api_state = api_state.with_deployments(plans, &inventory)?;
+            }
             if let Some(summary) = server_persistence_summary {
                 println!("{summary}");
             }
@@ -2092,8 +2148,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             api_key,
             timeout_seconds,
             command,
+            deployment,
         } => tokio::task::spawn_blocking(move || -> Result<()> {
             let client = WerkProtocolClient::new(&url, api_key)?
+                .with_deployment(deployment)?
                 .with_timeout(Duration::from_secs(timeout_seconds));
             match command {
                 RuntimeCommands::Info => print_runtime_json(&client.info()?),
@@ -4615,7 +4673,9 @@ fn should_print_startup_banner_for(
         | Commands::Video { .. }
         | Commands::Audio { .. } => true,
         Commands::Chat { .. } => stdin_is_terminal,
-        Commands::Import { .. }
+        Commands::Gpus
+        | Commands::DeploymentPlan { .. }
+        | Commands::Import { .. }
         | Commands::Convert { .. }
         | Commands::Pull { .. }
         | Commands::Remove { .. }
@@ -4638,6 +4698,7 @@ fn should_print_startup_banner_for(
 
 fn command_backend_install_verbose(command: &Commands) -> bool {
     match command {
+        Commands::Gpus | Commands::DeploymentPlan { .. } => false,
         Commands::Serve { verbose, .. } => *verbose,
         Commands::Run { verbose, debug, .. } | Commands::Chat { verbose, debug, .. } => {
             *verbose || *debug
@@ -12956,6 +13017,7 @@ mod tests {
                 url,
                 api_key,
                 timeout_seconds,
+                deployment: _,
                 command:
                     RuntimeCommands::States {
                         model,

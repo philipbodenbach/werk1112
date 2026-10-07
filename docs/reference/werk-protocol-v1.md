@@ -5,6 +5,13 @@ description: Versioned HTTP/JSON contract for Werk1112 runtime residency, persis
 
 # Werk Protocol 1.0 HTTP reference
 
+When the server uses deployment profiles, supply `x-werk-deployment: <instance-id>`
+on control requests. The ID selects a concrete adapter; replica aliases are not
+control targets. Adapters expose `runtime.placement` for the resolved plan, without
+claiming live expert movement. The authenticated diagnostic extension
+`GET /werk/v1/deployments` returns inventory/plans/slots as plain JSON; it does not
+replace existing protocol envelopes. See [profiles](../concepts/single-host-deployments.md).
+
 [Back to the documentation index](../documentation.md)
 
 Werk Protocol 1.0 is the versioned runtime-control API under `/werk/v1`. It is

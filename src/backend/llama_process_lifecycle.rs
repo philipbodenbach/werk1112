@@ -63,7 +63,7 @@ impl Drop for StartupPort {
     }
 }
 
-pub(crate) struct ManagedChild(Arc<Mutex<Child>>);
+pub(crate) struct ManagedChild(Arc<Mutex<Child>>, std::sync::atomic::AtomicBool);
 
 /// Register before preparing resources that must also be released if startup
 /// fails or a signal interrupts preparation. The owner must outlive its worker;
@@ -105,6 +105,14 @@ impl Drop for ManagedCleanup {
 }
 
 impl ManagedChild {
+    pub(crate) fn terminate(&self) {
+        let mut child = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if self.1.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        kill_group(&mut child);
+        let _ = child.wait();
+    }
     pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
         // Serialize registration with shutdown: no child can escape between
         // spawning and becoming visible to the interruption handler.
@@ -115,10 +123,17 @@ impl ManagedChild {
                 "Werk is shutting down",
             ));
         }
+        // A local vLLM MP executor owns several descendants. Give every owned
+        // runtime its own group so shutdown also stops ranks after leader death.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let child = Arc::new(Mutex::new(command.spawn()?));
         registry.children.retain(|child| child.strong_count() > 0);
         registry.children.push(Arc::downgrade(&child));
-        Ok(Self(child))
+        Ok(Self(child, std::sync::atomic::AtomicBool::new(false)))
     }
 }
 
@@ -132,10 +147,17 @@ impl Deref for ManagedChild {
 
 impl Drop for ManagedChild {
     fn drop(&mut self) {
-        let mut child = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = child.kill();
-        let _ = child.wait();
+        self.terminate();
     }
+}
+
+fn kill_group(child: &mut Child) {
+    #[cfg(unix)]
+    // The negative PID addresses only the group created in spawn above.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
 }
 
 fn shutdown_children() {
@@ -156,7 +178,7 @@ fn shutdown_children() {
     };
     // Stop all owned workers first, then reap them before exiting Werk.
     for child in &active {
-        let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+        kill_group(&mut child.lock().unwrap_or_else(|e| e.into_inner()));
     }
     for child in &active {
         let _ = child.lock().unwrap_or_else(|e| e.into_inner()).wait();
@@ -218,6 +240,42 @@ mod tests {
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_group_stops_descendant_ranks() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("rank.pid");
+        let child = ManagedChild::spawn(
+            Command::new("sh")
+                .args(["-c", "sleep 60 & echo $! > \"$1\"; wait", "fixture"])
+                .arg(&pid_file),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        child.terminate();
+        drop(child);
+        loop {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+            if stat
+                .as_ref()
+                .is_none_or(|s| s.split_whitespace().nth(2) == Some("Z"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "descendant still running");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn interruption_fixture() {

@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "parameters": {
+    "werk": "target/debug/werk",
+    "config": "examples/deployments/mixed.json",
+    "out": "/tmp/werk-mgpu-three-skipped.json",
+    "repetitions": 3,
+    "tokens": 16,
+    "prompt": "Return the integer result of 17 + 25, with no explanation.",
+    "required_gpus": 3,
+    "timeout": 600
+  },
+  "inventory_before": {
+    "devices": [
+      {
+        "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+        "physical_index": 0,
+        "vendor": "nvidia",
+        "name": "NVIDIA GeForce RTX 3090",
+        "architecture": "sm_86",
+        "runtime": "cuda",
+        "pci_bus_id": "00000000:03:00.0",
+        "total_bytes": 25769803776,
+        "free_bytes": 21717057536,
+        "numa_node": null,
+        "pcie_link": null,
+        "visible_index": 0
+      }
+    ],
+    "host_available_bytes": 100103020544,
+    "topology": null,
+    "warnings": []
+  },
+  "werk_revision": "8d8ee73a002e8473818d1e86099e0a21b3b51d23",
+  "dirty_diff": " .gitignore                                |   3 +-\n src/api.rs                                |   1 +\n src/api/chat.rs                           |  44 ++++++++++--\n src/api/extended.rs                       |  22 ++++--\n src/api/generation.rs                     |  26 ++++++-\n src/api/observability.rs                  |   3 +-\n src/api/router.rs                         |   1 +\n src/api/state.rs                          |  48 +++++++++++++\n src/api/werk/mod.rs                       |  40 +++++++++++\n src/backend/llama_process_lifecycle.rs    |  34 +++++++--\n src/backend/llama_server.rs               |  77 ++++++++++++++++++--\n src/backend/llama_server/fp4.rs           |   8 +++\n src/backend/llama_server/runtime_state.rs | 116 ++++++++++++++++--------------\n src/backend/vllm.rs                       |  76 +++++++++++++++++++-\n src/backend/vllm/runtime_control.rs       |   6 +-\n src/cli.rs                                |  59 ++++++++++++++-\n src/inference_service.rs                  |   3 +-\n src/inference_service/resources.rs        |  92 ++++++++++++++++++++++++\n src/lib.rs                                |   1 +\n 19 files changed, 574 insertions(+), 86 deletions(-)\n",
+  "cold_definition": "fresh worker; OS page cache not flushed",
+  "samples": [],
+  "hardware_cases": {
+    "single": "configured",
+    "two_equal": "requires explicit config and >=2 GPUs",
+    "two_unequal": "requires explicit config and >=2 unequal GPUs",
+    "independent": "requires explicit config and >=2 GPUs",
+    "mixed": "requires explicit config and >=3 GPUs",
+    "replicas": "requires explicit config and >=2 GPUs"
+  },
+  "status": "skipped",
+  "reason": "insufficient visible GPUs",
+  "installed_llama_revision": "ec928150501c2572fec05cb949061672bb424914"
+}

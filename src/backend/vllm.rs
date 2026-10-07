@@ -96,6 +96,7 @@ const LINUX_ARM64_MANAGED_VLLM_MESSAGE: &str = "Linux aarch64 detected without a
 #[derive(Clone)]
 pub struct VllmBackend {
     store: ModelStore,
+    deployment: Option<crate::deployments::Execution>,
     accelerator: VllmAccelerator,
     automatic_prefix_caching: Option<bool>,
     servers: Arc<super::runtime_cache::RuntimeCache<String, VllmProcess>>,
@@ -127,6 +128,7 @@ impl VllmAccelerator {
 
 struct VllmProcess {
     child: Option<super::llama_process_lifecycle::ManagedChild>,
+    _reservation: Mutex<Option<crate::inference_service::resources::Reservation>>,
     // Owned native process drops/reaps before its model file leases are released.
     _cache_release: Option<super::model_file_cache::CacheReleaseGuard>,
     command_label: String,
@@ -248,12 +250,18 @@ impl VllmBackend {
     fn new_with_accelerator(store: ModelStore, accelerator: VllmAccelerator) -> Self {
         Self {
             store,
+            deployment: None,
             accelerator,
             automatic_prefix_caching: None,
             servers: Arc::new(Default::default()),
             #[cfg(test)]
             test_server: None,
         }
+    }
+
+    pub(crate) fn with_deployment(mut self, deployment: crate::deployments::Execution) -> Self {
+        self.deployment = Some(deployment);
+        self
     }
 
     pub(crate) fn with_automatic_prefix_caching(mut self, enabled: Option<bool>) -> Self {
@@ -270,6 +278,7 @@ impl VllmBackend {
         let model_dir = store.model_dir(&model_name);
         let server = VllmProcess {
             child: None,
+            _reservation: Mutex::new(None),
             _cache_release: None,
             command_label: "mock remote vLLM OpenAI server".to_string(),
             discovery_source: "test HTTP server".to_string(),
@@ -291,6 +300,7 @@ impl VllmBackend {
             automatic_prefix_caching: None,
             servers: Arc::new(Default::default()),
             test_server: Some(Arc::new(server)),
+            deployment: None,
         }
     }
 
@@ -401,8 +411,36 @@ impl VllmBackend {
             return Ok((server.clone(), true, 0.0));
         }
 
-        let discovery = discover_vllm(&self.store);
-        let configured_args = configured_vllm_args()?;
+        let discovery = if let Some(deployment) = &self.deployment {
+            VllmDiscovery {
+                command: Some(VllmCommand::Executable(
+                    deployment.plan.profile.executable.clone(),
+                )),
+                source: format!(
+                    "deployment {} / {}",
+                    deployment.plan.profile.id, deployment.plan.profile.build
+                ),
+                attempts: Vec::new(),
+            }
+        } else {
+            discover_vllm(&self.store)
+        };
+        let configured_args = if let Some(deployment) = &self.deployment {
+            if !env::var("WERK_VLLM_ARGS")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                bail!("WERK_VLLM_ARGS conflicts with deployment plan");
+            }
+            ConfiguredVllmArgs {
+                raw: String::new(),
+                args: deployment.plan.args.clone(),
+                werk_managed_prefix_caching: None,
+            }
+        } else {
+            configured_vllm_args()?
+        };
         if let Some(command) = discovery.command.as_ref() {
             validate_vllm_args_target(command, &configured_args)?;
         }
@@ -417,11 +455,22 @@ impl VllmBackend {
         // Spark container).
         let model_dir = resolve_vllm_model_dir_for_discovery(&self.store, manifest, &discovery)?;
         let model_identity = ModelRuntimeIdentity::from_manifest(manifest)?;
+        if let Some(deployment) = &self.deployment {
+            if deployment.plan.model_identity != model_identity.to_string() {
+                bail!("deployment model identity changed; reload profiles");
+            }
+        }
         let key = vllm_server_cache_key(
             &model_identity,
             &model_dir,
             &discovery,
             &VllmCacheEnvironment::current(&configured_args),
+        );
+        let key = format!(
+            "{key}:{}",
+            self.deployment
+                .as_ref()
+                .map_or("", |d| d.plan.fingerprint.as_str())
         );
         self.servers
             .get_or_try_init(key, VllmProcess::is_running, || {
@@ -432,6 +481,7 @@ impl VllmBackend {
                     discovery,
                     self.accelerator,
                     configured_args,
+                    self.deployment.as_ref(),
                 )
             })
     }
@@ -712,7 +762,11 @@ impl VllmProcess {
         discovery: VllmDiscovery,
         accelerator: VllmAccelerator,
         configured_args: ConfiguredVllmArgs,
+        deployment: Option<&crate::deployments::Execution>,
     ) -> Result<Self> {
+        let reservation = deployment
+            .map(crate::deployments::Execution::reserve)
+            .transpose()?;
         let discovery = if discovery.command.is_some() {
             discovery
         } else {
@@ -741,6 +795,7 @@ impl VllmProcess {
             )?;
             let process = Self {
                 child: None,
+                _reservation: Mutex::new(None),
                 _cache_release: None,
                 command_label: "remote vLLM OpenAI server".to_string(),
                 discovery_source: discovery.source,
@@ -776,6 +831,9 @@ impl VllmProcess {
         )?;
         let mut child_command = Command::new(&launch.program);
         child_command.args(&launch.args);
+        if let Some(deployment) = deployment {
+            deployment.plan.apply(&mut child_command);
+        }
         if env_true("WERK_VLLM_LOG") {
             child_command
                 .stdout(Stdio::inherit())
@@ -806,6 +864,7 @@ impl VllmProcess {
         };
         let process = Self {
             child: Some(child),
+            _reservation: Mutex::new(reservation),
             _cache_release: cache_release,
             command_label: command.display(),
             discovery_source: discovery.source,
@@ -959,7 +1018,17 @@ impl VllmProcess {
                 .map(|models| remote_models_include_served_name(&self.model_name, &models))
                 .unwrap_or(false);
         }
-        matches!(self.try_wait_status(), Ok(None))
+        let running = matches!(self.try_wait_status(), Ok(None));
+        if !running {
+            let mut reservation = self._reservation.lock().unwrap_or_else(|e| e.into_inner());
+            if reservation.is_some() {
+                if let Some(child) = &self.child {
+                    child.terminate();
+                }
+                reservation.take();
+            }
+        }
+        running
     }
 
     fn try_wait_status(&self) -> Result<Option<ExitStatus>> {
@@ -2875,6 +2944,7 @@ mod tests {
             .expect("spawn owned test worker");
         let pid = child.lock().unwrap().id();
         let server = Arc::new(VllmProcess {
+            _reservation: Mutex::new(None),
             child: Some(child),
             _cache_release: None,
             command_label: "test worker".to_string(),

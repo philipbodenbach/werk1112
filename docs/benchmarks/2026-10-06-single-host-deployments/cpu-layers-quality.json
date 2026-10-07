@@ -1,0 +1,2985 @@
+{
+  "schema": 1,
+  "parameters": {
+    "werk": "target/debug/werk",
+    "config": "/tmp/werk-mgpu-cpu-layers.json",
+    "out": "/tmp/werk-mgpu-cpu-layers-final.json",
+    "repetitions": 3,
+    "tokens": 16,
+    "prompt": "Return the integer result of 17 + 25, with no explanation.",
+    "required_gpus": 1,
+    "timeout": 600,
+    "quality": true
+  },
+  "inventory_before": {
+    "devices": [
+      {
+        "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+        "physical_index": 0,
+        "vendor": "nvidia",
+        "name": "NVIDIA GeForce RTX 3090",
+        "architecture": "sm_86",
+        "runtime": "cuda",
+        "pci_bus_id": "00000000:03:00.0",
+        "total_bytes": 25769803776,
+        "free_bytes": 19472056320,
+        "numa_node": null,
+        "pcie_link": null,
+        "visible_index": 0
+      }
+    ],
+    "host_available_bytes": 99970998272,
+    "memory_topology": null,
+    "topology": null,
+    "warnings": []
+  },
+  "werk_revision": "8d8ee73a002e8473818d1e86099e0a21b3b51d23",
+  "dirty_diff": " .gitignore                                |   3 +-\n docs/api.md                               |   7 ++\n docs/backends.md                          |   6 ++\n docs/reference/cli.md                     |   6 ++\n docs/reference/environment-variables.md   |   5 ++\n docs/reference/werk-protocol-v1.md        |   7 ++\n src/api.rs                                |   1 +\n src/api/anthropic/extended.rs             |   6 +-\n src/api/anthropic/mod.rs                  |   7 +-\n src/api/chat.rs                           |  44 ++++++++++--\n src/api/extended.rs                       |  22 ++++--\n src/api/generation.rs                     |  26 ++++++-\n src/api/observability.rs                  |   3 +-\n src/api/router.rs                         |   3 +\n src/api/state.rs                          |  57 +++++++++++++++\n src/api/werk/mod.rs                       |  40 +++++++++++\n src/backend/llama_process_lifecycle.rs    |  70 ++++++++++++++++--\n src/backend/llama_server.rs               | 106 +++++++++++++++++++++++++--\n src/backend/llama_server/fp4.rs           |   8 +++\n src/backend/llama_server/runtime_state.rs | 116 ++++++++++++++++--------------\n src/backend/vllm.rs                       |  76 +++++++++++++++++++-\n src/backend/vllm/runtime_control.rs       |   6 +-\n src/cli.rs                                |  68 +++++++++++++++++-\n src/inference_service.rs                  |   3 +-\n src/inference_service/resources.rs        |  92 ++++++++++++++++++++++++\n src/lib.rs                                |   1 +\n src/werk_protocol/client.rs               |  35 +++++++++\n 27 files changed, 736 insertions(+), 88 deletions(-)\n",
+  "cold_definition": "fresh worker; OS page cache not flushed",
+  "samples": [
+    {
+      "alias": "qwen-cpu-layers",
+      "session": "validation-qwen-cpu-layers",
+      "ttft_seconds": 34.66523433100156,
+      "total_seconds": 35.927379277,
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 29,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 32
+      },
+      "text": "42",
+      "repetition": 0,
+      "worker_state": "cold"
+    },
+    {
+      "alias": "qwen-cpu-layers",
+      "session": "validation-qwen-cpu-layers",
+      "ttft_seconds": 2.1200984829993104,
+      "total_seconds": 3.361877948998881,
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 29,
+        "prompt_tokens_details": {
+          "cached_tokens": 25
+        },
+        "total_tokens": 32
+      },
+      "text": "42",
+      "repetition": 1,
+      "worker_state": "warm"
+    },
+    {
+      "alias": "qwen-cpu-layers",
+      "session": "validation-qwen-cpu-layers",
+      "ttft_seconds": 1.7246626570013177,
+      "total_seconds": 2.969727438001428,
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 29,
+        "prompt_tokens_details": {
+          "cached_tokens": 25
+        },
+        "total_tokens": 32
+      },
+      "text": "42",
+      "repetition": 2,
+      "worker_state": "warm"
+    }
+  ],
+  "hardware_cases": {
+    "single": "configured",
+    "two_equal": "requires explicit config and >=2 GPUs",
+    "two_unequal": "requires explicit config and >=2 unequal GPUs",
+    "independent": "requires explicit config and >=2 GPUs",
+    "mixed": "requires explicit config and >=3 GPUs",
+    "replicas": "requires explicit config and >=2 GPUs"
+  },
+  "plans": [
+    {
+      "profile": {
+        "id": "qwen-cpu-layers",
+        "alias": "multi-gpu-smoke",
+        "model": "qwen3.8-27b-ud-q4_k_xl",
+        "runtime": "llama_cuda",
+        "executable": "/home/philipbodenbach/.local/share/werk1112/backends/llama-cuda/upstream-ec928150501c/build/bin/llama-server",
+        "build": "ec928150501c",
+        "gpus": [
+          "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9"
+        ],
+        "strategy": "single",
+        "tensor_parallel": 1,
+        "pipeline_parallel": 1,
+        "split": [],
+        "context": 2048,
+        "batch": 256,
+        "parallel": 1,
+        "cpu_threads": 8,
+        "offload": {
+          "kind": "cpu_layers",
+          "gpu_layers": 10
+        },
+        "kv_cpu": false,
+        "memory": [
+          {
+            "weights": 4500000000,
+            "replicated": 0,
+            "kv": 268435456,
+            "experts": 0,
+            "compute": 536870912,
+            "overhead": 268435456,
+            "reserve": 536870912
+          }
+        ],
+        "host_bytes": 24000000000,
+        "native_args": [
+          "--no-warmup"
+        ]
+      },
+      "model_identity": "sha256:1352bb293f26ccf8ee2fd8d226093eff8357e5eac21f078dca9f0e8bc2f6f071",
+      "executable_sha256": "236d00dc1c71b01bd15a13b229edeac2e4b05a9ac740d33aadc14fe6f71287b6",
+      "runtime_version": "version: 0.4.1-dev (build 1, commit ec92815)",
+      "devices": [
+        {
+          "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+          "physical_index": 0,
+          "vendor": "nvidia",
+          "name": "NVIDIA GeForce RTX 3090",
+          "architecture": "sm_86",
+          "runtime": "cuda",
+          "pci_bus_id": "00000000:03:00.0",
+          "total_bytes": 25769803776,
+          "free_bytes": 19479396352,
+          "numa_node": null,
+          "pcie_link": null,
+          "visible_index": 0
+        }
+      ],
+      "strategy": "single",
+      "args": [
+        "--device",
+        "CUDA0",
+        "--split-mode",
+        "none",
+        "--main-gpu",
+        "0",
+        "--no-warmup"
+      ],
+      "environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+        "OMP_NUM_THREADS": "8"
+      },
+      "fingerprint": "9dfbe2941ae2927f458d6d1fb5ccda2ace5c1abb44cc6291893e762c82a0a90c",
+      "reasons": [
+        "Exclusive GPU ownership; component budgets are declared estimates, not measured usage or hard allocator limits.",
+        "Unknown P2P/NVLink is not treated as a prerequisite; no throughput prediction was made."
+      ]
+    }
+  ],
+  "telemetry": [
+    {
+      "protocol": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req_slVMMylE353VvwXe5RDvFQ",
+      "data": {
+        "host_swap_used_bytes": 0,
+        "host_memory_free_bytes": 71462412288,
+        "schema_version": 1,
+        "observed_at_ms": 1791311801218,
+        "server_started_ms": 1791311762444,
+        "uptime_seconds": 38.774472237,
+        "totals": {
+          "started": 1,
+          "completed": 1,
+          "errors": 0,
+          "cancelled": 0,
+          "active": 0,
+          "prompt_tokens": 29,
+          "output_tokens": 3,
+          "cached_tokens": 0,
+          "duration_seconds": 35.611646506
+        },
+        "requests": [
+          {
+            "id": 1,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791311765495,
+            "elapsed_seconds": 35.611646506,
+            "prompt_tokens": 29,
+            "cached_tokens": 0,
+            "output_tokens": 3,
+            "first_output_seconds": 6.78530549,
+            "decode_tokens_per_second": 2.3777480823461716,
+            "prefill_tokens_per_second": 4.278536882020673
+          }
+        ],
+        "backends": [
+          {
+            "backend": "deployment",
+            "instance": "qwen-cpu-layers",
+            "model": "multi-gpu-smoke",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "gpu_budget_bytes_estimate": 6110612736.0,
+              "gpu_count": 1.0,
+              "host_budget_bytes_estimate": 24000000000.0,
+              "queue_capacity": 0.0,
+              "slots_available": 1.0
+            }
+          },
+          {
+            "backend": "llama.cpp / CUDA",
+            "instance": "llama-105925-http://127.0.0.1:33477",
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "active_cached_tokens": 0.0,
+              "active_output_tokens": 0.0,
+              "active_prompt_tokens": 0.0,
+              "context_capacity_tokens": 2048.0,
+              "context_used_tokens": 31.0,
+              "gpu_layers_requested": 10.0,
+              "process_resident_bytes": 14857895936.0,
+              "requests_active": 0.0,
+              "slots_total": 1.0
+            }
+          }
+        ],
+        "memory": {
+          "observed_at_unix_ms": 1791311801218,
+          "overall_pressure": "normal",
+          "topology": "discrete",
+          "host": {
+            "capacity_bytes": 105469059072,
+            "available_bytes": 98799140864,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "accelerator": {
+            "capacity_bytes": 25769803776,
+            "available_bytes": 14750318592,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "last_action_unix_ms": null,
+          "counters": {
+            "active_reservations": 0,
+            "backend_cleanup_failures": 0,
+            "backend_cleanup_latched": 0,
+            "completed_demotions": 0,
+            "completed_evictions": 0,
+            "failed_releases": 0,
+            "managed_allocations": 0,
+            "orphaned_release_bytes": 0,
+            "pressure_actions_in_flight": 0
+          }
+        },
+        "backend_observed_at_ms": 1791311801122
+      }
+    },
+    {
+      "protocol": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req_Nh1w5XWosdx8opB222gLvw",
+      "data": {
+        "host_swap_used_bytes": 0,
+        "host_memory_free_bytes": 71134531584,
+        "schema_version": 1,
+        "observed_at_ms": 1791311804695,
+        "server_started_ms": 1791311762444,
+        "uptime_seconds": 42.250703029,
+        "totals": {
+          "started": 2,
+          "completed": 2,
+          "errors": 0,
+          "cancelled": 0,
+          "active": 0,
+          "prompt_tokens": 58,
+          "output_tokens": 6,
+          "cached_tokens": 25,
+          "duration_seconds": 38.669192943
+        },
+        "requests": [
+          {
+            "id": 2,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791311801524,
+            "elapsed_seconds": 3.057546437,
+            "prompt_tokens": 29,
+            "cached_tokens": 25,
+            "output_tokens": 3,
+            "first_output_seconds": 1.81453657,
+            "decode_tokens_per_second": 2.4173722036039798,
+            "prefill_tokens_per_second": 2.7614278238706107
+          },
+          {
+            "id": 1,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791311765495,
+            "elapsed_seconds": 35.611646506,
+            "prompt_tokens": 29,
+            "cached_tokens": 0,
+            "output_tokens": 3,
+            "first_output_seconds": 6.78530549,
+            "decode_tokens_per_second": 2.3777480823461716,
+            "prefill_tokens_per_second": 4.278536882020673
+          }
+        ],
+        "backends": [
+          {
+            "backend": "deployment",
+            "instance": "qwen-cpu-layers",
+            "model": "multi-gpu-smoke",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "gpu_budget_bytes_estimate": 6110612736.0,
+              "gpu_count": 1.0,
+              "host_budget_bytes_estimate": 24000000000.0,
+              "queue_capacity": 0.0,
+              "slots_available": 1.0
+            }
+          },
+          {
+            "backend": "llama.cpp / CUDA",
+            "instance": "llama-105925-http://127.0.0.1:33477",
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "active_cached_tokens": 0.0,
+              "active_output_tokens": 0.0,
+              "active_prompt_tokens": 0.0,
+              "context_capacity_tokens": 2048.0,
+              "context_used_tokens": 31.0,
+              "gpu_layers_requested": 10.0,
+              "process_resident_bytes": 15176921088.0,
+              "requests_active": 0.0,
+              "slots_total": 1.0
+            }
+          }
+        ],
+        "memory": {
+          "observed_at_unix_ms": 1791311804694,
+          "overall_pressure": "normal",
+          "topology": "discrete",
+          "host": {
+            "capacity_bytes": 105469059072,
+            "available_bytes": 98474463232,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "accelerator": {
+            "capacity_bytes": 25769803776,
+            "available_bytes": 14746124288,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "last_action_unix_ms": null,
+          "counters": {
+            "active_reservations": 0,
+            "backend_cleanup_failures": 0,
+            "backend_cleanup_latched": 0,
+            "completed_demotions": 0,
+            "completed_evictions": 0,
+            "failed_releases": 0,
+            "managed_allocations": 0,
+            "orphaned_release_bytes": 0,
+            "pressure_actions_in_flight": 0
+          }
+        },
+        "backend_observed_at_ms": 1791311804588
+      }
+    },
+    {
+      "protocol": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req_VYJv7BRWxhoCAnqliFSmMA",
+      "data": {
+        "host_swap_used_bytes": 0,
+        "host_memory_free_bytes": 71203618816,
+        "schema_version": 1,
+        "observed_at_ms": 1791311807768,
+        "server_started_ms": 1791311762444,
+        "uptime_seconds": 45.324147507,
+        "totals": {
+          "started": 3,
+          "completed": 3,
+          "errors": 0,
+          "cancelled": 0,
+          "active": 0,
+          "prompt_tokens": 87,
+          "output_tokens": 9,
+          "cached_tokens": 50,
+          "duration_seconds": 41.348555671
+        },
+        "requests": [
+          {
+            "id": 3,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791311804986,
+            "elapsed_seconds": 2.679362728,
+            "prompt_tokens": 29,
+            "cached_tokens": 25,
+            "output_tokens": 3,
+            "first_output_seconds": 1.4324756459999999,
+            "decode_tokens_per_second": 2.4101960935541715,
+            "prefill_tokens_per_second": 2.8012263769078105
+          },
+          {
+            "id": 2,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791311801524,
+            "elapsed_seconds": 3.057546437,
+            "prompt_tokens": 29,
+            "cached_tokens": 25,
+            "output_tokens": 3,
+            "first_output_seconds": 1.81453657,
+            "decode_tokens_per_second": 2.4173722036039798,
+            "prefill_tokens_per_second": 2.7614278238706107
+          },
+          {
+            "id": 1,
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "state": "done",
+            "started_ms": 1791311765495,
+            "elapsed_seconds": 35.611646506,
+            "prompt_tokens": 29,
+            "cached_tokens": 0,
+            "output_tokens": 3,
+            "first_output_seconds": 6.78530549,
+            "decode_tokens_per_second": 2.3777480823461716,
+            "prefill_tokens_per_second": 4.278536882020673
+          }
+        ],
+        "backends": [
+          {
+            "backend": "deployment",
+            "instance": "qwen-cpu-layers",
+            "model": "multi-gpu-smoke",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "gpu_budget_bytes_estimate": 6110612736.0,
+              "gpu_count": 1.0,
+              "host_budget_bytes_estimate": 24000000000.0,
+              "queue_capacity": 0.0,
+              "slots_available": 1.0
+            }
+          },
+          {
+            "backend": "llama.cpp / CUDA",
+            "instance": "llama-105925-http://127.0.0.1:33477",
+            "model": "qwen3.8-27b-ud-q4_k_xl",
+            "available": true,
+            "counters": {},
+            "gauges": {
+              "active_cached_tokens": 0.0,
+              "active_output_tokens": 0.0,
+              "active_prompt_tokens": 0.0,
+              "context_capacity_tokens": 2048.0,
+              "context_used_tokens": 31.0,
+              "gpu_layers_requested": 10.0,
+              "process_resident_bytes": 15177031680.0,
+              "requests_active": 0.0,
+              "slots_total": 1.0
+            }
+          }
+        ],
+        "memory": {
+          "observed_at_unix_ms": 1791311807767,
+          "overall_pressure": "normal",
+          "topology": "discrete",
+          "host": {
+            "capacity_bytes": 105469059072,
+            "available_bytes": 98543153152,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "accelerator": {
+            "capacity_bytes": 25769803776,
+            "available_bytes": 14752415744,
+            "managed_bytes": 0,
+            "reserved_bytes": 0,
+            "pressure": "normal"
+          },
+          "last_action_unix_ms": null,
+          "counters": {
+            "active_reservations": 0,
+            "backend_cleanup_failures": 0,
+            "backend_cleanup_latched": 0,
+            "completed_demotions": 0,
+            "completed_evictions": 0,
+            "failed_releases": 0,
+            "managed_allocations": 0,
+            "orphaned_release_bytes": 0,
+            "pressure_actions_in_flight": 0
+          }
+        },
+        "backend_observed_at_ms": 1791311807673
+      }
+    }
+  ],
+  "diagnostics_after": {
+    "deployments": {
+      "profiles": [
+        {
+          "available_slots": 1,
+          "plan": {
+            "args": [
+              "--device",
+              "CUDA0",
+              "--split-mode",
+              "none",
+              "--main-gpu",
+              "0",
+              "--no-warmup"
+            ],
+            "devices": [
+              {
+                "architecture": "sm_86",
+                "free_bytes": 19482542080,
+                "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+                "name": "NVIDIA GeForce RTX 3090",
+                "numa_node": null,
+                "pci_bus_id": "00000000:03:00.0",
+                "pcie_link": null,
+                "physical_index": 0,
+                "runtime": "cuda",
+                "total_bytes": 25769803776,
+                "vendor": "nvidia",
+                "visible_index": 0
+              }
+            ],
+            "environment": {
+              "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+              "CUDA_VISIBLE_DEVICES": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+              "OMP_NUM_THREADS": "8"
+            },
+            "executable_sha256": "236d00dc1c71b01bd15a13b229edeac2e4b05a9ac740d33aadc14fe6f71287b6",
+            "fingerprint": "9dfbe2941ae2927f458d6d1fb5ccda2ace5c1abb44cc6291893e762c82a0a90c",
+            "model_identity": "sha256:1352bb293f26ccf8ee2fd8d226093eff8357e5eac21f078dca9f0e8bc2f6f071",
+            "profile": {
+              "alias": "multi-gpu-smoke",
+              "batch": 256,
+              "build": "ec928150501c",
+              "context": 2048,
+              "cpu_threads": 8,
+              "executable": "/home/philipbodenbach/.local/share/werk1112/backends/llama-cuda/upstream-ec928150501c/build/bin/llama-server",
+              "gpus": [
+                "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9"
+              ],
+              "host_bytes": 24000000000,
+              "id": "qwen-cpu-layers",
+              "kv_cpu": false,
+              "memory": [
+                {
+                  "compute": 536870912,
+                  "experts": 0,
+                  "kv": 268435456,
+                  "overhead": 268435456,
+                  "replicated": 0,
+                  "reserve": 536870912,
+                  "weights": 4500000000
+                }
+              ],
+              "model": "qwen3.8-27b-ud-q4_k_xl",
+              "native_args": [
+                "--no-warmup"
+              ],
+              "offload": {
+                "gpu_layers": 10,
+                "kind": "cpu_layers"
+              },
+              "parallel": 1,
+              "pipeline_parallel": 1,
+              "runtime": "llama_cuda",
+              "split": [],
+              "strategy": "single",
+              "tensor_parallel": 1
+            },
+            "reasons": [
+              "Exclusive GPU ownership; component budgets are declared estimates, not measured usage or hard allocator limits.",
+              "Unknown P2P/NVLink is not treated as a prerequisite; no throughput prediction was made."
+            ],
+            "runtime_version": "version: 0.4.1-dev (build 1, commit ec92815)",
+            "strategy": "single"
+          },
+          "queue_capacity": 0,
+          "queue_policy": "reject",
+          "workers": [
+            {
+              "available": true,
+              "backend": "llama.cpp / CUDA",
+              "counters": {},
+              "gauges": {
+                "active_cached_tokens": 0.0,
+                "active_output_tokens": 0.0,
+                "active_prompt_tokens": 0.0,
+                "context_capacity_tokens": 2048.0,
+                "context_used_tokens": 31.0,
+                "gpu_layers_requested": 10.0,
+                "process_resident_bytes": 15177056256.0,
+                "requests_active": 0.0,
+                "slots_total": 1.0
+              },
+              "instance": "llama-105925-http://127.0.0.1:33477",
+              "model": "qwen3.8-27b-ud-q4_k_xl"
+            }
+          ]
+        }
+      ]
+    },
+    "inventory": {
+      "devices": [
+        {
+          "architecture": "sm_86",
+          "free_bytes": 14752415744,
+          "id": "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9",
+          "name": "NVIDIA GeForce RTX 3090",
+          "numa_node": null,
+          "pci_bus_id": "00000000:03:00.0",
+          "pcie_link": null,
+          "physical_index": 0,
+          "runtime": "cuda",
+          "total_bytes": 25769803776,
+          "vendor": "nvidia",
+          "visible_index": 0
+        }
+      ],
+      "host_available_bytes": 98572197888,
+      "memory_topology": null,
+      "topology": null,
+      "warnings": []
+    }
+  },
+  "quality": {
+    "qwen-cpu-layers": {
+      "structured": {
+        "choices": [
+          {
+            "finish_reason": "stop",
+            "index": 0,
+            "message": {
+              "content": "{\n  \"result\": 42\n}",
+              "role": "assistant"
+            }
+          }
+        ],
+        "created": 1791311821,
+        "id": "chatcmpl-pZQAmPXCUBx7k8OgxNaICl9LyRQnlCtF",
+        "model": "qwen-cpu-layers",
+        "object": "chat.completion",
+        "system_fingerprint": "b1-ec92815",
+        "timings": {
+          "cache_n": 0,
+          "predicted_ms": 6802.354,
+          "predicted_n": 12,
+          "predicted_per_second": 1.6170872612627925,
+          "predicted_per_token_ms": 618.3958181818182,
+          "prompt_ms": 6291.07,
+          "prompt_n": 26,
+          "prompt_per_second": 4.132842266895775,
+          "prompt_per_token_ms": 241.96423076923077
+        },
+        "usage": {
+          "completion_tokens": 12,
+          "prompt_tokens": 26,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 38
+        }
+      },
+      "tool_call": {
+        "choices": [
+          {
+            "finish_reason": "tool_calls",
+            "index": 0,
+            "message": {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"a\":17,\"b\":25}",
+                    "name": "add"
+                  },
+                  "id": "vS7f84dkUqFPhRmHxq8QNf7r1jrzUaP6",
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        ],
+        "created": 1791311857,
+        "id": "chatcmpl-1791311857",
+        "model": "qwen-cpu-layers",
+        "object": "chat.completion",
+        "usage": {
+          "completion_tokens": 37,
+          "prompt_tokens": 297,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 334
+        },
+        "werk": {
+          "backend_diagnostics": [
+            "llama.cpp request endpoint: /v1/chat/completions",
+            "chat template applied by backend/model: yes"
+          ],
+          "timings": {
+            "cached_prompt_tokens": 0,
+            "decode_seconds": 20.236459999999997,
+            "first_token_seconds": 18.401344872,
+            "load_seconds": 0.0,
+            "prompt_seconds": 14.636880999999999,
+            "total_seconds": 35.283067841,
+            "warmup_seconds": 0.0
+          }
+        }
+      },
+      "continuation": {
+        "choices": [
+          {
+            "finish_reason": "stop",
+            "index": 0,
+            "message": {
+              "content": "42",
+              "role": "assistant"
+            }
+          }
+        ],
+        "created": 1791311869,
+        "id": "chatcmpl-1791311869",
+        "model": "qwen-cpu-layers",
+        "object": "chat.completion",
+        "usage": {
+          "completion_tokens": 3,
+          "prompt_tokens": 364,
+          "prompt_tokens_details": {
+            "cached_tokens": 333
+          },
+          "total_tokens": 367
+        },
+        "werk": {
+          "backend_diagnostics": [
+            "llama.cpp request endpoint: /v1/chat/completions",
+            "chat template applied by backend/model: yes"
+          ],
+          "timings": {
+            "cached_prompt_tokens": 333,
+            "decode_seconds": 1.188267,
+            "first_token_seconds": 9.685171141,
+            "load_seconds": 0.0,
+            "prompt_seconds": 8.556282999999999,
+            "total_seconds": 10.874136207,
+            "warmup_seconds": 0.0
+          }
+        }
+      },
+      "status": "passed_reference_cases"
+    }
+  },
+  "status": "passed_transport",
+  "correctness": "Outputs retained for reference comparison; transport success alone is not numerical equivalence.",
+  "latency_seconds": {
+    "median": 3.361877948998881,
+    "min": 2.969727438001428,
+    "max": 35.927379277
+  },
+  "gpu_memory_samples": [
+    {
+      "time": 1791311761.5624828,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5742
+      }
+    },
+    {
+      "time": 1791311761.94387,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5742
+      }
+    },
+    {
+      "time": 1791311762.2627316,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5746
+      }
+    },
+    {
+      "time": 1791311762.5985043,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5746
+      }
+    },
+    {
+      "time": 1791311762.9209144,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5746
+      }
+    },
+    {
+      "time": 1791311763.3098838,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5747
+      }
+    },
+    {
+      "time": 1791311763.6804268,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5747
+      }
+    },
+    {
+      "time": 1791311764.0201464,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5747
+      }
+    },
+    {
+      "time": 1791311764.378585,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5740
+      }
+    },
+    {
+      "time": 1791311764.6798053,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5740
+      }
+    },
+    {
+      "time": 1791311765.0826716,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5740
+      }
+    },
+    {
+      "time": 1791311765.451657,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5761
+      }
+    },
+    {
+      "time": 1791311765.7503746,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5761
+      }
+    },
+    {
+      "time": 1791311766.0995545,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5761
+      }
+    },
+    {
+      "time": 1791311766.4379253,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5777
+      }
+    },
+    {
+      "time": 1791311766.7867773,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5759
+      }
+    },
+    {
+      "time": 1791311767.1227102,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5759
+      }
+    },
+    {
+      "time": 1791311767.4282076,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5759
+      }
+    },
+    {
+      "time": 1791311767.732149,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5759
+      }
+    },
+    {
+      "time": 1791311768.0307481,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5767
+      }
+    },
+    {
+      "time": 1791311768.317118,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6009
+      }
+    },
+    {
+      "time": 1791311768.6260922,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6005
+      }
+    },
+    {
+      "time": 1791311768.934155,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6010
+      }
+    },
+    {
+      "time": 1791311769.2349148,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6010
+      }
+    },
+    {
+      "time": 1791311769.5385833,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6010
+      }
+    },
+    {
+      "time": 1791311769.8306668,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6009
+      }
+    },
+    {
+      "time": 1791311770.1398838,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6016
+      }
+    },
+    {
+      "time": 1791311770.4479754,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6016
+      }
+    },
+    {
+      "time": 1791311770.7467675,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6016
+      }
+    },
+    {
+      "time": 1791311771.0536313,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6016
+      }
+    },
+    {
+      "time": 1791311771.3553505,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6016
+      }
+    },
+    {
+      "time": 1791311771.6613784,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6016
+      }
+    },
+    {
+      "time": 1791311771.9688828,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6012
+      }
+    },
+    {
+      "time": 1791311772.2711987,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6012
+      }
+    },
+    {
+      "time": 1791311772.5812879,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6012
+      }
+    },
+    {
+      "time": 1791311772.8851018,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6011
+      }
+    },
+    {
+      "time": 1791311773.1987655,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6005
+      }
+    },
+    {
+      "time": 1791311773.5048704,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6005
+      }
+    },
+    {
+      "time": 1791311773.8091755,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6005
+      }
+    },
+    {
+      "time": 1791311774.120674,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6010
+      }
+    },
+    {
+      "time": 1791311774.4448912,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6010
+      }
+    },
+    {
+      "time": 1791311774.7976272,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6010
+      }
+    },
+    {
+      "time": 1791311775.1422727,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6001
+      }
+    },
+    {
+      "time": 1791311775.4566898,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6001
+      }
+    },
+    {
+      "time": 1791311775.7716544,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6001
+      }
+    },
+    {
+      "time": 1791311776.0995805,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6001
+      }
+    },
+    {
+      "time": 1791311776.3967905,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5996
+      }
+    },
+    {
+      "time": 1791311776.7168164,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5996
+      }
+    },
+    {
+      "time": 1791311777.0335038,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5999
+      }
+    },
+    {
+      "time": 1791311777.3607402,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5999
+      }
+    },
+    {
+      "time": 1791311777.6929214,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5999
+      }
+    },
+    {
+      "time": 1791311778.0280051,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5996
+      }
+    },
+    {
+      "time": 1791311778.3469508,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6001
+      }
+    },
+    {
+      "time": 1791311778.6852148,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6092
+      }
+    },
+    {
+      "time": 1791311778.9911153,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6092
+      }
+    },
+    {
+      "time": 1791311779.3220217,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6092
+      }
+    },
+    {
+      "time": 1791311779.629579,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6008
+      }
+    },
+    {
+      "time": 1791311779.968765,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311780.3091323,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311780.628676,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311780.9491177,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311781.2551663,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6002
+      }
+    },
+    {
+      "time": 1791311781.6008885,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6002
+      }
+    },
+    {
+      "time": 1791311781.9122999,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6002
+      }
+    },
+    {
+      "time": 1791311782.2295682,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311782.5575554,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311782.8905752,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311783.2015684,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311783.5437093,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311783.8753142,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311784.201348,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6006
+      }
+    },
+    {
+      "time": 1791311784.5161486,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6002
+      }
+    },
+    {
+      "time": 1791311784.8346581,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6002
+      }
+    },
+    {
+      "time": 1791311785.1576226,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6002
+      }
+    },
+    {
+      "time": 1791311785.4924152,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6002
+      }
+    },
+    {
+      "time": 1791311785.8182628,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6002
+      }
+    },
+    {
+      "time": 1791311786.144767,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311786.465952,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6007
+      }
+    },
+    {
+      "time": 1791311786.829582,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6009
+      }
+    },
+    {
+      "time": 1791311787.1422575,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6009
+      }
+    },
+    {
+      "time": 1791311787.476785,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 6009
+      }
+    },
+    {
+      "time": 1791311787.8163288,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 9151
+      }
+    },
+    {
+      "time": 1791311788.1699495,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 9149
+      }
+    },
+    {
+      "time": 1791311788.4835532,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 9145
+      }
+    },
+    {
+      "time": 1791311788.8054707,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 9145
+      }
+    },
+    {
+      "time": 1791311789.1513724,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 9161
+      }
+    },
+    {
+      "time": 1791311789.479577,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10209
+      }
+    },
+    {
+      "time": 1791311789.8185332,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10209
+      }
+    },
+    {
+      "time": 1791311790.1156206,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10209
+      }
+    },
+    {
+      "time": 1791311790.418035,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10215
+      }
+    },
+    {
+      "time": 1791311790.7357693,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10215
+      }
+    },
+    {
+      "time": 1791311791.0445557,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10215
+      }
+    },
+    {
+      "time": 1791311791.376853,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10215
+      }
+    },
+    {
+      "time": 1791311791.6812353,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10217
+      }
+    },
+    {
+      "time": 1791311791.9770305,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10217
+      }
+    },
+    {
+      "time": 1791311792.278461,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10211
+      }
+    },
+    {
+      "time": 1791311792.5989845,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311792.9121616,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311793.1943114,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311793.4893806,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311793.7771585,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311794.0592623,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311794.3398488,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10247
+      }
+    },
+    {
+      "time": 1791311794.619903,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10247
+      }
+    },
+    {
+      "time": 1791311794.9009233,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10247
+      }
+    },
+    {
+      "time": 1791311795.1933854,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10247
+      }
+    },
+    {
+      "time": 1791311795.4798331,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10247
+      }
+    },
+    {
+      "time": 1791311795.7620184,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10247
+      }
+    },
+    {
+      "time": 1791311796.0465288,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10247
+      }
+    },
+    {
+      "time": 1791311796.3315668,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311796.6186907,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311796.9020436,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311797.189215,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311797.4753177,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311797.7618022,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311798.0542195,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10241
+      }
+    },
+    {
+      "time": 1791311798.3378544,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10247
+      }
+    },
+    {
+      "time": 1791311798.6734507,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10255
+      }
+    },
+    {
+      "time": 1791311798.9685407,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10255
+      }
+    },
+    {
+      "time": 1791311799.2555537,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10255
+      }
+    },
+    {
+      "time": 1791311799.5416305,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10255
+      }
+    },
+    {
+      "time": 1791311799.8248172,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10255
+      }
+    },
+    {
+      "time": 1791311800.113194,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10255
+      }
+    },
+    {
+      "time": 1791311800.4044797,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311800.6949782,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10255
+      }
+    },
+    {
+      "time": 1791311800.9839556,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311801.270098,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311801.5992086,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311801.921343,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311802.223636,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311802.519652,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311802.8048084,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311803.0880117,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311803.3762205,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10269
+      }
+    },
+    {
+      "time": 1791311803.6780784,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10269
+      }
+    },
+    {
+      "time": 1791311803.9592612,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10269
+      }
+    },
+    {
+      "time": 1791311804.24577,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311804.5338585,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10263
+      }
+    },
+    {
+      "time": 1791311804.8331132,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10263
+      }
+    },
+    {
+      "time": 1791311805.140713,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10263
+      }
+    },
+    {
+      "time": 1791311805.429773,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311805.7174695,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311806.0101824,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311806.2968862,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311806.5853462,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311806.884751,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311807.1879034,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311807.4857552,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311807.7702832,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311808.0855322,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311808.392166,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311808.677549,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311808.9613113,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311809.2429018,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311809.5228817,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311809.8062239,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311810.0947032,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311810.3780043,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311810.6727328,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311810.955869,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311811.2361372,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311811.5179856,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311811.798035,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311812.080093,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311812.3725042,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311812.6549258,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311812.9400089,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311813.2244825,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311813.520633,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311813.8085475,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311814.0951283,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311814.3866053,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311814.6980264,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311814.985782,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311815.2738335,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311815.562663,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311815.849057,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311816.1518815,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10256
+      }
+    },
+    {
+      "time": 1791311816.4393687,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311816.7307663,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311817.0164855,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311817.3016093,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311817.5889292,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311817.8879173,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10252
+      }
+    },
+    {
+      "time": 1791311818.1749487,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311818.472072,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311818.7640457,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311819.0737746,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311819.361407,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311819.6650558,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10251
+      }
+    },
+    {
+      "time": 1791311819.9499207,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10251
+      }
+    },
+    {
+      "time": 1791311820.2348585,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311820.5155346,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311820.8041444,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311821.0959077,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311821.3922994,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10246
+      }
+    },
+    {
+      "time": 1791311821.7446172,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10250
+      }
+    },
+    {
+      "time": 1791311822.0677862,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10250
+      }
+    },
+    {
+      "time": 1791311822.3690178,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10251
+      }
+    },
+    {
+      "time": 1791311822.695417,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10253
+      }
+    },
+    {
+      "time": 1791311823.0287733,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10255
+      }
+    },
+    {
+      "time": 1791311823.3600934,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10262
+      }
+    },
+    {
+      "time": 1791311823.671329,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10262
+      }
+    },
+    {
+      "time": 1791311823.9729357,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10262
+      }
+    },
+    {
+      "time": 1791311824.2972815,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10262
+      }
+    },
+    {
+      "time": 1791311824.6086786,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10262
+      }
+    },
+    {
+      "time": 1791311824.9155123,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311825.2182064,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311825.542483,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311825.8447978,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10257
+      }
+    },
+    {
+      "time": 1791311826.141952,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10262
+      }
+    },
+    {
+      "time": 1791311826.4432814,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10262
+      }
+    },
+    {
+      "time": 1791311826.7623875,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10262
+      }
+    },
+    {
+      "time": 1791311827.0638433,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311827.3710687,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311827.6711354,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311827.9874494,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311828.2806463,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311828.5943224,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311828.9141612,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311829.2264884,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311829.5229526,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311829.8275754,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10259
+      }
+    },
+    {
+      "time": 1791311830.1296275,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311830.4330947,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311830.7381544,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311831.0572836,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10264
+      }
+    },
+    {
+      "time": 1791311831.358454,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311831.6455545,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311831.9361029,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311832.2192516,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10263
+      }
+    },
+    {
+      "time": 1791311832.5052173,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311832.790066,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311833.07453,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311833.355902,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311833.6433458,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311833.9373105,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311834.2176774,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311834.5020473,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311834.7824306,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311835.0795696,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311835.3624992,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311835.6442428,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311835.981385,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311836.2748802,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311836.5657578,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311836.8524897,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311837.138781,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311837.4321709,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311837.7218938,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311838.0166395,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311838.3104463,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311838.6003692,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311838.8953948,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311839.1843991,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311839.4736865,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311839.7617629,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311840.0476239,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311840.3382585,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311840.6213326,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311840.905826,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311841.1922812,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311841.4819205,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311841.7657456,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311842.0631227,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311842.3527625,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311842.6388025,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311842.9262793,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311843.2140625,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311843.5158107,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311843.8077714,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311844.0953329,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311844.38738,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311844.6708193,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311844.965553,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311845.2483776,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311845.53858,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311845.8385527,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311846.126309,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311846.4180036,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311846.7100897,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311847.0016658,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311847.2881095,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311847.580483,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311847.8683522,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311848.1570778,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311848.4475088,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311848.7370136,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311849.0250823,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311849.3119962,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311849.5977738,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311849.889188,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311850.173466,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311850.4741714,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311850.7717748,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311851.0910156,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311851.3965597,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311851.7043931,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311852.0089235,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311852.2999659,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311852.5906408,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311852.879807,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311853.1698916,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311853.460342,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311853.7502263,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311854.039714,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311854.3342905,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311854.6243384,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311854.9107933,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311855.1947484,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311855.4806666,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311855.769468,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311856.0771055,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311856.3733513,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311856.667911,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311856.9523335,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311857.2540805,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311857.5445101,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311857.8451371,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311858.1626053,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311858.494915,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311858.8292294,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311859.132582,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311859.4352016,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311859.7454088,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311860.025243,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311860.332587,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311860.6191204,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311860.9026437,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311861.1839092,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10265
+      }
+    },
+    {
+      "time": 1791311861.466327,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311861.7536137,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311862.0305872,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10266
+      }
+    },
+    {
+      "time": 1791311862.3145335,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311862.5920541,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311862.9274952,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311863.216929,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311863.5064058,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311863.783533,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311864.0639193,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311864.3465283,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311864.6298952,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10267
+      }
+    },
+    {
+      "time": 1791311864.914514,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311865.1951175,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311865.4848173,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311865.766559,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311866.0479972,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10261
+      }
+    },
+    {
+      "time": 1791311866.3402405,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10268
+      }
+    },
+    {
+      "time": 1791311866.6700659,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10268
+      }
+    },
+    {
+      "time": 1791311866.9539592,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10274
+      }
+    },
+    {
+      "time": 1791311867.239446,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10274
+      }
+    },
+    {
+      "time": 1791311867.5262668,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10274
+      }
+    },
+    {
+      "time": 1791311867.8072486,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10274
+      }
+    },
+    {
+      "time": 1791311868.1127582,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10274
+      }
+    },
+    {
+      "time": 1791311868.3998039,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10269
+      }
+    },
+    {
+      "time": 1791311868.6891077,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10269
+      }
+    },
+    {
+      "time": 1791311868.976182,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10269
+      }
+    },
+    {
+      "time": 1791311869.3017626,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10269
+      }
+    },
+    {
+      "time": 1791311869.7451417,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5753
+      }
+    },
+    {
+      "time": 1791311870.1347313,
+      "used_mib": {
+        "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 5765
+      }
+    }
+  ],
+  "gpu_peak_used_mib_including_other_processes": {
+    "GPU-b41bf955-b7e6-6f64-82b2-6b3cf08450e9": 10274
+  },
+  "unavailable_measurements": [
+    "PCIe transfers",
+    "pinned RAM",
+    "per-worker GPU allocation",
+    "logit/logprob equivalence"
+  ],
+  "installed_llama_revision": "ec928150501c2572fec05cb949061672bb424914"
+}

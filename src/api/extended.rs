@@ -113,7 +113,11 @@ pub(super) fn normalize(options: &mut BTreeMap<String, Value>) {
 }
 
 pub(super) async fn openai(prepared: Prepared) -> Response {
-    let model = prepared.manifest.id.clone();
+    let model = prepared
+        .state
+        .requested_alias
+        .clone()
+        .unwrap_or_else(|| prepared.manifest.id.clone());
     let n = prepared
         .api_options
         .get("n")
@@ -192,6 +196,7 @@ pub(super) async fn openai(prepared: Prepared) -> Response {
 }
 
 pub(super) fn raw_stream(prepared: Prepared) -> crate::backend::ApiGenerateStream {
+    let permit = prepared.state.deployment_permit.clone();
     let guard = prepared.state.telemetry.begin(&prepared.manifest.id);
     let expected = prepared
         .api_options
@@ -200,6 +205,7 @@ pub(super) fn raw_stream(prepared: Prepared) -> crate::backend::ApiGenerateStrea
         .unwrap_or(1) as usize;
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tokio::task::spawn_blocking(move || {
+        let _permit = prepared.state.deployment_permit;
         if tx.is_closed() {
             return;
         }
@@ -212,13 +218,17 @@ pub(super) fn raw_stream(prepared: Prepared) -> crate::backend::ApiGenerateStrea
             let _ = tx.blocking_send(Err(e.to_string()));
         }
     });
-    crate::observability::observe_raw_stream(
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
-        guard,
-        expected,
-    )
+    Box::pin(super::deployments::AdmittedStream {
+        stream: crate::observability::observe_raw_stream(
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            guard,
+            expected,
+        ),
+        _permit: permit,
+    })
 }
 pub(super) fn raw_generate(prepared: Prepared) -> anyhow::Result<Value> {
+    let _permit = prepared.state.deployment_permit;
     let mut guard = prepared.state.telemetry.begin(&prepared.manifest.id);
     let result = prepared.state.backend.generate_api(
         &prepared.manifest,

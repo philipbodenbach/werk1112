@@ -1,5 +1,11 @@
 # CLI reference
 
+Single-host CUDA profiles add `werk gpus` (JSON inventory),
+`werk deployment-plan <profiles.json> [--inventory <fixture.json>]` (dry-run), and
+`werk --deployments <profiles.json> serve`. See
+[deployment profiles](../concepts/single-host-deployments.md) for configuration,
+native-build selection, replicas, budgets and compatibility limits.
+
 This page describes the stable command groups and their operational semantics.
 The installed binary remains authoritative for exact flags and accepted values:
 
