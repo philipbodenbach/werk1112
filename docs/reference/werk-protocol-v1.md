@@ -115,7 +115,7 @@ Returns the service, active adapter and negotiated limits:
 ~~~json
 {
   "service": "werk1112",
-  "service_version": "1.8.0",
+  "service_version": "1.9.0",
   "protocol": {"major": 1, "minor": 0},
   "active_backend": "llama-server-cpu",
   "limits": {
