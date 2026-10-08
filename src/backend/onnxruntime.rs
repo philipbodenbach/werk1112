@@ -462,7 +462,7 @@ impl OnnxRuntimeBackend {
             return Ok(format!("{} runner {}", mode.display(), path.display()));
         }
         if mode == OnnxRuntimeMode::Cpu
-            && let Some(runtime) = discover_onnx_genai_python()
+            && let Some(runtime) = discover_onnx_genai_python(store)
         {
             return Ok(format!(
                 "{} via Python onnxruntime-genai {}",
@@ -490,7 +490,9 @@ impl OnnxRuntimeBackend {
 
     pub fn availability(store: &ModelStore, mode: OnnxRuntimeMode) -> OnnxRuntimeAvailability {
         let discovery = discover_onnx_runtime(store, mode);
-        if discovery.path.is_some() {
+        if discovery.path.is_some()
+            || (mode == OnnxRuntimeMode::Cpu && discover_onnx_genai_python(store).is_some())
+        {
             OnnxRuntimeAvailability::Ready
         } else if find_bundled_runner(mode).is_some() {
             OnnxRuntimeAvailability::Installable
@@ -525,14 +527,19 @@ impl OnnxRuntimeBackend {
             bail!("ONNX Runtime route requires a safetensors source model or direct ONNX model");
         }
         let mut discovery = discover_onnx_runtime(store, mode);
-        if discovery.path.is_none() && options.install_missing_runtime {
-            install_managed_onnx_runtime(store, mode)?;
+        if discovery.path.is_none()
+            && options.install_missing_runtime
+            && let Some(source) = find_bundled_runner(mode)
+        {
+            // Request-time provisioning may copy a supplied bundle, but must
+            // never turn a missing runtime into an implicit pip installation.
+            install_runner_bundle(store, mode, &source)?;
             discovery = discover_onnx_runtime(store, mode);
         }
         if discovery.path.is_none() {
             if mode == OnnxRuntimeMode::Cpu
                 && onnx_genai_model_dir(store, manifest).is_some()
-                && discover_onnx_genai_python().is_some()
+                && discover_onnx_genai_python(store).is_some()
             {
                 if options.verbose {
                     crate::ui_eprintln!(
@@ -639,7 +646,7 @@ impl OnnxRuntimeBackend {
 
         if self.mode == OnnxRuntimeMode::Cpu
             && let Some(model_dir) = onnx_genai_model_dir(&self.store, manifest)
-            && let Some(runtime) = discover_onnx_genai_python()
+            && let Some(runtime) = discover_onnx_genai_python(&self.store)
         {
             return self.generate_with_python_genai(
                 manifest,
@@ -931,7 +938,7 @@ impl GenerationBackend for OnnxRuntimeBackend {
         } else if self.mode == OnnxRuntimeMode::Cpu
             && onnx_genai_model_dir(&self.store, manifest).is_some()
         {
-            if discover_onnx_genai_python().is_some() {
+            if discover_onnx_genai_python(&self.store).is_some() {
                 if onnx_genai_model_cache_size() == 0 {
                     OnnxResidencyRoute::EmbeddedPythonCacheDisabled
                 } else {
@@ -1106,8 +1113,30 @@ pub fn managed_runner_path(store: &ModelStore, mode: OnnxRuntimeMode) -> PathBuf
 }
 
 pub fn install_managed_onnx_runtime(store: &ModelStore, mode: OnnxRuntimeMode) -> Result<PathBuf> {
-    let source =
-        find_bundled_runner(mode).ok_or_else(|| anyhow!("{}", missing_bundle_message(mode)))?;
+    let target = match mode {
+        OnnxRuntimeMode::Cpu => "onnx-cpu",
+        OnnxRuntimeMode::Cuda => "onnx-cuda",
+        OnnxRuntimeMode::Rocm => "onnx-rocm",
+    };
+    super::python_install::ensure_install_platform(target)?;
+    let source = match find_bundled_runner(mode) {
+        Some(source) => source,
+        None if mode == OnnxRuntimeMode::Cpu => {
+            return super::python_install::PythonBackend::OnnxCpu.install(store);
+        }
+        None => anyhow::bail!(
+            "{}\nUse werk backend install onnx-cpu for the official CPU GenAI path, or select another compatible backend. GPU modes require a matching Werk runner bundle.",
+            missing_bundle_message(mode)
+        ),
+    };
+    install_runner_bundle(store, mode, &source)
+}
+
+fn install_runner_bundle(
+    store: &ModelStore,
+    mode: OnnxRuntimeMode,
+    source: &Path,
+) -> Result<PathBuf> {
     let dest = managed_runner_path(store, mode);
     fs::create_dir_all(
         dest.parent()
@@ -1230,9 +1259,11 @@ fn missing_message_from_discovery(
     message.push_str("\n\nFix:");
     message.push_str("\n- set WERK_ONNX_RUNTIME=/path/to/werk-onnx-runner");
     message.push_str("\n- or install a managed ONNX Runtime runner artifact for Werk");
-    message.push_str(
-        "\n- or install Python ONNX GenAI support with `python3 -m pip install onnxruntime-genai`",
-    );
+    if mode == OnnxRuntimeMode::Cpu {
+        message.push_str("\n- run werk backend install onnx-cpu for official Python ONNX GenAI support (models need genai_config.json)");
+    } else {
+        message.push_str("\n- provide a matching GPU runner bundle, then run werk backend install onnx-cuda or onnx-rocm as appropriate; the embedded Python GenAI route currently supports CPU only");
+    }
     message
 }
 
@@ -1253,12 +1284,16 @@ struct OnnxGenaiPythonRuntime {
     python: PathBuf,
 }
 
-fn discover_onnx_genai_python() -> Option<OnnxGenaiPythonRuntime> {
+fn discover_onnx_genai_python(store: &ModelStore) -> Option<OnnxGenaiPythonRuntime> {
     let mut candidates = Vec::<PathBuf>::new();
     for env_name in ["WERK_ONNX_GENAI_PYTHON", "WERK_ONNX_RUNTIME_PYTHON"] {
-        if let Some(path) = env::var_os(env_name).map(PathBuf::from) {
-            candidates.push(path);
+        if let Some(python) = env::var_os(env_name).map(PathBuf::from) {
+            return python_supports_onnx_genai(&python)
+                .then_some(OnnxGenaiPythonRuntime { python });
         }
+    }
+    if let Some(python) = super::python_install::PythonBackend::OnnxCpu.managed_python(store) {
+        return python_supports_onnx_genai(&python).then_some(OnnxGenaiPythonRuntime { python });
     }
     if let Some(path) = find_in_path("python3") {
         candidates.push(path);

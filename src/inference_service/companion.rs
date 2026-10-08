@@ -115,8 +115,16 @@ pub struct CompanionMediaBackend {
 
 impl CompanionMediaBackend {
     pub fn discover() -> Self {
+        Self::from_discovery(CompanionClient::discover())
+    }
+
+    pub fn discover_for_store(store: &ModelStore) -> Self {
+        Self::from_discovery(CompanionClient::discover_for_store(store))
+    }
+
+    fn from_discovery(client: Result<CompanionClient>) -> Self {
         Self {
-            client: CompanionClient::discover()
+            client: client
                 .map(CompanionClient::with_resident_worker)
                 .map_err(|error| error.to_string()),
             health_cache: Arc::new(OnceLock::new()),

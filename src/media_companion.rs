@@ -756,7 +756,11 @@ impl CompanionClient {
     }
 
     pub fn discover() -> Result<Self> {
-        let launcher = discover_launcher()?;
+        Self::discover_for_store(&ModelStore::resolve(None)?)
+    }
+
+    pub fn discover_for_store(store: &ModelStore) -> Result<Self> {
+        let launcher = discover_launcher(store)?;
         Ok(Self {
             launcher,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -1053,7 +1057,15 @@ impl CompanionClient {
     }
 
     pub fn discover_doctor_report() -> CompanionDoctorReport {
-        match Self::discover() {
+        Self::doctor_report_from(Self::discover())
+    }
+
+    pub fn doctor_report_for_store(store: &ModelStore) -> CompanionDoctorReport {
+        Self::doctor_report_from(Self::discover_for_store(store))
+    }
+
+    fn doctor_report_from(client: Result<Self>) -> CompanionDoctorReport {
+        match client {
             Ok(client) => client.doctor(),
             Err(err) => CompanionDoctorReport {
                 available: false,
@@ -1339,7 +1351,7 @@ fn exit_status_detail(status: ExitStatus) -> String {
     status.to_string()
 }
 
-fn discover_launcher() -> Result<CompanionLauncher> {
+fn discover_launcher(store: &ModelStore) -> Result<CompanionLauncher> {
     if let Some(configured) = env::var_os("WERK_MEDIA_COMPANION") {
         let path = resolve_program(&configured).ok_or_else(|| {
             anyhow!(
@@ -1356,9 +1368,9 @@ fn discover_launcher() -> Result<CompanionLauncher> {
         });
     }
 
-    let (python, python_source) = discover_python().ok_or_else(|| {
+    let (python, python_source) = discover_python(store).ok_or_else(|| {
         anyhow!(
-            "no media companion executable or Python found; set WERK_MEDIA_COMPANION or WERK_MEDIA_PYTHON"
+            "no media companion executable or Python found; run werk backend install media, or set WERK_MEDIA_COMPANION or WERK_MEDIA_PYTHON"
         )
     })?;
     if let Some((script, source)) = discover_repo_script() {
@@ -1380,10 +1392,14 @@ fn discover_launcher() -> Result<CompanionLauncher> {
     })
 }
 
-fn discover_python() -> Option<(PathBuf, String)> {
+fn discover_python(store: &ModelStore) -> Option<(PathBuf, String)> {
     if let Some(configured) = env::var_os("WERK_MEDIA_PYTHON") {
         return resolve_program(&configured)
             .map(|path| (path, "env WERK_MEDIA_PYTHON".to_string()));
+    }
+    if let Some(python) = crate::backend::python_install::PythonBackend::Media.managed_python(store)
+    {
+        return Some((python, "managed media environment".to_string()));
     }
     for name in python_program_names() {
         if let Some(path) = find_in_path(name) {

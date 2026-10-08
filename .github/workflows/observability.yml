@@ -1,9 +1,9 @@
 name: Werk Observability
 on:
   push:
-    paths: ["src/**", "build.rs", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
+    paths: ["src/**", "runtime/**", "build.rs", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
   pull_request:
-    paths: ["src/**", "build.rs", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
+    paths: ["src/**", "runtime/**", "build.rs", "Cargo.toml", "Cargo.lock", "utils/observability/**", ".cargo/config.toml", ".github/workflows/observability.yml"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -25,6 +25,16 @@ jobs:
         env:
           RUST_MIN_STACK: "16777216"
         run: cargo test --locked --lib logging
+      - name: Explicit backend installer and platform contracts
+        env:
+          RUST_MIN_STACK: "16777216"
+        run: cargo test --locked --lib backend_install
+      - name: oMLX launcher and installation contracts
+        env:
+          RUST_MIN_STACK: "16777216"
+        run: cargo test --locked --lib omlx_install
+      - name: Media installation guidance contracts
+        run: python -m unittest discover -s runtime -p test_werk_media_companion.py -k media_install
       - name: Validate Grafana and Prometheus assets
         run: python utils/observability/validate.py
       - name: Build the normal CLI
