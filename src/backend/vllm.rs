@@ -834,7 +834,9 @@ impl VllmProcess {
         if let Some(deployment) = deployment {
             deployment.plan.apply(&mut child_command);
         }
-        if env_true("WERK_VLLM_LOG") && !crate::terminal::interactive(crate::terminal::Stream::Err)
+        if env_true("WERK_VLLM_LOG")
+            && !crate::logging::enabled()
+            && !crate::terminal::interactive(crate::terminal::Stream::Err)
         {
             child_command
                 .stdout(Stdio::inherit())
@@ -854,6 +856,7 @@ impl VllmProcess {
         let pid = {
             let mut process = child.lock().unwrap_or_else(|error| error.into_inner());
             if !env_true("WERK_VLLM_LOG")
+                || crate::logging::enabled()
                 || crate::terminal::interactive(crate::terminal::Stream::Err)
             {
                 if let Some(stdout) = process.stdout.take() {
@@ -2894,7 +2897,14 @@ where
     thread::spawn(move || {
         let reader = BufReader::new(reader);
         for line in reader.lines().map_while(Result::ok) {
-            if env_true("WERK_VLLM_LOG")
+            if env_true("WERK_VLLM_LOG") && crate::logging::enabled() {
+                crate::logging::emit(
+                    crate::logging::Level::Debug,
+                    "backend.output",
+                    &line,
+                    serde_json::json!({"runtime":"vllm", "stream":label}),
+                );
+            } else if env_true("WERK_VLLM_LOG")
                 && crate::terminal::interactive(crate::terminal::Stream::Err)
             {
                 crate::ui_eprintln!("[vLLM] {line}");

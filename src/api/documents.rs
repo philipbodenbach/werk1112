@@ -65,7 +65,7 @@ pub(super) async fn expand(
     {
         let backend = state.backend.clone();
         let selected = manifest.clone();
-        let (ready, returned) = tokio::task::spawn_blocking(move || {
+        let (ready, returned) = crate::logging::spawn_blocking(move || {
             (
                 backend.task_readiness(&selected, InferenceTask::ImageUnderstanding),
                 permit,
@@ -98,7 +98,8 @@ pub(super) async fn expand(
             // A cancelled HTTP request cannot release the permit while its
             // bounded blocking download/read is still executing.
             let (resolved, returned) =
-                tokio::task::spawn_blocking(move || (file.resolve(&store, &owner), permit)).await?;
+                crate::logging::spawn_blocking(move || (file.resolve(&store, &owner), permit))
+                    .await?;
             permit = returned;
             let input = resolved?;
             input_bytes += input.data.len();

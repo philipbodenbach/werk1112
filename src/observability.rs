@@ -132,7 +132,17 @@ impl Telemetry {
         if r.active.len() < 128 {
             r.active.insert(id, entry.clone());
         }
+        drop(r);
+        let log_context = crate::logging::capture();
+        crate::logging::emit_in(
+            &log_context,
+            crate::logging::Level::Debug,
+            "inference.started",
+            "Inference accepted",
+            serde_json::json!({"inference_id":id,"model":entry.model}),
+        );
         RequestGuard {
+            log_context,
             telemetry: self.clone(),
             entry,
             start: Instant::now(),
@@ -185,6 +195,7 @@ struct RawTimings {
 }
 
 pub struct RequestGuard {
+    log_context: crate::logging::Context,
     telemetry: Arc<Telemetry>,
     entry: RequestSnapshot,
     start: Instant,
@@ -210,6 +221,13 @@ impl RequestGuard {
             return;
         }
         self.entry.state = phase.into();
+        crate::logging::emit_in(
+            &self.log_context,
+            crate::logging::Level::Debug,
+            "inference.phase",
+            &format!("Inference #{} · {phase}", self.entry.id),
+            serde_json::json!({"inference_id":self.entry.id,"model":self.entry.model,"phase":phase,"runtime":runtime.map(|v|v.0),"device":runtime.map(|v|v.1)}),
+        );
         if let (Some(analysis), Some((runtime, device))) = (&mut self.entry.analysis, runtime) {
             analysis.runtime = Some(runtime.chars().take(64).collect());
             analysis.device = Some(device.chars().take(64).collect());
@@ -401,6 +419,32 @@ impl RequestGuard {
             r.recent.pop_front();
         }
         r.recent.push_back(self.entry.clone());
+        drop(r);
+        crate::logging::emit_in(
+            &self.log_context,
+            match status {
+                "error" => crate::logging::Level::Error,
+                "cancelled" => crate::logging::Level::Warn,
+                _ => crate::logging::Level::Info,
+            },
+            match status {
+                "error" => "inference.failed",
+                "cancelled" => "inference.cancelled",
+                _ => "inference.completed",
+            },
+            &format!(
+                "Inference #{} {status} · {} · {:.2} s",
+                self.entry.id, self.entry.model, self.entry.elapsed_seconds
+            ),
+            serde_json::json!({
+                "inference_id":self.entry.id,"model":self.entry.model,"state":status,
+                "duration_seconds":self.entry.elapsed_seconds,"input_tokens":self.entry.prompt_tokens,
+                "output_tokens":self.entry.output_tokens,"cached_tokens":self.entry.cached_tokens,
+                "first_output_seconds":self.entry.first_output_seconds,
+                "decode_tokens_per_second":self.entry.decode_tokens_per_second,
+                "prefill_tokens_per_second":self.entry.prefill_tokens_per_second,"analysis":self.entry.analysis
+            }),
+        );
     }
 }
 impl Drop for RequestGuard {

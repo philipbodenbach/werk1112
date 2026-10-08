@@ -173,7 +173,7 @@ pub(super) async fn openai(prepared: Prepared) -> Response {
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        match tokio::task::spawn_blocking(move || raw_generate(prepared)).await {
+        match crate::logging::spawn_blocking(move || raw_generate(prepared)).await {
             Ok(Ok(mut value)) => {
                 if value["choices"].as_array().is_none_or(|c| c.len() != n) {
                     return api_error(
@@ -204,7 +204,7 @@ pub(super) fn raw_stream(prepared: Prepared) -> crate::backend::ApiGenerateStrea
         .and_then(Value::as_u64)
         .unwrap_or(1) as usize;
     let (tx, rx) = tokio::sync::mpsc::channel(8);
-    tokio::task::spawn_blocking(move || {
+    crate::logging::spawn_blocking(move || {
         let _permit = prepared.state.deployment_permit;
         if tx.is_closed() {
             return;

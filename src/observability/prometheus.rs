@@ -17,6 +17,19 @@ pub fn render(s: &Snapshot) -> String {
             );
         }
     };
+    let (dropped, failed) = crate::logging::counters();
+    metric(
+        "werk_log_records_dropped_total",
+        "counter",
+        "Records dropped by the bounded log file queue.",
+        dropped as f64,
+    );
+    metric(
+        "werk_log_write_errors_total",
+        "counter",
+        "Operational log file write and flush failures.",
+        failed as f64,
+    );
     metric(
         "werk_uptime_seconds",
         "gauge",

@@ -22,6 +22,10 @@ static TITLE: OnceLock<String> = OnceLock::new();
 static PROGRESS: OnceLock<indicatif::MultiProgress> = OnceLock::new();
 
 pub fn progress(bar: indicatif::ProgressBar) -> indicatif::ProgressBar {
+    if crate::logging::raw_console() {
+        bar.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        return bar;
+    }
     PROGRESS.get_or_init(indicatif::MultiProgress::new).add(bar)
 }
 
@@ -48,6 +52,7 @@ pub fn session_heading() {
 
 pub fn interactive(stream: Stream) -> bool {
     ENABLED.load(Ordering::Relaxed)
+        && !crate::logging::raw_console()
         && !env::var("TERM").is_ok_and(|value| value.eq_ignore_ascii_case("dumb"))
         && match stream {
             Stream::Out => HUMAN_STDOUT.load(Ordering::Relaxed) && io::stdout().is_terminal(),
@@ -254,6 +259,11 @@ pub fn finish() {
 }
 
 pub fn panel(stream: Stream, title: &str, text: &str) {
+    if crate::logging::raw_console()
+        && crate::logging::diagnostic(&format!("{title}\n{text}"), matches!(stream, Stream::Out))
+    {
+        return;
+    }
     if interactive(stream) {
         heading(stream, title);
         line(stream, format_args!("{text}"));
@@ -301,17 +311,20 @@ impl Write for ReportWriter {
         self.pending.extend_from_slice(data);
         while let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
             let bytes: Vec<_> = self.pending.drain(..=end).collect();
-            line(
-                self.stream,
-                format_args!("{}", String::from_utf8_lossy(&bytes[..bytes.len() - 1])),
-            );
+            let text = String::from_utf8_lossy(&bytes[..bytes.len() - 1]);
+            if !crate::logging::diagnostic(&text, matches!(self.stream, Stream::Out)) {
+                line(self.stream, format_args!("{text}"));
+            }
         }
         Ok(data.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         if !self.pending.is_empty() {
             let bytes = std::mem::take(&mut self.pending);
-            write(self.stream, &String::from_utf8_lossy(&bytes));
+            let text = String::from_utf8_lossy(&bytes);
+            if !crate::logging::diagnostic(&text, matches!(self.stream, Stream::Out)) {
+                write(self.stream, &text);
+            }
         }
         Ok(())
     }
@@ -325,7 +338,7 @@ impl Drop for ReportWriter {
 /// Tee installer tools through the same console stream without buffering their
 /// entire output or changing noninteractive command execution.
 pub fn command_status(command: &mut Command) -> io::Result<ExitStatus> {
-    if !interactive(Stream::Err) {
+    if !interactive(Stream::Err) && !crate::logging::enabled() {
         return command.status();
     }
     let label = command.get_program().to_string_lossy().into_owned();
@@ -353,10 +366,12 @@ pub fn command_status(command: &mut Command) -> io::Result<ExitStatus> {
                 // Bound individual tool lines (some progress printers omit LF).
                 match io::Read::take(&mut reader, 16 * 1024).read_until(b'\n', &mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => line(
-                        Stream::Err,
-                        format_args!("{}", String::from_utf8_lossy(&buffer).trim_end()),
-                    ),
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&buffer);
+                        if !crate::logging::diagnostic(text.trim_end(), false) {
+                            line(Stream::Err, format_args!("{}", text.trim_end()));
+                        }
+                    }
                 }
             }
         };
@@ -385,18 +400,20 @@ pub fn clap_styles() -> clap::builder::Styles {
 
 #[macro_export]
 macro_rules! ui_println {
-    () => { std::println!() };
+    () => { $crate::ui_println!("") };
     ($($args:tt)*) => {{
-        if $crate::terminal::interactive($crate::terminal::Stream::Out) {
+        if $crate::logging::diagnostic(&format!($($args)*), true) {
+        } else if $crate::terminal::interactive($crate::terminal::Stream::Out) {
             $crate::terminal::line($crate::terminal::Stream::Out, format_args!($($args)*));
         } else { std::println!($($args)*); }
     }};
 }
 #[macro_export]
 macro_rules! ui_eprintln {
-    () => { std::eprintln!() };
+    () => { $crate::ui_eprintln!("") };
     ($($args:tt)*) => {{
-        if $crate::terminal::interactive($crate::terminal::Stream::Err) {
+        if $crate::logging::diagnostic(&format!($($args)*), false) {
+        } else if $crate::terminal::interactive($crate::terminal::Stream::Err) {
             $crate::terminal::line($crate::terminal::Stream::Err, format_args!($($args)*));
         } else { std::eprintln!($($args)*); }
     }};

@@ -24,10 +24,10 @@ theme. Normal commands use scrollback-friendly panels; `top` is the full-screen
 dashboard. Narrow terminals use a compact banner and wrap diagnostic prose.
 
 `serve` displays its actual bound address, default model, authentication status
-and a `werk top --url …` command. Its interactive request feed shows HTTP status
-and time to response headers; this is not the duration of a streamed generation.
-Health and monitoring polls are omitted. Request bodies and credentials are not
-included in that feed.
+and a `werk top --url …` command. Its request feed shows HTTP status and elapsed
+response-body time, including streaming, in terminals and redirected logs.
+Monitoring polls are available at TRACE. Request bodies and credentials are not
+included in HTTP access events.
 
 Set `NO_COLOR=1` to remove colors while retaining layout. `TERM=dumb` and redirected
 streams use plain output. JSON/JSONL, `inspect`, protocol commands and `temp path`
@@ -40,6 +40,90 @@ For a local regression check without model downloads or package installation:
 ```bash
 cargo build
 python3 scripts/smoke-console.py target/debug/werk
+```
+
+## Operational logging
+
+The default threshold is **INFO**. Log levels and presentation are independent:
+
+| Level | Events |
+| --- | --- |
+| `error` | Failed inference, HTTP 5xx/stream errors, command failures. |
+| `warn` | HTTP 4xx, abandoned requests, cancelled inference/jobs, warnings. |
+| `info` | Server/process lifecycle, completed HTTP requests and inference, job state changes. |
+| `debug` | Request/inference start and phase details, backend diagnostics. |
+| `trace` | Also include successful monitoring polls. No per-token logging. |
+| `off` | Disable operational events. |
+
+`serve --verbose` defaults to DEBUG and keeps the colored terminal presentation
+and detailed analysis statistics. **`serve --verbose-pure`** defaults to DEBUG
+and writes raw JSONL to stderr, without a banner, panels or ANSI escapes.
+`--verbose-lite` is an alias of `--verbose-pure`; the two verbose modes conflict.
+An explicit `--log-level` always wins over either verbose mode's default.
+
+```bash
+# Readable console plus an independent structured file
+werk serve --model convaiinnovations/laya --verbose \
+  --log-file ./logs/werk.jsonl
+
+# Raw events for collectors; stdout remains separate
+werk serve --model convaiinnovations/laya --verbose-pure \
+  --log-file ./logs/werk.jsonl
+
+# Production INFO JSONL without debug phases
+werk serve --log-format json --log-level info
+```
+
+These global options also apply to other CLI commands:
+
+| Option | Default / behavior |
+| --- | --- |
+| `--log-level error\|warn\|info\|debug\|trace\|off` | INFO, or DEBUG with a verbose serve mode. |
+| `--log-format auto\|text\|json` | `auto`: terminal palette when interactive, plain text in pipes. `text`: undecorated text. `json`: raw JSONL. Pure mode forces JSON. |
+| `--log-file PATH` | Optional append-only JSONL destination, independent of console rendering. No file is created unless configured. |
+| `--log-max-size-mb N` | Rotate before exceeding 10 MiB; one oversized event remains intact. Range 1–4096. |
+| `--log-retention N` | Keep 5 rotated files, `PATH.1` newest through `PATH.N` oldest. Range 1–100. |
+
+Command results (for example `werk list --json`) remain on stdout. Operational
+logs use stderr. Interactive `top` suppresses console logs to protect its screen;
+file logging remains available. A file path has one writer per process, protected
+by a persistent `PATH.lock` sidecar; concurrent Werk processes need separate paths.
+New log and lock files have mode 0600 on Unix. Rotation preserves complete JSONL
+records. Appending does not change existing file permissions.
+
+Each event has `schema_version`, UTC `timestamp`, `level`, stable `event` name,
+`message`, `pid`, optional `request_id`, and typed `fields`. HTTP responses carry a
+server-generated `x-request-id`; the same ID appears in request events, correlated
+inference and background jobs. Werk and Anthropic request-ID headers use this ID
+as well. `inference_id` connects completion events to `top`'s numeric request rows;
+`job_id` connects later job state changes. Model names, runtime, device, precision,
+cache hits, token/result counts and measured durations are recorded when available.
+A missing measurement remains null rather than becoming an invented zero.
+
+`http.request.completed` is emitted when the response body finishes; its
+`headers_seconds` measures time to headers and `duration_seconds` includes the
+body stream. Dropping an unfinished body produces `http.request.cancelled`; a
+body error produces `http.request.failed`. This measures server-side body delivery,
+not client receipt. Routes use templates, never raw paths, queries or headers.
+
+Structured request/inference events exclude prompts, responses and tool payloads.
+Known configured credentials and sensitive structured field names are redacted.
+Free-form native/legacy diagnostics can include runtime-specific information;
+review them before sharing logs. Native llama.cpp/vLLM output remains opt-in via
+`WERK_LLAMA_LOG` / `WERK_VLLM_LOG` and is recorded at DEBUG when enabled.
+
+File writes use a bounded asynchronous queue (4096 events). A slow/full disk never
+creates an unbounded backlog: dropped records and write failures produce stderr
+errors and Prometheus counters `werk_log_records_dropped_total` and
+`werk_log_write_errors_total`. Shutdown waits up to three seconds for the queue.
+This is operational logging, not a durable audit journal; SIGKILL or a crash can
+lose queued records. Existing Prometheus metric names, Grafana queries and `top`
+statistics are unchanged by the log level or format.
+
+Validate without model downloads:
+
+```bash
+python3 scripts/smoke-logging.py target/debug/werk
 ```
 
 ## Global options

@@ -47,6 +47,7 @@ pub mod documents;
 pub(crate) mod file_store;
 pub mod inference;
 pub mod inference_service;
+pub mod logging;
 pub mod media_cli;
 pub mod media_companion;
 pub mod model_store;

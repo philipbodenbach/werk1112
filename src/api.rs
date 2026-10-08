@@ -12,6 +12,7 @@ mod documents;
 mod extended;
 mod files;
 mod generation;
+mod logging;
 mod media;
 mod observability;
 mod response;

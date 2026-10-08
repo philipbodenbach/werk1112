@@ -206,6 +206,7 @@ impl ApiState {
     }
 
     pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Self {
+        crate::logging::register_secrets(api_keys.iter().cloned());
         self.api_keys = Arc::new(api_keys);
         self
     }
@@ -410,7 +411,7 @@ impl ApiState {
             .await
             .map_err(|_| principal_unavailable())?;
         let deriver = self.principal_deriver.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::logging::spawn_blocking(move || {
             let _permit = permit;
             deriver.derive(&credential)
         })
@@ -431,7 +432,14 @@ impl ApiState {
     }
 
     pub(super) fn log_verbose(&self, message: impl AsRef<str>) {
-        if self.verbose {
+        if crate::logging::enabled() {
+            crate::logging::emit(
+                crate::logging::Level::Debug,
+                "backend.diagnostic",
+                message.as_ref(),
+                serde_json::json!({}),
+            );
+        } else if self.verbose {
             crate::ui_eprintln!("{}", message.as_ref());
         }
     }

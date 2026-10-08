@@ -444,7 +444,16 @@ impl TextAnalysisBackend {
                         );
                     }
                     for diagnostic in &diagnostics {
-                        crate::ui_eprintln!("[werk text-analysis] {diagnostic}");
+                        if crate::logging::enabled() {
+                            crate::logging::emit(
+                                crate::logging::Level::Warn,
+                                "backend.warning",
+                                diagnostic,
+                                json!({"model":manifest.id,"runtime":runtime,"device":device}),
+                            );
+                        } else {
+                            crate::ui_eprintln!("[werk text-analysis] {diagnostic}");
+                        }
                     }
                     let mut routes = self.routes.lock().unwrap();
                     if routes.len() >= 32 {
@@ -464,7 +473,16 @@ impl TextAnalysisBackend {
                         Err(error) => format!("{error:#}"),
                     };
                     let detail = format!("{runtime}/{device} failed: {error}");
-                    crate::ui_eprintln!("[werk text-analysis] {detail}");
+                    if crate::logging::enabled() {
+                        crate::logging::emit(
+                            crate::logging::Level::Warn,
+                            "backend.attempt_failed",
+                            &detail,
+                            json!({"model":manifest.id,"runtime":runtime,"device":device}),
+                        );
+                    } else {
+                        crate::ui_eprintln!("[werk text-analysis] {detail}");
+                    }
                     diagnostics.push(format!(
                         "{detail}; trying the next compatible runtime if permitted"
                     ));

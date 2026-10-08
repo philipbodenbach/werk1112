@@ -881,7 +881,9 @@ impl LlamaServerProcess {
         command.args(&args);
         execution.apply(&mut command);
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
-        if env_true("WERK_LLAMA_LOG") && !crate::terminal::interactive(crate::terminal::Stream::Err)
+        if env_true("WERK_LLAMA_LOG")
+            && !crate::logging::enabled()
+            && !crate::terminal::interactive(crate::terminal::Stream::Err)
         {
             command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         } else {
@@ -901,7 +903,9 @@ impl LlamaServerProcess {
         };
         let mut child_process = child.lock().unwrap_or_else(|e| e.into_inner());
         let mut log_readers = Vec::new();
-        if !env_true("WERK_LLAMA_LOG") || crate::terminal::interactive(crate::terminal::Stream::Err)
+        if !env_true("WERK_LLAMA_LOG")
+            || crate::logging::enabled()
+            || crate::terminal::interactive(crate::terminal::Stream::Err)
         {
             if let Some(stdout) = child_process.stdout.take() {
                 log_readers.push(spawn_log_tail_reader("stdout", stdout, log_tail.clone()));
@@ -3495,7 +3499,14 @@ where
     thread::spawn(move || {
         let reader = BufReader::new(reader);
         for line in reader.lines().map_while(Result::ok) {
-            if env_true("WERK_LLAMA_LOG")
+            if env_true("WERK_LLAMA_LOG") && crate::logging::enabled() {
+                crate::logging::emit(
+                    crate::logging::Level::Debug,
+                    "backend.output",
+                    &line,
+                    serde_json::json!({"runtime":"llama.cpp", "stream":label}),
+                );
+            } else if env_true("WERK_LLAMA_LOG")
                 && crate::terminal::interactive(crate::terminal::Stream::Err)
             {
                 crate::ui_eprintln!("[llama.cpp] {line}");

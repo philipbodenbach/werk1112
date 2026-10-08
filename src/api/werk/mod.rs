@@ -341,7 +341,9 @@ pub(super) async fn request_context(
     state: &ApiState,
     headers: &HeaderMap,
 ) -> Result<(String, ControlContext), Response> {
-    let request_id = new_request_id();
+    let request_id = crate::logging::capture()
+        .request_id
+        .unwrap_or_else(new_request_id);
     negotiate_protocol(headers).map_err(|error| protocol_error(request_id.clone(), error))?;
     let principal = state
         .werk_principal(headers)

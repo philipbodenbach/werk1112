@@ -144,7 +144,7 @@ pub(super) async fn prepare(
 
     let lookup_store = state.store.clone();
     let lookup_id = model_id.to_string();
-    let manifest = match tokio::task::spawn_blocking(move || lookup_store.get(&lookup_id))
+    let manifest = match crate::logging::spawn_blocking(move || lookup_store.get(&lookup_id))
         .await
         .map_err(|error| {
             GenerationError::new(
@@ -286,7 +286,7 @@ pub(super) async fn prepare(
         let options = options.clone();
         // Compatibility probing may invoke Python. Keep it off the async
         // executor, and never modify the process environment for a request.
-        match tokio::task::spawn_blocking(move || {
+        match crate::logging::spawn_blocking(move || {
             backend.with_chat_options(&selected_model, &options)
         })
         .await
@@ -312,7 +312,7 @@ pub(super) async fn prepare(
         let backend = state.backend.clone();
         let selected_model = manifest.clone();
         let has_images = !image_urls.is_empty();
-        tokio::task::spawn_blocking(move || {
+        crate::logging::spawn_blocking(move || {
             backend.supports_tool_calling(&selected_model, has_images)
         })
         .await
@@ -374,7 +374,7 @@ pub(super) async fn prepare(
         let prompt_state = state.clone();
         let prompt_manifest = manifest.clone();
         let has_images = !image_urls.is_empty();
-        tokio::task::spawn_blocking(move || {
+        crate::logging::spawn_blocking(move || {
             prompt_state.prompt_options(&prompt_manifest, has_images)
         })
         .await
@@ -434,7 +434,7 @@ pub(super) async fn prepare(
         let options = request.extra.clone();
         // Auto routing may probe a runtime. Validate off the async executor,
         // before a streaming handler commits HTTP 200 and starts generation.
-        match tokio::task::spawn_blocking(move || {
+        match crate::logging::spawn_blocking(move || {
             backend.validate_api_options(&selected_model, &selected_request, &options)
         })
         .await
@@ -463,7 +463,7 @@ pub(super) async fn prepare(
         let selected_model = manifest.clone();
         let selected_request = generate_request.clone();
         let options = request.extra.clone();
-        let counted = tokio::task::spawn_blocking(move || {
+        let counted = crate::logging::spawn_blocking(move || {
             backend.count_api_tokens(&selected_model, selected_request, options)
         })
         .await
@@ -575,7 +575,7 @@ pub(super) async fn generate(
     explicit_runtime_options: bool,
 ) -> anyhow::Result<GenerateResponse> {
     let mut guard = state.telemetry.begin(&manifest.id);
-    tokio::task::spawn_blocking(move || {
+    crate::logging::spawn_blocking(move || {
         let session = match select_session(&state, &manifest, &request, explicit_runtime_options) {
             Ok(session) => session,
             Err(error) => {
@@ -606,7 +606,7 @@ pub(super) async fn generate_stream(
     let permit = state.deployment_permit.clone();
     let guard = state.telemetry.begin(&manifest.id);
     let state = state.clone();
-    let stream = tokio::task::spawn_blocking(move || -> GenerateStream {
+    let stream = crate::logging::spawn_blocking(move || -> GenerateStream {
         match select_session(&state, &manifest, &request, explicit_runtime_options) {
             Ok(Some(session)) => session.generate_stream(request),
             Ok(None) => state.backend.generate_stream(manifest, request),

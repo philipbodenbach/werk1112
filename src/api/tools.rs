@@ -92,7 +92,7 @@ pub(super) async fn call(
         };
         let manager = state.job_manager.clone();
         let cancel = call.function.name == "cancel_job";
-        return match tokio::task::spawn_blocking(move || {
+        return match crate::logging::spawn_blocking(move || {
             if cancel {
                 manager.store().cancel(&args.id)
             } else {
@@ -171,7 +171,7 @@ pub(super) async fn call(
     };
     let service = state.inference_service.clone();
     let validation = request.clone();
-    match tokio::task::spawn_blocking(move || service.resolve(validation)).await {
+    match crate::logging::spawn_blocking(move || service.resolve(validation)).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => return invalid(error.to_string()),
         Err(error) => return internal(error.to_string()),

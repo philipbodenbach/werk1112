@@ -108,7 +108,7 @@ async fn handle(
     state.log_verbose(format!(
         "[werk serve] request #{request_id} model={model} task={task} accepted"
     ));
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::logging::spawn_blocking(move || {
         let _permit = permit;
         let outcome = (|| {
         let manifest = state.store.get(&model).map_err(|err| (StatusCode::NOT_FOUND, err.to_string()))?;
@@ -147,7 +147,7 @@ async fn handle(
         match &outcome {
             Ok(response) => {
                 observed.analysis_complete(response);
-                if state.verbose { log_stats(request_id, task, response); }
+                if state.verbose && crate::logging::enabled_for(crate::logging::Level::Debug) && !crate::logging::raw_console() { log_stats(request_id, task, response); }
             }
             Err((status, message)) => {
                 observed.error();

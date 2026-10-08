@@ -221,6 +221,12 @@ pub(crate) fn install_shutdown_handler() -> std::io::Result<tokio::task::JoinHan
     };
     Ok(tokio::spawn(async move {
         let status = wait.await;
+        crate::logging::emit(
+            crate::logging::Level::Info,
+            "process.stopping",
+            "Stopping Werk",
+            serde_json::json!({"exit_code":status}),
+        );
         if crate::terminal::interactive(crate::terminal::Stream::Err) {
             crate::terminal::heading(crate::terminal::Stream::Err, "Stopping Werk");
             crate::ui_eprintln!("Releasing runtime workers…");
@@ -229,6 +235,13 @@ pub(crate) fn install_shutdown_handler() -> std::io::Result<tokio::task::JoinHan
         if crate::terminal::interactive(crate::terminal::Stream::Err) {
             crate::ui_eprintln!("Stopped.");
         }
+        crate::logging::emit(
+            crate::logging::Level::Info,
+            "process.stopped",
+            "Werk stopped",
+            serde_json::json!({"exit_code":status}),
+        );
+        crate::logging::flush();
         std::process::exit(status);
     }))
 }

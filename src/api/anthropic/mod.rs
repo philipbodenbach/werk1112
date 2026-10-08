@@ -38,7 +38,9 @@ fn request_ids() -> (String, String) {
         .unwrap_or_default()
         .as_nanos();
     let suffix = format!("{stamp:x}_{sequence:x}");
-    let request_id = format!("req_werk_{suffix}");
+    let request_id = crate::logging::capture()
+        .request_id
+        .unwrap_or_else(|| format!("req_werk_{suffix}"));
     let id = format!("msg_werk_{suffix}");
     (id, request_id)
 }
@@ -90,7 +92,7 @@ pub(super) async fn count_tokens_handler(
             Ok(prepared) => prepared,
             Err(error) => return response::error(error.status, error.message, &request_id),
         };
-        match tokio::task::spawn_blocking(move || {
+        match crate::logging::spawn_blocking(move || {
             let _permit = prepared.state.deployment_permit;
             prepared
                 .state
@@ -272,6 +274,17 @@ fn log_completion(
     timings: crate::backend::GenerationTimings,
     diagnostics: &[String],
 ) {
+    if crate::logging::enabled() {
+        crate::logging::emit(
+            crate::logging::Level::Debug,
+            "backend.diagnostic",
+            "Anthropic completion diagnostics",
+            serde_json::json!({"model":model,"finish_reason":finish_reason,
+            "prompt_tokens":prompt_tokens,"completion_tokens":completion_tokens,"timings":timings,
+            "backend_diagnostics":diagnostics}),
+        );
+        return;
+    }
     crate::ui_eprintln!(
         "[werk serve] anthropic {}",
         serde_json::json!({"model":model,"finish_reason":finish_reason,

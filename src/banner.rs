@@ -12,6 +12,9 @@ pub const BANNER: &str = concat!(
 );
 
 pub fn print_banner() {
+    if crate::logging::raw_console() {
+        return;
+    }
     let mut stdout = io::stdout().lock();
     let colored = crate::terminal::color(crate::terminal::Stream::Out);
     let width = console::Term::stdout().size().1;

@@ -51,7 +51,7 @@ pub(super) async fn handle(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        match tokio::task::spawn_blocking(move || crate::api::extended::raw_generate(prepared))
+        match crate::logging::spawn_blocking(move || crate::api::extended::raw_generate(prepared))
             .await
         {
             Ok(Ok(raw)) => match convert(raw, matched_requested).and_then(|(generated, matched)| {

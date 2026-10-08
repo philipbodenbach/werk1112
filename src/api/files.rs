@@ -241,7 +241,7 @@ pub(super) async fn upload(
         }
         _ => return wire.error(StatusCode::BAD_REQUEST, "invalid expires_after"),
     };
-    match tokio::task::spawn_blocking(move || {
+    match crate::logging::spawn_blocking(move || {
         let _permit = _permit;
         state
             .files
@@ -292,7 +292,8 @@ pub(super) async fn list(
     {
         return wire.error(StatusCode::BAD_REQUEST, "invalid file pagination");
     }
-    let mut files = match tokio::task::spawn_blocking(move || state.files.list(&principal)).await {
+    let mut files = match crate::logging::spawn_blocking(move || state.files.list(&principal)).await
+    {
         Ok(Ok(f)) => f,
         _ => {
             return wire.error(
@@ -349,7 +350,7 @@ pub(super) async fn retrieve(
         Ok(v) => v,
         Err(e) => return e,
     };
-    match tokio::task::spawn_blocking(move || state.files.metadata(&principal, &id)).await {
+    match crate::logging::spawn_blocking(move || state.files.metadata(&principal, &id)).await {
         Ok(Ok(file)) => Json(wire.object(&file)).into_response(),
         _ => wire.error(StatusCode::NOT_FOUND, "file not found"),
     }
@@ -378,7 +379,7 @@ pub(super) async fn content(
             );
         }
     };
-    match tokio::task::spawn_blocking(move || (state.files.get(&principal, &id), permit)).await {
+    match crate::logging::spawn_blocking(move || (state.files.get(&principal, &id), permit)).await {
         Ok((Ok((_, bytes)), permit)) => {
             // Keep admission until the body is consumed or disconnected, including
             // slow clients. At most four upload/download buffers can coexist.
@@ -414,7 +415,7 @@ pub(super) async fn delete(
         Err(e) => return e,
     };
     let result_id = id.clone();
-    match tokio::task::spawn_blocking(move || state.files.delete(&principal, &id)).await {
+    match crate::logging::spawn_blocking(move || state.files.delete(&principal, &id)).await {
         Ok(Ok(())) => Json(if wire.anthropic {
             json!({"id":result_id,"type":"file_deleted"})
         } else {

@@ -150,11 +150,12 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
         .merge(werk::routes())
         .with_state(state);
 
-    if cors_origins.is_empty() {
+    let router = if cors_origins.is_empty() {
         router
     } else {
         router.layer(browser_cors_layer(cors_origins))
-    }
+    };
+    router.layer(axum::middleware::from_fn(super::logging::access))
 }
 
 fn configured_api_body_limit_bytes() -> usize {
@@ -195,6 +196,7 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
         ])
         .expose_headers([
             HeaderName::from_static("request-id"),
+            HeaderName::from_static("x-request-id"),
             HeaderName::from_static("x-werk-output-id"),
             HeaderName::from_static("x-werk-request-id"),
             HeaderName::from_static(PROTOCOL_VERSION_HEADER),
@@ -209,6 +211,12 @@ pub async fn serve(addr: SocketAddr, state: ApiState) -> anyhow::Result<()> {
 /// Serve on a listener reserved before potentially expensive model preparation.
 pub async fn serve_with_listener(listener: TcpListener, state: ApiState) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
+    crate::logging::emit(
+        crate::logging::Level::Info,
+        "server.started",
+        &format!("Werk server listening at http://{addr}"),
+        serde_json::json!({"address":addr.to_string(),"authentication":state.api_key_auth_enabled(),"model":state.default_model}),
+    );
     let console = crate::terminal::interactive(crate::terminal::Stream::Out);
     if console {
         crate::terminal::panel(
@@ -237,41 +245,6 @@ pub async fn serve_with_listener(listener: TcpListener, state: ApiState) -> anyh
         );
     }
     let app = router(state);
-    let app = if console {
-        app.layer(axum::middleware::from_fn(console_request))
-    } else {
-        app
-    };
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn console_request(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let method = request.method().clone();
-    let path = request
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map(|path| path.as_str().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
-    let started = std::time::Instant::now();
-    let response = next.run(request).await;
-    // Headers can precede a streaming body. Do not call this inference duration.
-    if !matches!(
-        path.as_str(),
-        "/health" | "/werk/v1/observability" | "/metrics"
-    ) {
-        crate::ui_println!(
-            "{}  {} {}  {} · headers {:.1} ms",
-            chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
-                .format("%H:%M:%S UTC"),
-            method,
-            path,
-            response.status().as_u16(),
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    response
 }

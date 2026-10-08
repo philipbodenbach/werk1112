@@ -119,6 +119,8 @@ const GIB: u64 = 1024 * 1024 * 1024;
     long_about = "Werk1112 imports local or Hugging Face models, routes inference across installed runtimes, serves OpenAI-compatible and Anthropic Messages API subsets, and provides a live terminal dashboard with werk top."
 )]
 pub struct Cli {
+    #[command(flatten)]
+    pub logging: crate::logging::LogArgs,
     #[arg(
         long,
         global = true,
@@ -723,8 +725,19 @@ pub enum Commands {
         )]
         cors_origins: Vec<CorsOrigin>,
 
-        #[arg(long, help = "Print HTTP request and generation logs")]
+        #[arg(
+            long,
+            conflicts_with = "verbose_pure",
+            help = "Debug logs and detailed terminal statistics"
+        )]
         verbose: bool,
+
+        #[arg(
+            long,
+            visible_alias = "verbose-lite",
+            help = "Raw JSONL debug logs, without terminal presentation"
+        )]
+        verbose_pure: bool,
 
         #[command(flatten)]
         persistence: ServePersistenceArgs,
@@ -1555,12 +1568,43 @@ pub async fn run_from_env() -> Result<()> {
     let (title, machine) = console_command(&matches);
     let cli = Cli::from_arg_matches(&matches)?;
     crate::terminal::init(!machine, title.clone());
+    let (verbose, pure) = match &cli.command {
+        Some(Commands::Serve {
+            verbose,
+            verbose_pure,
+            ..
+        }) => (*verbose, *verbose_pure),
+        Some(command) => (command_backend_install_verbose(command), false),
+        None => (false, false),
+    };
+    crate::logging::init(
+        &cli.logging,
+        verbose,
+        pure,
+        title == "serve",
+        title != "top" || !machine,
+    )?;
+    crate::logging::emit(
+        crate::logging::Level::Debug,
+        "command.started",
+        "Command started",
+        json!({"command":title,"version":env!("CARGO_PKG_VERSION")}),
+    );
     let shutdown = crate::backend::llama_process_lifecycle::install_shutdown_handler()?;
     let result = run(cli).await;
     shutdown.abort();
+    if result.is_ok() {
+        crate::logging::emit(
+            crate::logging::Level::Debug,
+            "command.completed",
+            "Command completed",
+            json!({"command":title}),
+        );
+    }
     if result.is_ok() && title != "top" {
         crate::terminal::finish();
     }
+    crate::logging::flush();
     result
 }
 
@@ -1616,6 +1660,16 @@ fn console_command(matches: &clap::ArgMatches) -> (String, bool) {
 
 /// Render actionable CLI errors without putting ANSI escapes into shared errors.
 pub fn print_error(error: &anyhow::Error) {
+    crate::logging::emit(
+        crate::logging::Level::Error,
+        "command.failed",
+        &format!("{error:#}"),
+        json!({}),
+    );
+    crate::logging::flush();
+    if crate::logging::json_console() {
+        return;
+    }
     diagnostics::print_error(error);
 }
 
@@ -1643,6 +1697,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         allow_unauthenticated: false,
         cors_origins: Vec::new(),
         verbose: false,
+        verbose_pure: false,
         persistence: ServePersistenceArgs::default(),
     });
     let selection_options =
@@ -1692,6 +1747,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             allow_unauthenticated,
             cors_origins,
             verbose,
+            verbose_pure,
             persistence,
         } => {
             let store = ModelStore::resolve(model_home)?;
@@ -1789,7 +1845,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 backend,
                 model,
                 Some(prompt_options_resolver),
-                verbose,
+                (verbose || verbose_pure || crate::logging::enabled())
+                    && crate::logging::enabled_for(crate::logging::Level::Debug),
             )
             .with_server_persistence(server_persistence)
             .with_default_image_model(image_model)
@@ -6565,7 +6622,7 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
 }
 
 fn terminal_spinner_enabled(debug: bool) -> bool {
-    io::stderr().is_terminal() && !debug
+    io::stderr().is_terminal() && !debug && !crate::logging::raw_console()
 }
 
 fn with_terminal_spinner<T>(
@@ -9031,7 +9088,16 @@ impl RoutedBackend {
             return;
         }
         if let Some(note) = self.fallback_note() {
-            crate::ui_eprintln!("{note}");
+            if crate::logging::enabled() {
+                crate::logging::emit(
+                    crate::logging::Level::Warn,
+                    "backend.fallback",
+                    &note,
+                    json!({}),
+                );
+            } else {
+                crate::ui_eprintln!("{note}");
+            }
         }
     }
 }
@@ -12300,6 +12366,7 @@ mod tests {
                 cors_origins,
                 verbose,
                 persistence,
+                ..
             } => {
                 assert_eq!(host, "0.0.0.0");
                 assert_eq!(port, 8080);
@@ -15720,6 +15787,7 @@ mod tests {
             allow_unauthenticated: false,
             cors_origins: Vec::new(),
             verbose: false,
+            verbose_pure: false,
             persistence: ServePersistenceArgs::default(),
         };
         assert!(should_print_startup_banner_for(&serve, true, true));

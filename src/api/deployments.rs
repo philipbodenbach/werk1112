@@ -175,7 +175,7 @@ pub(super) async fn diagnostics(State(state): State<ApiState>, headers: HeaderMa
         return response;
     }
     let registry = state.deployments.clone();
-    match tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+    match crate::logging::spawn_blocking(move || -> Result<serde_json::Value> {
         Ok(serde_json::json!({"inventory": crate::inference_service::devices::Inventory::detect()?, "deployments": registry.map(|r| r.diagnostics())}))
     }).await {
         Ok(Ok(value)) => Json(value).into_response(),
@@ -389,7 +389,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(crate::api::serve_with_listener(listener, state));
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::logging::spawn_blocking(move || {
             crate::werk_protocol::WerkProtocolClient::new(&format!("http://{address}"), None)
                 .unwrap()
                 .with_deployment(Some("worker-a".into()))

@@ -22,7 +22,7 @@ use crate::api::{response::api_error, state::ApiState};
 pub(super) async fn submit_job(state: ApiState, request: InferenceRequest) -> Response {
     let service = state.inference_service.clone();
     let request_to_validate = request.clone();
-    match tokio::task::spawn_blocking(move || service.resolve(request_to_validate)).await {
+    match crate::logging::spawn_blocking(move || service.resolve(request_to_validate)).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             return api_error(StatusCode::BAD_REQUEST, error.to_string(), None);
@@ -105,7 +105,7 @@ pub(super) async fn execute_direct(
     response_format: DirectResponseFormat,
 ) -> Response {
     let service = state.inference_service.clone();
-    match tokio::task::spawn_blocking(move || {
+    match crate::logging::spawn_blocking(move || {
         let result = service
             .execute(request)
             .map_err(|error| DirectExecutionError::Inference(error.to_string()))?;
@@ -155,7 +155,7 @@ pub(super) async fn execute_direct(
 pub(super) async fn execute_audio_bytes(state: ApiState, request: InferenceRequest) -> Response {
     let service = state.inference_service.clone();
     let output_store = service.output_store().clone();
-    match tokio::task::spawn_blocking(move || {
+    match crate::logging::spawn_blocking(move || {
         service.execute(request).map(|result| {
             let result_id = result.id.clone();
             let cleanup = ManagedResultCleanup::new(output_store, result_id);
@@ -227,7 +227,7 @@ async fn ephemeral_streaming_file_body(
 
 fn streaming_body(mut file: tokio::fs::File, cleanup: Option<ManagedResultCleanup>) -> Body {
     let (sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(8);
-    tokio::spawn(async move {
+    crate::logging::spawn(async move {
         loop {
             let mut buffer = vec![0_u8; 64 * 1024];
             match file.read(&mut buffer).await {

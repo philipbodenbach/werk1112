@@ -17,6 +17,18 @@ for the managed directory layout.
 | `NO_COLOR` | When set, disable colors in the banner, console panels, progress indicators, help and `top`; retain readable structure. |
 | `TERM` | `dumb` disables interactive console decoration. Redirected output and machine-readable JSON/JSONL stay plain regardless of terminal colors. |
 
+## Operational logging
+
+CLI flags override these variables. See [logging semantics](cli.md#operational-logging).
+
+| Variable | Meaning |
+| --- | --- |
+| `WERK_LOG_LEVEL` | `error`, `warn`, `info`, `debug`, `trace`, or `off`. Default INFO; verbose serve modes default to DEBUG when no level is specified. |
+| `WERK_LOG_FORMAT` | `auto`, `text`, or `json`. Default `auto`; `serve --verbose-pure` forces raw JSONL. |
+| `WERK_LOG_FILE` | Optional JSONL file path. One writer per path. |
+| `WERK_LOG_MAX_SIZE_MB` | Rotation size in MiB, default 10, range 1–4096. |
+| `WERK_LOG_RETENTION` | Rotated files to retain, default 5, range 1–100. |
+
 ## Core, serving and storage
 
 `WERK_DEPLOYMENTS` selects a server-owned deployment JSON file for `serve` (same

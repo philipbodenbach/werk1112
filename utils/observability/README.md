@@ -26,6 +26,20 @@ Automatic local credentials are never sent to remote targets or redirects.
 The URL is the server root, without `/v1`. `--once --json` supports scripts and
 noninteractive terminals. Authentication errors never print the key.
 
+## Operational logs
+
+`werk serve --verbose` keeps the detailed terminal view. `--verbose-pure` (alias
+`--verbose-lite`) emits raw JSONL at DEBUG; `--log-level info` changes the threshold.
+Use `--log-file ./logs/werk.jsonl` for a rotating JSONL file independently of the
+console format. [CLI logging reference](../../docs/reference/cli.md#operational-logging).
+
+HTTP and inference events share a server-owned `request_id`. The numeric
+`inference_id` matches request rows in `top`. Streaming HTTP durations include the
+body stream. Changing log levels does not change statistics collection or existing
+Prometheus/Grafana metrics. Two additional counters expose log-file health:
+`werk_log_records_dropped_total` and `werk_log_write_errors_total`; neither has
+request-ID labels.
+
 ## Server and data contract
 
 The **server must also run a build containing observability**. Updating the

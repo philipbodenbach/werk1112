@@ -126,3 +126,76 @@ async fn observability_counts_both_protocols_and_stream_modes_without_content() 
     assert_eq!(result["data"]["totals"]["active"], 0);
     assert!(!result.to_string().contains("private-prompt"));
 }
+
+#[tokio::test]
+async fn operational_logging_correlates_both_protocols_and_keeps_metrics_content_free() {
+    use crate::logging::{
+        self, Level,
+        tests::{fixture, records},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let context = fixture(path.clone(), Level::Debug);
+    let (app, _) = app();
+    let mut ids = vec![];
+    for streaming in [false, true] {
+        for endpoint in ["/v1/chat/completions", "/v1/messages"] {
+            let response = logging::scope(context.clone(), app.clone().oneshot(Request::builder()
+                .method("POST").uri(endpoint).header(header::AUTHORIZATION, "Bearer test-key")
+                .header(header::CONTENT_TYPE, "application/json").header("anthropic-version", "2023-06-01")
+                .body(Body::from(json!({"model":"mock","messages":[{"role":"user","content":"private-operational-prompt"}],
+                    "max_tokens":64,"stream":streaming}).to_string())).unwrap())).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            if endpoint == "/v1/messages" {
+                assert_eq!(response.headers()["request-id"], id);
+            }
+            ids.push(id);
+            let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+        }
+    }
+    let events = records(&context, &path);
+    for id in ids {
+        let request = events
+            .iter()
+            .filter(|e| e["request_id"] == id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request
+                .iter()
+                .filter(|e| e["event"] == "inference.started")
+                .count(),
+            1
+        );
+        let complete = request
+            .iter()
+            .filter(|e| e["event"] == "inference.completed")
+            .collect::<Vec<_>>();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0]["level"], "info");
+        assert_eq!(complete[0]["fields"]["output_tokens"], 1);
+        assert_eq!(
+            request
+                .iter()
+                .filter(|e| e["event"] == "http.request.completed")
+                .count(),
+            1
+        );
+    }
+    let raw = std::fs::read_to_string(path).unwrap();
+    assert!(!raw.contains("private-operational-prompt"));
+    assert!(!raw.contains("test-key"));
+    let response = response_json(
+        app.oneshot(get("/werk/v1/observability", true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response["data"]["totals"]["completed"], 4);
+    assert_eq!(response["data"]["totals"]["output_tokens"], 4);
+}
