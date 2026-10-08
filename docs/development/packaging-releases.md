@@ -287,8 +287,9 @@ After merging feature and fix changes, open **Actions → Release → Run workfl
 on the default branch and keep the default `auto` version mode. No manually
 prepared release PR or local preparation command is needed. The workflow updates
 the product version files and lockfiles, dates the changelog, generates the README
-release section and updates current documentation references. It creates and
-merges a release PR automatically, then tags the actual merge commit as
+release section and updates current documentation references. It creates a
+release PR through the Release App, waits for successful validation, merges it
+automatically, then tags the actual merge commit as
 `v<VERSION>` and creates the GitHub release from those notes. The workflow must
 first be merged into the default branch to appear in GitHub's manual workflow menu.
 
@@ -331,29 +332,67 @@ until the new downloads are ready. Disable the draft option to publish immediate
 and attach artifacts afterward. The workflow does not build binaries, upload
 assets, publish to npm or publish to the ComfyUI Registry.
 
-The release-tool tests and metadata validation run in this workflow. Complete
-normal feature validation before releasing; the full product suites and native
-platform smoke tests are separate. A push made with `GITHUB_TOKEN` does not
-trigger the other push workflows.
+The release-tool tests and metadata validation run in this workflow. Before
+merging, it requires successful PR runs of **Werk Observability** (all three OS
+jobs), **n8n Custom Nodes (Beta)** and **ComfyUI Registry** for exactly the release
+head commit. It also checks other reported PR workflows/checks. Missing, pending,
+approval-blocked, cancelled or failed validation cannot produce a release.
+Checks have up to 45 minutes to appear and finish; the release job allows 55
+minutes overall. Feature-specific and native GPU smoke tests remain separate.
+A release preparation push or merge uses `GITHUB_TOKEN`, avoiding duplicate push
+CI and unintended publishing. Only opening the PR uses the App token.
+
+### Release App setup
+
+Configure this once before running the updated workflow. A PR created with the
+built-in `GITHUB_TOKEN` starts GitHub PR workflows in an approval-required state;
+merging the PR immediately can leave failed/expired approval runs. A dedicated
+GitHub App installation token permits normal PR CI without that extra click.
+See [GitHub token trigger behavior](https://docs.github.com/en/actions/concepts/security/github_token)
+and the official [create-github-app-token action](https://github.com/actions/create-github-app-token).
+
+1. Create a private GitHub App in **Account Settings → Developer settings → GitHub
+   Apps → New GitHub App**, for example `werk-release`. Disable webhooks; no event
+   subscriptions, user authorization or callback URL are needed.
+2. Give it repository permissions **Contents: Read-only** and **Pull requests:
+   Read and write**. Metadata read access is implicit. It needs no administration,
+   Actions-write, secret-management or branch-protection bypass permission.
+3. Install the App on **only this repository** and generate its private key.
+4. Under repository **Settings → Secrets and variables → Actions**, add:
+   - Variable `RELEASE_APP_ID`: the numeric **App ID** (not its installation ID).
+   - Secret `RELEASE_APP_PRIVATE_KEY`: the complete generated PEM private key.
+     Upload the key as a secret; do not commit it or paste it into an issue/chat.
+
+The workflow validates both settings before creating any PR, tag or release.
+There is deliberately no fallback to `GITHUB_TOKEN` for PR creation. The official
+action issues a repository-scoped token and revokes it after the job. Git pushes,
+merges, tags and release creation still use the built-in token. The App token is
+only available in the preparation-PR step; validation uses the built-in token's
+read permissions for Actions, Checks and Commit statuses.
 
 ### Repository permissions and retries
 
-The workflow uses the built-in `GITHUB_TOKEN` with `contents: write` and
-`pull-requests: write`. In **Settings → Actions → General → Workflow permissions**,
-enable **Allow GitHub Actions to create and approve pull requests**. The workflow
-creates PRs but does not approve them, force-push, or bypass branch protection.
-The current `main` protection requires a PR with zero mandatory approvals and
-no required status checks, so the bot can merge its release PR without a manual
-step. If mandatory reviews/checks are added later, they must be satisfied before
-the release can proceed. Pushes and PRs created with `GITHUB_TOKEN` do not trigger
-other workflows automatically; required checks would need explicit orchestration.
+The built-in token retains `contents: write` and `pull-requests: write` for
+merging and publishing. Branch protection remains enabled; the workflow does
+not approve reviews, force-push or use an administrator bypass. The current
+repository does not configure required status checks, so the release workflow
+also enforces its three explicit validation workflows independently. If required
+reviews or additional checks are configured later, GitHub's merge rules still
+apply.
 
 The default branch is checked out at job start, including on retries. If it
 advances before the release PR is merged, the workflow stops; start it again on
 the latest branch. Its release branch includes the base commit identifier and
 is reused only when its tree matches the generated files. Existing open PRs
-for that branch are reused. If a merge or tag push succeeded but a later step
-failed, run again with `auto` before merging more commits. It reuses the prepared
+for that branch are reused. Failed CI must be fixed and rerun successfully before
+retrying Release; existing red runs are not deleted or disguised as successful.
+For an old, still-open preparation PR created by `github-actions[bot]` before
+this fix, close that PR and rerun Release after configuring the App. The same
+prepared branch can then receive a fresh App-authored PR with normal CI.
+
+If a merge or tag push succeeded but a later step failed, run again with `auto`
+before merging more commits. An untagged prepared version must have a merged
+preparation PR whose checks pass; retrying cannot bypass validation. It reuses the prepared
 version, tag and notes. An existing GitHub release is left intact, including its
 assets, notes and draft/publication state. A repeated click never publishes an
 existing draft implicitly.
@@ -376,7 +415,7 @@ an untagged prepared version without changing tracked files:
 
 ~~~bash
 python3 scripts/prepare-release.py check --notes-file /tmp/werk-release-notes.md
-python3 -m unittest discover -s scripts/tests -p 'test_prepare_release.py'
+python3 -m unittest discover -s scripts/tests -p 'test*release*.py'
 ~~~
 
 ## Maintainer release checklist
