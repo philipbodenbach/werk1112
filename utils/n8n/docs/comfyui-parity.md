@@ -1,6 +1,6 @@
 # ComfyUI parity and n8n adaptations
 
-The reference is the Werk/ComfyUI **1.8.0** release checkout, including `nodes.py`,
+The reference is the Werk/ComfyUI **1.9.0** release checkout, including `nodes.py`,
 `text_nodes.py`, `runtime_nodes.py`, their request builders, protocol client, and the actual
 Rust routes/DTOs in this checkout. `__init__.py` merges **20 media/configuration + 3 text + 10 runtime registrations = 33 public nodes**.
 The test suite checks the table against those registrations without importing

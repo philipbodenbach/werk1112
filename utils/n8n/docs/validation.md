@@ -1,7 +1,7 @@
 # Beta validation scope
 
-Release reference: `v1.8.0`, with Werk Core, Media Companion,
-ComfyUI and the n8n package at **1.8.0**. Server contracts are based on the
+Release reference: `v1.9.0`, with Werk Core, Media Companion,
+ComfyUI and the n8n package at **1.9.0**. Server contracts are based on the
 actual Rust DTOs/tests and ComfyUI client in the repository. Werk Protocol
 remains **1.0**, and all n8n node versions remain **1**.
 
@@ -153,6 +153,6 @@ Capability discovery can truthfully report unsupported, unavailable,
 externally managed or metadata-only. The package does not install missing
 adapters or invent a successful execution. See [contract clarifications and
 the text-readiness distinction](comfyui-parity.md#contract-clarifications-checked-in-source).
-The package remains private and manually installed for Werk **1.8.0**.
+The package remains private and manually installed for Werk **1.9.0**.
 No npm publication, Registry submission, cloud verification, Docker image,
 tag or release was performed by these validation commands.
