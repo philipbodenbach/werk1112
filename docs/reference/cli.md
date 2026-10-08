@@ -1053,6 +1053,12 @@ The route inventory and request contracts are documented in the
 werk backend list
 werk backend doctor --debug
 werk backend install TARGET
+werk backend install omlx  # Apple Silicon; explicit installation only
+werk backend install mlx
+werk backend install mlx-vlm
+werk backend install transformers
+werk backend install media
+werk backend install onnx-cpu
 ```
 
 The supported install targets, operating-system matrix and manual cleanup

@@ -425,6 +425,16 @@ pub enum BackendInstallArg {
     OnnxCpu,
     #[value(name = "vllm")]
     Vllm,
+    /// Install the managed oMLX CLI on Apple Silicon (explicit installation only).
+    Omlx,
+    /// Install official MLX-LM on Apple Silicon.
+    Mlx,
+    /// Install MLX-VLM on Apple Silicon.
+    MlxVlm,
+    /// Install Hugging Face Transformers and PyTorch.
+    Transformers,
+    /// Install Diffusers, Transformers and media codecs.
+    Media,
     #[value(name = "qwen-tts")]
     QwenTts,
     #[value(name = "text-analysis")]
@@ -445,8 +455,24 @@ impl BackendInstallArg {
             | Self::OnnxRocm
             | Self::OnnxCpu
             | Self::Vllm
+            | Self::Omlx
+            | Self::Mlx
+            | Self::MlxVlm
+            | Self::Transformers
+            | Self::Media
             | Self::QwenTts
             | Self::TextAnalysis => None,
+        }
+    }
+
+    fn python_backend(self) -> Option<crate::backend::python_install::PythonBackend> {
+        use crate::backend::python_install::PythonBackend;
+        match self {
+            Self::Mlx => Some(PythonBackend::Mlx),
+            Self::MlxVlm => Some(PythonBackend::MlxVlm),
+            Self::Transformers => Some(PythonBackend::Transformers),
+            Self::Media => Some(PythonBackend::Media),
+            _ => None,
         }
     }
 
@@ -2125,6 +2151,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             let store = ModelStore::resolve(model_home)?;
             match command {
                 BackendCommands::Install { target } => {
+                    crate::backend::python_install::ensure_install_platform(
+                        target
+                            .to_possible_value()
+                            .expect("install target")
+                            .get_name(),
+                    )?;
                     if let Some(mode) = target.mode() {
                         let executable = install_managed_llama_server_with_options(
                             &store,
@@ -2144,13 +2176,28 @@ pub async fn run(cli: Cli) -> Result<()> {
                     } else if let Some(mode) = target.onnx_mode() {
                         let executable = install_managed_onnx_runtime(&store, mode)?;
                         crate::ui_println!(
-                            "Installed {} runner: {}",
+                            "Installed {} runtime: {}",
                             mode.display(),
                             executable.display()
+                        );
+                    } else if let Some(backend) = target.python_backend() {
+                        let python = backend.install(&store)?;
+                        crate::ui_println!(
+                            "Installed {} backend: {}",
+                            backend.target(),
+                            python.display()
                         );
                     } else if target == BackendInstallArg::Vllm {
                         let python = install_managed_vllm(&store)?;
                         crate::ui_println!("Installed vLLM backend: {}", python.display());
+                    } else if target == BackendInstallArg::Omlx {
+                        let launcher = crate::backend::install_managed_omlx(&store)?;
+                        crate::ui_println!("Installed oMLX backend: {}", launcher.display());
+                        if env::var_os("WERK_OMLX_BIN").is_some() {
+                            crate::ui_eprintln!(
+                                "Warning: WERK_OMLX_BIN still overrides the managed runtime. Unset it to use this installation."
+                            );
+                        }
                     } else if target == BackendInstallArg::QwenTts {
                         let python = install_managed_qwen_tts(&store)?;
                         crate::ui_println!("Installed Qwen-TTS backend: {}", python.display());
@@ -4643,7 +4690,7 @@ fn print_inference_doctor(
     crate::ui_println!("Werk runtime diagnostics");
     print_backend_doctor(store, false);
 
-    let report = CompanionClient::discover_doctor_report();
+    let report = CompanionClient::doctor_report_for_store(store);
     crate::ui_println!(
         "Media companion: {} ({})",
         if report.available {
@@ -8474,7 +8521,8 @@ fn print_backend_list(store: &ModelStore) {
 
     crate::ui_println!();
     crate::ui_println!("oMLX discovery (model compatibility is checked per request)");
-    print_omlx_discovery();
+    print_omlx_discovery(store);
+    print_python_backend_discovery(store);
 
     crate::ui_println!();
     crate::ui_println!(
@@ -8522,6 +8570,12 @@ fn runtime_install_target_for_platform<'a>(
     architecture: &str,
     strix_halo: bool,
 ) -> Option<&'a str> {
+    if target.is_some_and(|target| {
+        crate::backend::python_install::platform_rejection(target, operating_system, architecture)
+            .is_some()
+    }) {
+        return None;
+    }
     match target {
         // The managed vLLM installer is intentionally unavailable outside
         // Linux and on every Linux ARM64 host, including DGX Spark. Rendering
@@ -8530,6 +8584,7 @@ fn runtime_install_target_for_platform<'a>(
         Some("vllm") if operating_system != "linux" || architecture == "aarch64" || strix_halo => {
             None
         }
+        Some("omlx") if operating_system != "macos" || architecture != "aarch64" => None,
         target => target,
     }
 }
@@ -8663,7 +8718,8 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
     }
     crate::ui_println!();
     crate::ui_println!("{:<24} {:<12} DETAIL", "RUNTIME", "STATUS");
-    print_omlx_discovery();
+    print_omlx_discovery(store);
+    print_python_backend_discovery(store);
     #[cfg(feature = "burn-experimental")]
     for mode in [BurnMode::Cuda, BurnMode::Cpu] {
         let status = BurnBackend::runtime_status(mode);
@@ -8701,7 +8757,10 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
                 .path
                 .as_ref()
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "runner ready".to_string()),
+                .unwrap_or_else(|| {
+                    OnnxRuntimeBackend::probe(store, mode)
+                        .unwrap_or_else(|error| format!("{error:#}"))
+                }),
             OnnxRuntimeAvailability::Installable => "bundled runner can be installed".to_string(),
             OnnxRuntimeAvailability::Unavailable => {
                 OnnxRuntimeBackend::unavailable_reason(store, mode)
@@ -8714,8 +8773,40 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
     }
 }
 
-fn print_omlx_discovery() {
-    let (status, detail) = match OmlxBackend::probe() {
+fn print_python_backend_discovery(store: &ModelStore) {
+    use crate::backend::python_install::{PythonBackend, platform_rejection};
+    for backend in [
+        PythonBackend::Mlx,
+        PythonBackend::MlxVlm,
+        PythonBackend::Transformers,
+        PythonBackend::Media,
+        PythonBackend::OnnxCpu,
+    ] {
+        if platform_rejection(backend.target(), env::consts::OS, env::consts::ARCH).is_some() {
+            crate::ui_println!(
+                "{:<24} {:<12} {}",
+                backend.target(),
+                "unsupported",
+                backend.hint()
+            );
+            continue;
+        }
+        match backend.probe(store) {
+            Ok(detail) => {
+                crate::ui_println!("{:<24} {:<12} {}", backend.target(), "available", detail)
+            }
+            Err(error) => crate::ui_println!(
+                "{:<24} {:<12} {}",
+                backend.target(),
+                "unavailable",
+                compact_reason(&format!("{error:#}"))
+            ),
+        }
+    }
+}
+
+fn print_omlx_discovery(store: &ModelStore) {
+    let (status, detail) = match OmlxBackend::probe_for_store(store) {
         Ok(detail) => ("installed", detail),
         Err(error) => ("unavailable", compact_reason(&format!("{error:#}"))),
     };
@@ -10584,7 +10675,7 @@ fn backend_unavailability_reason(
             candle_gguf_tokenizer_rejection(store, manifest).or_else(|| {
                 probe_device(mode).err().map(|_| match mode {
                     CandleDeviceMode::Cuda => candle_cuda_rejection_reason(),
-                    CandleDeviceMode::Metal => "Candle Metal is unavailable".to_string(),
+                    CandleDeviceMode::Metal => candle_metal_unavailable_message(),
                     CandleDeviceMode::Auto | CandleDeviceMode::Cpu => {
                         "Candle is unavailable".to_string()
                     }
@@ -10601,10 +10692,10 @@ fn backend_unavailability_reason(
                 .err()
                 .map(|error| compact_reason(&format!("{error:#}")))
         }
-        BackendChoice::MlxVlm => MlxVlmBackend::probe().err().map(|_| {
-            "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
-        }),
-        BackendChoice::TransformersCompat => TransformersCompatBackend::probe()
+        BackendChoice::MlxVlm => MlxVlmBackend::probe_for_store(store)
+            .err()
+            .map(|error| format!("{error:#}")),
+        BackendChoice::TransformersCompat => TransformersCompatBackend::probe_for_store(store)
             .err()
             .map(|_| TransformersCompatBackend::unavailable_reason()),
         BackendChoice::Burn(mode) => BurnBackend::probe(store, manifest, mode)
@@ -11211,7 +11302,7 @@ fn unavailable_backend_message(
             candle_cuda_unavailable_message()
         }
         (BackendChoice::Candle(CandleDeviceMode::Metal), ModelFormat::SafeTensors) => {
-            "Metal backend requested for safetensors model, but Candle Metal is unavailable. Build with Metal support on macOS or choose --backend cpu.".to_string()
+            candle_metal_unavailable_message()
         }
         (BackendChoice::Burn(mode), ModelFormat::SafeTensors) => {
             BurnBackend::missing_message(store, manifest, mode)
@@ -11226,10 +11317,10 @@ fn unavailable_backend_message(
         (BackendChoice::VllmRocm, ModelFormat::SafeTensors) => {
             VllmBackend::rocm_unavailable_reason(store)
         }
-        (BackendChoice::Mlx, _) => "mlx-lm is unavailable".to_string(),
-        (BackendChoice::Omlx, _) => "oMLX is unavailable; inspect the configured oMLX runtime with werk doctor".to_string(),
+        (BackendChoice::Mlx, _) => crate::backend::python_install::PythonBackend::Mlx.hint(),
+        (BackendChoice::Omlx, _) => "oMLX is unavailable; on Apple Silicon run werk backend install omlx, then inspect the model with werk doctor".to_string(),
         (BackendChoice::MlxVlm, _) => {
-            "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
+            crate::backend::python_install::PythonBackend::MlxVlm.hint()
         }
         (BackendChoice::TransformersCompat, ModelFormat::SafeTensors) => {
             TransformersCompatBackend::unavailable_reason()
@@ -11413,6 +11504,16 @@ fn routing_candidates_for_debug(
             runtime_candidate_ids(manifest, requested_backend_for_choice(requested))
         }
         concrete => backend_to_runtime_id(concrete).into_iter().collect(),
+    }
+}
+
+fn candle_metal_unavailable_message() -> String {
+    if !cfg!(target_os = "macos") {
+        "Candle Metal requires macOS; select --backend cpu on this host".to_string()
+    } else if cfg!(feature = "metal") {
+        "Candle Metal is compiled in but unavailable; check Metal device support or select --backend cpu".to_string()
+    } else {
+        "Candle Metal must be compiled into Werk. From a Werk source checkout run: cargo +stable install --path . --locked --force --features metal. Alternatively select --backend cpu".to_string()
     }
 }
 
@@ -12153,6 +12254,72 @@ mod tests {
     use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn backend_install_cli_targets_match_trusted_commands_and_registry() {
+        let mut cli_targets = BackendInstallArg::value_variants()
+            .iter()
+            .map(|target| target.to_possible_value().unwrap().get_name().to_string())
+            .collect::<Vec<_>>();
+        cli_targets.sort();
+        let mut trusted = crate::backend::BACKEND_INSTALL_TARGETS
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        trusted.sort();
+        assert_eq!(cli_targets, trusted);
+        for target in &cli_targets {
+            assert!(Cli::try_parse_from(["werk", "backend", "install", target]).is_ok());
+            assert!(
+                validated_backend_install_command(&format!("werk backend install {target}"))
+                    .is_some()
+            );
+        }
+        for runtime in runtime_registry() {
+            if let Some(target) = runtime.install_target {
+                assert!(crate::backend::BACKEND_INSTALL_TARGETS.contains(&target));
+            }
+        }
+        assert_eq!(
+            runtime_install_target_for_platform(Some("mlx"), "windows", "x86_64", false),
+            None
+        );
+        assert_eq!(
+            runtime_install_target_for_platform(Some("llama-cuda"), "macos", "aarch64", false),
+            None
+        );
+        assert_eq!(
+            runtime_install_target_for_platform(Some("transformers"), "windows", "x86_64", false),
+            Some("transformers")
+        );
+    }
+
+    #[test]
+    fn omlx_install_cli_and_platform_hints() {
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "omlx"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Backend {
+                command: BackendCommands::Install {
+                    target: BackendInstallArg::Omlx
+                }
+            })
+        ));
+        assert_eq!(
+            runtime_install_target_for_platform(Some("omlx"), "macos", "aarch64", false),
+            Some("omlx")
+        );
+        for (os, arch) in [
+            ("macos", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+        ] {
+            assert_eq!(
+                runtime_install_target_for_platform(Some("omlx"), os, arch, false),
+                None
+            );
+        }
+    }
 
     #[test]
     fn parses_native_parallel_slots_without_conflating_cpu_threads() {

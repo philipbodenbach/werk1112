@@ -37,6 +37,8 @@ use crate::{
     runtime_control::{BackendRuntimeAdapter, ModelResidencyStatus, StaticRuntimeAdapter},
 };
 
+pub(super) mod install;
+
 const API_OPTIONS: &[&str] = &[
     "response_format",
     "frequency_penalty",
@@ -355,9 +357,10 @@ struct OmlxChatSession {
 
 impl OmlxBackend {
     pub fn new(store: ModelStore) -> Self {
+        let invocation = OmlxInvocation::discover(&store).map_err(|error| format!("{error:#}"));
         Self {
             store,
-            invocation: OmlxInvocation::discover().map_err(|error| format!("{error:#}")),
+            invocation,
             servers: Arc::new(super::runtime_cache::RuntimeCache::retained(
                 MAX_CACHED_WORKERS,
             )),
@@ -385,7 +388,11 @@ impl OmlxBackend {
     }
 
     pub fn probe() -> Result<String> {
-        let invocation = OmlxInvocation::discover()?;
+        Self::probe_for_store(&ModelStore::resolve(None)?)
+    }
+
+    pub fn probe_for_store(store: &ModelStore) -> Result<String> {
+        let invocation = OmlxInvocation::discover(store)?;
         Ok(invocation.probe(None)?.detail)
     }
 
@@ -796,9 +803,17 @@ impl GenerationBackend for OmlxBackend {
             return None;
         }
         let result = self.probe_model(manifest);
+        let installable = self
+            .invocation
+            .as_ref()
+            .err()
+            .is_some_and(|reason| reason.contains(install::INSTALL_HINT))
+            && cfg!(all(target_os = "macos", target_arch = "aarch64"));
         Some(TaskReadiness {
             status: if result.is_ok() {
                 TaskReadinessStatus::Available
+            } else if installable {
+                TaskReadinessStatus::Installable
             } else {
                 TaskReadinessStatus::Unavailable
             },
@@ -809,7 +824,7 @@ impl GenerationBackend for OmlxBackend {
                 .unwrap_or_else(|error| format!("{error:#}")),
             adapter: Some("omlx".to_string()),
             required_backend: Some("omlx".to_string()),
-            install_command: None,
+            install_command: installable.then(|| "werk backend install omlx".into()),
             fallback_backend: None,
             missing_dependencies: Vec::new(),
             missing_dependency_groups: Vec::new(),
@@ -1048,15 +1063,12 @@ fn resolve_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Result<Pat
 }
 
 impl OmlxInvocation {
-    fn discover() -> Result<Self> {
+    fn discover(store: &ModelStore) -> Result<Self> {
         if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             bail!("oMLX local backend requires macOS on Apple Silicon");
         }
-        let launcher = match env::var_os("WERK_OMLX_BIN") {
-            Some(path) if !path.is_empty() => absolute_program(PathBuf::from(path))?,
-            Some(_) => bail!("WERK_OMLX_BIN is empty"),
-            None => find_program("omlx").context("oMLX is not installed; install oMLX and set WERK_OMLX_BIN to its Python CLI launcher")?,
-        };
+        let (launcher, managed_python) =
+            Self::select_launcher(store, env::var_os("WERK_OMLX_BIN"), || find_program("omlx"))?;
         let health_timeout = match env::var("WERK_OMLX_HEALTH_TIMEOUT_SECONDS") {
             Ok(value) => Duration::from_secs(
                 value
@@ -1068,10 +1080,46 @@ impl OmlxInvocation {
             Err(env::VarError::NotPresent) => DEFAULT_HEALTH_TIMEOUT,
             Err(_) => bail!("WERK_OMLX_HEALTH_TIMEOUT_SECONDS is not valid UTF-8"),
         };
-        Self::from_launcher(launcher, health_timeout)
+        if managed_python.is_some() {
+            Self::from_launcher_with_python(launcher, health_timeout, managed_python)
+        } else {
+            Self::from_launcher(launcher, health_timeout)
+        }
+    }
+
+    fn select_launcher(
+        store: &ModelStore,
+        explicit: Option<OsString>,
+        on_path: impl FnOnce() -> Option<PathBuf>,
+    ) -> Result<(PathBuf, Option<PathBuf>)> {
+        match explicit {
+            Some(path) if path.is_empty() => {
+                bail!("WERK_OMLX_BIN is empty; unset it to use werk backend install omlx")
+            }
+            Some(path) => {
+                let launcher = absolute_program(PathBuf::from(path)).context("Invalid WERK_OMLX_BIN; fix or unset the override to use the managed oMLX installation")?;
+                let managed_python = (install::installed(store)
+                    && fs::canonicalize(&launcher).ok()
+                        == fs::canonicalize(install::executable(store)).ok())
+                .then(|| install::python(store));
+                Ok((launcher, managed_python))
+            }
+            None if install::installed(store) => {
+                Ok((install::executable(store), Some(install::python(store))))
+            }
+            None => Ok((on_path().context(install::INSTALL_HINT)?, None)),
+        }
     }
 
     fn from_launcher(launcher: PathBuf, health_timeout: Duration) -> Result<Self> {
+        Self::from_launcher_with_python(launcher, health_timeout, None)
+    }
+
+    fn from_launcher_with_python(
+        launcher: PathBuf,
+        health_timeout: Duration,
+        managed_python: Option<PathBuf>,
+    ) -> Result<Self> {
         let expert_cache_bytes = expert_cache_bytes(env::var_os("WERK_OMLX_EXPERT_CACHE_MB"))?;
         let ngram_cache_bytes = ngram_cache_bytes(env::var_os("WERK_OMLX_NGRAM_CACHE_MB"))?;
         let expert_execution = expert_execution(env::var_os("WERK_OMLX_EXPERT_EXECUTION"))?;
@@ -1104,69 +1152,80 @@ impl OmlxInvocation {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut hasher);
         let launcher_fingerprint = hasher.finish();
-        let text =
-            std::str::from_utf8(&bytes).context("oMLX launcher must be a Python console script")?;
-        let shebang = text
-            .lines()
-            .next()
-            .and_then(|line| line.strip_prefix("#!"))
-            .context("oMLX launcher must have a Python shebang")?;
-        let words: Vec<&str> = shebang.split_whitespace().collect();
-        let mut index = 0;
-        if words.first().is_some_and(|word| {
-            Path::new(word)
-                .file_name()
-                .is_some_and(|name| name == "env")
-        }) {
-            index += 1;
-            if words.get(index) == Some(&"-S") {
-                index += 1;
+        // pip uses a shell/Python trampoline when a venv path contains spaces.
+        // Managed environments have a known interpreter; external launchers must
+        // still pass the original shebang and flag validation.
+        let (python, python_args) = if let Some(python) = managed_python {
+            if !python.is_file() {
+                bail!("Managed oMLX Python is missing; run werk backend install omlx");
             }
-        }
-        let program = words
-            .get(index)
-            .context("oMLX shebang has no Python interpreter")?;
-        if !Path::new(program)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("python"))
-        {
-            bail!("cannot verify oMLX launcher Python interpreter");
-        }
-        let python_path = PathBuf::from(program);
-        let python_path = if python_path.components().count() == 1 {
-            environment
+            (python, vec!["-I".into()])
+        } else {
+            let text = std::str::from_utf8(&bytes)
+                .context("oMLX launcher must be a Python console script")?;
+            let shebang = text
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("#!"))
+                .context("oMLX launcher must have a Python shebang")?;
+            let words: Vec<&str> = shebang.split_whitespace().collect();
+            let mut index = 0;
+            if words.first().is_some_and(|word| {
+                Path::new(word)
+                    .file_name()
+                    .is_some_and(|name| name == "env")
+            }) {
+                index += 1;
+                if words.get(index) == Some(&"-S") {
+                    index += 1;
+                }
+            }
+            let program = words
+                .get(index)
+                .context("oMLX shebang has no Python interpreter")?;
+            if !Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("python"))
+            {
+                bail!("cannot verify oMLX launcher Python interpreter");
+            }
+            let python_path = PathBuf::from(program);
+            let python_path = if python_path.components().count() == 1 {
+                environment
+                    .iter()
+                    .find(|(name, _)| name == "PATH")
+                    .and_then(|(_, path)| {
+                        env::split_paths(path)
+                            .map(|directory| directory.join(program))
+                            .find(|candidate| candidate.is_file())
+                    })
+                    .context("oMLX launcher Python is not present in the captured PATH")?
+            } else {
+                python_path
+            };
+            let python = if python_path.is_absolute() {
+                python_path
+            } else {
+                env::current_dir()?.join(python_path)
+            };
+            if !python.is_file() {
+                bail!("oMLX launcher Python does not exist: {}", python.display());
+            }
+            let python_args: Vec<String> = words[index + 1..]
                 .iter()
-                .find(|(name, _)| name == "PATH")
-                .and_then(|(_, path)| {
-                    env::split_paths(path)
-                        .map(|directory| directory.join(program))
-                        .find(|candidate| candidate.is_file())
-                })
-                .context("oMLX launcher Python is not present in the captured PATH")?
-        } else {
-            python_path
+                .map(|word| word.to_string())
+                .collect();
+            if python_args.iter().any(|flag| {
+                !matches!(
+                    flag.as_str(),
+                    "-s" | "-S" | "-E" | "-I" | "-P" | "-B" | "-u"
+                )
+            }) {
+                bail!("cannot verify custom oMLX launcher Python flags");
+            }
+            (python, python_args)
         };
-        let python = if python_path.is_absolute() {
-            python_path
-        } else {
-            env::current_dir()?.join(python_path)
-        };
-        if !python.is_file() {
-            bail!("oMLX launcher Python does not exist: {}", python.display());
-        }
-        let python_args: Vec<String> = words[index + 1..]
-            .iter()
-            .map(|word| word.to_string())
-            .collect();
-        if python_args.iter().any(|flag| {
-            !matches!(
-                flag.as_str(),
-                "-s" | "-S" | "-E" | "-I" | "-P" | "-B" | "-u"
-            )
-        }) {
-            bail!("cannot verify custom oMLX launcher Python flags");
-        }
         Ok(Self {
             launcher,
             python,

@@ -2254,6 +2254,13 @@ pub fn install_managed_llama_server_with_options(
     mode: LlamaCppMode,
     options: LlamaServerInstallOptions,
 ) -> Result<PathBuf> {
+    super::python_install::ensure_install_platform(match mode {
+        LlamaCppMode::Cuda => "llama-cuda",
+        LlamaCppMode::Rocm => "llama-rocm",
+        LlamaCppMode::Vulkan => "llama-vulkan",
+        LlamaCppMode::Metal => "llama-metal",
+        LlamaCppMode::Cpu => "llama-cpu",
+    })?;
     if mode == LlamaCppMode::Metal && !cfg!(target_os = "macos") {
         bail!("llama.cpp Metal backend can only be built on macOS");
     }

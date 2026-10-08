@@ -218,13 +218,34 @@ werk doctor --model MODEL --task text-generation --debug
 werk --backend omlx doctor --model MODEL --task text-generation
 ~~~
 
-Install the [upstream oMLX CLI](https://github.com/jundot/omlx#install) separately.
-Werk checks `WERK_OMLX_BIN` first, then `omlx` on `PATH` when that override is
-unset. An empty or invalid override fails discovery. The macOS application
-alone does not install that CLI. Werk does not install or upgrade oMLX,
-change the normal MLX-LM environment, manage a
-system service, or connect to an external oMLX server. `omlx` is not a
-`werk backend install` target, including when automatic provisioning is enabled.
+When oMLX is missing, Werk recommends this explicit install command:
+
+```bash
+werk backend install omlx
+werk --backend omlx serve --model MODEL
+```
+
+The installer requires **macOS 15+ on Apple Silicon**, native arm64 Python
+3.11–3.13 with `venv`, and Git (for upstream's pinned dependencies). It installs
+oMLX **0.7.0** from the upstream versioned source into
+`<WERK_HOME>/backends/omlx/venv`, then verifies imports, the version and Metal
+availability without loading weights. It uses the normal installer output and
+returns an actionable error if creation, installation or validation fails.
+Only a successfully validated environment is marked ready for discovery. Rerun
+the same command to repair an incomplete installation. This installs the standard
+upstream package; optional custom Metal kernel builds are not enabled by Werk.
+See [upstream requirements](https://github.com/jundot/omlx/tree/v0.7.0#install).
+
+Discovery checks `WERK_OMLX_BIN` first, then the complete Werk-managed environment,
+then `omlx` on `PATH`. `--model-home` selects the same managed store for install,
+serve and backend doctor. An empty or invalid explicit override fails discovery;
+unset it to use the managed installation. Existing external installations remain
+selectable through `WERK_OMLX_BIN` and are not modified by the installer.
+
+**oMLX is never installed automatically**, including with
+`--auto-install-backends`. `serve`, `run`, `chat`, routing and doctor only discover
+and probe installed runtimes. Werk does not manage an oMLX system service or attach
+to an external oMLX server. It owns only the workers launched for its requests.
 
 Werk captures the executable and its Python environment together. Recognized
 Python console entry points can be verified; opaque custom wrappers fail with
@@ -771,6 +792,11 @@ llama-rocm
 llama-vulkan
 llama-metal
 llama-cpu
+mlx
+mlx-vlm
+omlx
+transformers
+media
 onnx-cuda
 onnx-rocm
 onnx-cpu
@@ -781,6 +807,61 @@ text-analysis
 
 There is currently no <code>werk backend uninstall</code> command. See
 [Uninstall and cleanup](#uninstall-and-cleanup).
+
+### Platform-aware explicit installation
+
+Missing runtimes report the appropriate `werk backend install TARGET` command.
+The new MLX, oMLX, Transformers, media and Python ONNX GenAI installers run only
+when that command is invoked. `serve`, `run`, `chat`, `backend list` and `doctor`
+do not install these packages. Existing llama.cpp/ONNX bundle provisioning flags
+retain their documented behavior.
+
+| Runtime / target | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| `llama-cpu` | Yes | Intel / Apple Silicon | Yes |
+| `llama-vulkan` | Vulkan SDK / driver | Requires a compatible Vulkan SDK / driver; prefer Metal | Vulkan SDK / driver |
+| `llama-cuda` | NVIDIA CUDA toolchain | Unavailable; use Metal | NVIDIA CUDA toolchain |
+| `llama-rocm` | Supported AMD HIP toolchain / GPU required | Unavailable; use Metal | Supported ROCm toolchain / GPU required |
+| `llama-metal` | Unavailable | Metal-capable Mac | Unavailable |
+| `mlx`, `mlx-vlm`, `omlx` | Unavailable | Apple Silicon | These Werk-managed routes are unavailable |
+| `transformers`, `media`, `text-analysis`, `qwen-tts` | x86_64 with upstream Python wheels | Apple Silicon with upstream Python wheels | x86_64 / ARM64 with upstream Python wheels |
+| `vllm` | Use supported Linux in WSL2 | Unavailable | Managed generic x86_64 route; special hardware retains existing external-environment guidance |
+| `onnx-cpu` | Compatible bundle or official GenAI Python wheels | Compatible bundle or official GenAI Python wheels | Compatible bundle or official GenAI Python wheels |
+| `onnx-cuda`, `onnx-rocm` | CUDA runner bundle; no ROCm route | Unavailable | Matching GPU runner bundle required |
+
+This matrix describes managed installation paths, not a guarantee that every
+model or accelerator works with every wheel. Unsupported combinations stop with
+an alternative before downloading packages. Intel Macs can use llama.cpp CPU or
+Metal; newer PyTorch/MLX packages are not installed there by this managed flow.
+Candle and the experimental Burn / legacy llama bindings are compiled into Werk:
+they require an appropriate Cargo feature build, not a Python installation.
+For example, from a source checkout, use
+`cargo +stable install --path . --locked --force --features metal` for Candle Metal
+or `--features candle-cuda` for Candle CUDA. A compatible compiler/SDK is still
+required. No new experimental forks or unofficial Windows vLLM ports are added.
+
+The new shared Python installers use Python 3.11–3.13 and separate environments
+under `backends/<target>/venv` in the selected Werk home (`--model-home` / `WERK_HOME`).
+Explicit interpreter/launcher overrides take precedence, followed by a completed
+managed installation, then existing discovery. Imports, dependency consistency
+and, for MLX, Metal availability are checked before marking an installation
+complete. Failed installations can be retried with the same command. Stop workers
+using an environment before updating it, and restart an already running server
+after installation. No model weights are downloaded by these installers.
+
+Standard packages come from [MLX-LM](https://github.com/ml-explore/mlx-lm),
+[MLX-VLM](https://github.com/Blaizzy/mlx-vlm),
+[Hugging Face Diffusers](https://huggingface.co/docs/diffusers/main/installation)
+and [ONNX Runtime GenAI](https://onnxruntime.ai/docs/genai/howto/install.html).
+PyTorch installations print detected CUDA/ROCm and MPS availability; installing
+packages does not install GPU drivers. For a different CUDA/ROCm wheel, follow
+the [official PyTorch selector](https://pytorch.org/get-started/locally/) in an
+external environment and set the corresponding `WERK_*_PYTHON` override.
+The media target provides the general Diffusers/Transformers adapters and audio /
+video dependencies; architecture-specific runtimes such as Qwen-TTS and Laya
+retain their separate installers. Missing packages for a recognized media
+adapter now expose `werk backend install media` in structured readiness results;
+unknown architectures do not become installable merely because packages are missing.
 
 ## What each managed installer does
 
@@ -795,9 +876,15 @@ There is currently no <code>werk backend uninstall</code> command. See
 | <code>llama-cpu</code> | Builds the default CPU llama-server. | Git, CMake and a C/C++ compiler. | Executable help. |
 | <code>onnx-cuda</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
 | <code>onnx-rocm</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
-| <code>onnx-cpu</code> | Copies an existing platform-specific Werk ONNX runner bundle. | A compatible bundled or explicitly configured runner. | Runner help only. |
+| <code>onnx-cpu</code> | Copies a compatible runner bundle when present; otherwise installs official `onnxruntime-genai` in an isolated environment. | A runner bundle or Python 3.11–3.13 with compatible upstream wheels. | Runner help or Python GenAI API imports and dependency consistency. The Python route requires a model with `genai_config.json`; it does not export arbitrary models. |
 | <code>vllm</code> | Creates an isolated virtual environment and installs vLLM with pip on eligible generic Linux hosts. On DGX Spark and AMD Strix Halo this target stops with platform-specific container/environment guidance instead of installing an unverified generic wheel. | Native Linux x86_64, Python/venv, pip, compatible PyTorch and accelerator stack. | Import/version and runtime health checks. |
+| <code>omlx</code> | Installs pinned oMLX 0.7.0 in a managed virtual environment; explicit command only. | Apple Silicon, macOS 15+, native arm64 Python 3.11–3.13, venv/pip and Git. | Version, CLI/MLX imports and Metal availability; no weights loaded. |
 | <code>qwen-tts</code> | Creates an isolated virtual environment and installs exactly qwen-tts 0.1.1. | Python 3.9+, venv, pip and platform-compatible PyTorch/audio dependencies. | Exact package version and Qwen3TTSModel import. |
+| <code>mlx</code> | Installs official `mlx-lm` in a separate environment. | Apple Silicon, macOS 14+, native Python 3.11–3.13. | Generation module, dependency consistency and Metal. |
+| <code>mlx-vlm</code> | Installs `mlx-vlm` in a separate environment. | Same managed MLX prerequisites. | Generation module, dependency consistency and Metal; model support remains adapter-dependent. |
+| <code>transformers</code> | Installs PyTorch, Transformers, Accelerate and tokenizer dependencies. | Supported upstream wheels and Python 3.11–3.13. | Generation API imports, dependency consistency, accelerator report. |
+| <code>media</code> | Installs Diffusers, Transformers, PyTorch, Pillow, NumPy, PyAV, SoundFile, SciPy and librosa. | Supported upstream wheels and Python 3.11–3.13. | Framework/codec imports, dependency consistency, accelerator report. |
+| <code>text-analysis</code> | Installs the existing architecture-specific requirements; attempts optional TileLang on Linux. | Compatible Python/PyTorch wheels. | Existing worker preflight validates architecture dependencies before loading models. |
 
 ### Experimental CUDA expert offload
 

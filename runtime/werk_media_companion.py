@@ -16,6 +16,7 @@ import inspect
 import json
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -1762,6 +1763,7 @@ def model_probe_readiness(
     detail,
     backend_hint,
     dependencies,
+    recognized=False,
 ):
     """Build the additive, machine-readable readiness result for a probe."""
 
@@ -1797,15 +1799,35 @@ def model_probe_readiness(
             adapter,
         )
 
-    # An installation command is authoritative only when it came from the
-    # existing explicit architecture-backend hint and that adapter is actually
-    # implemented.  Generic dependency failures and unimplemented variants
-    # must never manufacture or repeat one.
+    # Architecture-specific recommendations remain authoritative only for
+    # implemented adapters. Generic media dependency remediation is added below
+    # after checking host support and recognized executable model metadata.
     install_command = (
         backend_hint.get("install_command")
         if status == "installable" and backend_hint is not None
         else None
     )
+
+    # Offer the standard media dependency environment only for an executable,
+    # recognized adapter. Installing packages cannot implement an unknown model.
+    machine = platform.machine().lower()
+    managed_host = (
+        (sys.platform == "linux" and machine in {"x86_64", "aarch64"})
+        or (sys.platform == "win32" and machine in {"amd64", "x86_64"})
+        or (sys.platform == "darwin" and machine == "arm64")
+    )
+    if (
+        status == "unavailable"
+        and backend_hint is None
+        and recognized
+        and adapter is not None
+        and managed_host
+        and (missing_dependencies or missing_dependency_groups)
+    ):
+        status = "installable"
+        required_backend = "media"
+        install_command = "werk backend install media"
+        detail += "; run werk backend install media or select WERK_MEDIA_PYTHON"
 
     return {
         "status": status,
@@ -1912,6 +1934,7 @@ def command_probe_model(payload):
         detail,
         backend_hint,
         dependencies,
+        recognized=bool(requested_task and recognized),
     )
     return result
 

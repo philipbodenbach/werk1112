@@ -9,6 +9,7 @@ pub(crate) mod model_file_cache;
 mod omlx;
 mod onnxruntime;
 mod openai_transport;
+pub(crate) mod python_install;
 pub(crate) mod runtime_cache;
 pub mod text_analysis;
 mod text_analysis_candle;
@@ -38,7 +39,7 @@ pub(crate) use llama_server::{
     SelectedRocmDeviceStatus, current_host_is_strix_halo,
     current_selected_rocm_device_is_strix_halo, current_selected_rocm_device_status,
 };
-pub use omlx::OmlxBackend;
+pub use omlx::{OmlxBackend, install::install as install_managed_omlx};
 pub use onnxruntime::{
     OnnxProvisionOptions, OnnxRuntimeAvailability, OnnxRuntimeBackend, OnnxRuntimeMode,
     install_managed_onnx_runtime, managed_runner_path,
@@ -59,6 +60,8 @@ pub(crate) use vllm::{vllm_architecture_supports_images, vllm_rocm_signals};
 /// must not render an arbitrary string as a trusted shell recommendation.
 pub const BACKEND_INSTALL_TARGETS: &[&str] = &[
     "llama-cuda",
+    "llama-cuda-nvfp4",
+    "llama-cuda-offload",
     "llama-rocm",
     "llama-vulkan",
     "llama-metal",
@@ -67,6 +70,11 @@ pub const BACKEND_INSTALL_TARGETS: &[&str] = &[
     "onnx-rocm",
     "onnx-cpu",
     "vllm",
+    "omlx",
+    "mlx",
+    "mlx-vlm",
+    "transformers",
+    "media",
     "qwen-tts",
     "text-analysis",
 ];
@@ -740,7 +748,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 760,
         implemented: true,
-        install_target: None,
+        install_target: Some("onnx-cpu"),
     },
     RuntimeDescriptor {
         id: RuntimeId::TransformersCompat,
@@ -759,7 +767,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 840,
         implemented: true,
-        install_target: None,
+        install_target: Some("transformers"),
     },
     RuntimeDescriptor {
         id: RuntimeId::TransformersPooling,
@@ -899,7 +907,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 875,
         implemented: true,
-        install_target: None,
+        install_target: Some("mlx-vlm"),
     },
     RuntimeDescriptor {
         id: RuntimeId::Mlx,
@@ -918,7 +926,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 850,
         implemented: true,
-        install_target: None,
+        install_target: Some("mlx"),
     },
     RuntimeDescriptor {
         id: RuntimeId::Omlx,
@@ -937,7 +945,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 845,
         implemented: true,
-        install_target: None,
+        install_target: Some("omlx"),
     },
     RuntimeDescriptor {
         id: RuntimeId::MediaCompanionCuda,
@@ -956,7 +964,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 1000,
         implemented: true,
-        install_target: None,
+        install_target: Some("media"),
     },
     RuntimeDescriptor {
         id: RuntimeId::MediaCompanionRocm,
@@ -975,7 +983,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 990,
         implemented: true,
-        install_target: None,
+        install_target: Some("media"),
     },
     RuntimeDescriptor {
         id: RuntimeId::MediaCompanionMetal,
@@ -994,7 +1002,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 980,
         implemented: true,
-        install_target: None,
+        install_target: Some("media"),
     },
     RuntimeDescriptor {
         id: RuntimeId::MediaCompanionCpu,
@@ -1013,7 +1021,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         supports_batching: true,
         priority: 500,
         implemented: true,
-        install_target: None,
+        install_target: Some("media"),
     },
 ];
 
@@ -1581,13 +1589,13 @@ mod tests {
     }
 
     #[test]
-    fn omlx_requires_model_probe_and_has_no_install_target_or_vision_claim() {
+    fn omlx_requires_model_probe_has_explicit_install_target_and_no_vision_claim() {
         let descriptor = runtime_descriptor(RuntimeId::Omlx);
         assert!(descriptor.supports_native_tool_calling());
         assert!(runtime_descriptor(RuntimeId::VllmCuda).supports_native_tool_calling());
         assert!(!runtime_descriptor(RuntimeId::Mlx).supports_native_tool_calling());
         assert!(!descriptor.capabilities.vision_language);
-        assert!(descriptor.install_target.is_none());
+        assert_eq!(descriptor.install_target, Some("omlx"));
         assert_eq!(descriptor.priority, 845);
         assert!(descriptor.priority < runtime_descriptor(RuntimeId::Mlx).priority);
         for format in [ModelFormat::Mlx, ModelFormat::SafeTensors] {

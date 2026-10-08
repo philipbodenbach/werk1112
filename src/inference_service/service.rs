@@ -70,8 +70,8 @@ impl InferenceService {
     pub fn new(store: ModelStore) -> Self {
         let outputs = OutputStore::new(store.home());
         Self {
+            backend: Arc::new(CompanionMediaBackend::discover_for_store(&store)),
             store,
-            backend: Arc::new(CompanionMediaBackend::discover()),
             outputs,
             resource_detector: Arc::new(detect_host_resources),
             routing_diagnostics: Arc::default(),

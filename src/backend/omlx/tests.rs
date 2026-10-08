@@ -2190,3 +2190,83 @@ fn reasoning_effort_controls_native_payload_and_preserves_worker_reuse() {
         );
     }
 }
+
+#[test]
+fn omlx_install_discovery_is_read_only_and_prefers_override_then_managed_then_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ModelStore::resolve(Some(temp.path().join("managed store"))).unwrap();
+    let missing = OmlxInvocation::select_launcher(&store, None, || None).unwrap_err();
+    assert!(missing.to_string().contains("werk backend install omlx"));
+    assert!(!store.home().exists());
+    let external = temp.path().join("external-omlx");
+    fs::write(&external, "external fixture").unwrap();
+    assert_eq!(
+        OmlxInvocation::select_launcher(&store, None, || Some(external.clone())).unwrap(),
+        (external.clone(), None)
+    );
+    let managed = install::executable(&store);
+    fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    fs::write(&managed, "managed fixture").unwrap();
+    fs::write(install::python(&store), "python fixture").unwrap();
+    // A partial install must not displace an existing external installation.
+    assert_eq!(
+        OmlxInvocation::select_launcher(&store, None, || Some(external.clone()))
+            .unwrap()
+            .0,
+        external
+    );
+    fs::write(
+        store.home().join("backends/omlx/installed-version"),
+        install::VERSION,
+    )
+    .unwrap();
+    assert_eq!(
+        OmlxInvocation::select_launcher(&store, None, || panic!(
+            "managed install should precede PATH"
+        ))
+        .unwrap(),
+        (managed.clone(), Some(install::python(&store)))
+    );
+    assert_eq!(
+        OmlxInvocation::select_launcher(&store, Some(external.clone().into_os_string()), || None)
+            .unwrap()
+            .0,
+        external
+    );
+    assert_eq!(
+        OmlxInvocation::select_launcher(&store, Some(managed.into_os_string()), || None)
+            .unwrap()
+            .1,
+        Some(install::python(&store))
+    );
+    assert!(OmlxInvocation::select_launcher(&store, Some("".into()), || None).is_err());
+    assert!(
+        OmlxInvocation::select_launcher(
+            &store,
+            Some(temp.path().join("missing").into_os_string()),
+            || None
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn omlx_install_interpreter_handles_pip_trampolines_in_paths_with_spaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("store with spaces/bin");
+    fs::create_dir_all(&root).unwrap();
+    let launcher = root.join("omlx");
+    let python = root.join("python");
+    fs::write(&python, "python fixture").unwrap();
+    fs::write(&launcher, "#!/bin/sh\n'''exec' '/path with spaces/python' \"$0\" \"$@\"\n' '''\nfrom omlx.cli import main\nmain()\n").unwrap();
+    assert!(OmlxInvocation::from_launcher(launcher.clone(), DEFAULT_HEALTH_TIMEOUT).is_err());
+    let invocation = OmlxInvocation::from_launcher_with_python(
+        launcher,
+        DEFAULT_HEALTH_TIMEOUT,
+        Some(python.clone()),
+    )
+    .unwrap();
+    assert_eq!(invocation.python, python);
+    assert_eq!(invocation.python_args, ["-I"]);
+    invocation.verify_launcher().unwrap();
+}

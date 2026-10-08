@@ -1,3 +1,4 @@
+use super::python_install::PythonBackend;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 #[cfg(unix)]
@@ -609,8 +610,8 @@ enum MlxInvocation {
 }
 
 impl MlxInvocation {
-    fn configured() -> Self {
-        let python = Self::pin_program(backend_program("WERK_MLX_PYTHON", default_python()));
+    fn configured(store: &ModelStore) -> Self {
+        let python = Self::pin_program(PythonBackend::Mlx.discover_python(store));
         let configured = |name| env::var(name).ok().filter(|value| !value.trim().is_empty());
         if let Some(module) = configured("WERK_MLX_MODULE") {
             return Self::Module { python, module };
@@ -621,6 +622,7 @@ impl MlxInvocation {
         // An explicit Python must not silently execute a PATH entry point from
         // another virtual environment. Otherwise retain console-entry discovery.
         if configured("WERK_MLX_PYTHON").is_none()
+            && PythonBackend::Mlx.managed_python(store).is_none()
             && let Some(generator) = sibling_program(&python, mlx_generate_program())
                 .or_else(|| find_program_in_path(mlx_generate_program()))
         {
@@ -714,9 +716,12 @@ impl MlxInvocation {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .context("failed to start the selected MLX runtime probe")?;
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start the selected MLX runtime probe; {}",
+                PythonBackend::Mlx.hint()
+            )
+        })?;
         let mut stdin = child
             .stdin
             .take()
@@ -1554,14 +1559,20 @@ impl GenerationBackend for LlamaCppBackend {
 impl MlxBackend {
     pub fn new(store: ModelStore) -> Self {
         Self {
+            invocation: MlxInvocation::configured(&store),
             store,
-            invocation: MlxInvocation::configured(),
         }
     }
 
     /// Checks installation only. Model routing must use `probe_model`.
     pub fn probe() -> Result<String> {
-        MlxInvocation::configured().probe(json!({}))
+        Self::probe_for_store(&ModelStore::resolve(None)?)
+    }
+
+    pub fn probe_for_store(store: &ModelStore) -> Result<String> {
+        MlxInvocation::configured(store)
+            .probe(json!({}))
+            .with_context(|| PythonBackend::Mlx.hint())
     }
 
     /// Resolves architecture and quantization in the actual selected runtime,
@@ -1605,7 +1616,13 @@ impl MlxBackend {
                 "config": config,
                 "werk_gemma4_compat": compat,
             }))
-            .with_context(|| format!("MLX model '{}' is not verified compatible", manifest.id))?;
+            .with_context(|| {
+                format!(
+                    "MLX model '{}' is not verified compatible; {}",
+                    manifest.id,
+                    PythonBackend::Mlx.hint()
+                )
+            })?;
         Ok(())
     }
 
@@ -1644,27 +1661,32 @@ impl MlxBackend {
 impl MlxVlmBackend {
     pub fn new(store: ModelStore) -> Self {
         Self {
+            python: PythonBackend::MlxVlm.discover_python(&store),
             store,
-            python: backend_program("WERK_MLX_VLM_PYTHON", default_python()),
             module: env::var("WERK_MLX_VLM_MODULE").unwrap_or_else(|_| "mlx_vlm".to_string()),
         }
     }
 
     pub fn probe() -> Result<String> {
-        let python = backend_program("WERK_MLX_VLM_PYTHON", default_python());
+        Self::probe_for_store(&ModelStore::resolve(None)?)
+    }
+
+    pub fn probe_for_store(store: &ModelStore) -> Result<String> {
+        let python = PythonBackend::MlxVlm.discover_python(store);
         let output = Command::new(&python)
             .args(["-c", "import mlx_vlm"])
             .output()
             .with_context(|| {
                 format!(
-                    "failed to execute {}; set WERK_MLX_VLM_PYTHON to a Python with mlx-vlm installed",
+                    "failed to execute {}; run werk backend install mlx-vlm on Apple Silicon or set WERK_MLX_VLM_PYTHON to an existing environment",
                     python.display()
                 )
             })?;
         if !output.status.success() {
             bail!(
-                "mlx-vlm is not importable with {}: {}",
+                "mlx-vlm is not importable with {}. {}: {}",
                 python.display(),
+                PythonBackend::MlxVlm.hint(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -1735,7 +1757,10 @@ impl MlxVlmBackend {
         if let Some(generator) = sibling_program(&self.python, mlx_vlm_generate_program()) {
             return Command::new(generator);
         }
-        if let Some(generator) = find_program_in_path(mlx_vlm_generate_program()) {
+        if env::var_os("WERK_MLX_VLM_PYTHON").is_none()
+            && PythonBackend::MlxVlm.managed_python(&self.store).is_none()
+            && let Some(generator) = find_program_in_path(mlx_vlm_generate_program())
+        {
             return Command::new(generator);
         }
 
@@ -1745,7 +1770,7 @@ impl MlxVlmBackend {
 
 impl TransformersCompatBackend {
     pub fn new(store: ModelStore) -> Self {
-        let python = backend_program("WERK_TRANSFORMERS_PYTHON", default_python());
+        let python = PythonBackend::Transformers.discover_python(&store);
         let client = CompanionClient::from_embedded_python(
             python.clone(),
             TRANSFORMERS_COMPAT_PY,
@@ -1762,20 +1787,25 @@ impl TransformersCompatBackend {
     }
 
     pub fn probe() -> Result<String> {
-        let python = backend_program("WERK_TRANSFORMERS_PYTHON", default_python());
+        Self::probe_for_store(&ModelStore::resolve(None)?)
+    }
+
+    pub fn probe_for_store(store: &ModelStore) -> Result<String> {
+        let python = PythonBackend::Transformers.discover_python(store);
         let output = Command::new(&python)
             .args(["-c", "import torch, transformers"])
             .output()
             .with_context(|| {
                 format!(
-                    "failed to execute {}; set WERK_TRANSFORMERS_PYTHON to a Python with torch and transformers installed",
+                    "failed to execute {}; run werk backend install transformers or set WERK_TRANSFORMERS_PYTHON to an existing environment",
                     python.display()
                 )
             })?;
         if !output.status.success() {
             bail!(
-                "Transformers compatibility backend is not importable with {}: {}",
+                "Transformers compatibility backend is not importable with {}. {}: {}",
                 python.display(),
+                PythonBackend::Transformers.hint(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -1786,7 +1816,7 @@ impl TransformersCompatBackend {
     }
 
     pub fn unavailable_reason() -> String {
-        "Transformers compatibility backend requires Python with torch and transformers installed; install with `python3 -m pip install torch transformers accelerate` or set WERK_TRANSFORMERS_PYTHON".to_string()
+        PythonBackend::Transformers.hint()
     }
 
     fn request_for(&self, manifest: &ModelManifest, request: &GenerateRequest) -> Result<Value> {
@@ -2121,7 +2151,7 @@ impl GenerationBackend for TransformersCompatBackend {
                 "Transformers model residency is disabled by WERK_TRANSFORMERS_MODEL_CACHE_SIZE=0"
                     .to_string(),
             )
-        } else if Self::probe().is_ok() {
+        } else if Self::probe_for_store(&self.store).is_ok() {
             (
                 ModelResidencyStatus::Supported,
                 format!(
@@ -2151,7 +2181,7 @@ impl GenerationBackend for TransformersCompatBackend {
                 "Transformers compatibility backend currently supports raw ChatGLM/GLM safetensors models"
             );
         }
-        Self::probe()?;
+        Self::probe_for_store(&self.store)?;
         original_mlx_model_dir(&self.store, manifest)?;
         Ok(())
     }
@@ -2298,7 +2328,7 @@ impl GenerationBackend for MlxVlmBackend {
                 "mlx-vlm backend supports MLX or Hugging Face-style safetensors model directories"
             );
         }
-        Self::probe()?;
+        Self::probe_for_store(&self.store)?;
         original_mlx_model_dir(&self.store, manifest)?;
         Ok(())
     }
@@ -2311,6 +2341,7 @@ impl GenerationBackend for MlxVlmBackend {
         if task != InferenceTask::ImageUnderstanding {
             return None;
         }
+        let mut installable = false;
         let readiness = if !manifest.supports_task(task) {
             Err(anyhow!(
                 "model '{}' does not advertise image-understanding",
@@ -2330,7 +2361,13 @@ impl GenerationBackend for MlxVlmBackend {
                 manifest.architecture.as_deref().unwrap_or("unknown")
             ))
         } else {
-            Self::probe().map(|_| ())
+            let result = Self::probe_for_store(&self.store).map(|_| ());
+            installable = result.is_err()
+                && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && env::var_os("WERK_MLX_VLM_PYTHON").is_none()
+                && env::var_os("WERK_MLX_VLM_GENERATE").is_none()
+                && env::var_os("WERK_MLX_VLM_MODULE").is_none();
+            result
         };
         Some(match readiness {
             Ok(()) => TaskReadiness {
@@ -2344,11 +2381,11 @@ impl GenerationBackend for MlxVlmBackend {
                 missing_dependency_groups: Vec::new(),
             },
             Err(error) => TaskReadiness {
-                status: TaskReadinessStatus::Unavailable,
+                status: if installable { TaskReadinessStatus::Installable } else { TaskReadinessStatus::Unavailable },
                 detail: error.to_string(),
                 adapter: Some("mlx-vlm".to_string()),
                 required_backend: Some("mlx-vlm".to_string()),
-                install_command: None,
+                install_command: installable.then(|| "werk backend install mlx-vlm".to_string()),
                 fallback_backend: None,
                 missing_dependencies: Vec::new(),
                 missing_dependency_groups: Vec::new(),
@@ -3061,23 +3098,6 @@ fn format_float(value: f64) -> String {
     text
 }
 
-fn backend_program(env_name: &str, default_name: &str) -> PathBuf {
-    if let Ok(path) = env::var(env_name)
-        && !path.trim().is_empty()
-    {
-        return PathBuf::from(path);
-    }
-    if let Ok(current_exe) = env::current_exe()
-        && let Some(dir) = current_exe.parent()
-    {
-        let sibling = dir.join(default_name);
-        if sibling.is_file() {
-            return sibling;
-        }
-    }
-    PathBuf::from(default_name)
-}
-
 fn sibling_program(program: &Path, sibling_name: &str) -> Option<PathBuf> {
     program
         .parent()
@@ -3131,14 +3151,6 @@ fn mlx_vlm_generate_program() -> &'static str {
 fn format_error_chain(err: &anyhow::Error) -> String {
     let messages = err.chain().map(ToString::to_string).collect::<Vec<_>>();
     messages.join(": ")
-}
-
-fn default_python() -> &'static str {
-    if cfg!(windows) {
-        "python.exe"
-    } else {
-        "python3"
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

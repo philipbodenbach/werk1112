@@ -88,6 +88,7 @@ pub fn require_qwen_tts_python(store: &crate::model_store::ModelStore) -> Result
 /// media companion. FlashAttention remains an optional, separately managed
 /// optimization and is intentionally not installed here.
 pub fn install_managed_qwen_tts(store: &crate::model_store::ModelStore) -> Result<PathBuf> {
+    super::python_install::ensure_install_platform("qwen-tts")?;
     let root = managed_qwen_tts_dir(store);
     let venv = root.join("venv");
     let venv_python = virtualenv_python(&venv);

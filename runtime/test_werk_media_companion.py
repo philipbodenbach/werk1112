@@ -2802,7 +2802,7 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
         self.assertEqual(result["readiness"]["missing_dependencies"], [])
         self.assertEqual(result["readiness"]["missing_dependency_groups"], [])
 
-    def test_generic_missing_dependencies_are_unavailable_not_installable(self):
+    def test_generic_missing_dependencies_offer_managed_media_install(self):
         with tempfile.TemporaryDirectory() as directory:
             model = Path(directory)
             (model / "config.json").write_text(
@@ -2816,10 +2816,10 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
             )
             dependencies = self.dependencies(qwen_tts=False)
             dependencies["transformers"]["available"] = False
-            with mock.patch.object(
-                COMPANION,
-                "dependency_snapshot",
-                return_value=dependencies,
+            with (
+                mock.patch.object(COMPANION.sys, "platform", "linux"),
+                mock.patch.object(COMPANION.platform, "machine", return_value="x86_64"),
+                mock.patch.object(COMPANION, "dependency_snapshot", return_value=dependencies),
             ):
                 result = COMPANION.command_probe_model(
                     {"model_path": str(model), "task": "text_to_speech"}
@@ -2827,15 +2827,41 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
 
         self.assertFalse(result["supported"])
         self.assertEqual(result["adapter"], "transformers_tts")
-        self.assertEqual(result["readiness"]["status"], "unavailable")
+        self.assertEqual(result["readiness"]["status"], "installable")
         self.assertEqual(
             result["readiness"]["missing_dependencies"],
             ["transformers"],
         )
-        self.assertIsNone(result["readiness"]["required_backend"])
-        self.assertIsNone(result["readiness"]["install_command"])
+        self.assertEqual(result["readiness"]["required_backend"], "media")
+        self.assertEqual(result["readiness"]["install_command"], "werk backend install media")
         self.assertIsNone(result["readiness"]["fallback_backend"])
         self.assertEqual(result["readiness"]["missing_dependency_groups"], [])
+
+    def test_media_install_hint_requires_supported_host_and_recognized_adapter(self):
+        dependencies = self.dependencies(qwen_tts=False)
+        dependencies["transformers"]["available"] = False
+        for os_name, machine, recognized, adapter, expected in [
+            ("linux", "x86_64", True, "transformers_tts", "installable"),
+            ("win32", "AMD64", True, "transformers_tts", "installable"),
+            ("darwin", "arm64", True, "transformers_tts", "installable"),
+            ("darwin", "x86_64", True, "transformers_tts", "unavailable"),
+            ("linux", "x86_64", False, "transformers_tts", "unavailable"),
+            ("linux", "x86_64", True, None, "unavailable"),
+        ]:
+            with (
+                self.subTest(os=os_name, machine=machine, recognized=recognized, adapter=adapter),
+                mock.patch.object(COMPANION.sys, "platform", os_name),
+                mock.patch.object(COMPANION.platform, "machine", return_value=machine),
+            ):
+                result = COMPANION.model_probe_readiness(
+                    "text_to_speech", False, adapter, "missing Transformers", None,
+                    dependencies, recognized=recognized,
+                )
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(
+                    result["install_command"],
+                    "werk backend install media" if expected == "installable" else None,
+                )
 
     def test_generic_alternative_dependencies_preserve_any_of_semantics(self):
         dependencies = self.dependencies(qwen_tts=False)
@@ -2893,10 +2919,10 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
             dependencies = self.dependencies(qwen_tts=False)
             dependencies["diffusers"]["available"] = True
             dependencies["transformers"]["available"] = False
-            with mock.patch.object(
-                COMPANION,
-                "dependency_snapshot",
-                return_value=dependencies,
+            with (
+                mock.patch.object(COMPANION.sys, "platform", "linux"),
+                mock.patch.object(COMPANION.platform, "machine", return_value="x86_64"),
+                mock.patch.object(COMPANION, "dependency_snapshot", return_value=dependencies),
             ):
                 result = COMPANION.command_probe_model(
                     {"model_path": str(model), "task": "music_generation"}
@@ -2904,7 +2930,7 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
 
         self.assertEqual(result["adapter"], "transformers_audio")
         self.assertFalse(result["supported"])
-        self.assertEqual(result["readiness"]["status"], "unavailable")
+        self.assertEqual(result["readiness"]["status"], "installable")
         self.assertEqual(
             result["readiness"]["missing_dependencies"],
             ["transformers"],

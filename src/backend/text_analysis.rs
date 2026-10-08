@@ -17,6 +17,7 @@ use std::{
 };
 
 pub fn install(store: &ModelStore) -> Result<PathBuf> {
+    super::python_install::ensure_install_platform("text-analysis")?;
     use std::process::Command;
     let root = store.home().join("backends/text-analysis");
     std::fs::create_dir_all(&root)?;
