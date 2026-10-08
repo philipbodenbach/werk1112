@@ -21,6 +21,10 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Headless telemetry, protocol and responsive TUI tests
         run: cargo test-observability
+      - name: Operational logging, file locking and rotation tests
+        env:
+          RUST_MIN_STACK: "16777216"
+        run: cargo test --locked --lib logging
       - name: Validate Grafana and Prometheus assets
         run: python utils/observability/validate.py
       - name: Build the normal CLI

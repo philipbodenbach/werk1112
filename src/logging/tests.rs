@@ -65,7 +65,16 @@ fn rotation_retains_complete_records_appends_and_excludes_second_writer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.jsonl");
     let mut file = RotatingFile::open(path.clone(), 12, 2).unwrap();
-    assert!(RotatingFile::open(path.clone(), 12, 2).is_err());
+    let error = RotatingFile::open(path.clone(), 12, 2).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("already used by another Werk process")
+    );
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+        fs2::lock_contended_error().raw_os_error()
+    );
     for i in 0..4 {
         file.write(format!("{{\"n\":{i}}}\n").as_bytes()).unwrap();
     }
@@ -90,6 +99,14 @@ fn rotation_retains_complete_records_appends_and_excludes_second_writer() {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(RotatingFile::sibling(&path, "lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
     }

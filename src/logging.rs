@@ -480,15 +480,18 @@ struct RotatingFile {
     max: u64,
     keep: u16,
 }
-fn private_file(path: &std::path::Path) -> io::Result<File> {
+fn private_file_options() -> OpenOptions {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)
+    options
+}
+fn private_file(path: &std::path::Path) -> io::Result<File> {
+    private_file_options().append(true).open(path)
 }
 impl RotatingFile {
     fn sibling(path: &std::path::Path, suffix: impl std::fmt::Display) -> PathBuf {
@@ -500,11 +503,22 @@ impl RotatingFile {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        let lock =
-            private_file(&Self::sibling(&path, "lock")).context("cannot open log lock file")?;
-        fs2::FileExt::try_lock_exclusive(&lock).context(
-            "log file is already used by another Werk process; choose a different --log-file",
-        )?;
+        // Windows LockFileEx needs GENERIC_READ or GENERIC_WRITE; an append-only
+        // handle has neither. Keep the sidecar intact, including when reopening.
+        let lock = private_file_options()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(Self::sibling(&path, "lock"))
+            .context("cannot open log lock file")?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|error| {
+            let contended = error.raw_os_error() == fs2::lock_contended_error().raw_os_error();
+            anyhow::Error::new(error).context(if contended {
+                "log file is already used by another Werk process; choose a different --log-file"
+            } else {
+                "cannot lock log file; check filesystem permissions and file-lock support"
+            })
+        })?;
         let file = private_file(&path)
             .with_context(|| format!("cannot open log file {}", path.display()))?;
         let bytes = file.metadata()?.len();
