@@ -104,14 +104,16 @@ werk doctor --model MODEL --task TASK
 The detailed support levels and known gaps are documented rather than hidden
 behind an “all models supported” claim.
 
-## What’s new in v1.7.1
+## What’s new in v1.8.0
 
-Werk Core, Media Companion, ComfyUI and n8n share release version **1.7.1**.
+Werk Core, Media Companion, ComfyUI and n8n share release version **1.8.0**.
 ComfyUI and n8n remain Beta integrations.
 
-- fix(): install + uninstall fix (`31825f4034ee`)
+- feat(): update text-\* support and quality of life features werk top and appearance (`25b94ef774df`)
+- feat(): update text-\* support and quality of life features werk top and appearance (`f128e968eef0`)
+- feat(): update text-\* support and quality of life features werk top and appearance (`2ed3a39bf7b1`)
 
-See the [v1.7.1 changelog](CHANGELOG.md#171---2026-10-07) for all changes and compatibility notes.
+See the [v1.8.0 changelog](CHANGELOG.md#180---2026-10-08) for all changes and compatibility notes.
 
 ## Install
 
