@@ -5,7 +5,6 @@ on:
       - ".github/workflows/release.yml"
       - ".github/workflows/release-checks.yml"
       - "scripts/prepare-release.py"
-      - "scripts/wait-release-checks.py"
       - "scripts/tests/test*release*.py"
   workflow_dispatch:
 permissions:
