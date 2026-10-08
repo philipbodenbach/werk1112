@@ -77,6 +77,26 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
             post(super::anthropic::messages_handler).layer(DefaultBodyLimit::max(body_limit_bytes)),
         )
         .route("/v1/models", get(models_handler))
+        .route(
+            "/v1/embeddings",
+            post(super::text_analysis::embeddings).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/v1/rerank",
+            post(super::text_analysis::rerank).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/rerank",
+            post(super::text_analysis::rerank).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/v1/classifications",
+            post(super::text_analysis::classify).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/v1/systemone",
+            post(super::text_analysis::classify).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route("/werk/v1/deployments", get(super::deployments::diagnostics))
         .route("/v1/models/{id}", get(model_handler))
         .route(
@@ -130,11 +150,12 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
         .merge(werk::routes())
         .with_state(state);
 
-    if cors_origins.is_empty() {
+    let router = if cors_origins.is_empty() {
         router
     } else {
         router.layer(browser_cors_layer(cors_origins))
-    }
+    };
+    router.layer(axum::middleware::from_fn(super::logging::access))
 }
 
 fn configured_api_body_limit_bytes() -> usize {
@@ -175,6 +196,7 @@ fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
         ])
         .expose_headers([
             HeaderName::from_static("request-id"),
+            HeaderName::from_static("x-request-id"),
             HeaderName::from_static("x-werk-output-id"),
             HeaderName::from_static("x-werk-request-id"),
             HeaderName::from_static(PROTOCOL_VERSION_HEADER),
@@ -189,12 +211,40 @@ pub async fn serve(addr: SocketAddr, state: ApiState) -> anyhow::Result<()> {
 /// Serve on a listener reserved before potentially expensive model preparation.
 pub async fn serve_with_listener(listener: TcpListener, state: ApiState) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
-    println!("Server running at http://{addr}");
-    if state.api_key_auth_enabled() {
-        println!(
+    crate::logging::emit(
+        crate::logging::Level::Info,
+        "server.started",
+        &format!("Werk server listening at http://{addr}"),
+        serde_json::json!({"address":addr.to_string(),"authentication":state.api_key_auth_enabled(),"model":state.default_model}),
+    );
+    let console = crate::terminal::interactive(crate::terminal::Stream::Out);
+    if console {
+        crate::terminal::panel(
+            crate::terminal::Stream::Out,
+            "Server ready",
+            &format!(
+                "LISTENING\nhttp://{addr}\n\nDefault model: {}\nAuthentication: {}\n\nAPI\nOpenAI: /v1 · Anthropic: /v1/messages · Werk: /werk/v1\n\nMONITOR\nwerk top --url http://{addr}\n\nCtrl+C stops the server. Requests appear below.",
+                state
+                    .default_model
+                    .as_deref()
+                    .unwrap_or("select a model per request"),
+                if state.api_key_auth_enabled() {
+                    "enabled · Bearer / X-API-Key"
+                } else {
+                    "disabled"
+                }
+            ),
+        );
+        crate::terminal::heading(crate::terminal::Stream::Out, "Requests");
+    } else {
+        crate::ui_println!("Server running at http://{addr}");
+    }
+    if !console && state.api_key_auth_enabled() {
+        crate::ui_println!(
             "API key auth enabled; use Authorization: Bearer <key> or X-API-Key: <key> (A1111 clients may use Basic werk:<key>)"
         );
     }
-    axum::serve(listener, router(state)).await?;
+    let app = router(state);
+    axum::serve(listener, app).await?;
     Ok(())
 }

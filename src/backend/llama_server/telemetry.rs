@@ -202,7 +202,7 @@ mod observability_tests {
         b.available = parse_slots(&mut b, &fetch_slots(&client, &url).unwrap());
         assert!(b.available);
         assert!(b.gauges["context_capacity_tokens"] > 0.);
-        eprintln!(
+        crate::ui_eprintln!(
             "live gauges: {:?}; rates: {:?}",
             b.gauges,
             crate::observability::Rates::between(&a, &b, start.elapsed().as_secs_f64())

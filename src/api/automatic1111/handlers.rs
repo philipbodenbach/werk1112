@@ -57,7 +57,7 @@ pub(in crate::api) async fn txt2img_handler(
         .lock_owned()
         .await;
     let service = Arc::clone(&state.inference_service);
-    match tokio::task::spawn_blocking(move || {
+    match crate::logging::spawn_blocking(move || {
         // Keep both guards in the worker so a disconnected HTTP client does
         // not make an ongoing generation look idle or bypass serialization.
         let _generation_lock = generation_lock;

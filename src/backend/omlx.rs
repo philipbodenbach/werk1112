@@ -1921,11 +1921,11 @@ impl OmlxProcess {
             }
             process.expert_offload = !native_experts;
             if native_experts {
-                eprintln!(
+                crate::ui_eprintln!(
                     "oMLX experts: native resident execution (auto; weights fit available memory)"
                 );
             } else {
-                eprintln!(
+                crate::ui_eprintln!(
                     "oMLX expert cache: {} MiB ({}) upper budget; SSD offload active, native memory guard may reduce residency",
                     actual.unwrap_or_default() / (1024 * 1024),
                     if requested_bytes == 0 {
@@ -1961,7 +1961,7 @@ impl OmlxProcess {
                 }
             }
             if status.get("ngram_offload").and_then(Value::as_str) == Some("supported") {
-                eprintln!(
+                crate::ui_eprintln!(
                     "oMLX N-gram cache: {} MiB initial, {} MiB upper budget ({}); shares memory with the expert cache",
                     status
                         .get("ngram_initial_cache_bytes")
@@ -2002,14 +2002,14 @@ impl OmlxProcess {
             // Unsupported model cache trees keep this already loaded worker;
             // starting a fallback worker would duplicate its model weights.
             match active {
-                Ok(true) => eprintln!(
+                Ok(true) => crate::ui_eprintln!(
                     "oMLX native short-prefix cache active for {}; worker lifetime, SSD limit 4GB",
                     model_dir.display()
                 ),
-                Ok(false) => eprintln!(
+                Ok(false) => crate::ui_eprintln!(
                     "oMLX native short-prefix cache unavailable for this runtime/model; ordinary prefix caching remains active"
                 ),
-                Err(error) => eprintln!(
+                Err(error) => crate::ui_eprintln!(
                     "oMLX native short-prefix cache could not be verified ({error:#}); continuing with the loaded worker"
                 ),
             }

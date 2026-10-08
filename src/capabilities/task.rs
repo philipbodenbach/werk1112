@@ -5,6 +5,8 @@ string_enum! {
     pub enum InferenceTask {
         TextGeneration => "text-generation",
         TextEmbedding => "text-embedding",
+        TextReranking => "text-reranking",
+        TextClassification => "text-classification",
         ImageUnderstanding => "image-understanding",
         ImageGeneration => "image-generation",
         ImageEditing => "image-editing",
@@ -48,6 +50,8 @@ impl InferenceTask {
     pub const fn output_modality(self) -> OutputModality {
         match self {
             Self::TextGeneration
+            | Self::TextReranking
+            | Self::TextClassification
             | Self::ImageUnderstanding
             | Self::SpeechToText
             | Self::SpeechTranslation
@@ -91,6 +95,8 @@ impl InferenceTask {
         match self {
             Self::TextGeneration
             | Self::TextEmbedding
+            | Self::TextReranking
+            | Self::TextClassification
             | Self::ImageGeneration
             | Self::VideoGeneration
             | Self::AudioGeneration
@@ -195,7 +201,11 @@ impl InferenceTask {
 
     pub const fn parameter_namespace(self) -> &'static str {
         match self {
-            Self::TextGeneration | Self::TextEmbedding | Self::ImageUnderstanding => "text",
+            Self::TextGeneration
+            | Self::TextEmbedding
+            | Self::TextReranking
+            | Self::TextClassification
+            | Self::ImageUnderstanding => "text",
             Self::ImageGeneration
             | Self::ImageEditing
             | Self::ImageVariation

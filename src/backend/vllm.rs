@@ -783,7 +783,7 @@ impl VllmProcess {
         };
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
         if let VllmCommand::Remote { host, port } = command {
-            eprintln!("Using remote vLLM {} backend", accelerator.display_name());
+            crate::ui_eprintln!("Using remote vLLM {} backend", accelerator.display_name());
             let url = format!("http://{host}:{port}");
             let configured_model = configured_vllm_model()?;
             let timeout = configured_vllm_health_timeout(current_vllm_platform()).duration;
@@ -814,7 +814,7 @@ impl VllmProcess {
             return Ok(process);
         }
 
-        eprintln!("Using vLLM {} backend", accelerator.display_name());
+        crate::ui_eprintln!("Using vLLM {} backend", accelerator.display_name());
         validate_werk_managed_prefix_caching_arg(&command, &configured_args)?;
         let runtime_version = vllm_version(&command)
             .and_then(|version| sanitize_runtime_version(&version))
@@ -834,7 +834,10 @@ impl VllmProcess {
         if let Some(deployment) = deployment {
             deployment.plan.apply(&mut child_command);
         }
-        if env_true("WERK_VLLM_LOG") {
+        if env_true("WERK_VLLM_LOG")
+            && !crate::logging::enabled()
+            && !crate::terminal::interactive(crate::terminal::Stream::Err)
+        {
             child_command
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
@@ -852,7 +855,10 @@ impl VllmProcess {
             })?;
         let pid = {
             let mut process = child.lock().unwrap_or_else(|error| error.into_inner());
-            if !env_true("WERK_VLLM_LOG") {
+            if !env_true("WERK_VLLM_LOG")
+                || crate::logging::enabled()
+                || crate::terminal::interactive(crate::terminal::Stream::Err)
+            {
                 if let Some(stdout) = process.stdout.take() {
                     spawn_log_tail_reader("stdout", stdout, log_tail.clone());
                 }
@@ -1058,28 +1064,29 @@ impl VllmProcess {
         if !request.debug {
             return;
         }
-        eprintln!("selected backend: {}", self.accelerator.backend_label());
-        eprintln!("actual engine: vLLM OpenAI-compatible server");
-        eprintln!("vLLM executable: {}", self.command_label);
-        eprintln!("discovery source: {}", self.discovery_source);
+        crate::ui_eprintln!("selected backend: {}", self.accelerator.backend_label());
+        crate::ui_eprintln!("actual engine: vLLM OpenAI-compatible server");
+        crate::ui_eprintln!("vLLM executable: {}", self.command_label);
+        crate::ui_eprintln!("discovery source: {}", self.discovery_source);
         if self.args.is_empty() {
-            eprintln!("full vLLM args: <remote server>");
+            crate::ui_eprintln!("full vLLM args: <remote server>");
         } else {
-            eprintln!("full vLLM args: {}", shell_join(&self.args));
+            crate::ui_eprintln!("full vLLM args: {}", shell_join(&self.args));
         }
-        eprintln!("model path: {}", self.model_dir.display());
-        eprintln!(
+        crate::ui_eprintln!("model path: {}", self.model_dir.display());
+        crate::ui_eprintln!(
             "server PID: {}",
             self.pid
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "external".to_string())
         );
-        eprintln!("server URL: {}", self.url);
-        eprintln!(
+        crate::ui_eprintln!("server URL: {}", self.url);
+        crate::ui_eprintln!(
             "served model name: {} ({})",
-            self.model_name, self.model_name_source
+            self.model_name,
+            self.model_name_source
         );
-        eprintln!("reused existing server: {reused}");
+        crate::ui_eprintln!("reused existing server: {reused}");
         if self.is_nemotron {
             print_nemotron_reasoning_parser_guidance(&self.args);
         }
@@ -1391,13 +1398,13 @@ fn is_nemotron_architecture_name(architecture: &str) -> bool {
 
 fn print_nemotron_reasoning_parser_guidance(args: &[String]) {
     if args.is_empty() {
-        eprintln!(
+        crate::ui_eprintln!(
             "Nemotron reasoning parser: controlled by the remote vLLM server; configure the parser when starting its Spark/container runtime if the model card requires one"
         );
     } else if has_reasoning_parser_arg(args) {
-        eprintln!("Nemotron reasoning parser: configured through WERK_VLLM_ARGS");
+        crate::ui_eprintln!("Nemotron reasoning parser: configured through WERK_VLLM_ARGS");
     } else {
-        eprintln!(
+        crate::ui_eprintln!(
             "Nemotron reasoning parser: not configured; add `--reasoning-parser <parser>` to WERK_VLLM_ARGS only when required by the concrete model card"
         );
     }
@@ -1506,7 +1513,7 @@ pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
         bail!("{reason}");
     }
     if platform == VllmPlatform::Wsl {
-        eprintln!("{WSL_VLLM_MESSAGE}");
+        crate::ui_eprintln!("{WSL_VLLM_MESSAGE}");
     }
 
     let root = managed_vllm_dir(store);
@@ -1518,14 +1525,14 @@ pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
         anyhow!("no Python interpreter found; install python3 or set WERK_VLLM_PYTHON")
     })?;
     if !managed_vllm_python(store).is_file() {
-        eprintln!("Creating vLLM virtualenv at {}", venv.display());
+        crate::ui_eprintln!("Creating vLLM virtualenv at {}", venv.display());
         run_command(
             Command::new(&python).arg("-m").arg("venv").arg(&venv),
             "failed to create vLLM virtualenv",
         )?;
     }
     let venv_python = managed_vllm_python(store);
-    eprintln!("Installing vLLM into {}", venv.display());
+    crate::ui_eprintln!("Installing vLLM into {}", venv.display());
     run_command(
         Command::new(&venv_python)
             .arg("-m")
@@ -2842,7 +2849,7 @@ fn validate_vllm_args_target(
 }
 
 fn run_command(command: &mut Command, context: &str) -> Result<()> {
-    let status = command.status().with_context(|| context.to_string())?;
+    let status = crate::terminal::command_status(command).with_context(|| context.to_string())?;
     if !status.success() {
         bail!("{context}; command exited with {status}");
     }
@@ -2890,6 +2897,18 @@ where
     thread::spawn(move || {
         let reader = BufReader::new(reader);
         for line in reader.lines().map_while(Result::ok) {
+            if env_true("WERK_VLLM_LOG") && crate::logging::enabled() {
+                crate::logging::emit(
+                    crate::logging::Level::Debug,
+                    "backend.output",
+                    &line,
+                    serde_json::json!({"runtime":"vllm", "stream":label}),
+                );
+            } else if env_true("WERK_VLLM_LOG")
+                && crate::terminal::interactive(crate::terminal::Stream::Err)
+            {
+                crate::ui_eprintln!("[vLLM] {line}");
+            }
             if let Ok(mut tail) = tail.lock() {
                 if tail.len() >= 80 {
                     tail.pop_front();

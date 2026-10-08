@@ -144,7 +144,7 @@ pub(super) async fn prepare(
 
     let lookup_store = state.store.clone();
     let lookup_id = model_id.to_string();
-    let manifest = match tokio::task::spawn_blocking(move || lookup_store.get(&lookup_id))
+    let manifest = match crate::logging::spawn_blocking(move || lookup_store.get(&lookup_id))
         .await
         .map_err(|error| {
             GenerationError::new(
@@ -155,7 +155,7 @@ pub(super) async fn prepare(
         })? {
         Ok(manifest) => manifest,
         Err(err) => {
-            eprintln!("[werk serve] POST {endpoint} model={model_id} -> 404");
+            crate::ui_eprintln!("[werk serve] POST {endpoint} model={model_id} -> 404");
             return Err(GenerationError::new(
                 StatusCode::NOT_FOUND,
                 err.to_string(),
@@ -168,7 +168,14 @@ pub(super) async fn prepare(
         && !manifest.supports_task(InferenceTask::TextGeneration)
         && !manifest.supports_task(InferenceTask::ImageUnderstanding)
     {
-        let message = if manifest.supports_task(InferenceTask::ImageGeneration) {
+        let message = if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
+            format!(
+                "model '{}' performs {} and cannot generate chat responses; use {} instead",
+                manifest.id,
+                task,
+                crate::backend::text_analysis::endpoint(task)
+            )
+        } else if manifest.supports_task(InferenceTask::ImageGeneration) {
             format!(
                 "model '{}' is an image-generation model and cannot be used with {endpoint}; use /v1/images/generations instead",
                 manifest.id
@@ -253,7 +260,7 @@ pub(super) async fn prepare(
         0
     };
     if removed_messages > 0 {
-        eprintln!(
+        crate::ui_eprintln!(
             "[werk serve] chat context model={} removed_messages={} context_size={} max_tokens={}",
             manifest.id,
             removed_messages,
@@ -279,7 +286,7 @@ pub(super) async fn prepare(
         let options = options.clone();
         // Compatibility probing may invoke Python. Keep it off the async
         // executor, and never modify the process environment for a request.
-        match tokio::task::spawn_blocking(move || {
+        match crate::logging::spawn_blocking(move || {
             backend.with_chat_options(&selected_model, &options)
         })
         .await
@@ -305,7 +312,7 @@ pub(super) async fn prepare(
         let backend = state.backend.clone();
         let selected_model = manifest.clone();
         let has_images = !image_urls.is_empty();
-        tokio::task::spawn_blocking(move || {
+        crate::logging::spawn_blocking(move || {
             backend.supports_tool_calling(&selected_model, has_images)
         })
         .await
@@ -367,7 +374,7 @@ pub(super) async fn prepare(
         let prompt_state = state.clone();
         let prompt_manifest = manifest.clone();
         let has_images = !image_urls.is_empty();
-        tokio::task::spawn_blocking(move || {
+        crate::logging::spawn_blocking(move || {
             prompt_state.prompt_options(&prompt_manifest, has_images)
         })
         .await
@@ -376,7 +383,7 @@ pub(super) async fn prepare(
     } {
         Ok(options) => options,
         Err(err) => {
-            eprintln!(
+            crate::ui_eprintln!(
                 "[werk serve] POST {endpoint} model={} -> routing error: {err}",
                 manifest.id
             );
@@ -427,7 +434,7 @@ pub(super) async fn prepare(
         let options = request.extra.clone();
         // Auto routing may probe a runtime. Validate off the async executor,
         // before a streaming handler commits HTTP 200 and starts generation.
-        match tokio::task::spawn_blocking(move || {
+        match crate::logging::spawn_blocking(move || {
             backend.validate_api_options(&selected_model, &selected_request, &options)
         })
         .await
@@ -456,7 +463,7 @@ pub(super) async fn prepare(
         let selected_model = manifest.clone();
         let selected_request = generate_request.clone();
         let options = request.extra.clone();
-        let counted = tokio::task::spawn_blocking(move || {
+        let counted = crate::logging::spawn_blocking(move || {
             backend.count_api_tokens(&selected_model, selected_request, options)
         })
         .await
@@ -568,7 +575,7 @@ pub(super) async fn generate(
     explicit_runtime_options: bool,
 ) -> anyhow::Result<GenerateResponse> {
     let mut guard = state.telemetry.begin(&manifest.id);
-    tokio::task::spawn_blocking(move || {
+    crate::logging::spawn_blocking(move || {
         let session = match select_session(&state, &manifest, &request, explicit_runtime_options) {
             Ok(session) => session,
             Err(error) => {
@@ -599,7 +606,7 @@ pub(super) async fn generate_stream(
     let permit = state.deployment_permit.clone();
     let guard = state.telemetry.begin(&manifest.id);
     let state = state.clone();
-    let stream = tokio::task::spawn_blocking(move || -> GenerateStream {
+    let stream = crate::logging::spawn_blocking(move || -> GenerateStream {
         match select_session(&state, &manifest, &request, explicit_runtime_options) {
             Ok(Some(session)) => session.generate_stream(request),
             Ok(None) => state.backend.generate_stream(manifest, request),

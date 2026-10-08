@@ -41,6 +41,25 @@ pub struct RequestSnapshot {
     pub first_output_seconds: Option<f64>,
     pub decode_tokens_per_second: Option<f64>,
     pub prefill_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<AnalysisSnapshot>,
+}
+
+/// Scalar, content-free metadata for non-generative inference. A model weight
+/// cache hit is distinct from reuse of cached prompt tokens.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalysisSnapshot {
+    pub task: String,
+    pub runtime: Option<String>,
+    pub device: Option<String>,
+    pub dtype: Option<String>,
+    pub model_cache_hit: Option<bool>,
+    pub load_seconds: Option<f64>,
+    pub inference_seconds: Option<f64>,
+    pub worker_seconds: Option<f64>,
+    pub results: Option<u64>,
+    pub attempts: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -113,7 +132,17 @@ impl Telemetry {
         if r.active.len() < 128 {
             r.active.insert(id, entry.clone());
         }
+        drop(r);
+        let log_context = crate::logging::capture();
+        crate::logging::emit_in(
+            &log_context,
+            crate::logging::Level::Debug,
+            "inference.started",
+            "Inference accepted",
+            serde_json::json!({"inference_id":id,"model":entry.model}),
+        );
         RequestGuard {
+            log_context,
             telemetry: self.clone(),
             entry,
             start: Instant::now(),
@@ -166,6 +195,7 @@ struct RawTimings {
 }
 
 pub struct RequestGuard {
+    log_context: crate::logging::Context,
     telemetry: Arc<Telemetry>,
     entry: RequestSnapshot,
     start: Instant,
@@ -174,6 +204,82 @@ pub struct RequestGuard {
     raw_timings: RawTimings,
 }
 impl RequestGuard {
+    pub fn id(&self) -> u64 {
+        self.entry.id
+    }
+
+    pub fn analysis_begin(&mut self, task: &str) {
+        self.entry.analysis = Some(AnalysisSnapshot {
+            task: task.into(),
+            ..Default::default()
+        });
+        self.analysis_phase("preparing", None);
+    }
+
+    pub fn analysis_phase(&mut self, phase: &str, runtime: Option<(&str, &str)>) {
+        if self.finished {
+            return;
+        }
+        self.entry.state = phase.into();
+        crate::logging::emit_in(
+            &self.log_context,
+            crate::logging::Level::Debug,
+            "inference.phase",
+            &format!("Inference #{} · {phase}", self.entry.id),
+            serde_json::json!({"inference_id":self.entry.id,"model":self.entry.model,"phase":phase,"runtime":runtime.map(|v|v.0),"device":runtime.map(|v|v.1)}),
+        );
+        if let (Some(analysis), Some((runtime, device))) = (&mut self.entry.analysis, runtime) {
+            analysis.runtime = Some(runtime.chars().take(64).collect());
+            analysis.device = Some(device.chars().take(64).collect());
+            analysis.attempts += 1;
+        }
+        if let Some(entry) = self
+            .telemetry
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .get_mut(&self.entry.id)
+        {
+            *entry = self.entry.clone();
+        }
+    }
+
+    pub fn analysis_complete(&mut self, value: &serde_json::Value) {
+        if self.finished {
+            return;
+        }
+        let usage = &value["usage"];
+        self.entry.prompt_tokens = usage["input_tokens"]
+            .as_u64()
+            .or_else(|| usage["prompt_tokens"].as_u64())
+            .or_else(|| usage["total_tokens"].as_u64());
+        // Non-generative tasks have no output-token/decode measurements.
+        self.entry.output_tokens = None;
+        if let Some(analysis) = &mut self.entry.analysis {
+            let werk = &value["werk"];
+            let text = |key: &str| werk[key].as_str().map(|s| s.chars().take(64).collect());
+            let seconds = |key: &str| werk[key].as_f64().filter(|s| s.is_finite() && *s >= 0.0);
+            analysis.runtime = text("runtime").or(analysis.runtime.take());
+            analysis.device = text("device").or(analysis.device.take());
+            analysis.dtype = text("dtype");
+            analysis.model_cache_hit = werk["model_cache_hit"].as_bool();
+            analysis.load_seconds = seconds("load_seconds");
+            analysis.inference_seconds = seconds("inference_seconds");
+            analysis.worker_seconds = seconds("total_seconds");
+            analysis.results = value["results"]
+                .as_array()
+                .or_else(|| value["data"].as_array())
+                .map(|rows| rows.len() as u64)
+                .or_else(|| {
+                    value["answers"]
+                        .as_object()
+                        .map(|answers| answers.len() as u64)
+                });
+        }
+        self.finish("done");
+    }
+
     fn raw_metadata(&mut self, value: &serde_json::Value) {
         let usage = &value["usage"];
         let timings = &value["timings"];
@@ -313,11 +419,41 @@ impl RequestGuard {
             r.recent.pop_front();
         }
         r.recent.push_back(self.entry.clone());
+        drop(r);
+        crate::logging::emit_in(
+            &self.log_context,
+            match status {
+                "error" => crate::logging::Level::Error,
+                "cancelled" => crate::logging::Level::Warn,
+                _ => crate::logging::Level::Info,
+            },
+            match status {
+                "error" => "inference.failed",
+                "cancelled" => "inference.cancelled",
+                _ => "inference.completed",
+            },
+            &format!(
+                "Inference #{} {status} · {} · {:.2} s",
+                self.entry.id, self.entry.model, self.entry.elapsed_seconds
+            ),
+            serde_json::json!({
+                "inference_id":self.entry.id,"model":self.entry.model,"state":status,
+                "duration_seconds":self.entry.elapsed_seconds,"input_tokens":self.entry.prompt_tokens,
+                "output_tokens":self.entry.output_tokens,"cached_tokens":self.entry.cached_tokens,
+                "first_output_seconds":self.entry.first_output_seconds,
+                "decode_tokens_per_second":self.entry.decode_tokens_per_second,
+                "prefill_tokens_per_second":self.entry.prefill_tokens_per_second,"analysis":self.entry.analysis
+            }),
+        );
     }
 }
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.finish("cancelled");
+        self.finish(if std::thread::panicking() {
+            "error"
+        } else {
+            "cancelled"
+        });
     }
 }
 fn positive_rate(tokens: u64, seconds: f64) -> Option<f64> {
@@ -529,6 +665,101 @@ impl Rates {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn analysis_requests_share_accounting_without_fabricating_generation_metrics() {
+        let t = Arc::new(Telemetry::default());
+        for (task, result, usage) in [
+            (
+                "text-classification",
+                serde_json::json!({"answers":{"private-question":{"value":"private-answer"}}}),
+                serde_json::json!({"input_tokens":47}),
+            ),
+            (
+                "text-reranking",
+                serde_json::json!({"results":[{"text":"private-document"},{"text":"private-document"}]}),
+                serde_json::json!({"total_tokens":47}),
+            ),
+            (
+                "text-embedding",
+                serde_json::json!({"data":[{"embedding":[0.123]}]}),
+                serde_json::json!({"prompt_tokens":47}),
+            ),
+        ] {
+            let mut guard = t.begin(task);
+            guard.analysis_begin(task);
+            guard.analysis_phase("loading / inference", Some(("transformers", "cuda")));
+            let live = t.snapshot();
+            assert_eq!(live.totals.active, 1);
+            assert_eq!(live.requests[0].state, "loading / inference");
+            assert_eq!(live.requests[0].analysis.as_ref().unwrap().attempts, 1);
+            assert_eq!(
+                live.requests[0]
+                    .analysis
+                    .as_ref()
+                    .unwrap()
+                    .inference_seconds,
+                None
+            );
+            let mut response = result;
+            response["usage"] = usage;
+            response["werk"] = serde_json::json!({"runtime":"transformers","device":"cuda","dtype":"torch.bfloat16","model_cache_hit":true,"load_seconds":0.1,"inference_seconds":0.4,"total_seconds":0.5,"diagnostics":["private-diagnostic"]});
+            guard.analysis_complete(&response);
+            guard.analysis_complete(&response); // Completion is idempotent.
+            let snapshot = t.snapshot();
+            let request = &snapshot.requests[0];
+            assert_eq!(request.state, "done");
+            assert_eq!(request.prompt_tokens, Some(47));
+            assert!(request.output_tokens.is_none());
+            assert!(request.cached_tokens.is_none());
+            assert!(request.first_output_seconds.is_none());
+            assert!(request.decode_tokens_per_second.is_none());
+            assert!(request.prefill_tokens_per_second.is_none());
+            let analysis = request.analysis.as_ref().unwrap();
+            assert_eq!(
+                analysis.results,
+                Some(if task == "text-reranking" { 2 } else { 1 })
+            );
+            assert_eq!(analysis.inference_seconds, Some(0.4));
+            assert_eq!(analysis.model_cache_hit, Some(true));
+            assert!(
+                !serde_json::to_string(&snapshot)
+                    .unwrap()
+                    .contains("private-")
+            );
+        }
+        let snapshot = t.snapshot();
+        assert_eq!(snapshot.totals.active, 0);
+        assert_eq!(snapshot.totals.completed, 3);
+        assert_eq!(snapshot.totals.prompt_tokens, 141);
+        assert_eq!(snapshot.totals.output_tokens, 0);
+        assert_eq!(snapshot.totals.cached_tokens, 0);
+    }
+
+    #[test]
+    fn analysis_failure_cancellation_and_old_snapshots_keep_the_shared_contract() {
+        let t = Arc::new(Telemetry::default());
+        let mut guard = t.begin("fixture");
+        guard.analysis_begin("text-classification");
+        guard.error();
+        drop(guard);
+        let mut guard = t.begin("fixture");
+        guard.analysis_begin("text-embedding");
+        drop(guard);
+        let snapshot = t.snapshot();
+        assert_eq!(snapshot.totals.errors, 1);
+        assert_eq!(snapshot.totals.cancelled, 1);
+        assert_eq!(snapshot.totals.active, 0);
+        assert_eq!(snapshot.totals.completed, 0);
+        let mut legacy = serde_json::to_value(&snapshot.requests[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("analysis");
+        assert!(
+            serde_json::from_value::<RequestSnapshot>(legacy)
+                .unwrap()
+                .analysis
+                .is_none()
+        );
+    }
+
     #[test]
     fn raw_completion_preserves_backend_rates() {
         let t = Arc::new(Telemetry::default());

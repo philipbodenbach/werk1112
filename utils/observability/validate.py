@@ -14,6 +14,10 @@ for panel in dashboard["panels"]:
     for target in panel["targets"]:
         assert "werk_" in target["expr"] or 'job="werk"' in target["expr"]
 assert len(ids) >= 10
+expressions = {target['expr'] for panel in dashboard['panels'] for target in panel['targets']}
+for metric in ['decode_tokens_per_second', 'prefill_tokens_per_second', 'first_output_seconds',
+               'load_seconds', 'inference_seconds', 'worker_seconds', 'model_cache_hit', 'results']:
+    assert f'werk_last_request_{metric}' + '{job="werk"}' in expressions
 config = (root / "prometheus.yml").read_text()
 assert "metrics_path: /metrics" in config
 assert "credentials_file:" in config

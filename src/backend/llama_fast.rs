@@ -228,7 +228,7 @@ mod imp {
                     }
 
                     let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
-                    eprintln!(
+                    crate::ui_eprintln!(
                         "Loading model '{}' with llama.cpp legacy FFI {}",
                         manifest.id,
                         display_name(self.mode)
@@ -246,7 +246,7 @@ mod imp {
                     model._cache_release = cache_release;
                     drop(stderr_guard);
                     let load_seconds = started.elapsed().as_secs_f64();
-                    eprintln!(
+                    crate::ui_eprintln!(
                         "Loaded model '{}' with llama.cpp legacy FFI {} in {:.2}s",
                         manifest.id,
                         display_name(self.mode),

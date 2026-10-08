@@ -417,8 +417,8 @@ fn validate_required_inputs(request: &InferenceRequest) -> Result<()> {
                 "source audio",
             )?;
         }
-        TextGeneration | TextEmbedding | ImageGeneration | VideoGeneration | AudioGeneration
-        | MusicGeneration | TextToSpeech => {}
+        TextGeneration | TextEmbedding | TextReranking | TextClassification | ImageGeneration
+        | VideoGeneration | AudioGeneration | MusicGeneration | TextToSpeech => {}
     }
     Ok(())
 }

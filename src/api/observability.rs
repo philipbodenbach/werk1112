@@ -54,7 +54,7 @@ async fn collect(state: &ApiState) -> Snapshot {
             let backend = state.backend.clone();
             let deployments = state.deployments.clone();
             let Ok((_gate, mut backends, swap, host_free)) =
-                tokio::task::spawn_blocking(move || {
+                crate::logging::spawn_blocking(move || {
                     let mut system = sysinfo::System::new();
                     system.refresh_memory();
                     (

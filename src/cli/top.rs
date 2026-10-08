@@ -1,4 +1,5 @@
 //! Read-only terminal client. Rendering never waits for network I/O.
+mod fields;
 mod ui;
 use crate::observability::{Rates, Snapshot};
 use anyhow::{Context, Result, bail};
@@ -149,6 +150,7 @@ struct App {
     animation: bool,
     tick: u64,
     target: String,
+    fields: fields::Selection,
 }
 impl App {
     fn new(args: &TopArgs) -> Self {
@@ -172,6 +174,7 @@ impl App {
             animation: !args.no_animation,
             tick: 0,
             target: args.url.clone(),
+            fields: fields::Selection::default(),
         }
     }
     fn update(&mut self, snapshot: Snapshot) {
@@ -258,9 +261,9 @@ pub fn run(args: TopArgs) -> Result<()> {
     if args.once {
         let snapshot = Client::new(&args)?.snapshot()?;
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            std::println!("{}", serde_json::to_string_pretty(&snapshot)?);
         } else {
-            println!(
+            crate::ui_println!(
                 "WERK TOP  up {:.0}s  active {}  completed {}  errors {}\n{}",
                 snapshot.uptime_seconds,
                 snapshot.totals.active,
@@ -270,15 +273,24 @@ pub fn run(args: TopArgs) -> Result<()> {
                     .requests
                     .iter()
                     .take(12)
-                    .map(|r| format!(
-                        "{}  {}  {:.1}s  output {}",
+                    .map(|r| if let Some(a) = &r.analysis {
+                        format!("{}  {}  {}  {:.2}s  input {}  results {}  runtime {}  device {}  load {}  inference {}  model cache {}",
+                            clean(&r.model), clean(&a.task), clean(&r.state), r.elapsed_seconds,
+                            r.prompt_tokens.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into()),
+                            a.results.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into()),
+                            clean(a.runtime.as_deref().unwrap_or("pending")), clean(a.device.as_deref().unwrap_or("pending")),
+                            a.load_seconds.map(|n| format!("{n:.2}s")).unwrap_or_else(|| "pending".into()),
+                            a.inference_seconds.map(|n| format!("{n:.2}s")).unwrap_or_else(|| "pending".into()),
+                            match a.model_cache_hit { Some(true) => "hit", Some(false) => "miss", None => "pending" })
+                    } else { format!(
+                        "{}  {}  {:.2}s  output {}",
                         clean(&r.model),
                         r.state,
                         r.elapsed_seconds,
                         r.output_tokens
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| "n/a".into())
-                    ))
+                    ) })
                     .collect::<Vec<_>>()
                     .join("\n")
             );
@@ -338,10 +350,29 @@ pub fn run(args: TopArgs) -> Result<()> {
                     }
                 }
             }
+            let width = terminal.size()?.width.saturating_sub(2);
+            app.fields.viewport_width = (if app.fields.split == 1 && width >= 80 {
+                width / 2
+            } else {
+                width
+            })
+            .saturating_sub(2);
             terminal.draw(|frame| ui::draw(frame, &app))?;
             if event::poll(Duration::from_millis(if app.animation { 100 } else { 250 }))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                        _ if !(key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+                            && app.fields.handle(
+                                key.code,
+                                app.snapshot
+                                    .as_ref()
+                                    .and_then(|s| s.requests.get(app.selected))
+                                    .is_some_and(|r| r.analysis.is_some()),
+                            ) =>
+                        {
+                            app.details = false;
+                        }
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break;

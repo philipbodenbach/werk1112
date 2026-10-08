@@ -112,7 +112,7 @@ pub fn install_managed_qwen_tts(store: &crate::model_store::ModelStore) -> Resul
     validate_bootstrap_python(&bootstrap)?;
 
     if !venv_python.is_file() {
-        eprintln!("Creating Qwen-TTS virtualenv at {}", venv.display());
+        crate::ui_eprintln!("Creating Qwen-TTS virtualenv at {}", venv.display());
         run_command(
             Command::new(&bootstrap).arg("-m").arg("venv").arg(&venv),
             "failed to create the managed Qwen-TTS virtualenv",
@@ -127,7 +127,7 @@ pub fn install_managed_qwen_tts(store: &crate::model_store::ModelStore) -> Resul
         );
     }
 
-    eprintln!("Installing {QWEN_TTS_PACKAGE} into {}", venv.display());
+    crate::ui_eprintln!("Installing {QWEN_TTS_PACKAGE} into {}", venv.display());
     run_command(
         Command::new(&venv_python)
             .arg("-m")
@@ -344,7 +344,7 @@ fn validate_bootstrap_python(path: &Path) -> Result<()> {
 }
 
 fn run_command(command: &mut Command, context: &str) -> Result<()> {
-    let status = command.status().with_context(|| context.to_string())?;
+    let status = crate::terminal::command_status(command).with_context(|| context.to_string())?;
     if !status.success() {
         bail!("{context}; command exited with {status}");
     }

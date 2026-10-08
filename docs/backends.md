@@ -776,6 +776,7 @@ onnx-rocm
 onnx-cpu
 vllm
 qwen-tts
+text-analysis
 ~~~
 
 There is currently no <code>werk backend uninstall</code> command. See
@@ -1074,3 +1075,77 @@ target-owned state and never delete models or outputs.
 
 These gaps should remain visible in documentation and diagnostics until the
 implementation changes.
+
+## Resident text analysis: embeddings, reranking and classification
+
+Selection uses the local `config.json` architecture and task, never a repository
+name. Compatible fine-tunes and locally imported checkpoints use the same loaders.
+Old manifests are corrected on read, including nested pooling configs mistakenly
+selected as a model config. Encoder support does not imply chat generation.
+
+| Architecture / model class | Task | Preferred execution | Compatible fallback |
+| --- | --- | --- | --- |
+| `xlm-roberta` / `XLMRobertaForSequenceClassification`, one output label | `text-reranking` | CUDA Transformers SDPA; installed native-Linux vLLM pooling is considered first | Transformers eager; native Candle; CPU versions |
+| Same class with multiple output labels | `text-classification` | CUDA Transformers SDPA | Transformers eager; native Candle; CPU versions |
+| `embedding_gemma2` / `EmbeddingGemma2Model` | `text-embedding` | CUDA SentenceTransformers, BF16; compatible installed native-Linux vLLM pooling is considered first | Eager attention; CPU FP32 |
+| `laya` / decision checkpoint | `text-classification` | CUDA Laya with TileLang fused kernels and CUDA graphs when installed | Laya CUDA without TileLang; Laya CPU |
+
+Candle sequence classification is a separate adapter, not Candle chat generation.
+It uses FP32; CUDA requires a Werk build with `--features cuda`. Other architectures
+are rejected with an explicit recommendation. EmbeddingGemma uses BF16 on capable
+CUDA devices and otherwise FP32; it never uses FP16. This implementation exposes
+text embeddings only: image/audio encoders are disabled. Multimodal embedding
+inputs are not yet exposed by these endpoints.
+
+Install dependencies in a managed environment, then start the ordinary server:
+
+~~~bash
+werk backend install text-analysis
+werk serve --model ORGANIZATION/CHECKPOINT
+~~~
+
+Normal API-key rules apply. For a local unauthenticated test, add
+`--allow-unauthenticated`. The default model can be omitted and selected per request.
+The new binary is required; installing Python packages alone does not update Werk.
+
+`WERK_TEXT_PYTHON` overrides the managed Python; `WERK_TRANSFORMERS_PYTHON` is a
+secondary override. The managed environment is under
+`backends/text-analysis/venv`. The installer adds optional TileLang on Linux;
+installation failure leaves the PyTorch path usable. `WERK_TEXT_THREADS` controls
+PyTorch CPU threads (default at most eight). The separate vLLM environment installed
+by `werk backend install vllm`, or `WERK_VLLM_PYTHON`, is reused for pooling. Its
+version must actually implement the architecture; importability alone is not proof.
+On WSL, automatic selection uses PyTorch rather than vLLM; explicit vLLM remains
+available for operator-tested environments.
+
+`--backend cuda` and `--backend cpu` constrain devices. `--backend transformers`
+constrains the implementation family, and `--backend candle` selects native
+sequence classification. Unsupported combinations fail with a mitigation.
+Per-request `werk` options are documented in [the API reference](api.md#text-analysis-endpoints).
+Explicit devices never fall back to another device. `fallback_policy=none` prevents
+runtime retries. In auto mode, failures are logged and included in
+`werk.diagnostics`; successful fallback choices are reused for the same model and
+options, avoiding repeated initialization failures. Restart the server to retry a
+previously failed preferred route after changing dependencies or freeing memory.
+
+Workers keep exact model weights resident; Python workers and native Candle each
+have a bounded two-model cache. Idle entries can be evicted. Requests for one model
+are serialized, and the API admits at most two concurrent analysis requests;
+excess requests receive HTTP 429. Failed Python processes are reaped before
+fallback so GPU allocations do not survive in a discarded runtime. Model input
+batches are processed together; this is not cross-request dynamic batching.
+First loads and TileLang compilation can take significantly longer than warm
+inference. Inspect `werk.model_cache_hit`, `runtime`, `device`, `dtype` and timings.
+No backend is asserted to be universally fastest without workload-specific tests.
+
+To verify a running server with your own installed checkpoints, use the smoke
+test below. It checks ranking, finite normalized embeddings and decision outputs,
+then reports cold/warm HTTP timings and the actual runtime. It uses `WERK_API_KEY`
+when set; omit model arguments for tasks you do not want to exercise.
+
+~~~bash
+python3 scripts/smoke-text-analysis.py \
+  --reranker ORGANIZATION/RERANKER \
+  --embedder ORGANIZATION/EMBEDDER \
+  --decisions ORGANIZATION/DECISIONS --device cuda
+~~~

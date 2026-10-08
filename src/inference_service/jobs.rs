@@ -48,6 +48,19 @@ pub struct JobStore {
     mutation_lock: Arc<Mutex<()>>,
 }
 
+fn log_state(record: &JobRecord) {
+    crate::logging::emit(
+        match record.status {
+            JobStatus::Failed => crate::logging::Level::Error,
+            JobStatus::Cancelled => crate::logging::Level::Warn,
+            _ => crate::logging::Level::Info,
+        },
+        "job.state_changed",
+        &format!("Job {} · {:?}", record.id, record.status),
+        serde_json::json!({"job_id":record.id,"state":record.status}),
+    );
+}
+
 impl JobStore {
     pub fn new(home: &Path) -> Self {
         Self {
@@ -74,6 +87,7 @@ impl JobStore {
             updated_unix: now,
         };
         self.write(&record)?;
+        log_state(&record);
         Ok(record)
     }
 
@@ -133,6 +147,7 @@ impl JobStore {
         record.error = error;
         record.updated_unix = unix_ts();
         self.write(&record)?;
+        log_state(&record);
         Ok(record)
     }
 
@@ -157,6 +172,7 @@ impl JobStore {
         record.error = None;
         record.updated_unix = unix_ts();
         self.write(&record)?;
+        log_state(&record);
         Ok(record)
     }
 
@@ -206,7 +222,7 @@ impl JobManager {
     pub fn new(service: InferenceService) -> Self {
         let store = JobStore::new(service.store().home());
         if let Err(error) = store.recover_interrupted() {
-            eprintln!("warning: failed to recover persisted media jobs: {error:#}");
+            crate::ui_eprintln!("warning: failed to recover persisted media jobs: {error:#}");
         }
         Self { service, store }
     }
@@ -219,7 +235,7 @@ impl JobManager {
         let record = self.store.create(request)?;
         let job_id = record.id.clone();
         let manager = self.clone();
-        tokio::spawn(async move {
+        crate::logging::spawn(async move {
             let current = manager.store.get(&job_id);
             if current
                 .as_ref()
@@ -246,7 +262,7 @@ impl JobManager {
                 Ok(record) => record.request,
                 Err(_) => return,
             };
-            let result = tokio::task::spawn_blocking(move || service.execute(request)).await;
+            let result = crate::logging::spawn_blocking(move || service.execute(request)).await;
             let cancelled = manager
                 .store
                 .get(&job_id)

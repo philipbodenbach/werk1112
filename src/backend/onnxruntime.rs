@@ -535,48 +535,48 @@ impl OnnxRuntimeBackend {
                 && discover_onnx_genai_python().is_some()
             {
                 if options.verbose {
-                    eprintln!(
+                    crate::ui_eprintln!(
                         "Selected runtime: {} via Python onnxruntime-genai",
                         mode.display()
                     );
-                    eprintln!("Runtime status: ready");
+                    crate::ui_eprintln!("Runtime status: ready");
                 }
                 return Ok(());
             }
             bail!("{}", missing_message_from_discovery(mode, &discovery));
         }
         if options.verbose {
-            eprintln!("Selected runtime: {}", mode.display());
-            eprintln!("Runtime status: ready");
+            crate::ui_eprintln!("Selected runtime: {}", mode.display());
+            crate::ui_eprintln!("Runtime status: ready");
         }
         if manifest.format == ModelFormat::Onnx {
             if options.verbose {
-                eprintln!("Artifact: direct ONNX model");
-                eprintln!("Result: runtime ready");
+                crate::ui_eprintln!("Artifact: direct ONNX model");
+                crate::ui_eprintln!("Result: runtime ready");
             }
             return Ok(());
         }
         if store.ready_onnx_artifact(manifest).is_some() {
             if options.verbose {
-                eprintln!("Artifact: ready");
-                eprintln!("Result: runtime ready");
+                crate::ui_eprintln!("Artifact: ready");
+                crate::ui_eprintln!("Result: runtime ready");
             }
             return Ok(());
         }
         if options.verbose {
-            eprintln!("Artifact: building ONNX export");
+            crate::ui_eprintln!("Artifact: building ONNX export");
         }
         if let Err(err) = store
             .build_onnx_artifact(&manifest.id, false)
             .with_context(|| "ONNX artifact generation failed")
         {
             if options.verbose {
-                eprintln!("Result: artifact build failed: {err}");
+                crate::ui_eprintln!("Result: artifact build failed: {err}");
             }
             return Err(err);
         }
         if options.verbose {
-            eprintln!("Result: runtime ready");
+            crate::ui_eprintln!("Result: runtime ready");
         }
         Ok(())
     }
@@ -662,12 +662,12 @@ impl OnnxRuntimeBackend {
         model_path: &Path,
     ) -> Result<GenerateResponse> {
         if request.verbose {
-            eprintln!("Starting generation...");
+            crate::ui_eprintln!("Starting generation...");
         }
         if request.debug {
-            eprintln!("selected backend: {}", self.mode.label());
-            eprintln!("ONNX Runtime runner: {}", runner.display());
-            eprintln!("ONNX model: {}", model_path.display());
+            crate::ui_eprintln!("selected backend: {}", self.mode.label());
+            crate::ui_eprintln!("ONNX Runtime runner: {}", runner.display());
+            crate::ui_eprintln!("ONNX model: {}", model_path.display());
         }
         let started = Instant::now();
         // The child is reaped inside owned_runner_output before this guard can
@@ -756,15 +756,15 @@ impl OnnxRuntimeBackend {
         model_dir: &Path,
     ) -> Result<GenerateResponse> {
         if request.verbose {
-            eprintln!("Starting generation...");
+            crate::ui_eprintln!("Starting generation...");
         }
         if request.debug {
-            eprintln!(
+            crate::ui_eprintln!(
                 "selected backend: {} via Python onnxruntime-genai",
                 self.mode.label()
             );
-            eprintln!("Python: {}", python.display());
-            eprintln!("ONNX GenAI model: {}", model_dir.display());
+            crate::ui_eprintln!("Python: {}", python.display());
+            crate::ui_eprintln!("ONNX GenAI model: {}", model_dir.display());
         }
         let client = self.python_genai_client(python, manifest)?;
         self.generate_with_python_genai_client(manifest, request, total_started, model_dir, &client)
@@ -947,7 +947,7 @@ impl GenerationBackend for OnnxRuntimeBackend {
     }
 
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
-        eprintln!("Using {} backend", self.mode.display());
+        crate::ui_eprintln!("Using {} backend", self.mode.display());
         Self::ensure_available_for_model(&self.store, manifest, self.mode)
     }
 
@@ -1439,7 +1439,7 @@ fn onnx_cache_paths_or_empty(
     match onnx_cache_paths(store, manifest, selected) {
         Ok(paths) => paths,
         Err(error) => {
-            eprintln!("[werk] ONNX model file cache release unavailable: {error:#}");
+            crate::ui_eprintln!("[werk] ONNX model file cache release unavailable: {error:#}");
             Vec::new()
         }
     }

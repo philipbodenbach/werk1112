@@ -87,7 +87,7 @@ impl CacheReleaseGuard {
         let paths = match gguf_paths(model_path, projector_path) {
             Ok(paths) => paths,
             Err(error) => {
-                eprintln!("[werk] model file cache release unavailable: {error:#}");
+                crate::ui_eprintln!("[werk] model file cache release unavailable: {error:#}");
                 return None;
             }
         };
@@ -123,7 +123,7 @@ impl CacheReleaseGuard {
         ) {
             Some(release) => release,
             None => {
-                eprintln!(
+                crate::ui_eprintln!(
                     "[werk] invalid WERK_MODEL_CACHE_RELEASE; expected auto, off or on; release disabled"
                 );
                 false
@@ -134,7 +134,7 @@ impl CacheReleaseGuard {
         let leases = match open_leases(&paths, require_gguf, LEASE_WAIT) {
             Ok(leases) => leases,
             Err(error) => {
-                eprintln!(
+                crate::ui_eprintln!(
                     "[werk] model file cache lease unavailable; scoped release skipped: {error:#}"
                 );
                 return None;
@@ -163,7 +163,7 @@ impl CacheReleaseGuard {
             drop(retained);
             if release {
                 let result = release_leases(&leases);
-                eprintln!(
+                crate::ui_eprintln!(
                     "[werk] model file cache release requested: {:.2} GiB across {} file(s); {} shared, {} changed, {} failed (advisory)",
                     result.requested_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                     result.advised_files,

@@ -212,8 +212,12 @@ pub(in crate::api) async fn capabilities_handler(
     }
     let service = state.inference_service.clone();
     let generation_backend = state.backend.clone();
-    match tokio::task::spawn_blocking(move || {
-        service.capabilities_with_generation_backend(generation_backend.as_ref())
+    match crate::logging::spawn_blocking(move || {
+        service.capabilities_with_text_policy(
+            generation_backend.as_ref(),
+            &state.text_backend,
+            &state.text_policy,
+        )
     })
     .await
     {
@@ -292,7 +296,8 @@ pub(in crate::api) async fn parameters_handler(
     let (mut runtimes, task_readiness) = if let Some(manifest) = manifest.as_ref() {
         let service = state.inference_service.clone();
         let manifest = manifest.clone();
-        match tokio::task::spawn_blocking(move || service.parameter_probe(&manifest, task)).await {
+        match crate::logging::spawn_blocking(move || service.parameter_probe(&manifest, task)).await
+        {
             Ok(Ok(probe)) => (probe.candidates, probe.readiness),
             Ok(Err(error)) => {
                 return api_error(StatusCode::BAD_REQUEST, error.to_string(), None);
