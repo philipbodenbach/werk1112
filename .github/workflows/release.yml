@@ -22,6 +22,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: read
+  checks: read
+  statuses: read
 
 concurrency:
   group: werk-product-release
@@ -30,7 +33,7 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 55
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -42,6 +45,16 @@ jobs:
         run: |
           if [[ "$SELECTED_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
             echo "::error::Run this workflow on the default branch: $DEFAULT_BRANCH"
+            exit 1
+          fi
+
+      - name: Require Release App configuration
+        env:
+          APP_ID: ${{ vars.RELEASE_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$APP_ID" || -z "$APP_PRIVATE_KEY" ]]; then
+            echo "::error::Configure RELEASE_APP_ID (Actions variable) and RELEASE_APP_PRIVATE_KEY (Actions secret) first. See docs/development/packaging-releases.md#release-app-setup. No PR, tag or release has been created."
             exit 1
           fi
 
@@ -58,7 +71,7 @@ jobs:
           python-version: "3.12"
 
       - name: Test release preparation
-        run: python -m unittest discover -s scripts/tests -p 'test_prepare_release.py'
+        run: python -m unittest discover -s scripts/tests -p 'test*release*.py'
 
       - name: Prepare versions, README, documentation and release notes
         id: prepare
@@ -66,8 +79,21 @@ jobs:
           BUMP: ${{ inputs.bump }}
         run: python scripts/prepare-release.py "$BUMP" --notes-file "$RUNNER_TEMP/release-notes.md"
 
-      - name: Create and merge the release preparation PR
+      # Only PR creation needs the App token. Git pushes, merges and tags keep
+      # GITHUB_TOKEN so they do not start duplicate push CI or registry publishing.
+      - name: Create repository-scoped Release App token
+        id: release-app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+
+      - name: Create the release preparation PR
+        id: release-pr
         env:
+          GH_TOKEN: ${{ steps.release-app.outputs.token }}
           RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
         run: |
           git config user.name 'github-actions[bot]'
@@ -102,18 +128,63 @@ jobs:
               pr=$(gh pr create --head "$branch" --base "$DEFAULT_BRANCH" \
                 --title "release(): $RELEASE_TAG" --body-file "$RUNNER_TEMP/release-pr.md")
             fi
-            # Do not silently incorporate commits merged during release preparation.
-            remote_head=$(git ls-remote --heads origin "refs/heads/$DEFAULT_BRANCH")
-            if [[ "${remote_head%%[[:space:]]*}" != "$base_sha" ]]; then
-              echo "::error::Default branch advanced. Restart Release from the latest branch."
-              exit 1
-            fi
-            gh pr merge "$pr" --merge --match-head-commit "$release_sha"
-            merged_sha=$(gh pr view "$pr" --json mergeCommit --jq '.mergeCommit.oid')
-            test -n "$merged_sha" && test "$merged_sha" != null
-            git fetch origin "$DEFAULT_BRANCH"
-            git checkout --detach "$merged_sha"
+            pr=$(gh pr view "$pr" --json number --jq '.number')
+            {
+              echo "number=$pr"
+              echo "head=$release_sha"
+              echo "base=$base_sha"
+            } >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Wait for release PR validation
+        if: steps.release-pr.outputs.number != ''
+        env:
+          RELEASE_PR: ${{ steps.release-pr.outputs.number }}
+          RELEASE_SHA: ${{ steps.release-pr.outputs.head }}
+        run: python scripts/wait-release-checks.py "$RELEASE_PR" "$RELEASE_SHA"
+
+      - name: Merge the validated release PR
+        if: steps.release-pr.outputs.number != ''
+        env:
+          RELEASE_PR: ${{ steps.release-pr.outputs.number }}
+          RELEASE_SHA: ${{ steps.release-pr.outputs.head }}
+          BASE_SHA: ${{ steps.release-pr.outputs.base }}
+        run: |
+          # Reject a changed base after waiting for CI; never use --admin.
+          remote_head=$(git ls-remote --heads origin "refs/heads/$DEFAULT_BRANCH")
+          if [[ "${remote_head%%[[:space:]]*}" != "$BASE_SHA" ]]; then
+            echo "::error::Default branch advanced during validation. Restart Release from the latest branch."
+            exit 1
+          fi
+          gh pr merge "$RELEASE_PR" --merge --match-head-commit "$RELEASE_SHA"
+          merged_sha=$(gh pr view "$RELEASE_PR" --json mergeCommit --jq '.mergeCommit.oid')
+          test -n "$merged_sha" && test "$merged_sha" != null
+          git fetch origin "$DEFAULT_BRANCH"
+          git checkout --detach "$merged_sha"
+          # Catch a base update racing the merge request before tagging anything.
+          test "$(git rev-parse HEAD^1)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD^2)" = "$RELEASE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse "$RELEASE_SHA^{tree}")"
+
+      - name: Validate a previously prepared release on retry
+        if: steps.release-pr.outputs.number == ''
+        env:
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+        run: |
+          # Reusing an existing tag does not create or modify a release commit.
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            exit 0
+          fi
+          prepared_sha=$(git rev-parse HEAD)
+          pr=$(gh api "repos/$GH_REPO/commits/$prepared_sha/pulls" --paginate \
+            --jq '.[] | select(.merged_at != null) | @json' \
+            | jq -rs --arg sha "$prepared_sha" --arg base "$DEFAULT_BRANCH" \
+              '[.[] | select(.merge_commit_sha == $sha and .base.ref == $base)][0]')
+          if [[ "$pr" == null ]]; then
+            echo "::error::Untagged prepared version has no merged preparation PR. Prepare it through a PR and pass release validation first."
+            exit 1
+          fi
+          python scripts/wait-release-checks.py "$(jq -r .number <<< "$pr")" "$(jq -r .head.sha <<< "$pr")"
 
       - name: Validate and tag the merged release
         env:
