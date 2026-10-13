@@ -915,6 +915,21 @@ impl OnnxRuntimeBackend {
 }
 
 impl GenerationBackend for OnnxRuntimeBackend {
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<super::PreloadHandle> {
+        let descriptor = self.runtime_control_adapter_for(manifest)?.descriptor();
+        anyhow::ensure!(
+            descriptor.capabilities.iter().any(|c| c.id
+                == crate::runtime_control::MODEL_RESIDENCY_CAPABILITY
+                && c.status == crate::werk_protocol::CapabilityStatus::Supported),
+            "the selected ONNX route does not support resident model preloading"
+        );
+        super::preload_resident(self, manifest, request)
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         true
     }

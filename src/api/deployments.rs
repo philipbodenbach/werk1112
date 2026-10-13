@@ -66,6 +66,31 @@ impl Registry {
     pub fn contains(&self, alias: &str) -> bool {
         self.instances.contains_key(alias) || self.aliases.contains_key(alias)
     }
+    /// Expand every replica without consuming request permits or changing the
+    /// routing cursor. Loading only one replica would leave alias traffic cold.
+    pub fn preload_targets(&self, alias: &str) -> Result<Vec<(String, ApiState, String)>> {
+        let ids = self
+            .aliases
+            .get(alias)
+            .cloned()
+            .or_else(|| {
+                self.instances
+                    .contains_key(alias)
+                    .then(|| vec![alias.into()])
+            })
+            .ok_or_else(|| anyhow::anyhow!("unknown deployment alias or ID {alias}"))?;
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                let instance = &self.instances[&id];
+                (
+                    id,
+                    instance.state.clone(),
+                    instance.plan.profile.model.clone(),
+                )
+            })
+            .collect())
+    }
     pub fn models(&self) -> Vec<(String, String)> {
         self.aliases
             .iter()
@@ -252,6 +277,29 @@ mod tests {
         .unwrap();
         (dir, registry)
     }
+    #[test]
+    fn preload_expands_aliases_without_affecting_request_admission() {
+        let (_dir, registry) = registry();
+        let targets = registry.preload_targets("chat").unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["worker-a", "worker-b"]
+        );
+        assert!(
+            targets
+                .iter()
+                .all(|(_, state, _)| state.deployment_permit.is_none())
+        );
+        assert_eq!(registry.preload_targets("worker-b").unwrap().len(), 1);
+        assert!(registry.preload_targets("missing").is_err());
+        let (a, _) = registry.select("chat", &HeaderMap::new()).unwrap();
+        let (b, _) = registry.select("chat", &HeaderMap::new()).unwrap();
+        assert!(!Arc::ptr_eq(&a.backend, &b.backend));
+    }
+
     #[test]
     fn sessions_stay_on_the_same_replica_and_do_not_spill_when_busy() {
         let (_dir, registry) = registry();

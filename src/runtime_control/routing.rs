@@ -638,6 +638,14 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
         Ok(())
     }
 
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> anyhow::Result<crate::backend::PreloadHandle> {
+        self.backend.preload(manifest, request)
+    }
+
     fn start_chat_session(
         &self,
         manifest: &ModelManifest,

@@ -520,6 +520,14 @@ impl VllmBackend {
 }
 
 impl GenerationBackend for VllmBackend {
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<super::PreloadHandle> {
+        super::preload_resident(self, manifest, request)
+    }
+
     fn validate_api_options(
         &self,
         manifest: &ModelManifest,

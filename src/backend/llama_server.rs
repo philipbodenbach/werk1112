@@ -472,6 +472,14 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<super::PreloadHandle> {
+        super::preload_resident(self, manifest, request)
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         telemetry::sample(self)
     }

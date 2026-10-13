@@ -712,6 +712,10 @@ pub enum Commands {
         )]
         model: Option<String>,
 
+        #[arg(long, value_name = "MODEL", num_args = 1.., action = ArgAction::Append,
+            help = "Load, warm and retain models in order before serving; repeatable, no model-count limit, failures are logged and skipped")]
+        preload: Vec<String>,
+
         #[arg(
             long,
             help = "Default image model for compatible clients that omit model or use an OpenAI image alias"
@@ -1717,6 +1721,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         host: "127.0.0.1".to_string(),
         port: 11434,
         model: None,
+        preload: Vec::new(),
         image_model: None,
         api_key: None,
         api_keys: None,
@@ -1767,6 +1772,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             host,
             port,
             model,
+            preload,
             image_model,
             api_key,
             api_keys,
@@ -1820,7 +1826,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     },
                 )
             };
-            if let Some(model) = model.as_deref().filter(|_| cli.deployments.is_none()) {
+            if let Some(model) = model
+                .as_deref()
+                .filter(|_| cli.deployments.is_none() && preload.is_empty())
+            {
                 let manifest = store.get(model)?;
                 with_terminal_spinner(
                     terminal_spinner_enabled(false),
@@ -1888,6 +1897,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             if let Some(summary) = server_persistence_summary {
                 crate::ui_println!("{summary}");
+            }
+            if !preload.is_empty() {
+                api_state.preload_models(&preload).await;
             }
             serve_with_listener(listener, api_state).await
         }
@@ -9497,6 +9509,16 @@ impl GenerationBackend for AutoBackend {
             .runtime_control_adapter_for_request(manifest, has_images)
     }
 
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::PreloadHandle> {
+        let backend = self.backend_for_execution(manifest, false, false)?;
+        let handle = backend.preload(manifest, request)?;
+        Ok(handle.with_owner(backend))
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for_execution(manifest, false, false)?
             .prepare(manifest)
@@ -9764,6 +9786,16 @@ impl GenerationBackend for GgufPreferredBackend {
             .runtime_control_adapter_for_request(manifest, has_images)
     }
 
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::PreloadHandle> {
+        let backend = self.backend_for_execution(manifest, false, false)?;
+        let handle = backend.preload(manifest, request)?;
+        Ok(handle.with_owner(backend))
+    }
+
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
         self.backend_for_execution(manifest, false, false)?
             .prepare(manifest)
@@ -9948,6 +9980,16 @@ impl GenerationBackend for MlxPreferredBackend {
     ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
         self.backend_for_request(manifest, has_images)?
             .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::PreloadHandle> {
+        let backend = self.backend_for_request(manifest, false)?;
+        let handle = backend.preload(manifest, request)?;
+        Ok(handle.with_owner(backend))
     }
 
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
@@ -10172,6 +10214,16 @@ impl GenerationBackend for VllmPreferredBackend {
     ) -> Result<Arc<dyn crate::runtime_control::BackendRuntimeAdapter>> {
         self.backend_for_request(manifest, has_images)?
             .runtime_control_adapter_for_request(manifest, has_images)
+    }
+
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::PreloadHandle> {
+        let backend = self.backend_for_request(manifest, false)?;
+        let handle = backend.preload(manifest, request)?;
+        Ok(handle.with_owner(backend))
     }
 
     fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
@@ -15943,11 +15995,36 @@ mod tests {
     }
 
     #[test]
+    fn serve_preload_accepts_large_and_repeated_lists_independent_of_default() {
+        let names: Vec<_> = (0..100).map(|i| format!("model-{i}")).collect();
+        let mut args = vec!["werk".to_string(), "serve".into(), "--preload".into()];
+        args.extend(names.clone());
+        args.extend([
+            "--preload".into(),
+            "model-0".into(),
+            "extra".into(),
+            "--model".into(),
+            "default".into(),
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Commands::Serve { preload, model, .. }) = cli.command else {
+            panic!("not serve")
+        };
+        assert_eq!(&preload[..100], names);
+        assert_eq!(&preload[100..], ["model-0", "extra"]);
+        assert_eq!(model.as_deref(), Some("default"));
+        assert!(Cli::try_parse_from(["werk", "serve", "--preload"]).is_err());
+        let cli = Cli::try_parse_from(["werk", "serve"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Serve { preload, .. }) if preload.is_empty()));
+    }
+
+    #[test]
     fn startup_banner_is_limited_to_interactive_terminal_commands() {
         let serve = Commands::Serve {
             host: "127.0.0.1".to_string(),
             port: 11434,
             model: None,
+            preload: Vec::new(),
             image_model: None,
             api_key: None,
             api_keys: None,

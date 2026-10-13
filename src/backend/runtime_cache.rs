@@ -3,12 +3,138 @@
 //! owns an Arc and never holds the registry or initialization lock.
 use anyhow::{Result, anyhow, bail};
 use std::{
+    cell::RefCell,
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
-type Slot<V> = Arc<Mutex<Option<Arc<V>>>>;
+type Slot<V> = Arc<CacheSlot<V>>;
+
+#[derive(Debug)]
+struct CacheSlot<V> {
+    value: Mutex<Option<Arc<V>>>,
+    pins: AtomicUsize,
+}
+impl<V> CacheSlot<V> {
+    fn new(value: Option<Arc<V>>) -> Self {
+        Self {
+            value: Mutex::new(value),
+            pins: AtomicUsize::new(0),
+        }
+    }
+}
+impl<V> std::ops::Deref for CacheSlot<V> {
+    type Target = Mutex<Option<Arc<V>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+struct CapturedSlot {
+    id: usize,
+    release: Option<Box<dyn FnOnce(bool) + Send + Sync>>,
+}
+impl Drop for CapturedSlot {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release(false);
+        }
+    }
+}
+
+// Explicit startup transaction. Backend loading and generation are synchronous;
+// the scope follows that call only, never unrelated requests or other threads.
+thread_local! {
+    static PRELOAD: RefCell<Option<Vec<CapturedSlot>>> = const { RefCell::new(None) };
+}
+
+/// Keeps successful preload slots outside the ordinary cache capacity/eviction
+/// policy. Owners also keep routed backend discovery identities reusable.
+pub struct PreloadHandle {
+    slots: Vec<CapturedSlot>,
+    owners: Vec<Arc<dyn super::GenerationBackend>>,
+}
+impl PreloadHandle {
+    pub(crate) fn with_owner(mut self, owner: Arc<dyn super::GenerationBackend>) -> Self {
+        self.owners.push(owner);
+        self
+    }
+}
+impl Drop for PreloadHandle {
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            if let Some(release) = slot.release.take() {
+                release(true);
+            }
+        }
+    }
+}
+
+pub(crate) fn preload(operation: impl FnOnce() -> Result<()>) -> Result<PreloadHandle> {
+    anyhow::ensure!(
+        !PRELOAD.with(|scope| scope.borrow().is_some()),
+        "nested preload transaction"
+    );
+    PRELOAD.with(|scope| *scope.borrow_mut() = Some(Vec::new()));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let slots = PRELOAD.with(|scope| scope.borrow_mut().take());
+            drop(slots); // rollback outside the RefCell borrow, including on panic
+        }
+    }
+    let _reset = Reset;
+    operation()?;
+    anyhow::ensure!(
+        PRELOAD.with(|scope| !scope.borrow().as_ref().unwrap().is_empty()),
+        "backend did not retain a resident model during warmup"
+    );
+    let slots = PRELOAD.with(|scope| scope.borrow_mut().take().unwrap());
+    Ok(PreloadHandle {
+        slots,
+        owners: Vec::new(),
+    })
+}
+
+fn capture<V: Send + Sync + 'static>(slot: &Slot<V>, loaded: &Arc<V>, fresh: bool) {
+    PRELOAD.with(|scope| {
+        let mut scope = scope.borrow_mut();
+        let Some(slots) = scope.as_mut() else { return };
+        let id = Arc::as_ptr(slot) as usize;
+        if slots.iter().any(|s| s.id == id) {
+            return;
+        }
+        slot.pins.fetch_add(1, Ordering::Relaxed);
+        let slot = slot.clone();
+        let loaded = Arc::downgrade(loaded);
+        slots.push(CapturedSlot {
+            id,
+            release: Some(Box::new(move |committed| {
+                // Only remove the resource created by this failed attempt. A cache
+                // hit, or a subsequently replaced worker, belongs to its old owner.
+                let removed = if !committed && fresh {
+                    let mut value = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if value
+                        .as_ref()
+                        .is_some_and(|v| loaded.ptr_eq(&Arc::downgrade(v)))
+                    {
+                        value.take()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                slot.pins.fetch_sub(1, Ordering::Relaxed);
+                drop(removed);
+            })),
+        });
+    });
+}
 
 #[derive(Debug)]
 pub(crate) struct RuntimeCache<K, V> {
@@ -27,7 +153,7 @@ impl<K, V> Default for RuntimeCache<K, V> {
     }
 }
 
-impl<K: Eq, V> RuntimeCache<K, V> {
+impl<K: Eq, V: Send + Sync + 'static> RuntimeCache<K, V> {
     pub(crate) fn bounded(capacity: usize) -> Self {
         Self {
             capacity: Some(capacity.max(1)),
@@ -47,7 +173,7 @@ impl<K: Eq, V> RuntimeCache<K, V> {
         self.entries
             .lock()
             .unwrap()
-            .push_back((key, Arc::new(Mutex::new(Some(value)))));
+            .push_back((key, Arc::new(CacheSlot::new(Some(value)))));
     }
 
     pub(crate) fn get_or_try_init(
@@ -73,9 +199,14 @@ impl<K: Eq, V> RuntimeCache<K, V> {
                     Arc::strong_count(slot) > 1
                         || !slot.try_lock().is_ok_and(|value| value.is_none())
                 });
-                let evicted = if self
-                    .capacity
-                    .is_some_and(|capacity| entries.len() >= capacity)
+                let ordinary_entries = entries
+                    .iter()
+                    .filter(|(_, slot)| slot.pins.load(Ordering::Relaxed) == 0)
+                    .count();
+                let evicted = if !PRELOAD.with(|scope| scope.borrow().is_some())
+                    && self
+                        .capacity
+                        .is_some_and(|capacity| ordinary_entries >= capacity)
                 {
                     if !self.evict_idle {
                         bail!(
@@ -102,7 +233,7 @@ impl<K: Eq, V> RuntimeCache<K, V> {
                 } else {
                     None
                 };
-                let slot = Arc::new(Mutex::new(None));
+                let slot = Arc::new(CacheSlot::new(None));
                 entries.push_back((key, slot.clone()));
                 (slot, evicted)
             }
@@ -113,6 +244,7 @@ impl<K: Eq, V> RuntimeCache<K, V> {
             .lock()
             .map_err(|_| anyhow!("runtime initialization poisoned"))?;
         if let Some(existing) = value.as_ref().filter(|existing| valid(existing)) {
+            capture(&slot, existing, false);
             return Ok((existing.clone(), true, 0.0));
         }
         // Release a failed instance before allocating its replacement. Ordinary
@@ -122,6 +254,7 @@ impl<K: Eq, V> RuntimeCache<K, V> {
         let loaded = Arc::new(load()?);
         let seconds = started.elapsed().as_secs_f64();
         *value = Some(loaded.clone());
+        capture(&slot, &loaded, true);
         Ok((loaded, false, seconds))
     }
 
@@ -198,6 +331,96 @@ mod tests {
         mpsc,
     };
     use std::{thread, time::Duration};
+
+    #[test]
+    fn preload_has_no_count_limit_and_preserves_ordinary_capacity() {
+        for cache in [RuntimeCache::bounded(2), RuntimeCache::retained(2)] {
+            let handles: Vec<_> = (0..100)
+                .map(|id| {
+                    preload(|| {
+                        cache.get_or_try_init(id, |_| true, || Ok(id))?;
+                        Ok(())
+                    })
+                    .unwrap()
+                })
+                .collect();
+            assert_eq!(cache.snapshot().len(), 100);
+            // Even explicit cleanup cannot evict pinned slots.
+            cache.remove_if(|_| true);
+            assert_eq!(cache.snapshot().len(), 100);
+            let a = cache.get_or_try_init(100, |_| true, || Ok(100)).unwrap().0;
+            let b = cache.get_or_try_init(101, |_| true, || Ok(101)).unwrap().0;
+            assert!(
+                cache
+                    .get_or_try_init(102, |_| true, || panic!("ordinary capacity exceeded"))
+                    .is_err()
+            );
+            for id in 0..100 {
+                assert_eq!(
+                    *cache
+                        .get_or_try_init(id, |_| true, || panic!("preloaded model evicted"))
+                        .unwrap()
+                        .0,
+                    id
+                );
+            }
+            drop((a, b, handles));
+            cache.remove_if(|_| true);
+            assert!(cache.snapshot().is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_preload_rolls_back_only_new_resources_and_releases_capacity() {
+        let cache = RuntimeCache::retained(1);
+        let existing = cache
+            .get_or_try_init("existing", |_| true, || Ok(1))
+            .unwrap()
+            .0;
+        let failed = preload(|| {
+            cache.get_or_try_init("existing", |_| true, || panic!("cache hit"))?;
+            cache.get_or_try_init("failed", |_| true, || Ok(2))?;
+            // Accessing a slot twice must not overwrite its rollback ownership.
+            cache.get_or_try_init("failed", |_| true, || panic!("cache hit"))?;
+            anyhow::bail!("warmup failed")
+        });
+        assert!(failed.is_err());
+        assert_eq!(cache.snapshot().len(), 1);
+        assert!(Arc::ptr_eq(&existing, &cache.snapshot()[0]));
+        let handle = preload(|| {
+            cache.get_or_try_init("next", |_| true, || Ok(3))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(cache.snapshot().len(), 2);
+        drop(handle);
+    }
+
+    #[test]
+    fn preload_scope_is_thread_local_and_unwinds_without_leaking() {
+        let cache = Arc::new(RuntimeCache::retained(1));
+        cache.get_or_try_init(0, |_| true, || Ok(0)).unwrap();
+        let failure = std::panic::catch_unwind(|| {
+            let _ = preload(|| {
+                let other = cache.clone();
+                thread::spawn(move || {
+                    assert!(
+                        other
+                            .get_or_try_init(1, |_| true, || panic!("must respect capacity"))
+                            .is_err()
+                    )
+                })
+                .join()
+                .unwrap();
+                cache.get_or_try_init(2, |_| true, || Ok(2))?;
+                panic!("warmup panic")
+            });
+        });
+        assert!(failure.is_err());
+        assert_eq!(cache.snapshot().len(), 1);
+        assert!(!PRELOAD.with(|scope| scope.borrow().is_some()));
+        assert!(preload(|| Ok(())).is_err());
+    }
 
     #[test]
     fn concurrent_cold_requests_load_exactly_one_runtime() {
