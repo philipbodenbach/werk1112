@@ -726,6 +726,14 @@ impl BurnMode {
 }
 
 impl GenerationBackend for BurnBackend {
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<super::PreloadHandle> {
+        super::preload_resident(self, manifest, request)
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         match self.mode {
             BurnMode::Cpu => cfg!(feature = "burn-cpu"),

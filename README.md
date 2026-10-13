@@ -249,6 +249,37 @@ export WERK_API_KEY="replace-with-generated-key"
 werk serve --model local-model
 ~~~
 
+Preload any number of resident text models before accepting requests:
+
+~~~bash
+werk serve --preload model-a model-b model-c --preload model-d --model model-a
+~~~
+
+The list has no fixed model-count limit. Werk deduplicates it in order, loads
+each model and runs an internal warmup of up to 32 output tokens. Successful
+instances remain retained until server shutdown, outside the ordinary model
+cache limit. `--model` independently selects the default; with `--preload`, a
+default not included in the list loads on demand. Without `--preload`, startup
+behavior is unchanged.
+
+Resources are allocated first come, first served. An unsupported backend,
+insufficient resources or a failed warmup is logged and skipped; remaining
+models are still attempted and the server starts with the successful set (even
+if that set is empty). Later requests cannot evict preloaded instances. Skipped
+models remain requestable, subject to the same resource constraints. Startup
+logs include `serve.preload.started`, `.ready`, `.failed` and `.finished` events.
+
+Preloading supports the resident llama.cpp, oMLX, vLLM, Candle, Burn,
+Transformers compatibility and embedded ONNX GenAI text routes when available.
+One-shot MLX/MLX-VLM and ONNX runners are skipped; explicitly disabled model
+residency is respected. In deployment mode, names may be aliases or instance
+IDs; an alias preloads every replica in instance-ID order. Existing deployment
+admission rules still apply. This does not add distributed cluster management.
+Image/audio/video generation is not warmed. Prompt processing and dynamic
+expert offloading can still cause prompt-dependent latency; preloading avoids
+restarting successfully retained model instances, rather than promising zero
+inference latency.
+
 OpenAI-compatible clients use:
 
 ~~~text

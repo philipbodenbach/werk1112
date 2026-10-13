@@ -11,6 +11,7 @@ mod onnxruntime;
 mod openai_transport;
 pub(crate) mod python_install;
 pub(crate) mod runtime_cache;
+pub use runtime_cache::PreloadHandle;
 pub mod text_analysis;
 mod text_analysis_candle;
 pub(crate) use openai_transport::ApiOptionError;
@@ -1411,6 +1412,21 @@ pub trait ChatGenerationSession: Send + Sync {
 pub type ApiGenerateStream =
     std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<serde_json::Value, String>> + Send>>;
 
+pub(crate) fn preload_resident<B: GenerationBackend + ?Sized>(
+    backend: &B,
+    manifest: &ModelManifest,
+    request: GenerateRequest,
+) -> Result<PreloadHandle> {
+    runtime_cache::preload(|| {
+        let response = backend.generate(manifest, request)?;
+        anyhow::ensure!(
+            response.completion_tokens > 0,
+            "warmup completed without decoding any tokens"
+        );
+        Ok(())
+    })
+}
+
 pub trait GenerationBackend: Send + Sync {
     /// Read only: sample already-running workers; never load or prepare models.
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
@@ -1519,6 +1535,16 @@ pub trait GenerationBackend: Send + Sync {
 
     fn prepare(&self, _manifest: &ModelManifest) -> Result<()> {
         Ok(())
+    }
+
+    /// Load and warm a resident text model, retaining its exact runtime until
+    /// the returned handle is dropped. One-shot adapters must not claim success.
+    fn preload(
+        &self,
+        _manifest: &ModelManifest,
+        _request: GenerateRequest,
+    ) -> Result<PreloadHandle> {
+        anyhow::bail!("this backend does not support resident text-model preloading")
     }
 
     fn start_chat_session(

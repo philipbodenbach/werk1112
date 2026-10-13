@@ -1423,6 +1423,14 @@ impl ChatGenerationSession for LlamaCppChatSession {
 
 #[cfg(feature = "llama-cpp")]
 impl GenerationBackend for LlamaCppBackend {
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<super::PreloadHandle> {
+        super::preload_resident(self, manifest, request)
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         self.mode.compiled()
     }
@@ -2139,6 +2147,18 @@ fn link_or_copy_file(source: &Path, target: &Path) -> Result<()> {
 }
 
 impl GenerationBackend for TransformersCompatBackend {
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<super::PreloadHandle> {
+        anyhow::ensure!(
+            transformers_model_cache_capacity() > 0,
+            "Transformers model residency is disabled by WERK_TRANSFORMERS_MODEL_CACHE_SIZE=0"
+        );
+        super::preload_resident(self, manifest, request)
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         true
     }

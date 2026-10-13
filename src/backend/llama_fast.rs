@@ -293,6 +293,14 @@ mod imp {
     }
 
     impl GenerationBackend for LlamaFastBackend {
+        fn preload(
+            &self,
+            manifest: &ModelManifest,
+            request: GenerateRequest,
+        ) -> Result<crate::backend::PreloadHandle> {
+            crate::backend::preload_resident(self, manifest, request)
+        }
+
         fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
             compiled(self.mode)
         }

@@ -5,6 +5,10 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Add `serve --preload MODEL...` for ordered, best-effort loading and warmup of
+  any number of resident text models, with retained cache slots, deployment
+  replica support and per-model startup diagnostics.
+
 ## [1.9.0] - 2026-10-08
 
 ### Changes

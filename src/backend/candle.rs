@@ -115,6 +115,14 @@ pub fn probe_device(mode: CandleDeviceMode) -> Result<String> {
 }
 
 impl GenerationBackend for CandleBackend {
+    fn preload(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<super::PreloadHandle> {
+        super::preload_resident(self, manifest, request)
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         true
     }

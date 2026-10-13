@@ -10,6 +10,7 @@ mod documents;
 mod generic_tools;
 mod media;
 mod observability;
+mod preload;
 mod support;
 mod text_analysis;
 mod tools;
