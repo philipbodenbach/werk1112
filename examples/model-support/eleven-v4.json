@@ -1,0 +1,7 @@
+{
+  "inputs": [{"text": "Guten Tag. Dies ist ein Sprachtest.", "voice_id": "REPLACE_WITH_YOUR_VOICE_ID"}],
+  "language_code": "de",
+  "output_format": "mp3_44100_128",
+  "settings": {"stability": 0.5},
+  "stream": false
+}

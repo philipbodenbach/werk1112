@@ -54,6 +54,7 @@ fn format(
                 manifest.architecture.as_deref().unwrap_or("-").to_string(),
                 super::join_display(&manifest.metadata.tasks),
                 match &manifest.storage {
+                    _ if crate::model_support::remote(manifest).is_some() => "remote",
                     ModelStorage::Managed => "managed",
                     ModelStorage::External { .. } => "external",
                 }

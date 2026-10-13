@@ -94,6 +94,8 @@ pub type PromptOptionsResolver = Arc<
 
 #[derive(Clone)]
 pub struct ApiState {
+    pub(super) actions: Arc<crate::providers::action::ActionBackend>,
+    pub(super) provider_gate: Arc<Semaphore>,
     pub(super) text_backend: crate::backend::text_analysis::TextAnalysisBackend,
     pub(super) text_policy: crate::backend::text_analysis::Policy,
     pub(super) text_gate: Arc<Semaphore>,
@@ -174,6 +176,8 @@ impl ApiState {
         let local_control = LocalWerkControl::new(store.clone(), runtime_adapter);
         let principal_deriver = local_control.principal_deriver();
         Self {
+            actions: Arc::new(crate::providers::action::ActionBackend::default()),
+            provider_gate: Arc::new(Semaphore::new(4)),
             text_backend: crate::backend::text_analysis::TextAnalysisBackend::new(store.clone()),
             text_policy: Default::default(),
             text_gate: Arc::new(Semaphore::new(2)),

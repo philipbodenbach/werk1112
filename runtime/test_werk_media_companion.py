@@ -3247,5 +3247,23 @@ class Qwen3TTSVoiceDesignTests(unittest.TestCase):
         self.assertNotIn("warm and precise", persisted)
 
 
+
+
+class FluxSchnellRegressionTests(unittest.TestCase):
+    def test_flux1_schnell_keeps_local_diffusers_auto_pipeline(self):
+        """FLUX 3 providers must not replace the established Schnell loader."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "model_index.json").write_text(json.dumps({"_class_name": "FluxPipeline", "_diffusers_version": "0.35.0"}))
+            pipeline = object()
+            loader = mock.Mock(return_value=pipeline)
+            diffusers = types.SimpleNamespace(AutoPipelineForText2Image=types.SimpleNamespace(from_pretrained=loader))
+            torch = types.SimpleNamespace(float32="float32")
+            with mock.patch.object(COMPANION, "require_module", return_value=diffusers):
+                loaded = COMPANION.load_diffusers_pipeline(path, "image_generation", False, torch, "bfloat16")
+            self.assertIs(loaded, pipeline)
+            loader.assert_called_once_with(str(path), local_files_only=True, torch_dtype="bfloat16")
+
+
 if __name__ == "__main__":
     unittest.main()

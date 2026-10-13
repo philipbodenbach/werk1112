@@ -685,6 +685,11 @@ impl From<ServePersistenceReuseArg> for ReuseMode {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
+    #[command(about = "Official model support catalog, hosted inference and action prediction")]
+    Support {
+        #[command(subcommand)]
+        command: crate::providers::cli::SupportCommands,
+    },
     #[command(about = "Print physical GPU inventory and inherited visibility as JSON")]
     Gpus,
     #[command(about = "Resolve deployment profiles without loading weights or starting workers")]
@@ -713,7 +718,7 @@ pub enum Commands {
         model: Option<String>,
 
         #[arg(long, value_name = "MODEL", num_args = 1.., action = ArgAction::Append,
-            help = "Load, warm and retain models in order before serving; repeatable, no model-count limit, failures are logged and skipped")]
+            help = "Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, failures are logged and skipped")]
         preload: Vec<String>,
 
         #[arg(
@@ -1748,6 +1753,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     crate::terminal::session_heading();
 
     match command {
+        Commands::Support { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            crate::logging::spawn_blocking(move || crate::providers::cli::run(&store, command))
+                .await?
+        }
         Commands::Gpus => {
             std::println!(
                 "{}",
@@ -4947,7 +4957,8 @@ fn should_print_startup_banner_for(
         | Commands::Video { .. }
         | Commands::Audio { .. } => true,
         Commands::Chat { .. } => stdin_is_terminal,
-        Commands::Gpus
+        Commands::Support { .. }
+        | Commands::Gpus
         | Commands::DeploymentPlan { .. }
         | Commands::Import { .. }
         | Commands::Convert { .. }
@@ -4972,7 +4983,7 @@ fn should_print_startup_banner_for(
 
 fn command_backend_install_verbose(command: &Commands) -> bool {
     match command {
-        Commands::Gpus | Commands::DeploymentPlan { .. } => false,
+        Commands::Support { .. } | Commands::Gpus | Commands::DeploymentPlan { .. } => false,
         Commands::Serve { verbose, .. } => *verbose,
         Commands::Run { verbose, debug, .. } | Commands::Chat { verbose, debug, .. } => {
             *verbose || *debug
@@ -5765,7 +5776,7 @@ fn percent_encode_hf_path(path: &str) -> String {
 fn estimate_source_url(manifest: &ModelManifest) -> Option<String> {
     match &manifest.source {
         ModelSource::HuggingFace { repo } => Some(format!("https://huggingface.co/{repo}")),
-        ModelSource::LocalPath { .. } => None,
+        ModelSource::LocalPath { .. } | ModelSource::Provider { .. } => None,
     }
 }
 
@@ -7987,7 +7998,8 @@ fn chat_template_default_source(
         | BackendChoice::Omlx
         | BackendChoice::TransformersCompat
         | BackendChoice::Vllm
-        | BackendChoice::VllmRocm => ChatTemplateSource::Model,
+        | BackendChoice::VllmRocm
+        | BackendChoice::Provider => ChatTemplateSource::Model,
         _ => ChatTemplateSource::Werk,
     }
 }
@@ -8002,7 +8014,10 @@ fn chat_template_model_preferred(manifest: &ModelManifest, backend: BackendChoic
         ) && manifest.format == ModelFormat::Gguf
         || matches!(
             backend,
-            BackendChoice::Vllm | BackendChoice::VllmRocm | BackendChoice::Omlx
+            BackendChoice::Vllm
+                | BackendChoice::VllmRocm
+                | BackendChoice::Omlx
+                | BackendChoice::Provider
         )
 }
 
@@ -9052,6 +9067,7 @@ fn trim_float(mut value: String) -> String {
 #[derive(Debug, Clone, Copy)]
 enum BackendChoice {
     Auto,
+    Provider,
     GgufPreferred {
         llama: LlamaCppMode,
         candle: CandleDeviceMode,
@@ -10443,6 +10459,7 @@ fn build_concrete_backend(
 ) -> Result<Arc<dyn GenerationBackend>> {
     validate_fp4_backend_policy(backend, &runtime_options)?;
     match backend {
+        BackendChoice::Provider => Ok(Arc::new(crate::backend::ProviderBackend)),
         BackendChoice::Auto => bail!("auto backend cannot be built as a concrete backend"),
         BackendChoice::GgufPreferred { llama, candle } => Ok(Arc::new(GgufPreferredBackend::new(
             store,
@@ -10541,6 +10558,7 @@ fn runtime_id_to_backend_for_request(
 
 fn backend_to_runtime_id(backend: BackendChoice) -> Option<RuntimeId> {
     match backend {
+        BackendChoice::Provider => None,
         BackendChoice::Burn(BurnMode::Cuda) => Some(RuntimeId::BurnCuda),
         BackendChoice::Burn(BurnMode::Cpu) => Some(RuntimeId::BurnCpu),
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => Some(RuntimeId::LlamaServerCuda),
@@ -10647,11 +10665,15 @@ fn backend_supports_manifest(backend: BackendChoice, manifest: &ModelManifest) -
 }
 
 fn backend_supports_images(backend: BackendChoice) -> bool {
+    if matches!(backend, BackendChoice::Provider) {
+        return true;
+    }
     runtime_supports_images(backend_runtime(backend))
 }
 
 fn backend_runtime(backend: BackendChoice) -> BackendRuntime {
     match backend {
+        BackendChoice::Provider => BackendRuntime::Provider,
         BackendChoice::Auto | BackendChoice::GgufPreferred { .. } => BackendRuntime::Candle,
         BackendChoice::Burn(_) => BackendRuntime::Burn,
         BackendChoice::Candle(_) => BackendRuntime::Candle,
@@ -10669,6 +10691,7 @@ fn backend_runtime(backend: BackendChoice) -> BackendRuntime {
 
 fn backend_accelerator(backend: BackendChoice) -> BackendAccelerator {
     match backend {
+        BackendChoice::Provider => BackendAccelerator::Auto,
         BackendChoice::Auto | BackendChoice::GgufPreferred { .. } => BackendAccelerator::Auto,
         BackendChoice::Candle(CandleDeviceMode::Auto) => BackendAccelerator::Auto,
         BackendChoice::Candle(CandleDeviceMode::Cpu)
@@ -10717,6 +10740,7 @@ fn backend_unavailability_reason(
     selection_options: SelectionOptions,
 ) -> Option<String> {
     match backend {
+        BackendChoice::Provider => None,
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
         | BackendChoice::Candle(CandleDeviceMode::Auto) => None,
@@ -10981,6 +11005,25 @@ fn routed_backend_for_request_with_tools(
     tool_calling: bool,
     selection_options: SelectionOptions,
 ) -> Result<RoutedBackend> {
+    if let Some((provider, model)) = crate::model_support::remote(manifest) {
+        anyhow::ensure!(
+            matches!(backend, BackendChoice::Auto | BackendChoice::Provider),
+            "remote model requires --backend auto; local runtime overrides are incompatible"
+        );
+        anyhow::ensure!(
+            provider == crate::model_support::Provider::Mistral && model == "mistral-large-4",
+            "unsupported_task: use werk support image/speech for this hosted model"
+        );
+        return Ok(RoutedBackend {
+            choice: BackendChoice::Provider,
+            selection: None,
+            omlx: None,
+        });
+    }
+    anyhow::ensure!(
+        !crate::model_support::is_action(manifest),
+        "unsupported_task: use werk support action for DROID policies"
+    );
     if has_images && !manifest.supports_task(InferenceTask::ImageUnderstanding) {
         bail!(
             "model '{}' does not advertise image-understanding; select a vision-language model",
@@ -10989,6 +11032,9 @@ fn routed_backend_for_request_with_tools(
     }
     let capabilities = request_capabilities(has_images).with_tool_calling(tool_calling);
     match backend {
+        BackendChoice::Provider => {
+            bail!("unsupported_task: provider backend requires a registered remote model")
+        }
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
         | BackendChoice::Candle(CandleDeviceMode::Auto)
@@ -11266,6 +11312,7 @@ fn vllm_probe_unavailability_reason(probe: Result<String>) -> Option<String> {
 
 fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
     match backend {
+        BackendChoice::Provider => RequestedBackend::Auto,
         BackendChoice::Auto => RequestedBackend::Auto,
         BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Cuda,
@@ -11662,6 +11709,7 @@ fn unsupported_backend_message(backend: BackendChoice, manifest: &ModelManifest)
 
 fn backend_label(backend: BackendChoice) -> &'static str {
     match backend {
+        BackendChoice::Provider => "provider",
         BackendChoice::Auto => "auto",
         BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Cuda,
@@ -11714,6 +11762,7 @@ fn backend_label(backend: BackendChoice) -> &'static str {
 
 fn verbose_backend_label(backend: BackendChoice) -> &'static str {
     match backend {
+        BackendChoice::Provider => "official hosted provider",
         BackendChoice::Auto => "auto",
         BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Cuda,

@@ -113,8 +113,16 @@ impl ModelFormat {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelSource {
-    LocalPath { path: String },
-    HuggingFace { repo: String },
+    Provider {
+        provider: crate::model_support::Provider,
+        model: String,
+    },
+    LocalPath {
+        path: String,
+    },
+    HuggingFace {
+        repo: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3687,6 +3695,7 @@ fn infer_model_family(
     }
     let mut hints = vec![manifest.id.to_ascii_lowercase()];
     match &manifest.source {
+        ModelSource::Provider { model, .. } => hints.push(model.to_ascii_lowercase()),
         ModelSource::HuggingFace { repo } => hints.push(repo.to_ascii_lowercase()),
         ModelSource::LocalPath { path } => {
             if let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) {
@@ -3887,6 +3896,7 @@ fn infer_inference_tasks(
             .to_ascii_lowercase(),
     ];
     match &manifest.source {
+        ModelSource::Provider { model, .. } => hints.push(model.to_ascii_lowercase()),
         ModelSource::HuggingFace { repo } => hints.push(repo.to_ascii_lowercase()),
         ModelSource::LocalPath { path } => {
             if let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) {
@@ -4921,6 +4931,13 @@ fn read_manifest(path: &Path) -> Result<ModelManifest> {
         if !external.is_dir() {
             return Ok(manifest);
         }
+    }
+    // Provider contracts and action packages have their own validated metadata;
+    // generic HF heuristics must not turn them into local chat models.
+    if crate::model_support::remote(&manifest).is_some()
+        || crate::model_support::is_action(&manifest)
+    {
+        return Ok(manifest);
     }
     reconcile_mlx_safetensors_manifest(path, &mut manifest);
     if let Some(model_dir) = path.parent() {

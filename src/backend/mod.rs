@@ -1,4 +1,6 @@
 mod burn;
+mod provider;
+pub use provider::ProviderBackend;
 mod candle;
 mod external;
 mod llama_fast;
@@ -105,6 +107,7 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendRuntime {
+    Provider,
     Burn,
     Candle,
     LlamaServer,
@@ -344,6 +347,7 @@ const CANDLE_SAFETENSORS_ARCHES: &[&str] = &[
 ];
 const BURN_ARCHES: &[&str] = &["phi3"];
 const VLLM_ARCHES: &[&str] = &[
+    "kolibri1",
     "llama",
     "qwen2",
     "qwen3",
@@ -1110,6 +1114,7 @@ pub fn runtime_supports_layout(descriptor: &RuntimeDescriptor, layout: Repositor
 
 pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) -> bool {
     match runtime {
+        BackendRuntime::Provider => matches!(format, ModelFormat::Unknown),
         BackendRuntime::Candle => matches!(format, ModelFormat::Gguf | ModelFormat::SafeTensors),
         BackendRuntime::Burn => matches!(format, ModelFormat::SafeTensors),
         BackendRuntime::LlamaServer
@@ -1139,6 +1144,7 @@ pub fn backend_supports_accelerator(
     accelerator: BackendAccelerator,
 ) -> bool {
     match runtime {
+        BackendRuntime::Provider => matches!(accelerator, BackendAccelerator::Auto),
         BackendRuntime::Candle => matches!(
             accelerator,
             BackendAccelerator::Auto
@@ -1196,6 +1202,7 @@ pub fn explain_backend_rejection(
 ) -> Option<&'static str> {
     if !backend_supports_format(runtime, format) {
         return Some(match runtime {
+            BackendRuntime::Provider => "provider models have no local weight format",
             BackendRuntime::Candle => "Candle supports GGUF and safetensors only",
             BackendRuntime::Burn => "Burn supports safetensors only",
             BackendRuntime::LlamaServer => "llama.cpp server supports GGUF only",
