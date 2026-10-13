@@ -664,6 +664,7 @@ fn manifest_text_contains(manifest: &ModelManifest, needle: &str) -> bool {
         return true;
     }
     match &manifest.source {
+        ModelSource::Provider { model, .. } => model.to_ascii_lowercase().contains(needle),
         ModelSource::HuggingFace { repo } => repo.to_ascii_lowercase().contains(needle),
         ModelSource::LocalPath { path } => path.to_ascii_lowercase().contains(needle),
     }

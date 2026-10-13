@@ -95,11 +95,17 @@ pub(super) async fn model_handler(
 }
 
 fn model_object(manifest: ModelManifest) -> ModelObject {
+    let owned_by = match crate::model_support::remote(&manifest) {
+        Some((crate::model_support::Provider::Mistral, _)) => "mistral",
+        Some((crate::model_support::Provider::Bfl, _)) => "black-forest-labs",
+        Some((crate::model_support::Provider::ElevenLabs, _)) => "elevenlabs",
+        None => "local",
+    };
     ModelObject {
         id: manifest.id,
         object: "model",
         created: manifest.created_unix,
-        owned_by: "local",
+        owned_by,
     }
 }
 

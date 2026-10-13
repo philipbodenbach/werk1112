@@ -517,6 +517,17 @@ impl InferenceService {
             .list()?
             .into_iter()
             .map(|manifest| {
+                if let Some((provider, model)) = crate::model_support::remote(&manifest) {
+                    let credentials = std::env::var_os(provider.key_env()).is_some_and(|v| !v.is_empty());
+                    return json!({"id":manifest.id,"provider":provider,"upstream_model":model,"tasks":manifest.metadata.tasks,
+                        "input_modalities":manifest.metadata.input_modalities,"output_modalities":manifest.metadata.output_modalities,
+                        "runtime":"provider","credentials_configured":credentials,"verification_status":"IMPLEMENTED_UNTESTED",
+                        "preload":"client_and_local_credential_validation_only","support_catalog":"/werk/v1/model-support",
+                        "endpoint":match provider {crate::model_support::Provider::Mistral=>"/v1/chat/completions",crate::model_support::Provider::Bfl=>"/werk/v1/images/flux-3",crate::model_support::Provider::ElevenLabs=>"/werk/v1/audio/dialogue"}});
+                }
+                if crate::model_support::is_action(&manifest) {
+                    return json!({"id":manifest.id,"tasks":["action_prediction"],"input_modalities":["text","image","state"],"output_modalities":["action"],"runtime":"flux-action","verification_status":"IMPLEMENTED_UNTESTED","endpoint":"/werk/v1/actions/predictions","preload":"resident_load_and_synthetic_prediction"});
+                }
                 if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
                     let report = text_policy.apply(Default::default()).and_then(|options| text_backend.diagnostics(&manifest, &options))
                         .unwrap_or_else(|error| json!({"ready":false,"detail":sanitize_capability_detail(&format!("{error:#}"))}));

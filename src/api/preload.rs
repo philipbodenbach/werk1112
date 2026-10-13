@@ -57,7 +57,7 @@ impl ApiState {
                 event(
                     Level::Info,
                     "serve.preload.started",
-                    format!("Preloading '{id}' (load and warmup)..."),
+                    format!("Preparing preload target '{id}'..."),
                     json!({"model":model,"target":id}),
                 );
                 let started = Instant::now();
@@ -111,6 +111,21 @@ impl ApiState {
 
     fn preload_one(&self, model: &str) -> Result<PreloadHandle> {
         let manifest = self.store.get(model)?;
+        if let Some((provider, _)) = crate::model_support::remote(&manifest) {
+            let handle = crate::providers::http::preload(provider)?;
+            event(
+                Level::Info,
+                "serve.preload.remote_prepared",
+                format!(
+                    "Prepared remote provider for '{model}'; credentials validated locally, no inference or billing, no local weights"
+                ),
+                json!({"model":model,"mode":"remote_client_only"}),
+            );
+            return Ok(handle);
+        }
+        if crate::model_support::is_action(&manifest) {
+            return self.actions.preload(&self.store, &manifest);
+        }
         anyhow::ensure!(
             manifest.metadata.tasks.is_empty()
                 || manifest.supports_task(InferenceTask::TextGeneration)

@@ -62,6 +62,8 @@ fn apply_vllm_reasoning_effort(body: &mut Value) {
     else {
         return;
     };
+    let effort = body["reasoning_effort"].clone();
+    body["chat_template_kwargs"]["reasoning_effort"] = effort;
     // Match vLLM ChatCompletionRequest.build_chat_params, including versions
     // before automatic enable_thinking injection. Only explicit requests
     // override the server default; the native model/template owns effort levels.
@@ -449,6 +451,7 @@ impl VllmBackend {
             discovery.command.as_ref(),
             self.automatic_prefix_caching,
         );
+        let configured_args = kolibri_args(manifest, discovery.command.as_ref(), configured_args)?;
         // A remote vLLM server owns and loads its weights. The installed Werk
         // manifest is still required for routing, but its local repository may
         // intentionally contain metadata only (common when Werk runs beside a
@@ -525,6 +528,24 @@ impl GenerationBackend for VllmBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<super::PreloadHandle> {
+        if crate::model_support::is_kolibri(manifest) {
+            return super::runtime_cache::preload(|| {
+                let response = self.generate_api(
+                    manifest,
+                    request,
+                    std::collections::BTreeMap::from([(
+                        "reasoning_effort".into(),
+                        Value::String("none".into()),
+                    )]),
+                    None,
+                )?;
+                anyhow::ensure!(
+                    response["usage"]["completion_tokens"].as_u64().unwrap_or(0) > 0,
+                    "Kolibri warmup decoded no tokens"
+                );
+                Ok(())
+            });
+        }
         super::preload_resident(self, manifest, request)
     }
 
@@ -535,6 +556,16 @@ impl GenerationBackend for VllmBackend {
         options: &std::collections::BTreeMap<String, Value>,
     ) -> Result<()> {
         super::openai_transport::validate_api_options(options, API_OPTIONS)?;
+        if crate::model_support::is_kolibri(manifest)
+            && let Some(effort) = options.get("reasoning_effort")
+        {
+            anyhow::ensure!(
+                effort
+                    .as_str()
+                    .is_some_and(|s| ["none", "low", "medium", "high"].contains(&s)),
+                "Kolibri reasoning_effort must be none, low, medium or high"
+            );
+        }
         if let Some(effort) = options.get("reasoning_effort")
             && super::openai_transport::reasoning_effort_thinking(effort).is_none()
         {
@@ -822,6 +853,9 @@ impl VllmProcess {
             return Ok(process);
         }
 
+        if crate::model_support::is_kolibri(manifest) {
+            require_kolibri_plugin(&command)?;
+        }
         crate::ui_eprintln!("Using vLLM {} backend", accelerator.display_name());
         validate_werk_managed_prefix_caching_arg(&command, &configured_args)?;
         let runtime_version = vllm_version(&command)
@@ -1388,6 +1422,49 @@ fn parse_remote_vllm_model_ids(bytes: &[u8]) -> Result<Vec<String>> {
     models.sort();
     models.dedup();
     Ok(models)
+}
+
+fn kolibri_args(
+    manifest: &ModelManifest,
+    command: Option<&VllmCommand>,
+    mut args: ConfiguredVllmArgs,
+) -> Result<ConfiguredVllmArgs> {
+    if !crate::model_support::is_kolibri(manifest)
+        || matches!(command, Some(VllmCommand::Remote { .. }))
+    {
+        return Ok(args);
+    }
+    for (flag, value) in [
+        ("--reasoning-parser", "kolibri1"),
+        ("--tool-call-parser", "kolibri1"),
+        ("--kv-cache-dtype", "fp8"),
+        ("--max-model-len", "262144"),
+    ] {
+        if !args
+            .args
+            .iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+        {
+            args.args.extend([flag.into(), value.into()]);
+        }
+    }
+    if !args.args.iter().any(|a| a == "--enable-auto-tool-choice") {
+        args.args.push("--enable-auto-tool-choice".into());
+    }
+    Ok(args)
+}
+fn require_kolibri_plugin(command: &VllmCommand) -> Result<()> {
+    let python = match command {
+        VllmCommand::Python(p) => p.clone(),
+        VllmCommand::Executable(p) => p.parent().unwrap_or(Path::new(".")).join("python"),
+        VllmCommand::Remote { .. } => return Ok(()),
+    };
+    let status = Command::new(python).args(["-c", "import importlib.metadata as m; v=m.version('aleph-alpha-inference'); assert int(v.split('.')[0]) >= 1"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    anyhow::ensure!(
+        status.is_ok_and(|s| s.success()),
+        "unsupported_architecture: Kolibri requires aleph-alpha-inference>=1 and its compatible vLLM version; install the vendor package in WERK_VLLM_PYTHON's environment (https://github.com/Aleph-Alpha/aleph-alpha-inference)"
+    );
+    Ok(())
 }
 
 fn is_nemotron_manifest(manifest: &ModelManifest) -> bool {
@@ -4829,6 +4906,93 @@ exit 9
             std::process::id()
         ));
         ModelStore::resolve(Some(root)).unwrap()
+    }
+
+    #[test]
+    fn kolibri_uses_vendor_parsers_and_keeps_explicit_context_and_parallelism() {
+        let mut manifest = test_manifest("kolibri", None, None);
+        manifest.architecture = Some("kolibri1".into());
+        let command = VllmCommand::Python("python".into());
+        let configured = configured_vllm_args_from(Some(
+            "--max-model-len 65536 --tensor-parallel-size 2".into(),
+        ))
+        .unwrap();
+        let args = kolibri_args(&manifest, Some(&command), configured).unwrap();
+        let joined = args.args.join(" ");
+        assert!(joined.contains("--reasoning-parser kolibri1"));
+        assert!(joined.contains("--tool-call-parser kolibri1"));
+        assert!(joined.contains("--kv-cache-dtype fp8"));
+        assert!(joined.contains("--enable-auto-tool-choice"));
+        assert!(joined.contains("--max-model-len 65536"));
+        assert!(!joined.contains("262144"));
+        let remote = VllmCommand::Remote {
+            host: "localhost".into(),
+            port: 8000,
+        };
+        assert!(
+            kolibri_args(
+                &manifest,
+                Some(&remote),
+                configured_vllm_args_from(None).unwrap()
+            )
+            .unwrap()
+            .args
+            .is_empty()
+        );
+        for effort in ["none", "low", "medium", "high"] {
+            let mut body = json!({"reasoning_effort":effort});
+            apply_vllm_reasoning_effort(&mut body);
+            assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], effort);
+            assert_eq!(
+                body["chat_template_kwargs"]["enable_thinking"],
+                effort != "none"
+            );
+        }
+    }
+
+    #[test]
+    fn kolibri_preload_sends_short_non_reasoning_native_request() {
+        let reply = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"one two"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":32}});
+        let (url, requests, server) = crate::providers::tests::mock(vec![(
+            200,
+            "application/json",
+            serde_json::to_vec(&reply).unwrap(),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::resolve(Some(dir.path().into())).unwrap();
+        let backend = VllmBackend::with_mock_http_server(store, url, "kolibri".into());
+        let mut manifest = test_manifest("kolibri", None, None);
+        manifest.architecture = Some("kolibri1".into());
+        let request = GenerateRequest {
+            prompt: "count".into(),
+            messages: vec![],
+            image_urls: vec![],
+            max_tokens: 32,
+            temperature: Some(0.0),
+            top_p: None,
+            stop: vec![],
+            seed: Some(0),
+            stream_granularity: super::super::StreamGranularity::Token,
+            verbose: false,
+            debug: false,
+            tool_config: None,
+        };
+        // The HTTP-only fixture intentionally owns no real resident runtime;
+        // the preload transaction must not falsely report a retained model.
+        let error = backend.preload(&manifest, request).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("did not retain a resident model")
+        );
+        server.join().unwrap();
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent[0].1["max_tokens"], 32);
+        assert_eq!(
+            sent[0].1["chat_template_kwargs"]["reasoning_effort"],
+            "none"
+        );
+        assert_eq!(sent[0].1["chat_template_kwargs"]["enable_thinking"], false);
     }
 
     fn test_manifest(

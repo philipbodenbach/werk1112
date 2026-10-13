@@ -16,6 +16,7 @@ The browser-friendly index is published as the
 | Need | Page |
 | --- | --- |
 | Review release notes and upgrade changes | [Changelog](../CHANGELOG.md) |
+| Review Kolibri, Mistral Large 4, FLUX 3 and Eleven v4 | [Model support matrix](model-support-matrix.md) |
 | Install and run a first command | [Getting started](getting-started.md) |
 | Look up CLI commands and semantics | [CLI reference](reference/cli.md) |
 | Understand every HTTP route | [HTTP API](api.md) |

@@ -1382,3 +1382,18 @@ Failure messages include the attempted runtime and mitigation, such as installin
 `text-analysis`, selecting the correct Python, reducing batches or freeing VRAM.
 `werk.diagnostics` records fallbacks, while `werk.runtime`, `device`, `dtype`,
 `model_cache_hit` and timings identify the actual successful execution.
+
+## Official provider and action extensions
+
+These routes use the existing server bearer authentication. They preserve
+vendor/task schemas; existing OpenAI-compatible routes retain their contracts.
+
+| Route | Contract |
+| --- | --- |
+| `GET /werk/v1/model-support` | Exact identities, capabilities, sources and honest inference verification status. |
+| `POST /werk/v1/images/flux-3` | FLUX 3 Image prompt/references/aspect-ratio/resolution → binary PNG/JPEG. |
+| `POST /werk/v1/audio/dialogue` | Eleven v4 text/voice pairs → audio; `stream:true` streams binary chunks. |
+| `POST /werk/v1/actions/predictions` | Registered DROID policy, instruction, state and synchronized RGB observations → typed 32×8 action targets with units. |
+
+Registered Mistral Large 4 uses `/v1/chat/completions`, including tools, structured
+output and SSE. Vendor keys remain on the server. See [examples and limitations](model-support-matrix.md).

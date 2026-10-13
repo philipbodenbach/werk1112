@@ -15,3 +15,5 @@ mod support;
 mod text_analysis;
 mod tools;
 mod vllm_tools;
+
+mod providers;

@@ -13,6 +13,21 @@ Werk supports text, image, video and audio workflows without coupling clients
 to llama.cpp, vLLM, Candle, MLX, oMLX, ONNX Runtime, Diffusers, Transformers or
 architecture-specific companion runtimes.
 
+## European model integrations
+
+Optional hosted adapters cover Mistral Large 4, FLUX 3 Image and Eleven v4;
+Kolibri uses Aleph Alpha's vLLM plugin, and FLUX 3 Action has a resident DROID
+prediction adapter. All five new paths remain `IMPLEMENTED_UNTESTED` for actual
+inference; some local/remote modes are unavailable upstream. See the
+[status matrix and examples](docs/model-support-matrix.md),
+[upstream audit](docs/model-support-audit.md) and
+[test report](docs/model-support-implementation.md).
+
+`werk support list` shows exact identities and blockers. `serve --preload`
+retains local workers; hosted-model preload only prepares the client and validates
+local credentials, without a paid generation. FLUX.1 Schnell keeps its existing
+Diffusers pipeline.
+
 ## Core capabilities
 
 - [live terminal dashboard and Prometheus/Grafana observability](utils/observability/README.md)

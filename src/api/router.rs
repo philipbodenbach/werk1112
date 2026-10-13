@@ -40,6 +40,20 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
         .map(|origin| origin.header_value())
         .collect::<Vec<_>>();
     let router = Router::new()
+        .route("/werk/v1/model-support", get(super::providers::catalog))
+        .route(
+            "/werk/v1/images/flux-3",
+            post(super::providers::image).layer(DefaultBodyLimit::max(
+                (32 * 1024 * 1024).min(body_limit_bytes),
+            )),
+        )
+        .route("/werk/v1/audio/dialogue", post(super::providers::speech))
+        .route(
+            "/werk/v1/actions/predictions",
+            post(super::providers::action).layer(DefaultBodyLimit::max(
+                (32 * 1024 * 1024).min(body_limit_bytes),
+            )),
+        )
         .route("/metrics", get(super::observability::metrics))
         .route(
             "/werk/v1/observability",

@@ -16,6 +16,7 @@ mod logging;
 mod media;
 mod observability;
 mod preload;
+mod providers;
 mod response;
 mod router;
 mod state;

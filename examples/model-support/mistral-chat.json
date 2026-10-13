@@ -1,0 +1,6 @@
+{
+  "model": "mistral-large-4",
+  "messages": [{"role": "user", "content": "Antworte mit einem JSON-Objekt mit dem Feld greeting."}],
+  "response_format": {"type": "json_object"},
+  "max_tokens": 128
+}

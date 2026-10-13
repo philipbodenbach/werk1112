@@ -339,3 +339,18 @@ target-specific `CC_*`/`CXX_*` settings are documented in the
 - store and authentication: [`src/model_store.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/model_store.rs)
 - installers: [`scripts`](https://github.com/philipbodenbach/werk1112/tree/main/scripts)
 - ComfyUI defaults: [`utils/comfyUI/config.py`](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/config.py)
+
+## Optional official providers and FLUX Action
+
+| Variable | Meaning |
+| --- | --- |
+| `MISTRAL_API_KEY` | Official Mistral API key for registered `mistral-large-4`. |
+| `BFL_API_KEY` | Official BFL key for FLUX 3 Image submission and regional polling; never sent to image storage. |
+| `ELEVENLABS_API_KEY` | Official ElevenLabs key for `eleven_v4` dialogue and streaming audio. |
+| `WERK_FLUX_ACTION_PYTHON` | Python executable in the official `flux-action` environment; local DROID checkpoints require NVIDIA CUDA and matching dependencies. |
+
+Local-only use requires no hosted keys. Keys are not saved in manifests.
+Kolibri requires `aleph-alpha-inference>=1` in the selected `WERK_VLLM_PYTHON`
+environment. See the [model support guide](../model-support-matrix.md) for exact
+contracts, commands and the distinction between local warmup and non-billable
+hosted-client preload.

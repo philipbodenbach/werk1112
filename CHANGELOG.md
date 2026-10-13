@@ -5,6 +5,13 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+- Add evidence-backed model discovery and optional Mistral Large 4, FLUX 3 Image
+  and Eleven v4 provider adapters, plus Kolibri vLLM plugin routing and typed
+  FLUX 3 Action DROID predictions. Actual inference remains unverified; see the
+  model-support audit and matrix for upstream and access blockers.
+- Extend startup preload with resident DROID warmup and explicitly non-billable
+  hosted-client preparation, preserving existing text preload and Schnell paths.
+
 - Add `serve --preload MODEL...` for ordered, best-effort loading and warmup of
   any number of resident text models, with retained cache slots, deployment
   replica support and per-model startup diagnostics.
