@@ -119,16 +119,22 @@ werk doctor --model MODEL --task TASK
 The detailed support levels and known gaps are documented rather than hidden
 behind an “all models supported” claim.
 
-## What’s new in v1.9.0
+## What’s new in v1.9.1
 
-Werk Core, Media Companion, ComfyUI and n8n share release version **1.9.0**.
+Werk Core, Media Companion, ComfyUI and n8n share release version **1.9.1**.
 ComfyUI and n8n remain Beta integrations.
 
-- feat(): update text-\* support and quality of life features werk top and appearance (`2c7dd7c1ab33`)
-- fix(): release pipeline fix (`fceb9c25463a`)
-- fix(release): restore built-in token and immediate metadata merge (`c1efcddfb9d3`)
+- Add evidence-backed model discovery and optional Mistral Large 4, FLUX 3 Image
+  and Eleven v4 provider adapters, plus Kolibri vLLM plugin routing and typed
+  FLUX 3 Action DROID predictions. Actual inference remains unverified; see the
+  model-support audit and matrix for upstream and access blockers.
+- Extend startup preload with resident DROID warmup and explicitly non-billable
+  hosted-client preparation, preserving existing text preload and Schnell paths.
+- Add `serve --preload MODEL...` for ordered, best-effort loading and warmup of
+  any number of resident text models, with retained cache slots, deployment
+  replica support and per-model startup diagnostics.
 
-See the [v1.9.0 changelog](CHANGELOG.md#190---2026-10-08) for all changes and compatibility notes.
+See the [v1.9.1 changelog](CHANGELOG.md#191---2026-10-14) for all changes and compatibility notes.
 
 ## Install
 

@@ -5,6 +5,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-10-14
+
 - Add evidence-backed model discovery and optional Mistral Large 4, FLUX 3 Image
   and Eleven v4 provider adapters, plus Kolibri vLLM plugin routing and typed
   FLUX 3 Action DROID predictions. Actual inference remains unverified; see the
@@ -472,7 +474,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.9.1...HEAD
+[1.9.1]: https://github.com/philipbodenbach/werk1112/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/philipbodenbach/werk1112/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/philipbodenbach/werk1112/compare/v1.7.1...v1.8.0
 [1.7.1]: https://github.com/philipbodenbach/werk1112/compare/v1.7.0...v1.7.1
