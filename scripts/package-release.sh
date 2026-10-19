@@ -16,7 +16,7 @@ usage() {
 Usage: ./scripts/package-release.sh <linux|linux-strix-halo|linux-aarch64|windows|macos>
 
 Builds release artifacts into releases/.
-Regenerates docs/reference/ after building; requires Python 3.9+ (python3).
+Validates reference generation in a temporary directory; requires Python 3.9+ (python3).
 Artifacts are runtime-router binaries, one per configured platform profile.
 Accelerator support may be compiled in or discovered through companion runtimes.
 USAGE
@@ -200,8 +200,13 @@ package_target() {
 
     [ -f "$binary_path" ] || die "expected build output not found: $binary_path"
 
-    printf '\n==> Updating CLI reference\n'
-    python3 "$SCRIPT_DIR/generate-cli-reference.py" "$binary_path" --target "$rust_target"
+    printf '\n==> Validating build-specific CLI reference generation\n'
+    (
+        reference_dir="$(mktemp -d)"
+        trap 'rm -rf -- "$reference_dir"' EXIT
+        python3 "$SCRIPT_DIR/generate-cli-reference.py" "$binary_path" \
+            --target "$rust_target" --profile discovery --output-dir "$reference_dir"
+    )
 
     rm -rf "$staging_dir"
     mkdir -p "$staging_dir" "$REPO_ROOT/releases"

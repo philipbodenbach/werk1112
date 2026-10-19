@@ -462,7 +462,9 @@ limited to 512 KiB; a message array contains 1 through 256 role/content items.
 By default, omitting the top-level `policy` member uses that protocol default,
 and omitting `allow_experimental` means `false`. A server started with
 `werk serve --persistence` can instead provide a policy and experimental opt-in
-for those two omitted members. The granular server options are
+independently for each omitted member. In particular, `policy: {}` does not
+prevent a missing `allow_experimental` from defaulting to `true` under server
+persistence. The granular server options are
 `--persistence-mode`, `--persistence-reuse`,
 `--persistence-ttl-seconds` and `--persistence-pin`.
 

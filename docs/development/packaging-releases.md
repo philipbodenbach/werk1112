@@ -64,12 +64,14 @@ those retain their own licenses.
 ## Build on the matching platform
 
 Each packaging command invokes its target build before creating the archive.
-After a successful build, it automatically regenerates the CLI/parameter
-catalogues in `docs/reference/`. Python 3.9+ is required; generation errors stop
-packaging before an existing archive is replaced. Windows packaging invokes
+After a successful build, it validates CLI/parameter generation using
+`--profile discovery` in a temporary directory, then discards that output without
+overwriting the canonical Linux catalogues in `docs/reference/`. Python 3.9+ is
+required; generation errors stop packaging before an existing archive is replaced. Windows packaging invokes
 the hook through `scripts/build-windows.ps1`. Native artifacts are inspected
 directly; cross-builds compile a separate backend-neutral host binary for
-documentation. See [automatic reference generation](build.md#automatic-cli-reference-generation).
+parser/schema discovery, which does not validate inference on the foreign target.
+See [automatic reference generation](build.md#automatic-cli-reference-generation).
 
 The configured Rust target alone does not provide a foreign linker, SDK or
 accelerator toolchain. Unless a complete cross-compilation environment exists:
@@ -96,7 +98,7 @@ The shell script:
 1. reads the version from `Cargo.toml`;
 2. runs `cargo build-linux`;
 3. verifies the expected target binary;
-4. regenerates the CLI reference from the new build;
+4. validates CLI reference generation in a temporary discovery directory;
 5. recreates `target/package/linux` as a staging directory;
 6. copies `werk`, the current root `README.md`, and the authoritative
    `LICENSE`;
@@ -296,9 +298,10 @@ on the default branch and keep the default `auto` version mode. No manually
 prepared release PR or local preparation command is needed. The workflow updates
 the product version files and lockfiles, dates the changelog, generates the README
 release section and updates current documentation references. It creates a
-backend-neutral CLI build after the version bump and regenerates all five
-CLI/parameter catalogues before preparing the release PR. It then creates a
-release PR with the built-in `GITHUB_TOKEN`, merges it immediately when branch
+canonical Linux CLI build (`--no-default-features`, no optional backend features)
+in `target/cli-reference-neutral` after the version bump, then regenerates and
+checks all five CLI/parameter catalogues before preparing the release PR. It then
+creates a release PR with the built-in `GITHUB_TOKEN`, merges it immediately when branch
 rules allow it, then tags the actual merge commit as
 `v<VERSION>` and creates the GitHub release from those notes. The workflow must
 first be merged into the default branch to appear in GitHub's manual workflow menu.
@@ -353,11 +356,14 @@ npm or publish to the ComfyUI Registry.
 The release-tool tests, CLI reference build/check and metadata validation run
 directly in this workflow.
 The generated version/documentation commit includes `[skip ci]`, so it does not
-start duplicate **Werk Observability**, **n8n Custom Nodes (Beta)** or
-**ComfyUI Registry** PR workflows that would require manual approval when opened
-with `GITHUB_TOKEN`. This marker is limited to the generated release commit;
-normal feature and fix PRs retain their CI. Complete their checks before starting
-Release. Native GPU smoke tests and platform artifact builds remain manual.
+start duplicate **CLI Reference**, **Werk Observability**, **n8n Custom Nodes (Beta)**
+or **ComfyUI Registry** PR workflows that would require manual approval when
+opened with `GITHUB_TOKEN`. This marker is limited to the generated release commit;
+normal feature and fix PRs retain their CI. Release runs the canonical reference
+build/check inline before the PR and checks again before tagging. No required
+checks or branch protections are changed or bypassed; repository rules still
+govern merging. Complete ordinary PR checks before starting Release. Native GPU
+smoke tests and platform artifact builds remain manual.
 See [GitHub's skip instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs).
 
 No custom GitHub App, personal access token or additional release secret is

@@ -49,6 +49,8 @@ class DiscoveryBinaryTests(unittest.TestCase):
                 self.assertIn("--locked", command)
                 self.assertIn("--no-default-features", command)
                 self.assertEqual(command[command.index("--target") + 1], HOST)
+                self.assertEqual(command[command.index("--target-dir") + 1],
+                                 str(ROOT / "target/cli-reference-host"))
 
     def test_host_build_failure_never_falls_back_to_foreign_artifact(self):
         results = [subprocess.CompletedProcess([], 0, stdout=f"host: {HOST}\n"),
@@ -82,6 +84,9 @@ class PackagingReferenceTests(unittest.TestCase):
         assets.mkdir(parents=True)
         for name in ["README.md", "prometheus.yml", "grafana-dashboard.json"]:
             (assets / name).write_text("fixture\n")
+        self.canonical = self.repo / "docs/reference/cli-options.md"
+        self.canonical.parent.mkdir(parents=True)
+        self.canonical.write_text("canonical reference fixture\n")
         self.trace = self.repo / "trace.jsonl"
         bin_dir = self.repo / "fake-bin"
         bin_dir.mkdir()
@@ -103,6 +108,9 @@ from pathlib import Path
 assert Path(sys.argv[1]).read_text() == 'fresh binary fixture'
 with open(os.environ['BUILD_TRACE'], 'a') as trace:
     trace.write(json.dumps(['reference', *sys.argv[1:]]) + '\\n')
+output = Path(sys.argv[sys.argv.index('--output-dir') + 1])
+assert output.resolve() != Path('docs/reference').resolve()
+(output / 'cli-options.md').write_text('noncanonical discovery')
 if os.environ.get('REFERENCE_FAIL'):
     sys.exit(23)
 Path('README.md').write_text('reference generated before staging')
@@ -124,9 +132,13 @@ Path('README.md').write_text('reference generated before staging')
         result = self.run_package()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         calls = [json.loads(line) for line in self.trace.read_text().splitlines()]
-        self.assertEqual(calls, [["cargo", "build-linux"],
-                               ["reference", "target/x86_64-unknown-linux-gnu/release/werk",
-                                "--target", HOST]])
+        self.assertEqual(calls[0], ["cargo", "build-linux"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][:-1],
+                         ["reference", "target/x86_64-unknown-linux-gnu/release/werk",
+                          "--target", HOST, "--profile", "discovery", "--output-dir"])
+        self.assertFalse(Path(calls[1][-1]).exists())
+        self.assertEqual(self.canonical.read_text(), "canonical reference fixture\n")
         with tarfile.open(self.archive) as archive:
             self.assertEqual(archive.extractfile("README.md").read(),
                              b"reference generated before staging")
@@ -143,6 +155,9 @@ Path('README.md').write_text('reference generated before staging')
     def test_generation_failure_preserves_archive_and_staging(self):
         result = self.run_package(REFERENCE_FAIL="1")
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertFalse(Path(calls[-1][-1]).exists())
+        self.assertEqual(self.canonical.read_text(), "canonical reference fixture\n")
         self.assertEqual(self.archive.read_bytes(), b"previous release")
         self.assertTrue(self.staged.exists())
 

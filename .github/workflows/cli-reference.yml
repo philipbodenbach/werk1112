@@ -1,0 +1,64 @@
+name: CLI Reference
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "runtime/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "scripts/generate-cli-reference.py"
+      - "scripts/tests/**"
+      - "scripts/*release*"
+      - "scripts/build-windows.ps1"
+      - "docs/reference/**"
+      - ".github/workflows/cli-reference.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Generated release metadata uses [skip ci]. Release runs the same canonical
+# build/check itself before the preparation PR and again before tagging.
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TARGET_DIR: target/cli-reference-neutral
+      RUST_MIN_STACK: "16777216"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Test generator and build integration
+        run: |
+          python -B -m unittest discover -s scripts/tests -p 'test_cli_reference.py'
+          python -B -m unittest discover -s scripts/tests -p 'test_build_reference.py'
+          python -B -m unittest discover -s scripts/tests -p 'test_release_reference.py'
+      - name: Build the canonical Linux CLI from this checkout
+        run: cargo +stable build --locked --bin werk --no-default-features
+      - name: Check reference drift without rewriting
+        run: python scripts/generate-cli-reference.py target/cli-reference-neutral/debug/werk --check
+      - name: Check the neutral parser including rejection of burn
+        run: cargo +stable test --locked --no-default-features --lib cli::tests::parses_cli_commands -- --exact
+
+  conditional-parser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TARGET_DIR: target/cli-reference-burn
+      RUST_MIN_STACK: "16777216"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Check burn-experimental parser acceptance without inference
+        run: cargo +stable test --locked --no-default-features --features burn-experimental --lib cli::tests::parses_cli_commands -- --exact

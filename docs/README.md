@@ -19,7 +19,7 @@ The browser-friendly index is published as the
 | Review Kolibri, Mistral Large 4, FLUX 3 and Eleven v4 | [Model support matrix](model-support-matrix.md) |
 | Install and run a first command | [Getting started](getting-started.md) |
 | Look up CLI commands and semantics | [CLI reference](reference/cli.md) |
-| Look up every command, argument and option | [Complete CLI index](reference/cli-options.md) |
+| Look up commands, arguments and options in the canonical Linux profile | [Complete CLI index](reference/cli-options.md) |
 | Look up media options and parameter defaults | [Media CLI rules](reference/cli-media.md) and [parameter schema](reference/parameters-schema.md) |
 | Understand every HTTP route | [HTTP API](api.md) |
 | Implement a runtime-control client | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |

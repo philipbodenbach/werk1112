@@ -7,15 +7,18 @@ Single-host CUDA profiles add `werk gpus` (JSON inventory),
 native-build selection, replicas, budgets and compatibility limits.
 
 This page describes the public command groups and their operational semantics.
-The complete reference also includes:
+The reference for the canonical Linux build (`--no-default-features`, no optional
+backend features) also includes:
 
-- [Every command, argument and core/global option](cli-options.md).
+- [Every command, argument and core/global option in that profile](cli-options.md).
 - [Image options](cli-image.md), [video options](cli-video.md) and [audio options](cli-audio.md), including per-command applicability.
 - [Media input, task selection, routing and override rules](cli-media.md).
 - [All canonical parameter schemas](parameters-schema.md), [tasks and formats](tasks-and-formats.md), and [environment variables](environment-variables.md).
 
-The command and schema catalogues are generated from the current binary. For
-a different installed version, inspect its exact flags and accepted values:
+The command and schema catalogues are generated from a fresh build of the current
+checkout. Other platforms and feature builds can expose a different parser; see
+[conditional build options](#conditional-build-options). For an installed binary,
+inspect its exact flags and accepted values:
 
 ```bash
 werk --help
@@ -38,7 +41,6 @@ Compatibility spellings remain accepted:
 | `werk rm`, `werk delete` | `werk remove` |
 | `werk auth hf` | `werk auth huggingface` |
 | `werk auth api-keys` | `werk auth api-key` |
-| `werk temp purge` | `werk temp clear` |
 | `serve --verbose-lite` | `serve --verbose-pure` |
 | `run/chat --single-turn` | `--no-history` |
 | `bench --tokens` | `--max-tokens` |
@@ -58,39 +60,69 @@ go to stderr; structured command results go to stdout.
 
 ### Keeping the reference complete
 
-The GitHub **Release** workflow builds a backend-neutral CLI after preparing
-the new product version and regenerates the catalogues before creating its
-release preparation PR. A final `--check` must pass before tagging. Retrying an
-existing tag only checks its reference; it never regenerates tagged content.
+The checked-in catalogues use **Linux, `--no-default-features`, no optional
+backend features**. The **CLI Reference** PR workflow builds this profile from
+the checked-out revision in `target/cli-reference-neutral`, then runs `--check`.
+Changes to sources, schemas, Cargo configuration, the generator, tests or reference
+trigger it. Drift fails the check, prints a diff and a regeneration command, and
+does not rewrite files.
 
-`scripts/package-release.sh` and `scripts/build-windows.ps1` automatically
-regenerate the catalogues after a successful build. Windows packaging through
-`scripts/package-release.ps1` uses the same build hook. Python 3.9+ is required;
-generation failures stop the script before packaging. The generated files are
-updated locally in `docs/reference/`.
+The GitHub **Release** workflow builds the same profile after preparing the new
+product version, regenerates and checks the catalogues before its release PR,
+and checks again before tagging. Existing-tag retries only check; they never
+regenerate tagged content. Generated release commits use `[skip ci]`; the inline
+Release checks cover reference validation without requiring a duplicate PR run.
+Existing repository rules still apply.
 
-Plain `cargo build` and the Cargo build aliases do not invoke the generator.
-For these builds, or to check documentation separately, run:
+To regenerate or check locally on Linux:
 
 ```bash
-cargo build --bin werk
-python3 scripts/generate-cli-reference.py target/debug/werk
-python3 scripts/generate-cli-reference.py target/debug/werk --check
+cargo +stable build --locked --bin werk --no-default-features --target-dir target/cli-reference-neutral
+python3 scripts/generate-cli-reference.py target/cli-reference-neutral/debug/werk
+python3 scripts/generate-cli-reference.py target/cli-reference-neutral/debug/werk --check
 ```
+
+Use this fresh build even if another binary reports the same version: a version
+match does not establish source revision or build features. The generator rejects
+version mismatches and the known noncanonical `burn` parser value; these guards
+are not a universal binary provenance check. Plain Cargo builds and aliases do
+not invoke the generator.
 
 The script recursively discovers public command help, including nested runtime
 state actions, and queries all canonical task schemas in a temporary empty store
-with automatic backend installation disabled. It does not perform inference or
-download models. It strips environment defaults and rejects a different package
-version. `--check` exits nonzero for drift and does not rewrite the reference.
-Packaging passes `--target TRIPLE`: native builds use their new artifact;
-cross-builds first compile a backend-neutral host binary for discovery instead
-of attempting to execute a foreign binary. This additional Cargo build uses
-the lockfile and does not install models or inference backends.
-Build from the current checkout even when an installed binary has the same
-version. Review the prose here and in `cli-media.md` when behavior, aliases,
-conflicts or support boundaries change; help/schema comparison alone cannot
-prove that prose is semantically current.
+with automatic backend installation disabled. It strips environment defaults and
+does not perform inference, download models or install backends. Python 3.9+ is
+required. Review the prose here and in `cli-media.md` when behavior, aliases,
+conflicts or support boundaries change: help/schema comparison alone cannot
+prove that prose is semantically current or that inference works.
+
+`scripts/package-release.sh` and `scripts/build-windows.ps1` validate generation
+after a successful build using `--profile discovery` and a temporary output
+directory, then discard that output. Windows packaging through
+`scripts/package-release.ps1` uses the same hook. Generation failures stop
+packaging. These runs cannot overwrite the canonical catalogues. With
+`--target TRIPLE`, native builds inspect their new artifact; cross-builds compile a neutral
+host discovery tool in `target/cli-reference-host` and use the exact Cargo-reported
+executable. That host parser/schema snapshot does not validate foreign-target
+inference or optional backend execution.
+
+### Conditional build options
+
+`--backend burn` is accepted only when compiled with `burn-experimental`. The
+canonical neutral tables intentionally omit this value. Parser acceptance does
+not enable the separate `burn-runtime` implementation or promise model/hardware
+support. The PR workflow runs the existing parser test in both configurations,
+using separate build directories and no models or inference. As in the existing
+CI test setup, the large CLI test needs a 16 MiB thread stack:
+
+```bash
+RUST_MIN_STACK=16777216 cargo +stable test --locked --no-default-features --target-dir target/cli-reference-neutral --lib cli::tests::parses_cli_commands -- --exact
+RUST_MIN_STACK=16777216 cargo +stable test --locked --no-default-features --features burn-experimental --target-dir target/cli-reference-burn --lib cli::tests::parses_cli_commands -- --exact
+```
+
+If generating discovery output from an optional-feature binary, use
+`--profile discovery --output-dir TEMP_DIRECTORY`. Do not compare that output
+with neutral pages or use it to replace the checked-in reference.
 
 ## Terminal presentation
 
@@ -108,7 +140,10 @@ Monitoring polls are available at TRACE. Request bodies and credentials are not
 included in HTTP access events.
 
 Set `NO_COLOR=1` to remove colors while retaining layout. `TERM=dumb` and redirected
-streams use plain output. JSON/JSONL, `inspect`, protocol commands and `temp path`
+streams use plain output for ordinary commands. Interactive `top` instead requires
+a TTY and uses raw mode and an alternate screen, even with `TERM=dumb`.
+`NO_COLOR` changes its colors, not that mode; use `werk top --once` or
+`werk top --once --json` for scripts. JSON/JSONL, `inspect`, protocol commands and `temp path`
 remain unadorned even in a terminal. Streamed model content is not rewritten.
 Backend installer output is streamed through the same presentation; failures
 retain nonzero exit codes and their diagnostic details.
@@ -137,7 +172,9 @@ The default threshold is **INFO**. Log levels and presentation are independent:
 and detailed analysis statistics. **`serve --verbose-pure`** defaults to DEBUG
 and writes raw JSONL to stderr, without a banner, panels or ANSI escapes.
 `--verbose-lite` is an alias of `--verbose-pure`; the two verbose modes conflict.
-An explicit `--log-level` always wins over either verbose mode's default.
+`run`/`chat` and image/video/audio commands also default to DEBUG with their
+supported `--verbose` or `--debug` flags, as does `bench --debug`. An explicit
+`--log-level` (or `WERK_LOG_LEVEL` when no flag is given) wins over these defaults.
 
 ```bash
 # Readable console plus an independent structured file
@@ -156,7 +193,7 @@ These global options also apply to other CLI commands:
 
 | Option | Default / behavior |
 | --- | --- |
-| `--log-level error\|warn\|info\|debug\|trace\|off` | INFO, or DEBUG with a verbose serve mode. |
+| `--log-level error\|warn\|info\|debug\|trace\|off` | INFO; DEBUG for verbose serve modes, `run`/`chat` and media `--verbose`/`--debug`, or `bench --debug`. An explicit level wins. |
 | `--log-format auto\|text\|json` | `auto`: terminal palette when interactive, plain text in pipes. `text`: undecorated text. `json`: raw JSONL. Pure mode forces JSON. |
 | `--log-file PATH` | Optional append-only JSONL destination, independent of console rendering. No file is created unless configured. |
 | `--log-max-size-mb N` | Rotate before exceeding 10 MiB; one oversized event remains intact. Range 1–4096. |
@@ -327,12 +364,13 @@ werk list --family flux --json
 werk inspect model-id
 ```
 
-`list` shows model metadata, a `managed` or `external` storage label, and the
-absolute storage path in `PATH`. For managed models, this is the directory
+`list` shows model metadata, a `managed`, `external` or `remote` storage label,
+and the absolute local path in `PATH`. For managed models, this is the directory
 containing `manifest.json` and `files/`; for external bindings, it is the
-external files' source path. It supports metadata filters and sizes table
-columns to their contents. When the table
-would exceed the terminal width, each model is shown as a labeled block with
+external files' source path. Hosted registrations use `remote`, with `PATH`
+pointing to their local registration directory, not weights or a provider URL.
+It supports metadata filters and sizes table columns to their contents. When the
+table would exceed the terminal width, each model is shown as a labeled block with
 its full name and path. `list --json` prints the stored/enriched manifests.
 External bindings include a `storage` record with `kind: "external"` and their
 absolute path. They remain listed if the external disk is unmounted; loading
@@ -532,9 +570,12 @@ currently accepts only plain `http://` with no path or embedded credentials.
 `--api-key` overrides the `WERK_API_KEY` default, but the environment variable
 avoids placing a key directly in shell history. The bundled client does not
 follow redirects or provide TLS; use it only over loopback or a trusted private
-hop. `--timeout-seconds` is a total per-request deadline, defaults to 30 and
-accepts values from 1 through 86400; like `--url` and `--api-key`, it must
-appear before the runtime subcommand.
+hop. `--timeout-seconds` defaults to 30 and accepts 1 through 86400. The shared
+request deadline starts before DNS resolution and bounds TCP connection attempts
+and I/O. Synchronous DNS resolution itself can block past that deadline; after
+it returns, the client checks the remaining time before connecting. It is not a
+hard timeout on DNS. Like `--url` and `--api-key`, the option must appear before
+the runtime subcommand.
 
 The active store belongs to the server. A client-side global `--model-home`
 does not redirect remote runtime state; start the server with the intended
@@ -600,9 +641,14 @@ werk runtime prune --all --confirm-all --execute
 
 `--all` is rejected without `--confirm-all`; `--confirm-all` is invalid for
 the ID and filter forms. `--execute` changes `dry_run` from true to false.
-Pruning affects only the selected runtime states. It does not purge temporary
-files and cannot remove models, artifacts, outputs, jobs, authentication data,
-backend installations or external paths.
+The selector determines which live runtime states are explicitly deleted. Execute
+also performs maintenance in the same principal namespace: it expires volatile
+states, reconciles TTL/catalog remnants and can quarantine corrupt entries. This
+can affect entries outside a narrow ID/model/time selector. Dry-run does not run
+that additional maintenance, and `matched`/`removed` do not account for all of it.
+Pruning cannot affect other principals and does not purge temporary files or remove
+models, model artifacts, outputs, jobs, authentication data, backend installations
+or external paths.
 
 To clear every runtime state visible to the current authenticated principal,
 preview and then execute the explicit all-selector:
@@ -833,10 +879,14 @@ diagnostics before entering native inference.
 
 On WSL, `WERK_MODEL_CACHE_RELEASE=auto` (the default) requests release of the
 loaded model files' clean OS cache pages when their local model owner or worker
-is destroyed. This applies to all model families, after `run`, after leaving
-`chat`, and when `serve` stops or unloads its worker. Owned subprocesses are
-stopped and reaped first, including CLI interruption. An active chat/server
-worker retains its model; this is not an idle timer between requests.
+is destroyed on backend paths that acquire a `CacheReleaseGuard` file lease.
+Those paths can release pages after `run`, after leaving `chat`, or when `serve`
+stops or unloads the worker. Subprocesses participating in `ManagedChild` cleanup
+are stopped and reaped first, including CLI interruption. These guarantees do not
+cover every local provider: the DROID worker uses a normal `Child` with kill/wait
+on drop, without a `CacheReleaseGuard` lease or central `ManagedChild` interrupt
+registration. An active chat/server worker retains its model; this is not an
+idle timer between requests.
 
 This file-scoped operation does not delete model files, chat history or saved
 KV snapshots, and does not restart WSL or clear the system-wide cache. It can
@@ -1164,8 +1214,10 @@ werk serve --model chat-model --persistence
 
 `--persistence` supplies `auto` retention, `prefer` reuse, no TTL and no pinning
 when a `POST /werk/v1/prefill` request omits its top-level `policy` member. It
-also supplies `allow_experimental: true` when that member is omitted. For a
-local vLLM process started by this server, it defaults vLLM's native automatic
+independently supplies `allow_experimental: true` when the top-level
+`allow_experimental` member is omitted, even if `policy: {}` is present. Each
+explicit top-level value wins over its respective server default. For a local
+vLLM process started by this server, it defaults vLLM's native automatic
 prefix cache on. Werk verifies that the installed vLLM help advertises the
 generated flag before starting the process. A remote vLLM endpoint remains
 externally managed and receives no generated launch argument.

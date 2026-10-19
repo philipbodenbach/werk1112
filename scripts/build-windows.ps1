@@ -84,9 +84,16 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Write-Host "Updating CLI reference from the Windows build."
+Write-Host "Validating build-specific CLI reference generation."
 $BinaryPath = Join-Path $RepoRoot "target\x86_64-pc-windows-msvc\release\werk.exe"
-& $PythonLauncher @PythonArgs (Join-Path $ScriptDir "generate-cli-reference.py") $BinaryPath --target x86_64-pc-windows-msvc
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+$ReferenceDir = Join-Path ([System.IO.Path]::GetTempPath()) ("werk-cli-reference-" + [guid]::NewGuid().ToString("N"))
+New-Item $ReferenceDir -ItemType Directory | Out-Null
+try {
+    & $PythonLauncher @PythonArgs (Join-Path $ScriptDir "generate-cli-reference.py") $BinaryPath --target x86_64-pc-windows-msvc --profile discovery --output-dir $ReferenceDir
+    $ReferenceExitCode = $LASTEXITCODE
+} finally {
+    Remove-Item $ReferenceDir -Recurse -Force
+}
+if ($ReferenceExitCode -ne 0) {
+    exit $ReferenceExitCode
 }

@@ -32,7 +32,7 @@ class ReleaseReferenceOrderTests(unittest.TestCase):
 
     def test_reference_check_is_required_before_any_tag_mutation(self):
         script = step_script("Validate and tag the merged release")
-        check = "python scripts/generate-cli-reference.py target/debug/werk --check"
+        check = "python scripts/generate-cli-reference.py target/cli-reference-neutral/debug/werk --check"
         self.assertTrue(script.startswith(check + "\n"))
         self.assertLess(script.index(check), script.index("git tag -a"))
         self.assertLess(script.index(check), script.index("git push"))
@@ -67,7 +67,7 @@ with open('trace.jsonl', 'a') as trace:
 if os.environ.get('REFERENCE_BUILD_FAIL'):
     sys.exit(17)
 version = re.search(r'version = "([^"]+)"', Path('Cargo.toml').read_text())[1]
-binary = Path('target/debug/werk')
+binary = Path(os.environ['CARGO_TARGET_DIR']) / 'debug/werk'
 binary.parent.mkdir(parents=True, exist_ok=True)
 binary.write_text('werk ' + version)
 """)
@@ -88,7 +88,8 @@ if '--check' in sys.argv:
     sys.exit(0 if reference.read_text() == expected else 1)
 reference.write_text(expected)
 """)
-        self.env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", RELEASE_TAG="v1.2.4")
+        self.env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", RELEASE_TAG="v1.2.4",
+                        CARGO_TARGET_DIR="target/cli-reference-neutral")
 
     def run_step(self, **env):
         return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step_script(REFERENCE_STEP)],
@@ -104,7 +105,8 @@ reference.write_text(expected)
         self.assertEqual(self.reference.read_text(), "Generated for werk 1.2.4\n")
         self.assertEqual(self.calls(), [
             ["cargo", "+stable", "build", "--locked", "--bin", "werk", "--no-default-features"],
-            ["reference", "target/debug/werk"],
+            ["reference", "target/cli-reference-neutral/debug/werk"],
+            ["reference", "target/cli-reference-neutral/debug/werk", "--check"],
         ])
 
     def test_build_failure_leaves_reference_untouched(self):
@@ -123,7 +125,7 @@ reference.write_text(expected)
         result = self.run_step(REFERENCE_TAG_EXISTS="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.reference.read_bytes(), before)
-        self.assertEqual(self.calls()[-1], ["reference", "target/debug/werk", "--check"])
+        self.assertEqual(self.calls()[-1], ["reference", "target/cli-reference-neutral/debug/werk", "--check"])
 
     def test_existing_tag_with_current_reference_passes_without_rewriting(self):
         self.reference.write_text("Generated for werk 1.2.4\n")
@@ -131,7 +133,7 @@ reference.write_text(expected)
         result = self.run_step(REFERENCE_TAG_EXISTS="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.reference.stat().st_mtime_ns, before)
-        self.assertEqual(self.calls()[-1], ["reference", "target/debug/werk", "--check"])
+        self.assertEqual(self.calls()[-1], ["reference", "target/cli-reference-neutral/debug/werk", "--check"])
 
 
 if __name__ == "__main__":
