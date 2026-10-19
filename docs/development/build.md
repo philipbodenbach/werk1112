@@ -111,6 +111,37 @@ cargo +stable install --path . --locked --force
 `werk` already found on `PATH`. Run the local file explicitly or use
 `cargo install` when replacement is intended.
 
+## Automatic CLI reference generation
+
+The GitHub **Release** workflow builds a backend-neutral CLI after the version
+bump, regenerates the catalogues before preparing the release PR and checks
+them again before tagging. This build is for documentation discovery; platform
+release artifacts are still built separately. Existing-tag retries only check
+the reference without rewriting it.
+
+The build in `scripts/build-windows.ps1` and the release builds in
+`scripts/package-release.sh` regenerate the five CLI/parameter catalogues in
+`docs/reference/` after Cargo succeeds. `scripts/package-release.ps1` inherits
+this step from the Windows build script. Python 3.9+ is required (`python3` for
+the shell script; `py -3`, `python` or `python3` on Windows). A generator error
+fails the script before an archive is staged or replaced.
+
+Native builds query the freshly built binary. Cross-builds compile an additional
+backend-neutral host binary using `cargo build --locked --no-default-features`
+and an explicit host target, then use that executable for documentation.
+Discovery only calls version/help and model-free parameter inspection.
+
+Direct Cargo commands and aliases remain ordinary Rust builds. Run the
+generator manually after these builds, or check for drift without rewriting:
+
+~~~bash
+python3 scripts/generate-cli-reference.py target/debug/werk
+python3 scripts/generate-cli-reference.py target/debug/werk --check
+~~~
+
+See [reference maintenance](../reference/cli.md#keeping-the-reference-complete)
+for the scope of generated and manually maintained documentation.
+
 ## Target release aliases
 
 Release tooling uses one alias for each configured platform profile:

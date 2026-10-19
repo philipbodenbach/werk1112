@@ -5,136 +5,58 @@
 </p>
 
 Werk1112 is a local-first, multimodal inference runtime and router written in
-Rust.
-Applications use one CLI and HTTP service; Werk resolves models, parameters,
-hardware and installed runtimes, then selects an executable backend.
+Rust. Developers use one CLI and HTTP service for text, image, video and audio
+workflows across compatible backends. Werk discovers models, selects an
+executable backend and runs requests through the runtimes available on your
+hardware.
 
-Werk supports text, image, video and audio workflows without coupling clients
-to llama.cpp, vLLM, Candle, MLX, oMLX, ONNX Runtime, Diffusers, Transformers or
-architecture-specific companion runtimes.
+Documented paths include Apple Silicon, NVIDIA CUDA and AMD Strix Halo;
+see the [platform overview](#platform-overview) for requirements and validation
+limits. Optional hosted adapters connect to external providers and remain subject
+to their access requirements and costs.
 
-## European model integrations
+[Install](#install) · [Quick start](#quick-start) · [HTTP service](#http-service) ·
+[Documentation](#documentation)
 
-Optional hosted adapters cover Mistral Large 4, FLUX 3 Image and Eleven v4;
-Kolibri uses Aleph Alpha's vLLM plugin, and FLUX 3 Action has a resident DROID
-prediction adapter. All five new paths remain `IMPLEMENTED_UNTESTED` for actual
-inference; some local/remote modes are unavailable upstream. See the
-[status matrix and examples](docs/model-support-matrix.md),
-[upstream audit](docs/model-support-audit.md) and
-[test report](docs/model-support-implementation.md).
+## Why Werk1112?
 
-`werk support list` shows exact identities and blockers. `serve --preload`
-retains local workers; hosted-model preload only prepares the client and validates
-local credentials, without a paid generation. FLUX.1 Schnell keeps its existing
-Diffusers pipeline.
+- **Connect existing clients.** Use the documented OpenAI-compatible API and
+  Anthropic Messages subsets through one service, with streaming and client tool
+  calling. See [API coverage](docs/api.md).
+- **Run local AI inference on your own hardware.** Suitable local paths can work
+  offline once models, runtimes and dependencies are provisioned. This can reduce
+  reliance on paid hosted inference; downloads and hosted APIs require a network.
+- **Manage models across modalities.** Import existing files or pull compatible
+  Hugging Face repositories into a shared [model store](docs/concepts/models-manifests-and-store.md),
+  then use typed text and media commands without integrating each runtime yourself.
+- **Diagnose runtime choices.** Use automatic or explicit backend selection,
+  `werk inspect` and `werk doctor` to check model requirements and routing blockers.
+- **Work within memory limits.** Use backend-specific CPU/GPU offload, placement
+  and cache controls where implemented. [Memory capabilities](docs/concepts/runtime-persistence-and-memory.md)
+  depend on the model and runtime; routing alone does not reduce memory use.
+- **Serve and observe multiple models.** Retain supported workers with
+  [startup preload](docs/reference/cli.md#startup-preload), inspect activity with
+  `werk top`, and connect [Prometheus/Grafana](utils/observability/README.md).
+  Capacity and concurrent execution remain backend- and resource-dependent.
 
-## Core capabilities
+## Platform overview
 
-- [live terminal dashboard and Prometheus/Grafana observability](utils/observability/README.md)
-- managed local and Hugging Face model store
-- explicit or automatic runtime and accelerator selection
-- typed chat, image, video and audio commands
-- workload estimation, parameter validation and provenance
-- OpenAI-compatible and Anthropic Messages API subsets with text, streaming and
-  client tool calling, plus Werk-native media and job APIs
-- optional ComfyUI nodes with native IMAGE, VIDEO and AUDIO values
-- optional [native n8n nodes (Beta)](utils/n8n/README.md),
-  with manual installation, binary media and runtime operations
-- experimental [SSD expert offload for oMLX](docs/backends.md#experimental-omlx-expert-offload)
-  with a bounded cache and existing ComfyUI/n8n expert controls
+These are documented runtime paths, not blanket hardware-validation or model-fit
+claims. Install the matching drivers, runtimes and model packages separately.
 
-Werk is an inference runtime and router, not an agent framework, workflow
-engine or GUI.
+| Hardware / platform | Runtime path | Main requirement or limit | Guide |
+| --- | --- | --- | --- |
+| CPU / generic hosts | llama.cpp CPU; compatible Candle or ONNX paths | Releases target Linux x86_64, Windows x86_64 and macOS Apple Silicon; architecture, build features and runner availability still apply. | [Backend matrix](docs/backends.md#platform-support-matrix) |
+| NVIDIA CUDA | llama.cpp CUDA; eligible local vLLM; compatible Python media runtimes | Linux is the primary path; Windows needs a matching CUDA toolchain, WSL2 is best effort. Local vLLM execution requires native Linux. | [Backends](docs/backends.md) |
+| Apple Silicon | llama.cpp Metal, MLX/MLX-VLM and oMLX adapters | macOS and compatible model/runtime versions required; managed oMLX requires macOS 15+. | [Installation matrix](docs/backends.md#platform-aware-explicit-installation) |
+| AMD Strix Halo, Ryzen AI Max/Max+ (`gfx1151`) | llama.cpp ROCm/HIP or Vulkan; operator-provisioned ROCm vLLM/Python | Native Linux x86_64; implemented integration still requires the real-hardware smoke gate. No NPU adapter. | [Strix Halo](docs/integrations/strix-halo.md) |
+| NVIDIA DGX Spark / GB10 | Compatible llama.cpp CUDA and Spark vLLM environment/container | Linux aarch64 profile is Spark-specific; real GB10 smoke testing required. No native TensorRT-LLM or NIM adapter. | [DGX Spark](docs/integrations/dgx-spark.md) |
 
-Save and resume a terminal conversation with any chat backend:
-
-~~~bash
-werk chat MODEL --persistence --session project
-werk run MODEL "Continue with a short summary" --session project --stream
-~~~
-
-Both commands share the same model/session history. Completed turns are saved locally,
-including when runtime routing changes. Without `--session`, the name is
-`default` for that model. Native KV reuse is separate and backend-dependent;
-conversation persistence works even when the backend must recompute the prompt.
-See the [CLI reference](docs/reference/cli.md#persistent-terminal-chat).
-
-Monitor a running server with a responsive dashboard in Werk's logo colors:
-
-~~~bash
-werk top
-werk top --demo
-werk top --once --json
-~~~
-
-`werk top` shows request activity, timing, memory and supported native cache/offload
-metrics. Both the server and client need the new observability build. Previewing
-with `--demo` uses simulated data and leaves running inference untouched. The same
-telemetry is available through authenticated `/metrics` for Prometheus and Grafana.
-See [setup, metric semantics and backend coverage](utils/observability/README.md).
-
-Inspect and clean up persisted caches:
-
-~~~bash
-werk cache list
-werk cache purge <CACHE-ID>
-werk cache purge --all --dry-run
-werk cache purge --all
-~~~
-
-The list distinguishes chat KV caches, saved chat histories, oMLX worker
-caches and runtime states. `--all` preserves saved histories and skips active
-or protected entries. Use `--include-history` to explicitly remove histories
-too. See [cache management](docs/reference/cli.md#local-persistence-caches).
-
-For experimental DeepSeek V4 chat with an 8 GiB expert cache and thinking
-explicitly disabled:
-
-~~~bash
-WERK_OMLX_EXPERT_CACHE_MB=8192 WERK_OMLX_THINKING=0 \
-  werk --backend omlx chat mlx-community/DeepSeek-V4-Flash-2bit-DQ --persistence --verbose
-~~~
-
-oMLX enables thinking by default for this model; its hidden reasoning can delay
-the first visible answer. Omit `WERK_OMLX_THINKING` to preserve that default.
-SSD expert offload saves memory but can substantially reduce generation speed.
-For ComfyUI or n8n, start `werk --backend omlx serve` and select the options
-directly in **WERK Text Config** (ComfyUI) or **WERK Text → Chat Options**
-(n8n): thinking `disabled`, expert offload `enabled`, and an expert cache
-budget of `8192` MiB. The default `inherit` keeps the server's
-settings. See the [chat API options](docs/api.md#omlx-chat-options) for the
-request contract and server compatibility check.
-
-## Status
-
-Werk1112 is under active development. Model discovery is broader than model
-execution: a repository may be imported and classified even when no installed
-runtime can execute its architecture. Use the following before a large run:
-
-~~~bash
-werk inspect MODEL
-werk doctor --model MODEL --task TASK
-~~~
-
-The detailed support levels and known gaps are documented rather than hidden
-behind an “all models supported” claim.
-
-## What’s new in v1.9.1
-
-Werk Core, Media Companion, ComfyUI and n8n share release version **1.9.1**.
-ComfyUI and n8n remain Beta integrations.
-
-- Add evidence-backed model discovery and optional Mistral Large 4, FLUX 3 Image
-  and Eleven v4 provider adapters, plus Kolibri vLLM plugin routing and typed
-  FLUX 3 Action DROID predictions. Actual inference remains unverified; see the
-  model-support audit and matrix for upstream and access blockers.
-- Extend startup preload with resident DROID warmup and explicitly non-billable
-  hosted-client preparation, preserving existing text preload and Schnell paths.
-- Add `serve --preload MODEL...` for ordered, best-effort loading and warmup of
-  any number of resident text models, with retained cache slots, deployment
-  replica support and per-model startup diagnostics.
-
-See the [v1.9.1 changelog](CHANGELOG.md#191---2026-10-14) for all changes and compatibility notes.
+Unified memory is shared physical capacity, not additive RAM and VRAM pools.
+Memory budgets and estimates do not guarantee that a model fits.
+[Single-host deployment profiles](docs/concepts/single-host-deployments.md) expose
+supported local CUDA multi-GPU strategies; they do not provide multi-node clusters
+or mixed NVIDIA/AMD sharding. See [implementation and hardware evidence](docs/multi-gpu-progress.md).
 
 ## Install
 
@@ -153,7 +75,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/philipbodenbach/werk1112/main/scripts/install.ps1 | iex
 ~~~
 
-Install from source:
+From a source checkout with stable Rust and the [native build dependencies](docs/development/build.md):
 
 ~~~bash
 cargo +stable install --path . --locked
@@ -162,107 +84,36 @@ cargo +stable install --path . --locked
 Installer options, first-model setup and uninstall behavior are documented in
 [Getting started](docs/getting-started.md).
 
-Target-specific source builds use the checked-in Cargo aliases
-`build-linux`, `build-linux-strix-halo`, `build-linux-aarch64`,
-`build-windows`, and `build-macos-apple-silicon` on the matching host
-platform. The dedicated profiles cover AMD Strix Halo and NVIDIA DGX
-Spark/GB10. See
-[Building from source](docs/development/build.md) for the feature graph,
-platform prerequisites and troubleshooting.
-
 ## Quick start
 
-Import a local model or pull a Hugging Face repository:
+First choose a text model and compatible runtime from the
+[backend guide](docs/backends.md). For example, a local GGUF chat model needs a
+llama.cpp build that supports its architecture. If you choose the CPU path,
+`werk backend install llama-cpu` builds that runtime and requires Git, CMake and
+a C/C++ compiler. Accelerator alternatives are in the platform guides above.
 
-~~~bash
-werk import /path/to/model --name local-model
-werk pull org/model-repository --name model-name
-werk list
-werk inspect model-name
-~~~
-
-Keep large models on a RAID alongside small models in the normal local store:
-
-~~~bash
-werk import /mnt/f/Werk1112/models/wan22-ti2v-5b --name wan22-ti2v-5b --link
-# Register all models in an existing collection:
-werk import /mnt/f/Werk1112/models --all --link
-~~~
-
-`--link` registers existing files without copying them, including an existing
-Werk model directory with its metadata. Removing the registration leaves the
-external files intact. `--all` discovers separate models directly inside a
-collection directory, retaining existing Werk model IDs or using directory
-names and file stems. Omit `--link` to copy the collection into the active store.
-Ordinary imports still copy files; `--model-home` and
-`WERK_HOME` still select the complete store. See
-[Models, manifests and the store](docs/concepts/models-manifests-and-store.md).
-
-Run text and media inference:
-
-~~~bash
-werk chat local-model
-
-werk image generate IMAGE_MODEL \
-  --prompt "A quiet orbital greenhouse"
-
-werk video generate VIDEO_MODEL \
-  --prompt "Sunlight breaking through a forest canopy"
-
-werk audio generate speech TTS_MODEL \
-  --text "Werk elf zwölf ist bereit." \
-  --output speech.wav
-~~~
-
-Inspect a rendered page or slide with a compatible vision-language model:
-
-~~~bash
-werk --backend auto run VISION_MODEL \
-  "Find clipped text, missing controls, overlap and grid misalignment." \
-  --image /absolute/path/to/render.png \
-  --debug
-~~~
-
-Vision is supplied by the model and its processor, not by vLLM itself. Werk
-can route compatible requests through llama.cpp with a GGUF projector, optional
-vLLM, or the supported MLX-VLM path. See
-[Vision and visual quality assurance](docs/integrations/vision.md).
-
-Werk chooses among accepted runtimes when the backend is <code>auto</code>.
-Use verbose diagnostics to see the effective request and decision:
-
-~~~bash
-werk video generate VIDEO_MODEL \
-  --prompt "Clouds moving above a mountain ridge" \
-  --backend auto --verbose --debug
-~~~
-
-## Backend management
-
-Inspect discovered runtimes and their prerequisites:
+Replace `/absolute/path/to/model.gguf` with your compatible local model file;
+`local-model` is the name this example registers:
 
 ~~~bash
 werk backend list
 werk backend doctor --debug
+werk import /absolute/path/to/model.gguf --name local-model
+werk inspect local-model
+werk doctor --model local-model
+werk chat local-model --max-tokens 128
 ~~~
 
-Managed installers are explicit:
+Already imported? Use its ID from `werk list`. To download instead, follow
+[Hugging Face pull setup](docs/getting-started.md#add-a-model), including Git LFS
+and access requirements. Import or discovery alone does not prove that inference
+will succeed. `--backend auto` is the default; add an explicit backend or use
+`werk chat local-model --debug` when diagnosing selection.
 
-~~~bash
-werk backend install llama-cuda
-werk backend install llama-cpu
-werk backend install vllm
-werk backend install qwen-tts
-~~~
+### HTTP service
 
-Installation support is not the same as verified model execution on every
-operating system. See [Backends, installation and platform support](docs/backends.md)
-for the complete matrix, fallback rules, managed paths and current uninstall
-limitations.
-
-## HTTP service
-
-Authentication is enabled by default:
+Authentication is enabled by default. Generate a key, replace the placeholder
+with that key, then serve the same model (POSIX shell example):
 
 ~~~bash
 werk auth api-key generate
@@ -270,126 +121,150 @@ export WERK_API_KEY="replace-with-generated-key"
 werk serve --model local-model
 ~~~
 
-Preload any number of resident text models before accepting requests:
-
-~~~bash
-werk serve --preload model-a model-b model-c --preload model-d --model model-a
-~~~
-
-The list has no fixed model-count limit. Werk deduplicates it in order, loads
-each model and runs an internal warmup of up to 32 output tokens. Successful
-instances remain retained until server shutdown, outside the ordinary model
-cache limit. `--model` independently selects the default; with `--preload`, a
-default not included in the list loads on demand. Without `--preload`, startup
-behavior is unchanged.
-
-Resources are allocated first come, first served. An unsupported backend,
-insufficient resources or a failed warmup is logged and skipped; remaining
-models are still attempted and the server starts with the successful set (even
-if that set is empty). Later requests cannot evict preloaded instances. Skipped
-models remain requestable, subject to the same resource constraints. Startup
-logs include `serve.preload.started`, `.ready`, `.failed` and `.finished` events.
-
-Preloading supports the resident llama.cpp, oMLX, vLLM, Candle, Burn,
-Transformers compatibility and embedded ONNX GenAI text routes when available.
-One-shot MLX/MLX-VLM and ONNX runners are skipped; explicitly disabled model
-residency is respected. In deployment mode, names may be aliases or instance
-IDs; an alias preloads every replica in instance-ID order. Existing deployment
-admission rules still apply. This does not add distributed cluster management.
-Image/audio/video generation is not warmed. Prompt processing and dynamic
-expert offloading can still cause prompt-dependent latency; preloading avoids
-restarting successfully retained model instances, rather than promising zero
-inference latency.
-
-OpenAI-compatible clients use:
-
-~~~text
-http://127.0.0.1:11434/v1
-~~~
-
-Werk exposes OpenAI-compatible Chat Completions (`POST /v1/chat/completions`)
-and Anthropic-compatible Messages (`POST /v1/messages`) subsets on the same
-server, alongside OpenAI-inspired media routes, Werk-native discovery/jobs/outputs
-and a small AUTOMATIC1111 compatibility
-surface. A separate `/werk/v1` protocol provides versioned runtime capability,
-state and memory control without changing those existing routes. These classes
-are intentionally documented separately.
-
-Both chat APIs support documents and persistent file references through
-`/v1/files`. Text extraction is shared across all text backends, including CUDA,
-vLLM, llama.cpp and MLX/oMLX. PDF page images require a vision-capable runtime;
-local OCR is optional. See [Documents and files](docs/integrations/documents.md)
-for formats, dependencies, limits and examples.
-
-`POST /v1/messages` supports Anthropic-style text, images, documents, streaming and client
-tool cycles on the same server. `POST /v1/messages/count_tokens` provides native
-backend token counting where supported. Provider features and Werk runtime
-parameters remain separate; these endpoints do not imply full provider API coverage. See [Anthropic clients](docs/integrations/anthropic-clients.md)
-for SDK setup, protocol limits and Qwen/GLM test commands.
+Configure OpenAI-compatible clients with `http://127.0.0.1:11434/v1` and the key.
+From another terminal with `WERK_API_KEY` set:
 
 ~~~bash
 curl -fsS http://127.0.0.1:11434/v1/models \
   -H "Authorization: Bearer $WERK_API_KEY"
 ~~~
 
-All chat and vision adapters expose OpenAI function-tool calls. llama.cpp and
-vLLM preserve native tool transport; oMLX uses native parsing where available.
-Other generators use Werk's shared structured tool protocol. Model compliance
-is separate from adapter capability. Image, video, audio and music functions
-are available as callable tools through `/v1/tools` and `/v1/tools/call`.
-See [Tool calling across backends and modalities](docs/tool-calling.md).
+For several installed text models, `werk serve --preload model-a model-b`
+performs ordered, best-effort loading and warmup. Successful instances remain
+resident until shutdown; unsupported paths or resource failures are logged and
+skipped. This does not generally warm image, video or audio generation.
+See [preload semantics and limits](docs/reference/cli.md#startup-preload).
 
-See the [HTTP API reference and coverage matrix](docs/api.md) for all 42
-method/path operations, exact request fields, task coverage, responses,
-authentication, limits, persistence and known gaps.
+## Core capabilities
+
+Typed commands cover chat, vision, image, video and audio workflows. Each model
+placeholder below requires a compatible installed model and its runtime:
+
+~~~bash
+werk image generate IMAGE_MODEL --prompt "A quiet orbital greenhouse"
+werk video generate VIDEO_MODEL --prompt "Clouds crossing a mountain ridge"
+werk audio generate speech TTS_MODEL --text "Hello from Werk." --output speech.wav
+~~~
+
+See [media inference](docs/media-inference.md) and
+[vision and rendered-output inspection](docs/integrations/vision.md) for tasks,
+parameters and runtime requirements. Planning includes workload estimation,
+parameter validation and provenance.
+
+Save terminal conversations with `werk chat local-model --persistence --session project`.
+[Conversation history](docs/reference/cli.md#persistent-terminal-chat), resident
+weights, automatic prefix/KV reuse, native KV snapshots and SSD expert caches are
+separate mechanisms. Native reuse is backend-dependent; KV state is not portable
+between arbitrary runtimes. [Cache cleanup](docs/reference/cli.md#local-persistence-caches)
+and [linked model collections](docs/concepts/models-manifests-and-store.md)
+have their own storage semantics.
+
+[Experimental oMLX SSD expert offload](docs/backends.md#experimental-omlx-expert-offload)
+can substantially slow generation. Its budget limits expert-cache residency,
+not total process memory: dense/shared weights, KV and workspace need additional
+space. Logical read counters do not measure physical SSD throughput.
+[Thinking and per-request oMLX controls](docs/api.md#omlx-chat-options) also affect
+latency and remain model-dependent.
+
+### APIs and integrations
+
+| Surface | Contract |
+| --- | --- |
+| OpenAI Chat Completions and Anthropic Messages | Compatible subsets at `POST /v1/chat/completions` and `POST /v1/messages`; documented text, vision, streaming and client tool cycles. See [API coverage](docs/api.md) and [Anthropic clients](docs/integrations/anthropic-clients.md). |
+| Media, jobs and files | OpenAI-inspired and Werk-native routes, plus small ComfyUI/AUTOMATIC1111 compatibility surfaces. [Documents and files](docs/integrations/documents.md) have format and runtime limits. |
+| Werk Protocol 1.0 | Separate `/werk/v1` capability, state and memory controls; inspect support before using optional operations. [Protocol reference](docs/reference/werk-protocol-v1.md). |
+| ComfyUI and n8n | Optional [ComfyUI nodes (Beta)](utils/comfyUI/README.md) and manually installed [n8n nodes (Beta)](utils/n8n/README.md), including native media and runtime controls. |
+
+[Tool calling](docs/tool-calling.md) exposes model-requested calls and explicit
+media tool invocation; model compliance remains separate from adapter capability.
+Werk remains an inference runtime/router; client applications own agent loops
+and workflow execution.
+
+## Performance examples
+
+Historical measurements of specific implementations and workloads follow.
+They measure **decode tokens per second**, excluding startup and prefill, not
+end-to-end latency or a general router speedup. They are not guarantees for the
+current release or other hardware.
+
+### DeepSeek V4 Flash: static CPU/GPU placement
+
+GGUF **Q2_K_S** on an RTX 3090 (24 GiB VRAM) and Xeon E5-2673 v3
+(48 logical CPUs, 98.22 GiB WSL2 guest RAM), using llama.cpp `ec928150501c`
+and CUDA 13.0: combined decode **5.93 → 7.19 tok/s** after moving five layers'
+routed experts from CPU to GPU. Each variant used two requests, 128 output
+tokens each, a 23-token prompt, context 4096 and 24 generation threads.
+Second requests reused 19 prompt tokens; OS caches were not cleared.
+See the [2026-09-19 report, raw data and reproduction](docs/benchmarks/2026-09-19-cuda-tuning/README.md).
+
+### Qwen3.8 Flash: expert decode implementation
+
+`pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit` on Apple Silicon with
+48 GiB unified memory, macOS and oMLX 0.6.4 with experimental expert offload:
+legacy → direct decode means were **6.09 → 6.26 tok/s** for first requests and
+**12.06 → 12.66 tok/s** for repeats. Two samples per mode/state in ABBA order
+used a 32-token prompt, 96 output tokens, a 22 GiB expert ceiling and thinking
+off. Repeats had zero expert misses and reused 31 prompt tokens.
+See the [2026-09-22 report, raw data and reproduction](docs/benchmarks/2026-09-22-text-decode/README.md).
+
+These are small samples with cache effects. The Qwen artifacts do not record the
+exact chip variant or effective context limit; they establish only this short
+workload. The same report found no confirmed GLM full-model gain. Layer timings
+and logical expert reads must not be interpreted as whole-model throughput or
+physical disk bandwidth. For controlled API comparisons, see the
+[chat benchmark harness](utils/benchmarks/README.md).
+
+## Status
+
+Werk1112 is under active development. Execution depends on architecture,
+checkpoint, platform and installed runtime; discovery covers more models than
+executable adapters.
+
+### European model integrations
+
+Optional hosted adapters for Mistral Large 4, FLUX 3 Image and Eleven v4,
+Kolibri via Aleph Alpha's vLLM plugin, and FLUX 3 Action DROID predictions all
+remain **`IMPLEMENTED_UNTESTED` for actual inference**. Some local/remote modes
+are unavailable upstream. Use `werk support list` and the
+[model support matrix](docs/model-support-matrix.md),
+[audit](docs/model-support-audit.md) and
+[implementation report](docs/model-support-implementation.md) for exact identities,
+requirements and blockers. FLUX.1 Schnell retains its existing Diffusers path.
+
+## What’s new in v1.9.1
+
+Werk Core, Media Companion, ComfyUI and n8n share release version **1.9.1**.
+ComfyUI and n8n remain Beta integrations.
+
+- Add evidence-backed model discovery and optional Mistral Large 4, FLUX 3 Image
+  and Eleven v4 provider adapters, plus Kolibri vLLM plugin routing and typed
+  FLUX 3 Action DROID predictions. Actual inference remains unverified; see the
+  [model-support matrix](docs/model-support-matrix.md) for upstream and access blockers.
+- Extend startup preload with resident DROID warmup and explicitly non-billable
+  hosted-client preparation, preserving existing text preload and Schnell paths.
+- Add `serve --preload MODEL...` for ordered, best-effort loading and warmup of
+  supported resident text models within available resources, with retained cache
+  slots, deployment replica support and per-model startup diagnostics.
+
+See the [v1.9.1 changelog](CHANGELOG.md#191---2026-10-14) for all changes and compatibility notes.
 
 ## Documentation
 
-| Topic | Document |
+| Need | Reference |
 | --- | --- |
-| Published documentation | [GitHub Pages documentation](https://philipbodenbach.github.io/werk1112/documentation.html) |
-| Release notes and upgrade changes | [CHANGELOG.md](CHANGELOG.md) |
-| Documentation home and wiki roadmap | [docs/README.md](docs/README.md) |
-| Installation and first run | [docs/getting-started.md](docs/getting-started.md) |
-| CLI command groups and semantics | [docs/reference/cli.md](docs/reference/cli.md) |
-| HTTP API contract and coverage | [docs/api.md](docs/api.md) |
-| Werk Protocol 1.0 HTTP contract | [docs/reference/werk-protocol-v1.md](docs/reference/werk-protocol-v1.md) |
-| Runtime persistence, memory and capability boundaries | [docs/concepts/runtime-persistence-and-memory.md](docs/concepts/runtime-persistence-and-memory.md) |
-| Backends, routing, installation and OS support | [docs/backends.md](docs/backends.md) |
-| Tasks, modalities, repository layouts and formats | [docs/reference/tasks-and-formats.md](docs/reference/tasks-and-formats.md) |
-| Models, manifests and managed storage | [docs/concepts/models-manifests-and-store.md](docs/concepts/models-manifests-and-store.md) |
-| Environment-variable index | [docs/reference/environment-variables.md](docs/reference/environment-variables.md) |
-| Media tasks, parameters, jobs and examples | [docs/media-inference.md](docs/media-inference.md) |
-| Building from source | [docs/development/build.md](docs/development/build.md) |
-| Packaging and releases | [docs/development/packaging-releases.md](docs/development/packaging-releases.md) |
-| DGX Spark and AMD Strix Halo | [docs/integrations/dgx-spark.md](docs/integrations/dgx-spark.md) · [docs/integrations/strix-halo.md](docs/integrations/strix-halo.md) |
-| Vision models and rendered-output QA | [docs/integrations/vision.md](docs/integrations/vision.md) |
-| Client integration guides | [docs/README.md#integrations](docs/README.md#integrations) |
-| ComfyUI custom nodes | [utils/comfyUI/README.md](utils/comfyUI/README.md) |
+| Browse all guides and integrations | [Documentation index](docs/README.md) · [Published documentation](https://philipbodenbach.github.io/werk1112/documentation.html) |
+| Install, manage models and diagnose a first run | [Getting started](docs/getting-started.md) · [CLI reference](docs/reference/cli.md) |
+| Review runtime and task coverage | [Backends](docs/backends.md) · [Tasks and formats](docs/reference/tasks-and-formats.md) |
+| Configure serving and memory | [Persistence and memory](docs/concepts/runtime-persistence-and-memory.md) · [Concurrency](docs/concepts/inference-concurrency.md) · [Environment variables](docs/reference/environment-variables.md) |
+| Operate a service | [Dashboard, Prometheus and Grafana](utils/observability/README.md) |
+| Review releases | [Changelog](CHANGELOG.md) · [Packaging and releases](docs/development/packaging-releases.md) |
 
-The versioned files under <code>docs/</code> are the source of truth. A public
-wiki may mirror tutorials later, but should not replace versioned API and
-backend contracts.
-
-## Platform overview
-
-Werk's release packaging currently targets:
-
-- Linux x86_64
-- Linux x86_64 AMD Strix Halo (`gfx1151` profile)
-- Linux aarch64 (DGX Spark/GB10 only)
-- Windows x86_64
-- macOS Apple Silicon
-
-Runtime support depends on the backend, accelerator and upstream packages.
-For example, llama.cpp Metal is macOS-only, local vLLM is native-Linux-only,
-and Qwen-TTS currently has Linux with NVIDIA CUDA as its primary documented
-path. The detailed and experimental combinations are listed in
-[docs/backends.md](docs/backends.md).
+The versioned files under `docs/` are the documentation source of truth.
 
 ## Development
 
-Common checks:
+See [Building from source](docs/development/build.md) for Cargo aliases, feature
+bundles, native dependencies and platform prerequisites. Common checks:
 
 ~~~bash
 cargo +stable fmt --all --check
@@ -399,9 +274,8 @@ python -m unittest runtime.test_werk_media_companion
 python -m pytest utils/comfyUI/tests
 ~~~
 
-The project deliberately keeps optional backend dependencies outside the main
-Werk process where version conflicts would otherwise affect unrelated
-architectures.
+Optional backend dependencies stay outside the main Werk process where version
+conflicts would otherwise affect unrelated architectures.
 
 ## License
 

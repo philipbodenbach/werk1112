@@ -30,7 +30,7 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -60,11 +60,27 @@ jobs:
       - name: Test release preparation
         run: python -m unittest discover -s scripts/tests -p 'test*release*.py'
 
+      - name: Install stable Rust for CLI reference generation
+        run: rustup toolchain install stable --profile minimal
+
       - name: Prepare versions, README, documentation and release notes
         id: prepare
         env:
           BUMP: ${{ inputs.bump }}
         run: python scripts/prepare-release.py "$BUMP" --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      - name: Build and refresh the CLI reference
+        env:
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+        run: |
+          # Build after the version bump so the reference carries the release version.
+          cargo +stable build --locked --bin werk --no-default-features
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            # Retrying an existing release must never rewrite its tagged documentation.
+            python scripts/generate-cli-reference.py target/debug/werk --check
+          else
+            python scripts/generate-cli-reference.py target/debug/werk
+          fi
 
       - name: Create the release preparation PR
         id: release-pr
@@ -89,7 +105,7 @@ jobs:
               git reset --hard "$release_sha"
             else
               # Only generated release metadata skips duplicate PR CI. The
-              # release tests above and metadata validation below still run.
+              # release tests, CLI reference build and validation still run.
               git commit -m "release(): $RELEASE_TAG [skip ci]"
               release_sha=$(git rev-parse HEAD)
               git push origin "HEAD:refs/heads/$branch"
@@ -99,8 +115,9 @@ jobs:
             if [[ -z "$pr" ]]; then
               cat > "$RUNNER_TEMP/release-pr.md" <<'BODY'
           Automatically synchronize product versions, changelog, README and current
-          documentation for this release. Platform artifacts are built and uploaded
-          manually after the tag is available. Release preparation tests passed.
+          documentation for this release, including the generated CLI reference
+          from a fresh build. Platform artifacts are built and uploaded manually
+          after the tag is available. Release preparation tests passed.
           This generated metadata commit skips duplicate PR CI; product changes
           must pass their normal CI before starting Release.
           BODY
@@ -161,6 +178,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
         run: |
+          python scripts/generate-cli-reference.py target/debug/werk --check
           if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
             test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
           else

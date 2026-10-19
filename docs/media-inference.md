@@ -12,6 +12,7 @@ manages outputs and metadata.
 ## Public commands
 
 ```text
+werk run MODEL [PROMPT] [--task TASK] [--input MODALITY[:ROLE]=SOURCE]
 werk chat MODEL
 werk image generate|edit|upscale MODEL
 werk video generate|animate|transform|upscale MODEL
@@ -24,8 +25,10 @@ werk audio embed MODEL
 werk serve
 ```
 
-The old `werk run` parser remains hidden for compatibility. New applications
-should use `chat` for text and the typed media commands for generated files.
+`werk run` is the public one-shot frontend for text, vision and canonical media
+requests. Use `chat` for interactive text, or the typed media commands for
+task-specific options. The complete [media CLI reference](reference/cli-media.md)
+links every image, video and audio option and describes input/override rules.
 The former `audio generate MODEL`, `audio speak`, and `audio separate` forms
 remain available as compatibility aliases.
 

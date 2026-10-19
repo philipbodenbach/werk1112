@@ -17,6 +17,9 @@ and describe the current repository state.
 | --- | --- |
 | Install Werk1112 and run a first request | [Getting started](getting-started.md) |
 | Look up a command or global option | [CLI reference](reference/cli.md) |
+| Find every accepted command and option | [Complete CLI index](reference/cli-options.md) |
+| Configure image, video and audio requests | [Media CLI reference](reference/cli-media.md) |
+| Look up parameter types, defaults and constraints | [Canonical parameter schema](reference/parameters-schema.md) |
 | Understand every HTTP route | [HTTP API](api.md) |
 | Integrate runtime state, memory or prefill/decode | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |
 | Understand persistence safety and backend support | [Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md) |

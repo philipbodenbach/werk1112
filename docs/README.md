@@ -19,6 +19,8 @@ The browser-friendly index is published as the
 | Review Kolibri, Mistral Large 4, FLUX 3 and Eleven v4 | [Model support matrix](model-support-matrix.md) |
 | Install and run a first command | [Getting started](getting-started.md) |
 | Look up CLI commands and semantics | [CLI reference](reference/cli.md) |
+| Look up every command, argument and option | [Complete CLI index](reference/cli-options.md) |
+| Look up media options and parameter defaults | [Media CLI rules](reference/cli-media.md) and [parameter schema](reference/parameters-schema.md) |
 | Understand every HTTP route | [HTTP API](api.md) |
 | Implement a runtime-control client | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |
 | Review runtime persistence, memory and backend boundaries | [Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md) |
@@ -77,8 +79,14 @@ model works on every accelerator.
 
 [reference/cli.md](reference/cli.md) documents the command groups, global
 controls, model lifecycle, authentication, estimation, diagnostics, artifacts,
-text/media inference and serving semantics. The installed `--help` output is
-authoritative for exact flags.
+text/media inference and serving semantics. The [complete command index](reference/cli-options.md)
+and [image](reference/cli-image.md), [video](reference/cli-video.md) and
+[audio](reference/cli-audio.md) catalogues enumerate every public command and
+option. [Media CLI rules](reference/cli-media.md) explain task selection, input
+precedence, routing, profiles and structured overrides; the
+[parameter schema](reference/parameters-schema.md) includes every canonical task.
+The catalogues can be regenerated and checked against a freshly built binary
+with `scripts/generate-cli-reference.py`; see [maintenance instructions](reference/cli.md#keeping-the-reference-complete).
 
 ### Runtime control
 
@@ -103,10 +111,10 @@ production-backend capability matrix.
 
 ### Media
 
-[media-inference.md](media-inference.md) currently contains the complete media
-guide: canonical tasks, schemas, parameter provenance, estimation, planning,
-the Python companion, jobs, outputs, Wan video examples and audio smoke tests.
-It will be split into smaller image, video, audio and operations pages later.
+[media-inference.md](media-inference.md) contains the media execution guide:
+parameter provenance, estimation, planning, the Python companion, jobs, outputs,
+Wan video examples and audio smoke tests. The exhaustive CLI option catalogues
+and shared input rules live in [reference/](reference/cli-media.md).
 
 ### Vision
 

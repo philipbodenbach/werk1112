@@ -16,6 +16,7 @@ usage() {
 Usage: ./scripts/package-release.sh <linux|linux-strix-halo|linux-aarch64|windows|macos>
 
 Builds release artifacts into releases/.
+Regenerates docs/reference/ after building; requires Python 3.9+ (python3).
 Artifacts are runtime-router binaries, one per configured platform profile.
 Accelerator support may be compiled in or discovered through companion runtimes.
 USAGE
@@ -137,6 +138,7 @@ package_target() {
     local platform="$1"
     local cargo_alias=""
     local binary_path=""
+    local rust_target=""
     local binary_name="werk"
     local artifact_name=""
     local staging_dir=""
@@ -146,29 +148,34 @@ package_target() {
         linux)
             cargo_alias="build-linux"
             binary_path="target/x86_64-unknown-linux-gnu/release/werk"
+            rust_target="x86_64-unknown-linux-gnu"
             artifact_name="werk1112-v${VERSION}-linux-x86_64.tar.gz"
             ;;
         linux-strix-halo)
             is_strix_halo_host || die "linux-strix-halo release packaging must run natively on AMD Ryzen AI Max/Strix Halo (gfx1151)"
             cargo_alias="build-linux-strix-halo"
             binary_path="target/x86_64-unknown-linux-gnu/release/werk"
+            rust_target="x86_64-unknown-linux-gnu"
             artifact_name="werk1112-v${VERSION}-linux-x86_64-amd-strix-halo.tar.gz"
             ;;
         linux-aarch64)
             is_dgx_spark_host || die "linux-aarch64 release packaging must run natively on NVIDIA DGX Spark/GB10"
             cargo_alias="build-linux-aarch64"
             binary_path="target/aarch64-unknown-linux-gnu/release/werk"
+            rust_target="aarch64-unknown-linux-gnu"
             artifact_name="werk1112-v${VERSION}-linux-aarch64-dgx-spark.tar.gz"
             ;;
         windows)
             cargo_alias="build-windows"
             binary_path="target/x86_64-pc-windows-msvc/release/werk.exe"
+            rust_target="x86_64-pc-windows-msvc"
             binary_name="werk.exe"
             artifact_name="werk1112-v${VERSION}-windows-x86_64.zip"
             ;;
         macos)
             cargo_alias="build-macos-apple-silicon"
             binary_path="target/aarch64-apple-darwin/release/werk"
+            rust_target="aarch64-apple-darwin"
             artifact_name="werk1112-v${VERSION}-macos-aarch64.tar.gz"
             ;;
         *)
@@ -178,6 +185,9 @@ package_target() {
 
     staging_dir="$REPO_ROOT/target/package/$platform"
     artifact="$REPO_ROOT/releases/$artifact_name"
+
+    require_command python3
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "CLI reference generation requires Python 3.9+")'
 
     printf '\n==> Building %s release artifact\n' "$platform"
     printf '    Note: release artifacts are runtime-router binaries; platform profiles may use compiled or companion accelerator support.\n'
@@ -189,6 +199,9 @@ package_target() {
     fi
 
     [ -f "$binary_path" ] || die "expected build output not found: $binary_path"
+
+    printf '\n==> Updating CLI reference\n'
+    python3 "$SCRIPT_DIR/generate-cli-reference.py" "$binary_path" --target "$rust_target"
 
     rm -rf "$staging_dir"
     mkdir -p "$staging_dir" "$REPO_ROOT/releases"
