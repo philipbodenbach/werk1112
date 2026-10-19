@@ -169,6 +169,7 @@
 
     .nav-links {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       gap: 18px;
       font-size: 0.95rem;
@@ -181,6 +182,10 @@
       gap: 48px;
       min-height: 68vh;
       padding: 44px 0 48px;
+    }
+
+    .hero > * {
+      min-width: 0;
     }
 
     .eyebrow {
@@ -288,11 +293,15 @@
       font-size: 1.08rem;
     }
 
+    .section .terminal {
+      margin: 20px 0;
+    }
+
     .feature-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 16px;
-      margin-top: 24px;
+      margin: 24px 0;
     }
 
     .feature-card {
@@ -433,11 +442,10 @@
     </a>
     <nav class="nav-links" aria-label="Primary navigation">
       <a href="#features">Features</a>
+      <a href="#quick-start">Quick start</a>
+      <a href="#platforms">Platforms</a>
+      <a href="#apis">APIs</a>
       <a href="#documentation">Documentation</a>
-      <a href="api.html">HTTP API</a>
-      <a href="concepts/runtime-persistence-and-memory.html">Runtime control</a>
-      <a href="backends.html">Backends</a>
-      <a href="media-inference.html">Media inference</a>
       <a href="https://github.com/philipbodenbach/werk1112">Repository</a>
     </nav>
   </header>
@@ -448,11 +456,16 @@
         <p class="eyebrow">Multimodal Rust inference runtime and router</p>
         <h1 id="hero-title">Werk1112 &ndash; Local-first, multimodal inference runtime and router in Rust</h1>
         <p class="lead">
-          Normalize, validate, estimate and route text, image, video and audio requests
-          through one Rust control plane and an optional managed media companion.
+          Use one CLI and HTTP service for text, image, video and audio workflows across
+          compatible backends. Werk discovers models, selects an executable backend and
+          runs requests through the runtimes available on your hardware.
+        </p>
+        <p>
+          Local execution supports digital sovereignty by letting teams run compatible
+          inference on infrastructure they control.
         </p>
         <div class="actions" aria-label="Project links">
-          <a class="button primary" href="https://github.com/philipbodenbach/werk1112">View the GitHub repository</a>
+          <a class="button primary" href="getting-started.html">Install and run Werk</a>
           <a class="button secondary" href="#documentation">Read the documentation</a>
         </div>
       </div>
@@ -460,33 +473,180 @@
       <aside class="hero-visual" aria-label="Werk1112 terminal preview">
         <img src="assets/banner_werk.png" width="546" height="145"
           alt="Werk1112 startup banner: WERK1112 - Inference Router.">
-        <pre class="terminal"><code>werk image generate flux-dev --prompt "orbital station"
-werk audio transcribe whisper-large audio.wav
-werk serve --model local-model</code></pre>
+        <pre class="terminal"><code># After importing a compatible model
+werk inspect local-model
+werk doctor --model local-model
+werk chat local-model --max-tokens 128</code></pre>
       </aside>
     </section>
 
     <section class="section" id="features" aria-labelledby="features-title">
-      <h2 id="features-title">One control plane for every modality</h2>
+      <h2 id="features-title">One service across compatible runtimes</h2>
       <p class="section-copy">
-        Applications target Werk1112 while Werk1112 chooses the local or companion runtime
-        for the model format, requested backend, and host capabilities.
+        Route typed requests according to the model, task, installed runtime and host capabilities.
+        Optional hosted adapters connect to external providers and remain subject to their
+        access requirements and costs.
       </p>
 
       <div class="feature-grid">
         <article class="feature-card">
-          <h3>Shared CLI and API</h3>
-          <p>Use the same typed request pipeline for chat, image, video, music, speech and transcription workloads.</p>
+          <h3>Choose your local stack</h3>
+          <p>Choose compatible models, hardware and runtimes to support digital sovereignty and
+            reduce reliance on paid hosted inference. Suitable local workflows can work offline once
+            models, runtimes and dependencies are provisioned; downloads and hosted APIs require a network.</p>
         </article>
         <article class="feature-card">
-          <h3>Capability-aware planner</h3>
-          <p>Score task, layout, accelerator, parameter support and memory fit before selecting a backend.</p>
+          <h3>Manage models across modalities</h3>
+          <p>Import existing files, link external weights or pull compatible Hugging Face repositories
+            into a shared <a href="concepts/models-manifests-and-store.html">model store</a>.
+            Use typed chat, vision, image, video and audio commands with the required runtimes.</p>
         </article>
         <article class="feature-card">
-          <h3>Inspectable defaults</h3>
-          <p>Resolve model, runtime, hardware, profile and request defaults with machine-readable provenance.</p>
+          <h3>Inspect runtime choices</h3>
+          <p>Use automatic or explicit backend selection, <code>werk inspect</code> and
+            <code>werk doctor</code> to diagnose requirements and routing blockers.
+            Planning estimates do not guarantee that a model fits or executes.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Serve and observe models</h3>
+          <p>Retain supported workers with <a href="reference/cli.html#startup-preload">startup preload</a>,
+            inspect activity with <code>werk top</code>, and connect
+            <a href="https://github.com/philipbodenbach/werk1112/tree/main/utils/observability">Prometheus and Grafana</a>.
+            Capacity and concurrency depend on the backend and available resources.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Work within memory limits</h3>
+          <p>Use backend-specific CPU/GPU offload, placement and cache controls where implemented.
+            <a href="concepts/runtime-persistence-and-memory.html">Weight residency, prefix/KV reuse and SSD expert caches</a>
+            have separate semantics; KV state is not portable between arbitrary runtimes.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Analyze text</h3>
+          <p>Use <a href="api.html#text-analysis-endpoints">embedding, reranking and classification endpoints</a>
+            with compatible models and installed pooling runtimes. The embedding API accepts text and
+            float output; reranking and classification use their documented contracts.</p>
         </article>
       </div>
+    </section>
+
+    <section class="section" id="quick-start" aria-labelledby="quick-start-title">
+      <h2 id="quick-start-title">Start with a compatible local model</h2>
+      <p class="section-copy">
+        <a href="getting-started.html">Install Werk for Linux, macOS or Windows</a>, then provision
+        the matching drivers, runtime and model separately. For a local GGUF chat model, choose a
+        llama.cpp build that supports its architecture from the <a href="backends.html">backend guide</a>.
+        Replace the path below with your model file.
+      </p>
+      <pre class="terminal"><code>werk backend list
+werk import /absolute/path/to/model.gguf --name local-model
+werk doctor --model local-model
+werk chat local-model --max-tokens 128</code></pre>
+      <h3>Serve with authentication</h3>
+      <p class="section-copy">
+        Generate a key and replace the placeholder below with it before starting the service
+        (POSIX shell example). Configure compatible OpenAI clients with
+        <code>http://127.0.0.1:11434/v1</code> and the same key.
+      </p>
+      <pre class="terminal"><code>werk auth api-key generate
+export WERK_API_KEY="replace-with-generated-key"
+werk serve --model local-model</code></pre>
+      <p class="section-copy">
+        For several installed text models, <code>werk serve --preload model-a model-b</code> performs
+        ordered, best-effort loading and warmup. Successful workers remain resident until shutdown;
+        unsupported paths and resource failures are logged and skipped.
+        This does not generally warm image, video or audio generation.
+      </p>
+    </section>
+
+    <section class="section" id="platforms" aria-labelledby="platforms-title">
+      <h2 id="platforms-title">Match the runtime to your hardware</h2>
+      <p class="section-copy">
+        These are documented integration paths. Execution still depends on architecture, checkpoint,
+        platform and installed runtime; discovery covers more models than executable adapters.
+      </p>
+      <div class="feature-grid">
+        <article class="feature-card">
+          <h3>CPU and NVIDIA CUDA</h3>
+          <p>Use compatible llama.cpp, Candle or ONNX CPU paths, or llama.cpp CUDA and eligible
+            vLLM/Python runtimes. Linux is the primary CUDA path; Windows needs a matching toolchain,
+            WSL2 is best effort, and local vLLM requires native Linux.
+            See the <a href="backends.html#platform-support-matrix">platform matrix</a>.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Apple Silicon</h3>
+          <p>Choose compatible llama.cpp Metal, MLX/MLX-VLM or oMLX adapters on macOS.
+            Managed oMLX requires macOS 15+. Unified memory is shared physical capacity;
+            budgets and offload settings do not guarantee model fit.
+            See <a href="backends.html#platform-aware-explicit-installation">runtime requirements</a>.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Strix Halo and DGX Spark</h3>
+          <p><a href="integrations/strix-halo.html">AMD Strix Halo</a> has native Linux ROCm/HIP and
+            Vulkan paths, with no NPU adapter. <a href="integrations/dgx-spark.html">DGX Spark / GB10</a>
+            uses a Spark-specific Linux aarch64 profile, without native TensorRT-LLM or NIM adapters.
+            Both integrations still require their real-hardware smoke gates.</p>
+        </article>
+      </div>
+      <p class="section-copy">
+        <a href="concepts/single-host-deployments.html">Single-host deployment profiles</a> configure
+        supported local CUDA GPU groups, aliases and replicas. Multi-GPU hardware runs remain unverified;
+        these profiles do not provide multi-node clusters or mixed NVIDIA/AMD sharding.
+      </p>
+    </section>
+
+    <section class="section" id="apis" aria-labelledby="apis-title">
+      <h2 id="apis-title">APIs and integrations</h2>
+      <p class="section-copy">
+        For digital sovereignty initiatives, the documented API subsets let existing compatible
+        clients connect to a self-operated Werk service. Client applications own agent loops and
+        workflow execution; Werk remains an inference runtime and router.
+      </p>
+      <div class="feature-grid">
+        <article class="feature-card">
+          <h3>OpenAI and Anthropic clients</h3>
+          <p>Use Chat Completions at <code>/v1/chat/completions</code> and Messages at
+            <code>/v1/messages</code> for documented text, vision, streaming and client tool cycles.
+            These are <a href="api.html#compatibility-classes">compatible subsets</a>;
+            the OpenAI Responses API is not implemented.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Media and runtime control</h3>
+          <p>Use OpenAI-inspired and Werk-native media, job and file routes, plus small
+            ComfyUI/AUTOMATIC1111 compatibility surfaces. Separate
+            <a href="reference/werk-protocol-v1.html">Werk Protocol 1.0</a> routes expose capability,
+            state and memory controls; inspect support before using optional operations.</p>
+        </article>
+        <article class="feature-card">
+          <h3>ComfyUI and n8n</h3>
+          <p>Connect optional <a href="integrations/comfyui.html">ComfyUI nodes (Beta)</a> or
+            manually installed <a href="https://github.com/philipbodenbach/werk1112/tree/main/utils/n8n">n8n nodes (Beta)</a>
+            for native media and runtime controls.
+            <a href="integrations/documents.html">Document and file inputs</a> retain their format and runtime limits.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="release" aria-labelledby="release-title">
+      <h2 id="release-title">What’s new in v1.9.1</h2>
+      <p class="section-copy">
+        Werk Core, Media Companion, ComfyUI and n8n share version 1.9.1.
+        ComfyUI and n8n remain Beta integrations.
+      </p>
+      <ul>
+        <li>Startup preload retains supported text workers, expands deployment aliases and reports
+          per-model diagnostics.</li>
+        <li>Evidence-backed discovery adds optional hosted Mistral Large 4, FLUX 3 Image and Eleven v4
+          adapters, Kolibri vLLM plugin routing and typed FLUX 3 Action DROID predictions.</li>
+        <li>Preload adds resident DROID warmup. Hosted-client preparation performs no network calls
+          or inference and incurs no billing for that preparation step.</li>
+      </ul>
+      <p class="section-copy">
+        Actual inference for these new provider, Kolibri and DROID integrations remains
+        <code>IMPLEMENTED_UNTESTED</code>; some local/remote modes are unavailable upstream.
+        Check <code>werk support list</code> and the <a href="model-support-matrix.html">model support matrix</a>
+        for exact requirements and blockers. FLUX.1 Schnell retains its existing Diffusers path.
+      </p>
+      <a href="https://github.com/philipbodenbach/werk1112/blob/main/CHANGELOG.md#191---2026-10-14">Read the v1.9.1 changelog</a>
     </section>
 
     <section class="section" id="documentation" aria-labelledby="documentation-title">
@@ -523,7 +683,15 @@ werk serve --model local-model</code></pre>
         </article>
         <article class="feature-card">
           <h3><a href="concepts/models-manifests-and-store.html">Models and storage</a></h3>
-          <p>Imports, pulls, manifests, model selection, managed storage and optimized artifacts.</p>
+          <p>Imports, external weight links, pulls, manifests, model selection, managed storage and optimized artifacts.</p>
+        </article>
+        <article class="feature-card">
+          <h3><a href="concepts/single-host-deployments.html">Deployment profiles</a></h3>
+          <p>Local CUDA GPU groups, aliases, replicas, admission and concurrency limits, with hardware validation status.</p>
+        </article>
+        <article class="feature-card">
+          <h3><a href="model-support-matrix.html">Model support status</a></h3>
+          <p>Exact model identities, local and hosted paths, dependencies, access requirements and inference verification.</p>
         </article>
       </div>
 
@@ -579,6 +747,7 @@ werk serve --model local-model</code></pre>
     <span class="footer-links">
       <a href="#documentation">Documentation</a>
       <a href="https://github.com/philipbodenbach/werk1112">GitHub repository</a>
+      <a href="https://github.com/philipbodenbach/werk1112/blob/main/LICENSE">Elastic License 2.0</a>
       <a href="https://github.com/philipbodenbach">GitHub profile</a>
     </span>
   </footer>
