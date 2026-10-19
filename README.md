@@ -8,7 +8,8 @@ Werk1112 is a local-first, multimodal inference runtime and router written in
 Rust. Developers use one CLI and HTTP service for text, image, video and audio
 workflows across compatible backends. Werk discovers models, selects an
 executable backend and runs requests through the runtimes available on your
-hardware.
+hardware. Local execution supports digital sovereignty by letting teams run
+compatible inference on infrastructure they control.
 
 Documented paths include Apple Silicon, NVIDIA CUDA and AMD Strix Halo;
 see the [platform overview](#platform-overview) for requirements and validation
@@ -23,9 +24,11 @@ to their access requirements and costs.
 - **Connect existing clients.** Use the documented OpenAI-compatible API and
   Anthropic Messages subsets through one service, with streaming and client tool
   calling. See [API coverage](docs/api.md).
-- **Run local AI inference on your own hardware.** Suitable local paths can work
-  offline once models, runtimes and dependencies are provisioned. This can reduce
-  reliance on paid hosted inference; downloads and hosted APIs require a network.
+- **Run local AI inference on your own hardware.** Choose compatible models,
+  hardware and runtimes to support digital sovereignty and reduce reliance on
+  paid hosted inference. Suitable local paths can work offline once models,
+  runtimes and dependencies are provisioned; downloads and hosted APIs require
+  a network.
 - **Manage models across modalities.** Import existing files or pull compatible
   Hugging Face repositories into a shared [model store](docs/concepts/models-manifests-and-store.md),
   then use typed text and media commands without integrating each runtime yourself.
@@ -175,6 +178,8 @@ latency and remain model-dependent.
 | Werk Protocol 1.0 | Separate `/werk/v1` capability, state and memory controls; inspect support before using optional operations. [Protocol reference](docs/reference/werk-protocol-v1.md). |
 | ComfyUI and n8n | Optional [ComfyUI nodes (Beta)](utils/comfyUI/README.md) and manually installed [n8n nodes (Beta)](utils/n8n/README.md), including native media and runtime controls. |
 
+For digital sovereignty initiatives, the documented API subsets let existing
+compatible clients connect to a self-operated Werk service.
 [Tool calling](docs/tool-calling.md) exposes model-requested calls and explicit
 media tool invocation; model compliance remains separate from adapter capability.
 Werk remains an inference runtime/router; client applications own agent loops
