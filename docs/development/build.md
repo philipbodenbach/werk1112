@@ -111,6 +111,48 @@ cargo +stable install --path . --locked --force
 `werk` already found on `PATH`. Run the local file explicitly or use
 `cargo install` when replacement is intended.
 
+## Automatic CLI reference generation
+
+The canonical checked-in catalogues describe **Linux, `--no-default-features`,
+no optional backend features**. The **CLI Reference** PR workflow builds this
+profile from the checked-out revision in `target/cli-reference-neutral` and runs
+`--check`. It also tests `--backend burn` rejection without `burn-experimental`
+and acceptance with that feature, using separate Cargo directories without
+inference or model downloads.
+
+The GitHub **Release** workflow uses the same neutral directory/profile after
+the version bump. It regenerates and checks before its preparation PR and checks
+again before tagging. Existing-tag retries only check without rewriting. The
+inline validation also covers generated release commits marked `[skip ci]`;
+repository rules remain unchanged. Platform release artifacts are built separately.
+
+`scripts/build-windows.ps1` and `scripts/package-release.sh` validate reference
+generation after Cargo succeeds, with `--profile discovery --output-dir` pointing
+to a temporary directory. They discard the discovery output and do not overwrite
+`docs/reference/`. `scripts/package-release.ps1` inherits the Windows hook.
+Python 3.9+ is required (`python3` for the shell script; `py -3`, `python` or
+`python3` on Windows). A generator error fails before staging/replacing an archive.
+
+Native packaging queries its freshly built artifact. Cross-builds compile a
+backend-neutral host tool with the lockfile and explicit host target in
+`target/cli-reference-host`, then use the exact executable reported by Cargo.
+Discovery calls only version/help and model-free parameters. A host snapshot
+does not validate foreign-target inference or optional backend execution.
+
+Direct Cargo commands and aliases remain ordinary Rust builds. For canonical
+regeneration/checks on Linux, build from the current checkout first; a matching
+package version alone does not prove source revision or feature configuration:
+
+~~~bash
+cargo +stable build --locked --bin werk --no-default-features --target-dir target/cli-reference-neutral
+python3 scripts/generate-cli-reference.py target/cli-reference-neutral/debug/werk
+python3 scripts/generate-cli-reference.py target/cli-reference-neutral/debug/werk --check
+~~~
+
+See [reference maintenance](../reference/cli.md#keeping-the-reference-complete)
+and [conditional options](../reference/cli.md#conditional-build-options) for
+feature checks and the boundary between generated syntax and maintained semantics.
+
 ## Target release aliases
 
 Release tooling uses one alias for each configured platform profile:

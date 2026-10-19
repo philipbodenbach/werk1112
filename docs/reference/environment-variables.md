@@ -15,7 +15,7 @@ for the managed directory layout.
 | Variable | Meaning |
 | --- | --- |
 | `NO_COLOR` | When set, disable colors in the banner, console panels, progress indicators, help and `top`; retain readable structure. |
-| `TERM` | `dumb` disables interactive console decoration. Redirected output and machine-readable JSON/JSONL stay plain regardless of terminal colors. |
+| `TERM` | `dumb` disables decoration for ordinary commands. Interactive `top` still uses TTY raw mode/alternate screen; `NO_COLOR` only removes its colors. Use `top --once` or `top --once --json` for scripts. Redirected ordinary output and machine-readable JSON/JSONL stay plain. |
 
 ## Operational logging
 
@@ -23,7 +23,7 @@ CLI flags override these variables. See [logging semantics](cli.md#operational-l
 
 | Variable | Meaning |
 | --- | --- |
-| `WERK_LOG_LEVEL` | `error`, `warn`, `info`, `debug`, `trace`, or `off`. Default INFO; verbose serve modes default to DEBUG when no level is specified. |
+| `WERK_LOG_LEVEL` | `error`, `warn`, `info`, `debug`, `trace`, or `off`. Default INFO; DEBUG with verbose serve modes, supported `run`/`chat` and image/video/audio `--verbose`/`--debug`, or `bench --debug`. An explicit level wins. |
 | `WERK_LOG_FORMAT` | `auto`, `text`, or `json`. Default `auto`; `serve --verbose-pure` forces raw JSONL. |
 | `WERK_LOG_FILE` | Optional JSONL file path. One writer per path. |
 | `WERK_LOG_MAX_SIZE_MB` | Rotation size in MiB, default 10, range 1–4096. |
@@ -39,7 +39,7 @@ per-profile options. [Deployment configuration](../concepts/single-host-deployme
 | Variable | Meaning |
 | --- | --- |
 | `WERK_HOME` | Managed store root. A global `--model-home` value wins. Runtime-state data is stored beneath `runtime-state/v1` and its private namespace-HMAC key beneath `auth`. See the [store resolution order](../concepts/models-manifests-and-store.md#store-root). |
-| `WERK_API_KEY` | Single bearer key for `werk serve`; also the default for `werk runtime` and the ComfyUI client. A configured serve key must not be empty. |
+| `WERK_API_KEY` | Single bearer key for `werk serve`; also the default for `werk run --server`, `werk runtime`, `werk top` and the ComfyUI client. A configured serve key must not be empty. |
 | `WERK_API_KEYS` | TOML key file for `werk serve`. The uninstall scripts also consult it when locating an optional key file to remove. |
 | `WERK_API_BODY_LIMIT_BYTES` | Positive request-body limit for chat completions (including inline vision data), audio transcription/translation uploads and generic-job creation. Default: 128 MiB; maximum: 512 MiB. Invalid values use the default. |
 | `WERK_OUTPUT_MAX_BYTES` | Output-store retention ceiling. Default: 20 GiB; invalid values use the default. Oldest outputs are removed first. |
@@ -70,7 +70,7 @@ There is deliberately no environment variable for:
 defaults for missing top-level `policy` and `allow_experimental` members on
 `POST /werk/v1/prefill`. In addition, the effective reuse default controls the
 native prefix-cache flag generated for a local Werk-started vLLM process;
-explicit vLLM arguments win. For local oMLX 0.6.4, `auto` or `disk` mode with
+explicit vLLM arguments win. For local oMLX 0.6.4 and 0.7.0, `auto` or `disk` mode with
 reuse enabled also opts into verified short exact-prefix caching for the
 worker. This cache has no cross-restart guarantee. Werk sends no generated
 flag to remote vLLM: its model lifetime is externally managed and its APC
@@ -85,6 +85,20 @@ The current memory thresholds, bounded state catalog, principal isolation and
 dry-run-first maintenance rules are implementation safety policy. A backend
 must report exact capability status and bounded memory requirements through its
 adapter. See [Runtime persistence and memory architecture](../concepts/runtime-persistence-and-memory.md).
+
+## Documents and text analysis
+
+| Variable | Meaning |
+| --- | --- |
+| `WERK_DOCUMENT_PYTHON` | Interpreter for the isolated document-extraction worker. Default: `python` on Windows, `python3` elsewhere. PDF extraction/rendering requires the optional packages in this interpreter; Office extraction uses its standard library. Plain UTF-8 inputs do not start Python. |
+| `WERK_DOCUMENT_TESSERACT` | Tesseract executable for explicitly requested document OCR; default `tesseract`. |
+| `WERK_DOCUMENT_OCR_LANG` | Tesseract language selection; default `eng`, for example `deu+eng`. Required language data must be installed. |
+| `WERK_TEXT_PYTHON` | Text-analysis worker interpreter. Takes priority over `WERK_TRANSFORMERS_PYTHON`, then the managed `backends/text-analysis/venv` interpreter, then platform `python` / `python3`. Selects the environment for embeddings, reranking and classification; vLLM pooling uses its separate vLLM environment. |
+| `WERK_TEXT_THREADS` | PyTorch CPU thread count for the text-analysis worker. Default `min(8, CPU count)` (at least one). Integer values are clamped to at least one; a noninteger value fails model loading. |
+
+See [document input contracts](../integrations/documents.md) and
+[text-analysis endpoints](../api.md#text-analysis-endpoints). These settings
+configure workers used by `serve`; they do not add new CLI subcommands.
 
 ## Media and Qwen-TTS
 
@@ -138,6 +152,12 @@ for snapshot isolation and compatibility with older runtimes.
 
 Managed CUDA builds additionally read `WERK_LLAMA_CUDA_COMPILER`,
 `WERK_LLAMA_CUDA_HOST_COMPILER`, and `WERK_LLAMA_CUDA_ARCH`.
+`WERK_LLAMA_CUDA_NCCL=true` enables `GGML_CUDA_NCCL` when configuring the managed
+CUDA build; default `false` keeps NCCL optional. An explicit enabled build
+requires its native NCCL dependencies. This is a build setting, not a request
+to distribute a model across GPUs at inference time.
+Accepted boolean spellings are `1/true/yes/on` and `0/false/no/off`, ignoring
+case and surrounding whitespace; other values fail configuration.
 
 Managed ROCm llama.cpp builds read `WERK_LLAMA_ROCM_ARCH` before the upstream
 `GPU_TARGETS` value and `WERK_LLAMA_HIP_NO_VMM` before the upstream
@@ -327,6 +347,11 @@ target-specific `CC_*`/`CXX_*` settings are documented in the
 [build guide](../development/build.md).
 
 ## Source of truth
+
+This reference covers user-configurable settings. Internal child-process
+handoff variables, temporary installer shell variables and test-only hooks are
+not configuration interfaces. For example, oMLX worker lifetime/persistence
+paths and byte budgets are derived by Werk from the public settings above.
 
 - CLI-bound settings: [`src/cli.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/cli.rs)
 - serving and retention: [`src/api/router.rs`](https://github.com/philipbodenbach/werk1112/blob/main/src/api/router.rs) and

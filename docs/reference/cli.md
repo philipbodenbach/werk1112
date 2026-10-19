@@ -6,13 +6,123 @@ Single-host CUDA profiles add `werk gpus` (JSON inventory),
 [deployment profiles](../concepts/single-host-deployments.md) for configuration,
 native-build selection, replicas, budgets and compatibility limits.
 
-This page describes the stable command groups and their operational semantics.
-The installed binary remains authoritative for exact flags and accepted values:
+This page describes the public command groups and their operational semantics.
+The reference for the canonical Linux build (`--no-default-features`, no optional
+backend features) also includes:
+
+- [Every command, argument and core/global option in that profile](cli-options.md).
+- [Image options](cli-image.md), [video options](cli-video.md) and [audio options](cli-audio.md), including per-command applicability.
+- [Media input, task selection, routing and override rules](cli-media.md).
+- [All canonical parameter schemas](parameters-schema.md), [tasks and formats](tasks-and-formats.md), and [environment variables](environment-variables.md).
+
+The command and schema catalogues are generated from a fresh build of the current
+checkout. Other platforms and feature builds can expose a different parser; see
+[conditional build options](#conditional-build-options). For an installed binary,
+inspect its exact flags and accepted values:
 
 ```bash
 werk --help
 werk COMMAND --help
 ```
+
+## Syntax, aliases and input contracts
+
+Examples use `MODEL` for an installed model ID and `PATH` for a filesystem path.
+Angle brackets in usage lines denote required arguments; square brackets denote
+optional ones. A `--` separator ends option parsing, for example
+`werk run model-id -- "--explain this text"`. Shell quoting is required for
+whitespace and structured JSON. Task/layout names accept hyphens or underscores;
+JSON serialization uses underscores.
+
+Compatibility spellings remain accepted:
+
+| Spelling | Canonical form / scope |
+| --- | --- |
+| `werk rm`, `werk delete` | `werk remove` |
+| `werk auth hf` | `werk auth huggingface` |
+| `werk auth api-keys` | `werk auth api-key` |
+| `serve --verbose-lite` | `serve --verbose-pure` |
+| `run/chat --single-turn` | `--no-history` |
+| `bench --tokens` | `--max-tokens` |
+| Media `--output-path` | `--output` |
+| Image/video `--cfg` | `--guidance` |
+| Music/sound `--tempo` | `--bpm` |
+| `werk audio speak` | `werk audio generate speech`; hidden compatibility command with the same options. |
+| `werk audio separate` | `werk audio transform separate`; hidden compatibility command with the same options. |
+| `werk audio generate MODEL` | Legacy model/task inference using the music/sound options; see [task selection](cli-media.md#task-selection). |
+
+`--help` / `-h` and `--version` / `-V` report help and version without executing
+inference. `werk help COMMAND …` is equivalent to command help. Numeric ranges,
+required option combinations and accepted enum values are checked before
+execution; command errors return a nonzero exit status. Output-format switches
+are command-specific: `--json` is not a global option. Ordinary operational logs
+go to stderr; structured command results go to stdout.
+
+### Keeping the reference complete
+
+The checked-in catalogues use **Linux, `--no-default-features`, no optional
+backend features**. The **CLI Reference** PR workflow builds this profile from
+the checked-out revision in `target/cli-reference-neutral`, then runs `--check`.
+Changes to sources, schemas, Cargo configuration, the generator, tests or reference
+trigger it. Drift fails the check, prints a diff and a regeneration command, and
+does not rewrite files.
+
+The GitHub **Release** workflow builds the same profile after preparing the new
+product version, regenerates and checks the catalogues before its release PR,
+and checks again before tagging. Existing-tag retries only check; they never
+regenerate tagged content. Generated release commits use `[skip ci]`; the inline
+Release checks cover reference validation without requiring a duplicate PR run.
+Existing repository rules still apply.
+
+To regenerate or check locally on Linux:
+
+```bash
+cargo +stable build --locked --bin werk --no-default-features --target-dir target/cli-reference-neutral
+python3 scripts/generate-cli-reference.py target/cli-reference-neutral/debug/werk
+python3 scripts/generate-cli-reference.py target/cli-reference-neutral/debug/werk --check
+```
+
+Use this fresh build even if another binary reports the same version: a version
+match does not establish source revision or build features. The generator rejects
+version mismatches and the known noncanonical `burn` parser value; these guards
+are not a universal binary provenance check. Plain Cargo builds and aliases do
+not invoke the generator.
+
+The script recursively discovers public command help, including nested runtime
+state actions, and queries all canonical task schemas in a temporary empty store
+with automatic backend installation disabled. It strips environment defaults and
+does not perform inference, download models or install backends. Python 3.9+ is
+required. Review the prose here and in `cli-media.md` when behavior, aliases,
+conflicts or support boundaries change: help/schema comparison alone cannot
+prove that prose is semantically current or that inference works.
+
+`scripts/package-release.sh` and `scripts/build-windows.ps1` validate generation
+after a successful build using `--profile discovery` and a temporary output
+directory, then discard that output. Windows packaging through
+`scripts/package-release.ps1` uses the same hook. Generation failures stop
+packaging. These runs cannot overwrite the canonical catalogues. With
+`--target TRIPLE`, native builds inspect their new artifact; cross-builds compile a neutral
+host discovery tool in `target/cli-reference-host` and use the exact Cargo-reported
+executable. That host parser/schema snapshot does not validate foreign-target
+inference or optional backend execution.
+
+### Conditional build options
+
+`--backend burn` is accepted only when compiled with `burn-experimental`. The
+canonical neutral tables intentionally omit this value. Parser acceptance does
+not enable the separate `burn-runtime` implementation or promise model/hardware
+support. The PR workflow runs the existing parser test in both configurations,
+using separate build directories and no models or inference. As in the existing
+CI test setup, the large CLI test needs a 16 MiB thread stack:
+
+```bash
+RUST_MIN_STACK=16777216 cargo +stable test --locked --no-default-features --target-dir target/cli-reference-neutral --lib cli::tests::parses_cli_commands -- --exact
+RUST_MIN_STACK=16777216 cargo +stable test --locked --no-default-features --features burn-experimental --target-dir target/cli-reference-burn --lib cli::tests::parses_cli_commands -- --exact
+```
+
+If generating discovery output from an optional-feature binary, use
+`--profile discovery --output-dir TEMP_DIRECTORY`. Do not compare that output
+with neutral pages or use it to replace the checked-in reference.
 
 ## Terminal presentation
 
@@ -30,7 +140,10 @@ Monitoring polls are available at TRACE. Request bodies and credentials are not
 included in HTTP access events.
 
 Set `NO_COLOR=1` to remove colors while retaining layout. `TERM=dumb` and redirected
-streams use plain output. JSON/JSONL, `inspect`, protocol commands and `temp path`
+streams use plain output for ordinary commands. Interactive `top` instead requires
+a TTY and uses raw mode and an alternate screen, even with `TERM=dumb`.
+`NO_COLOR` changes its colors, not that mode; use `werk top --once` or
+`werk top --once --json` for scripts. JSON/JSONL, `inspect`, protocol commands and `temp path`
 remain unadorned even in a terminal. Streamed model content is not rewritten.
 Backend installer output is streamed through the same presentation; failures
 retain nonzero exit codes and their diagnostic details.
@@ -59,7 +172,9 @@ The default threshold is **INFO**. Log levels and presentation are independent:
 and detailed analysis statistics. **`serve --verbose-pure`** defaults to DEBUG
 and writes raw JSONL to stderr, without a banner, panels or ANSI escapes.
 `--verbose-lite` is an alias of `--verbose-pure`; the two verbose modes conflict.
-An explicit `--log-level` always wins over either verbose mode's default.
+`run`/`chat` and image/video/audio commands also default to DEBUG with their
+supported `--verbose` or `--debug` flags, as does `bench --debug`. An explicit
+`--log-level` (or `WERK_LOG_LEVEL` when no flag is given) wins over these defaults.
 
 ```bash
 # Readable console plus an independent structured file
@@ -78,7 +193,7 @@ These global options also apply to other CLI commands:
 
 | Option | Default / behavior |
 | --- | --- |
-| `--log-level error\|warn\|info\|debug\|trace\|off` | INFO, or DEBUG with a verbose serve mode. |
+| `--log-level error\|warn\|info\|debug\|trace\|off` | INFO; DEBUG for verbose serve modes, `run`/`chat` and media `--verbose`/`--debug`, or `bench --debug`. An explicit level wins. |
 | `--log-format auto\|text\|json` | `auto`: terminal palette when interactive, plain text in pipes. `text`: undecorated text. `json`: raw JSONL. Pure mode forces JSON. |
 | `--log-file PATH` | Optional append-only JSONL destination, independent of console rendering. No file is created unless configured. |
 | `--log-max-size-mb N` | Rotate before exceeding 10 MiB; one oversized event remains intact. Range 1–4096. |
@@ -128,7 +243,7 @@ python3 scripts/smoke-logging.py target/debug/werk
 
 ## Global options
 
-Global options precede the subcommand:
+Global options can appear before or after a subcommand; examples put them first:
 
 ```bash
 werk --model-home /srv/werk \
@@ -140,7 +255,7 @@ The most important global controls are:
 
 | Option | Meaning |
 | --- | --- |
-| `--model-home PATH` | Select the complete Werk store; equivalent to `WERK_HOME`. |
+| `--model-home PATH` | Select the complete Werk store; overrides `WERK_HOME`. |
 | `--backend BACKEND` | Select `auto` or constrain routing to a named runtime/backend family. |
 | `--device DEVICE` | Legacy Candle-only device override. Prefer `--backend` or typed media accelerator controls. |
 | `--auto-install-backends` | Permit managed provisioning during runtime selection. Installation is otherwise explicit. |
@@ -149,6 +264,9 @@ The most important global controls are:
 | `--gpu-layers`, `--main-gpu` | Advanced llama.cpp accelerator placement controls. |
 | `--kv-cache-type`, `--flash-attn`, `--kv-offload` | Advanced llama.cpp cache and attention controls. |
 | `--threads`, `--threads-batch` | CPU helper-thread controls for generation and prompt evaluation. |
+| `--parallel N` | llama-server active sequence slots; default 1, positive integer. Each slot receives `--ctx-size` tokens, so additional slots increase memory demand. |
+| `--warmup-tokens N` | Native llama-server startup warmup control: 0 disables it (default); a positive value enables native warmup rather than specifying its token count. Separate from `serve --preload`. |
+| `--fp4-kernel auto\|native\|marlin\|ggml` | NVFP4 CUDA kernel policy; default `auto`. See [NVFP4 requirements and limits](../nvfp4.md). |
 
 Backend availability, explicit constraints and fallback semantics are covered
 in [Backends](../backends.md).
@@ -246,12 +364,13 @@ werk list --family flux --json
 werk inspect model-id
 ```
 
-`list` shows model metadata, a `managed` or `external` storage label, and the
-absolute storage path in `PATH`. For managed models, this is the directory
+`list` shows model metadata, a `managed`, `external` or `remote` storage label,
+and the absolute local path in `PATH`. For managed models, this is the directory
 containing `manifest.json` and `files/`; for external bindings, it is the
-external files' source path. It supports metadata filters and sizes table
-columns to their contents. When the table
-would exceed the terminal width, each model is shown as a labeled block with
+external files' source path. Hosted registrations use `remote`, with `PATH`
+pointing to their local registration directory, not weights or a provider URL.
+It supports metadata filters and sizes table columns to their contents. When the
+table would exceed the terminal width, each model is shown as a labeled block with
 its full name and path. `list --json` prints the stored/enriched manifests.
 External bindings include a `storage` record with `kind: "external"` and their
 absolute path. They remain listed if the external disk is unmounted; loading
@@ -275,6 +394,7 @@ are accepted. Inspect the manifest to obtain exact filenames.
 ```bash
 werk remove model-id
 werk rm model-id
+werk delete model-id
 ```
 
 This removes the managed model directory and its local optimized artifacts.
@@ -284,6 +404,68 @@ and original import sources are separate.
 
 The directory layout and retention rules are documented in
 [Models, manifests and the store](../concepts/models-manifests-and-store.md).
+
+### Convert an NVFP4 checkpoint to GGUF
+
+For an installed, compatible Hugging Face NVFP4 checkpoint:
+
+```bash
+werk convert source-nvfp4 --to gguf --name converted-nvfp4 \
+  --python /path/to/converter-venv/bin/python
+```
+
+The model IDs and interpreter path are placeholders. `--to` accepts only `gguf`
+(the default); `--name` is required and must identify a new destination.
+`--converter PATH` selects a compatible `convert_hf_to_gguf.py`; otherwise Werk
+discovers the installed NVFP4 profile's converter. `--python` defaults to
+`python3`, and `--verbose` shows conversion diagnostics. Provision the converter
+and its dependencies first.
+
+This explicit conversion preserves the source and validates the output before
+registering a separate model. It does not download missing files, install Python
+packages or overwrite an existing model. Only supported ModelOpt or
+compressed-tensors inputs with declared NVFP4 metadata qualify; it is not a
+general format converter. See [checkpoint and projector requirements](../nvfp4.md#hugging-face-nvfp4-checkpoints).
+
+## Model support and provider commands
+
+`werk support` exposes the evidence catalog, official hosted registrations and
+model-specific provider/action commands:
+
+```text
+werk support list
+werk support register MODEL [--name NAME]
+werk support register-action NAME --checkpoint PATH
+werk support image --request PATH --output PATH
+werk support speech --request PATH --output PATH
+werk support action --request PATH --output PATH
+```
+
+Uppercase values are placeholders; brackets mark optional arguments.
+`list` prints the support/evidence catalog as JSON. `register` accepts the
+official hosted IDs `mistral-large-4`, `flux-3-image` and `eleven_v4`, with an
+optional local alias via `--name`. It does not register arbitrary provider IDs.
+Listing and registration need no provider credentials and do not establish
+successful inference. See [discovery and registration](../model-support-matrix.md#discovery-and-registration).
+
+`register-action` links a complete local DROID package without copying weights.
+Keep its config, checkpoint and saved manifest/encoder references available at
+that path; registration alone does not validate execution. See the
+[DROID prerequisites and request contract](../model-support-matrix.md#flux-3-action-local-droid-predictions).
+
+| Command | Input and output |
+| --- | --- |
+| `support image` | Read the [FLUX 3 Image JSON contract](../model-support-matrix.md#flux-3-image-generation-and-reference-editing), write returned image bytes and print metadata. |
+| `support speech` | Read the [Eleven v4 dialogue JSON contract](../model-support-matrix.md#eleven-v4-audio-and-streaming-dialogue), write the completed audio file and print metadata. HTTP audio streaming does not make this CLI command stream audio incrementally. |
+| `support action` | Read the DROID JSON contract and write prediction JSON with `executed: false`; no hardware is actuated. |
+
+All three `--output` paths must not already exist; files are created without
+overwriting. Hosted inference requires `MISTRAL_API_KEY`, `BFL_API_KEY` or
+`ELEVENLABS_API_KEY` as appropriate, provider access and potentially paid usage.
+The new Kolibri, Mistral Large 4, FLUX 3 Image, Eleven v4 and DROID paths remain
+**`IMPLEMENTED_UNTESTED` for actual inference**. Consult the
+[model support matrix](../model-support-matrix.md) for exact mode-specific status
+and JSON fields; these commands do not change that verification status.
 
 ## Temporary files
 
@@ -388,13 +570,20 @@ currently accepts only plain `http://` with no path or embedded credentials.
 `--api-key` overrides the `WERK_API_KEY` default, but the environment variable
 avoids placing a key directly in shell history. The bundled client does not
 follow redirects or provide TLS; use it only over loopback or a trusted private
-hop. `--timeout-seconds` is a total per-request deadline, defaults to 30 and
-accepts values from 1 through 86400; like `--url` and `--api-key`, it must
-appear before the runtime subcommand.
+hop. `--timeout-seconds` defaults to 30 and accepts 1 through 86400. The shared
+request deadline starts before DNS resolution and bounds TCP connection attempts
+and I/O. Synchronous DNS resolution itself can block past that deadline; after
+it returns, the client checks the remaining time before connecting. It is not a
+hard timeout on DNS. Like `--url` and `--api-key`, the option must appear before
+the runtime subcommand.
 
 The active store belongs to the server. A client-side global `--model-home`
 does not redirect remote runtime state; start the server with the intended
 `WERK_HOME`/`--model-home` instead.
+
+For a server using deployment profiles, select an exact instance with
+`werk runtime --deployment INSTANCE_ID capabilities`. Replica aliases are not
+runtime-control targets; see [deployment profiles](../concepts/single-host-deployments.md).
 
 ### List states
 
@@ -452,9 +641,14 @@ werk runtime prune --all --confirm-all --execute
 
 `--all` is rejected without `--confirm-all`; `--confirm-all` is invalid for
 the ID and filter forms. `--execute` changes `dry_run` from true to false.
-Pruning affects only the selected runtime states. It does not purge temporary
-files and cannot remove models, artifacts, outputs, jobs, authentication data,
-backend installations or external paths.
+The selector determines which live runtime states are explicitly deleted. Execute
+also performs maintenance in the same principal namespace: it expires volatile
+states, reconciles TTL/catalog remnants and can quarantine corrupt entries. This
+can affect entries outside a narrow ID/model/time selector. Dry-run does not run
+that additional maintenance, and `matched`/`removed` do not account for all of it.
+Pruning cannot affect other principals and does not purge temporary files or remove
+models, model artifacts, outputs, jobs, authentication data, backend installations
+or external paths.
 
 To clear every runtime state visible to the current authenticated principal,
 preview and then execute the explicit all-selector:
@@ -499,6 +693,10 @@ werk auth huggingface status
 werk auth huggingface logout
 ```
 
+`login --token TOKEN` supplies the token noninteractively; omitting it prompts
+for a token. `auth hf` is the short command alias. Token discovery order and
+storage are described in [environment variables](environment-variables.md#core-serving-and-storage).
+
 Generate an API key file for `werk serve`:
 
 ```bash
@@ -542,6 +740,16 @@ host and output demand, fit status, confidence, assumptions, warnings and
 recommendations. An estimate is a planning aid, not a guarantee that a
 third-party backend can load the architecture.
 
+Workload geometry options are `--width`, `--height`, `--frames`, `--duration`
+(seconds), `--batch-size`, `--sample-rate` (Hz), `--channels` and `--steps`.
+They populate the selected task's namespace; they are not all valid for every
+task. For audio, for example:
+
+```bash
+werk estimate music-model --task music-generation \
+  --duration 30 --sample-rate 44100 --channels 2 --json
+```
+
 ## Parameters and diagnostics
 
 ```bash
@@ -552,13 +760,20 @@ werk parameters flux-dev --sources
 
 werk doctor
 werk doctor --task image-generation
-werk doctor --model flux-dev --debug
+werk doctor --model flux-dev
+werk doctor --runtime RUNTIME
+werk doctor perf model-id
 werk backend doctor --debug
 ```
 
 `parameters` describes the typed schema and, with a model, model/runtime
 support. `doctor` checks the host and can add a non-executing model/task probe.
 Neither command performs a full cold model load.
+Replace `RUNTIME` with the runtime name to inspect. `doctor perf MODEL` reports
+the selected backend and available llama.cpp runtime/performance configuration;
+it does not run a throughput benchmark. `doctor` has no `--debug` flag; use
+`backend doctor --debug` for detailed discovery or `chat MODEL --debug` for
+inference diagnostics.
 
 ## Optimized artifacts
 
@@ -580,9 +795,25 @@ Start an interactive chat:
 werk chat model-id --max-tokens 128
 ```
 
-`--max-tokens` is a hard completion cap and can stop text mid-sentence. Terminal
-chat streams decoded pieces by default. Use `--stream-granularity chunk` to
-reduce terminal flushes and `--verbose` for prompt/decode timing and throughput.
+`--max-tokens` defaults to 256; it is a hard completion cap and can stop text
+mid-sentence. Terminal chat streams decoded pieces by default. Use
+`--stream-granularity chunk` to reduce terminal flushes and `--verbose` for
+prompt/decode timing and throughput.
+
+`--chat-template model|generic|phi3|llama3|gemma|chatml|qwen-chatml|none`
+overrides prompt formatting on supported local routes. Model-native formatting
+is preferred for GGUF/native-server and external tokenizer-based backends;
+`none` requests untemplated text. The backend can reject an incompatible
+override. Tool requests through `run` require the model template, and
+`run --server` rejects local template overrides because the server owns them.
+Inside interactive `chat`, `/exit` and `/quit` end the conversation.
+
+Text embeddings, reranking and classification use dedicated HTTP endpoints.
+Their CLI lifecycle is `pull`/`import`, `inspect`, `backend install text-analysis`,
+`doctor --model …` and `serve`. There is no dedicated text-analysis inference
+subcommand; `chat` cannot turn a non-generative analysis model into a chat model.
+See [text-analysis endpoints](../api.md#text-analysis-endpoints) and the
+[task table](tasks-and-formats.md#canonical-tasks).
 
 For oMLX `run` and `chat`, the first completed turn includes worker/model
 preparation in `load duration` and `total duration`, including persistent-session
@@ -648,10 +879,14 @@ diagnostics before entering native inference.
 
 On WSL, `WERK_MODEL_CACHE_RELEASE=auto` (the default) requests release of the
 loaded model files' clean OS cache pages when their local model owner or worker
-is destroyed. This applies to all model families, after `run`, after leaving
-`chat`, and when `serve` stops or unloads its worker. Owned subprocesses are
-stopped and reaped first, including CLI interruption. An active chat/server
-worker retains its model; this is not an idle timer between requests.
+is destroyed on backend paths that acquire a `CacheReleaseGuard` file lease.
+Those paths can release pages after `run`, after leaving `chat`, or when `serve`
+stops or unloads the worker. Subprocesses participating in `ManagedChild` cleanup
+are stopped and reaped first, including CLI interruption. These guarantees do not
+cover every local provider: the DROID worker uses a normal `Child` with kill/wait
+on drop, without a `CacheReleaseGuard` lease or central `ManagedChild` interrupt
+registration. An active chat/server worker retains its model; this is not an
+idle timer between requests.
 
 This file-scoped operation does not delete model files, chat history or saved
 KV snapshots, and does not restart WSL or clear the system-wide cache. It can
@@ -900,10 +1135,15 @@ werk --backend omlx bench model-id \
 ```
 
 `--runs` defaults to 5 measured runs after 1 unmeasured `--warmups` run.
-Temperature defaults to 0 and seed to 42; omitted `--top-p` inherits the
-backend's behavior. A warmup does not guarantee that every later request
+`--max-tokens` defaults to 256. Temperature defaults to 0 and seed to 42;
+omitted `--top-p` inherits the backend's behavior. A warmup does not guarantee that every later request
 reuses its prompt cache. Keep runtime settings and system load consistent
 between comparisons.
+
+`--compare` defaults to `none`; `--compare legacy` adds the legacy llama backend
+for GGUF runs using automatic or llama-server selection, subject to compiled
+backend availability. Other routes keep their selected backend. Use
+`--print-native-info` for available resolved llama.cpp settings in the text report.
 
 JSON samples contain token counts, timings, `finish_reason` and
 `backend_diagnostics`. Add `--include-output` with `--json` to retain generated
@@ -940,8 +1180,11 @@ piped standard input and then an interactive prompt where supported. Generated
 outputs go to the requested `--output` destination or Werk's managed output
 store. Prompt text is not included in automatic filenames.
 
-See [Media inference](../media-inference.md) for the canonical task tree,
-parameters and runnable examples.
+See [media CLI rules](cli-media.md) for task selection, input precedence,
+structured lists, profiles, routing and output contracts. Every option is
+listed in the [image](cli-image.md), [video](cli-video.md) and
+[audio](cli-audio.md) catalogues. [Media inference](../media-inference.md)
+provides execution support and runnable examples.
 
 ## Server
 
@@ -959,6 +1202,10 @@ through `--api-key`, `WERK_API_KEY`, `--api-keys` or the default key file.
 Browser CORS is disabled by default. Add exact trusted origins with repeatable
 `--cors-origin`; wildcard and opaque `null` origins are rejected.
 
+`--image-model` selects the default for compatible image requests that omit a
+model or use an OpenAI image alias. Startup checks its declared image-generation
+support; it does not warm the image pipeline. See [HTTP model selection](../api.md).
+
 Enable persistence defaults and supported backend prefix caching:
 
 ```bash
@@ -967,14 +1214,16 @@ werk serve --model chat-model --persistence
 
 `--persistence` supplies `auto` retention, `prefer` reuse, no TTL and no pinning
 when a `POST /werk/v1/prefill` request omits its top-level `policy` member. It
-also supplies `allow_experimental: true` when that member is omitted. For a
-local vLLM process started by this server, it defaults vLLM's native automatic
+independently supplies `allow_experimental: true` when the top-level
+`allow_experimental` member is omitted, even if `policy: {}` is present. Each
+explicit top-level value wins over its respective server default. For a local
+vLLM process started by this server, it defaults vLLM's native automatic
 prefix cache on. Werk verifies that the installed vLLM help advertises the
 generated flag before starting the process. A remote vLLM endpoint remains
 externally managed and receives no generated launch argument.
 
-For local oMLX 0.6.4, persistence mode `auto` or `disk` with reuse other than
-`disabled` also enables verified short exact-prefix caching. This applies to
+For local oMLX 0.6.4 and 0.7.0, persistence mode `auto` or `disk` with reuse other
+than `disabled` also enables verified short exact-prefix caching. This applies to
 ordinary OpenAI chat and supported tool requests, including when `auto`
 routing selects oMLX. The native SSD cache is limited to 4 GB in the private
 worker's `cache/prefix-cache` directory and lasts for that worker. It does not
@@ -1047,6 +1296,66 @@ The separate model-, pipeline-, and backend-owned reuse paths are listed in the
 The route inventory and request contracts are documented in the
 [HTTP API reference](../api.md).
 
+### Startup preload
+
+`--preload MODEL...` accepts multiple values and is repeatable:
+
+```bash
+werk serve --preload model-a model-b model-c --preload model-d --model model-a
+```
+
+Replace the names with already installed compatible models, or configured
+deployment aliases/instance IDs. Matching builds, runtimes and resources must
+be available; authentication uses the ordinary `serve` configuration.
+
+Werk processes targets sequentially in first-occurrence order and deduplicates
+them. The CLI imposes no fixed model count, but RAM, VRAM and runtime capacity
+still limit residency. Request handling begins after the preload run; the
+listener can already be bound while preparation is in progress.
+
+`--model` independently selects the default for chat/text-analysis requests
+that omit a model. Preload does not choose that default. With a nonempty preload
+list, a default outside the list receives no separate startup preparation and
+remains requestable on demand. Without `--preload`, existing startup behavior
+is retained: outside deployment mode, Werk prepares the default model; for
+text-analysis models this can be a runtime check with weights loaded on the
+first request.
+
+| Target | Preparation and residency boundary |
+| --- | --- |
+| Supported local text model | Internal synthetic warmup with at most 32 output tokens, without a public HTTP request or saved conversation. Compatible resident llama.cpp, oMLX, local vLLM, Candle, experimental Burn, Transformers compatibility and embedded ONNX GenAI routes participate, subject to model/build/runtime requirements. |
+| Separately operated vLLM endpoint | Werk can retain its client configuration and send the synthetic warmup, but the external service owns weights and residency. This is not Werk-guaranteed remote residency. |
+| Optional hosted provider | Check credential presence/header validity locally and prepare an HTTP client. No provider call, inference, billing or local weight residency; account access and remote readiness are not verified. These model paths remain `IMPLEMENTED_UNTESTED`. |
+| FLUX 3 Action DROID | Load a separate resident policy worker and warm it with a synthetic prediction. Real model inference remains `IMPLEMENTED_UNTESTED`. See [model-specific requirements](../model-support-matrix.md). |
+
+One-shot MLX/MLX-VLM and nonresident ONNX runners do not support resident
+preload. Explicitly disabled residency is respected. Preload does not generally
+warm image, video or audio generation.
+
+Successful local instances are retained until server shutdown. Pinned runtime
+entries sit outside ordinary cache capacity/eviction limits and cannot be
+evicted by later requests. Earlier targets claim resources first. Missing
+models, incompatible paths, resource shortages and warmup failures are logged
+and skipped; later targets are still attempted. The server can start with no
+successful preloads. Skipped models remain requestable under normal routing and
+resource rules.
+
+In deployment mode, an alias expands to all replicas in instance-ID order;
+individual IDs also work. Deduplication uses the expanded target instance IDs.
+Existing placement/admission rules still apply. This adds no multi-node cluster
+management or guarantee that all resident models decode simultaneously; see
+[deployment profiles](../concepts/single-host-deployments.md) and
+[inference concurrency](../concepts/inference-concurrency.md).
+
+Startup events are `serve.preload.started`, `serve.preload.ready`,
+`serve.preload.failed` and `serve.preload.finished`. Hosted-client preparation
+also emits `serve.preload.remote_prepared`. “Ready” means preparation succeeded
+for that target type, not that hosted inference was verified. Residency,
+conversation history, prefix/KV reuse and expert caches are
+[separate mechanisms](../concepts/runtime-persistence-and-memory.md#execution-lifetime-and-reuse-matrix).
+Prompt processing, cache misses and dynamic expert offload can still add latency;
+preload guarantees neither KV reuse nor a latency-free answer.
+
 ## Backend management
 
 ```bash
@@ -1061,6 +1370,7 @@ werk backend install media
 werk backend install onnx-cpu
 ```
 
+`TARGET` is a placeholder for a supported installer name, such as `llama-cpu`.
 The supported install targets, operating-system matrix and manual cleanup
 procedure are documented in [Backends](../backends.md). There is currently no
 managed `werk backend uninstall` command.
@@ -1076,11 +1386,11 @@ with the updated binary; opening the dashboard never restarts them.
 
 | Option | Meaning |
 | --- | --- |
-| `--interval-ms 2000` | Poll interval, 500–60000 ms |
+| `--interval-ms N` | Poll interval, 500–60000 ms; default 2000 ms |
 | `--once` | Print one snapshot and exit |
 | `--once --json` | Structured snapshot for scripts |
 | `--no-animation` | Disable decorative animation |
-| `--demo` | Simulated preview without a server connection |
+| `--demo` | Simulated preview without a server connection; conflicts with `--once`, `--json` and `--api-key` |
 
 Keys: `q`/Escape/Ctrl-C quit; Space pauses the display; arrows select a request;
 Tab/Enter toggles details; `b` selects a native worker; `a` toggles animation. The dashboard is read-only.

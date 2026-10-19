@@ -17,6 +17,9 @@ and describe the current repository state.
 | --- | --- |
 | Install Werk1112 and run a first request | [Getting started](getting-started.md) |
 | Look up a command or global option | [CLI reference](reference/cli.md) |
+| Find every accepted command and option | [Complete CLI index](reference/cli-options.md) |
+| Configure image, video and audio requests | [Media CLI reference](reference/cli-media.md) |
+| Look up parameter types, defaults and constraints | [Canonical parameter schema](reference/parameters-schema.md) |
 | Understand every HTTP route | [HTTP API](api.md) |
 | Integrate runtime state, memory or prefill/decode | [Werk Protocol 1.0](reference/werk-protocol-v1.md) |
 | Understand persistence safety and backend support | [Runtime persistence and memory architecture](concepts/runtime-persistence-and-memory.md) |
@@ -24,17 +27,22 @@ and describe the current repository state.
 | Use tool calling across backends and media | [Tool calling](tool-calling.md) |
 | Configure vLLM arguments | [vLLM launch](backends.md#vllm-launch-arguments-and-tool-calling) |
 | Run image, video or audio inference | [Media inference](media-inference.md) |
+| Use embeddings, reranking or classification | [Text-analysis API](api.md#text-analysis-endpoints) |
+| Preload installed models when starting the service | [Startup preload](reference/cli.md#startup-preload) |
 
 ## Models and configuration
 
 - [Models, manifests and managed storage](concepts/models-manifests-and-store.md)
 - [Runtime persistence, memory and capability boundaries](concepts/runtime-persistence-and-memory.md)
 - [Tasks, modalities, repository layouts and formats](reference/tasks-and-formats.md)
+- [Model support matrix and inference verification](model-support-matrix.md)
 - [Environment variables](reference/environment-variables.md)
 
 ## Integrations and platforms
 
 - [OpenAI-compatible clients](integrations/openai-clients.md)
+- [Anthropic-compatible clients](integrations/anthropic-clients.md)
+- [Documents and file inputs](integrations/documents.md)
 - [Open WebUI](integrations/open-webui.md)
 - [AUTOMATIC1111-compatible clients](integrations/automatic1111.md)
 - [ComfyUI integration choices](integrations/comfyui.md)
@@ -46,6 +54,14 @@ and describe the current repository state.
 The self-contained [ComfyUI custom-node documentation][comfyui-source] stays
 beside the package source so that it can also serve as the package and Registry
 documentation.
+
+## Serving and observability
+
+- [Single-host deployment profiles, GPU groups and replicas](concepts/single-host-deployments.md)
+- [Inference concurrency and admission limits](concepts/inference-concurrency.md)
+- [Live terminal dashboard](reference/cli.md#live-dashboard)
+- [Prometheus and Grafana][observability-source]
+- [Multi-GPU implementation and hardware evidence](multi-gpu-progress.md)
 
 ## Development and releases
 
@@ -61,3 +77,4 @@ OpenAPI description becomes a tested source of truth.
 [comfyui-source]: https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/README.md
 [n8n-source]: https://github.com/philipbodenbach/werk1112/blob/main/utils/n8n/README.md
 [docs-source]: https://github.com/philipbodenbach/werk1112/tree/main/docs
+[observability-source]: https://github.com/philipbodenbach/werk1112/tree/main/utils/observability

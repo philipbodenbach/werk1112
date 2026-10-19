@@ -37,6 +37,8 @@ carry prompt text in addition to any required media input.
 | --- | --- | --- | --- | --- |
 | `text-generation` | text | text | `text` | yes |
 | `text-embedding` | text | embedding | `text` | yes |
+| `text-reranking` | text | text | `text` | no |
+| `text-classification` | text | text | `text` | no |
 | `image-understanding` | image | text | `text` | yes |
 | `image-generation` | text | image | `image` | yes |
 | `image-editing` | image | image | `image` | yes |
@@ -78,6 +80,17 @@ One manifest can declare several tasks. Task inference from repository metadata
 is heuristic; the runtime planner still checks task, format, layout,
 architecture, accelerator and explicit parameters before accepting a
 candidate.
+
+Text analysis has dedicated [HTTP endpoints](../api.md#text-analysis-endpoints)
+for embeddings, query/document reranking and classification/decisions. The
+`text` output modality for the latter two represents structured analysis
+results, not generated chat prose. Their required input fields follow those
+endpoint contracts. The CLI manages and serves these models; there is no
+dedicated terminal rerank/classify command.
+
+The [parameter schema](parameters-schema.md) covers all 40 canonical tasks.
+The [media CLI task mapping](cli-media.md#task-selection) explains which task
+each typed command selects and when input flags change that selection.
 
 The generic media companion currently registers execution for the task subset
 listed in [Media companion execution support](../media-inference.md#execution-support).
