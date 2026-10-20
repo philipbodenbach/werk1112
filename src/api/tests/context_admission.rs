@@ -44,7 +44,7 @@ impl GenerationBackend for Counter {
         self.counts.fetch_add(1, Ordering::SeqCst);
         *self.counted.lock().unwrap() = Some(signature(&request, &options));
         self.native
-            .ok_or_else(|| anyhow::anyhow!("tokenizer unavailable"))
+            .ok_or_else(|| crate::backend::UnsupportedTokenCounting.into())
     }
     fn generate_api(
         &self,
@@ -185,6 +185,71 @@ async fn requests_well_within_budget_do_not_add_tokenizer_round_trips() {
     let app = app(backend.clone());
     let response = post_json(&app, "/v1/chat/completions", request(false, false), None).await;
     assert_eq!(response.status(), StatusCode::OK);
+    // Ordinary clients need no Werk handshake/header and still receive the
+    // OpenAI response shape, even when native token counting is unsupported.
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["choices"][0]["message"]["content"], "ok");
+    assert!(value.get("protocol").is_none());
+    assert!(value.get("data").is_none());
     assert_eq!(backend.counts.load(Ordering::SeqCst), 0);
     assert_eq!(backend.generations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn protocol_token_count_preserves_full_tool_history_without_generating() {
+    let backend = Counter::new(Some(3012));
+    let app = app(backend.clone());
+    let original = request(true, true);
+    let response = post_json(&app, "/werk/v1/chat/count_tokens", original.clone(), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-werk-protocol-version"], "1.0");
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["protocol"], json!({"major":1,"minor":0}));
+    assert_eq!(
+        value["data"],
+        json!({"model":"context-test","input_tokens":3012})
+    );
+    assert_eq!(backend.counts.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
+    let counted = backend.counted.lock().unwrap().clone().unwrap();
+    let normalized = serde_json::to_value(
+        serde_json::from_value::<crate::openai::ChatCompletionRequest>(original).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        counted["messages"] == normalized["messages"],
+        "native count must preserve every tool/result message"
+    );
+    assert_eq!(counted["tools"]["tools"], normalized["tools"]);
+    assert_eq!(counted["options"]["reasoning_effort"], "low");
+}
+
+#[tokio::test]
+async fn protocol_token_count_reports_unsupported_instead_of_guessing() {
+    let backend = Counter::new(None);
+    let app = app(backend.clone());
+    let response = post_json(
+        &app,
+        "/werk/v1/chat/count_tokens",
+        request(false, true),
+        None,
+    )
+    .await;
+    assert!(!response.status().is_success());
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["protocol"], json!({"major":1,"minor":0}));
+    assert_eq!(value["error"]["code"], "unsupported");
+    assert_eq!(value["error"]["retryable"], false);
+    assert!(value.get("data").is_none());
+    assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
 }

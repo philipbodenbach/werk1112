@@ -540,7 +540,7 @@ impl GenerationBackend for LlamaServerBackend {
     ) -> Result<usize> {
         self.validate_api_options(manifest, &request, &options)?;
         if request_has_images(&request) {
-            bail!("native llama.cpp token counting does not expose image token counts");
+            return Err(super::UnsupportedTokenCounting.into());
         }
         let (server, _, _) = self.cached_server(manifest, false)?;
         let mut body = chat_template_body(&request);

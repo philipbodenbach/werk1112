@@ -90,6 +90,11 @@ fn parse_slots(sample: &mut BackendSnapshot, value: &Value) -> bool {
     let Some(slots) = value.as_array() else {
         return false;
     };
+    if slots.is_empty() {
+        return false;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut per_request_min = u64::MAX;
     let mut active = 0.;
     let mut capacity = 0.;
     let mut context = 0.;
@@ -104,6 +109,10 @@ fn parse_slots(sample: &mut BackendSnapshot, value: &Value) -> bool {
         ) else {
             return false;
         };
+        if n_ctx == 0 || !ids.insert(id) {
+            return false;
+        }
+        per_request_min = per_request_min.min(n_ctx);
         capacity += n_ctx as f64;
         context += slot["n_prompt_tokens"].as_u64().unwrap_or(0) as f64;
         if !processing {
@@ -133,6 +142,9 @@ fn parse_slots(sample: &mut BackendSnapshot, value: &Value) -> bool {
         ("requests_active", active),
         ("slots_total", slots.len() as f64),
         ("context_capacity_tokens", capacity),
+        // The aggregate cannot be divided safely when slots differ in size.
+        // Clients use this minimum to admit a request into any native slot.
+        ("context_per_request_tokens", per_request_min as f64),
         ("context_used_tokens", context),
     ] {
         sample.gauges.insert(key.into(), value);
@@ -237,6 +249,7 @@ mod observability_tests {
         ));
         assert_eq!(sample.gauges["requests_active"], 1.);
         assert_eq!(sample.gauges["context_capacity_tokens"], 65536.);
+        assert_eq!(sample.gauges["context_per_request_tokens"], 32768.);
         assert_eq!(sample.gauges["active_output_tokens"], 34.);
         assert_eq!(sample.gauges["slot_0_task"], 42.);
         assert_eq!(sample.gauges["active_prompt_tokens"], 1200.);
@@ -246,5 +259,29 @@ mod observability_tests {
             &mut BackendSnapshot::default(),
             &serde_json::json!({"error":501})
         ));
+    }
+
+    #[test]
+    fn per_request_context_is_minimum_not_average_and_requires_all_slots() {
+        let mut sample = BackendSnapshot::default();
+        assert!(parse_slots(
+            &mut sample,
+            &serde_json::json!([
+                {"id":0,"is_processing":false,"n_ctx":8192},
+                {"id":1,"is_processing":true,"n_ctx":32768}
+            ])
+        ));
+        assert_eq!(sample.gauges["context_capacity_tokens"], 40960.);
+        assert_eq!(sample.gauges["context_per_request_tokens"], 8192.);
+        for slots in [
+            serde_json::json!([]),
+            serde_json::json!([{"id":0,"is_processing":false,"n_ctx":0}]),
+            serde_json::json!([{"id":0,"is_processing":false,"n_ctx":8192},{"id":1,"is_processing":false}]),
+            serde_json::json!([{"id":0,"is_processing":false,"n_ctx":8192},{"id":0,"is_processing":false,"n_ctx":8192}]),
+        ] {
+            let mut invalid = BackendSnapshot::default();
+            assert!(!parse_slots(&mut invalid, &slots));
+            assert!(!invalid.gauges.contains_key("context_per_request_tokens"));
+        }
     }
 }

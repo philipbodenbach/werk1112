@@ -35,6 +35,10 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/werk/v1/experts", get(list_experts_handler));
 
     let writes = Router::new()
+        .route(
+            "/werk/v1/chat/count_tokens",
+            post(chat_count_tokens_handler),
+        )
         .route("/werk/v1/states/prune", post(prune_states_handler))
         .route("/werk/v1/states/{id}/actions", post(state_action_handler))
         .route("/werk/v1/experts/actions", post(expert_action_handler))
@@ -43,6 +47,97 @@ pub(super) fn routes() -> Router<ApiState> {
         .layer(DefaultBodyLimit::max(MAX_WERK_BODY_BYTES));
 
     reads.merge(writes)
+}
+
+async fn chat_count_tokens_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Result<Json<crate::openai::ChatCompletionRequest>, JsonRejection>,
+) -> Response {
+    let (request_id, _) = match request_context(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Json(mut request) = match body {
+        Ok(body) => body,
+        Err(error) => return json_rejection(request_id, error),
+    };
+    // This route never generates, regardless of an inherited stream setting.
+    request.stream = Some(false);
+    let prepared = match super::generation::prepare(
+        state,
+        request,
+        super::generation::ContextPolicy::Count,
+        "/werk/v1/chat/count_tokens",
+        &headers,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return protocol_error(
+                request_id,
+                ProtocolError::new(
+                    if error.status == StatusCode::TOO_MANY_REQUESTS {
+                        ProtocolErrorCode::ResourceExhausted
+                    } else if error.status.is_server_error() {
+                        ProtocolErrorCode::Unavailable
+                    } else {
+                        ProtocolErrorCode::InvalidRequest
+                    },
+                    error.message,
+                )
+                .retryable(
+                    error.status == StatusCode::TOO_MANY_REQUESTS || error.status.is_server_error(),
+                ),
+            );
+        }
+    };
+    let model = prepared
+        .state
+        .requested_alias
+        .clone()
+        .unwrap_or_else(|| prepared.manifest.id.clone());
+    match crate::logging::spawn_blocking(move || {
+        let _permit = prepared.state.deployment_permit;
+        prepared.state.backend.count_api_tokens(
+            &prepared.manifest,
+            prepared.request,
+            prepared.api_options,
+        )
+    })
+    .await
+    {
+        Ok(Ok(count)) => success(
+            request_id,
+            crate::werk_protocol::ChatTokenCountResponse {
+                model,
+                input_tokens: count as u64,
+            },
+        ),
+        Ok(Err(error)) => {
+            let unsupported = error.is::<crate::backend::UnsupportedTokenCounting>();
+            protocol_error(
+                request_id,
+                ProtocolError::new(
+                    if unsupported {
+                        ProtocolErrorCode::Unsupported
+                    } else {
+                        ProtocolErrorCode::Unavailable
+                    },
+                    format!("Native chat token count unavailable: {error}"),
+                )
+                .retryable(!unsupported),
+            )
+        }
+        Err(_) => protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "Native chat token count task failed",
+            ),
+        ),
+    }
 }
 
 async fn info_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {

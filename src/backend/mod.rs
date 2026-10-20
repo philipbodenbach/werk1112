@@ -1434,6 +1434,18 @@ pub(crate) fn preload_resident<B: GenerationBackend + ?Sized>(
     })
 }
 
+#[derive(Debug)]
+pub struct UnsupportedTokenCounting;
+
+impl std::fmt::Display for UnsupportedTokenCounting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "the selected backend does not expose exact native chat token counting for this request",
+        )
+    }
+}
+impl std::error::Error for UnsupportedTokenCounting {}
+
 pub trait GenerationBackend: Send + Sync {
     /// Read only: sample already-running workers; never load or prepare models.
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
@@ -1466,7 +1478,7 @@ pub trait GenerationBackend: Send + Sync {
     /// Count a fully templated prompt using the selected runtime's tokenizer.
     /// Never implement this by generating a token or estimating from bytes.
     fn count_tokens(&self, _manifest: &ModelManifest, _request: GenerateRequest) -> Result<usize> {
-        anyhow::bail!("the selected backend does not expose native chat token counting")
+        Err(UnsupportedTokenCounting.into())
     }
     /// Count the same chat template as generate_api, including request overrides.
     /// A counter that cannot preserve these options must report unsupported.
@@ -1477,7 +1489,7 @@ pub trait GenerationBackend: Send + Sync {
         options: std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<usize> {
         if !options.is_empty() {
-            anyhow::bail!("native token counting with API options is not supported")
+            return Err(UnsupportedTokenCounting.into());
         }
         self.count_tokens(manifest, request)
     }

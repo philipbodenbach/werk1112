@@ -191,6 +191,7 @@ It sends no launch setting to remote vLLM.
 | GET | `/werk/v1/capabilities` | none | Capability array |
 | GET | `/werk/v1/memory` | none | Memory telemetry and accounting |
 | GET | `/werk/v1/observability` | none | Server-wide chat, worker and memory observations |
+| POST | `/werk/v1/chat/count_tokens` | OpenAI chat request | Exact native input token count |
 | GET | `/werk/v1/states` | query filters | One page of runtime states |
 | POST | `/werk/v1/states/{id}/actions` | State action | Updated/projected state |
 | POST | `/werk/v1/states/prune` | Explicit selector | Match/removal summary |
@@ -199,9 +200,49 @@ It sends no launch setting to remote vLLM.
 | POST | `/werk/v1/prefill` | Input and persistence policy | Opaque handoff and state metadata |
 | POST | `/werk/v1/decode` | Opaque handoff and decode options | Completion and optional next handoff |
 
-All five POST routes have a fixed 1 MiB HTTP body limit. Individual DTOs have
+All listed POST routes have a fixed 1 MiB HTTP body limit. Individual DTOs have
 tighter semantic limits where described below. Unknown fields are rejected on
 the mutation, prefill and decode request DTOs.
+
+## Native chat token count
+
+This is an optional control-plane extension. Existing OpenAI-compatible and
+Anthropic-compatible generation routes keep their request/response formats and
+do not require a Werk handshake, version header or prior counting call. Clients
+may ignore this capability; generation still performs its own context admission.
+
+`api.chat.token_count` with status `supported` and operation `count_tokens`
+advertises `POST /werk/v1/chat/count_tokens`. This additive route accepts the
+same chat request as `/v1/chat/completions`, including tool definitions,
+assistant tool calls, their results and supported template/API options. It
+counts the selected backend's actual chat template without trimming history or
+generating output. `stream` is ignored; the response is always a protocol JSON
+envelope:
+
+~~~json
+{"protocol":{"major":1,"minor":0},"request_id":"req_example",
+ "data":{"model":"selected-model-or-alias","input_tokens":3012}}
+~~~
+
+The count excludes the reserved output budget. Clients must add their output
+reserve and margin before context admission. Cache counts only for the exact
+model, messages, tools and options. The server validates context again during
+generation; a count does not reserve capacity or promise a reusable state.
+The selected model may be prepared to access its tokenizer.
+
+An unsupported native counter returns the typed `unsupported` error, never
+an estimate labeled as an exact count. Temporary native failures return
+`unavailable` with `retryable: true`; clients may retry this read-only operation
+with a bounded backoff. Authentication, versioning and the 1 MiB request bound
+are the same as other protocol routes.
+
+For existing local llama.cpp workers, `/werk/v1/observability` also reports
+`context_per_request_tokens`: the **minimum** `n_ctx` across all validated native
+slots. `context_capacity_tokens` remains the sum across slots and must not be
+used as an individual request limit or divided to infer a minimum. Use only
+fresh, available samples for the selected model. If several workers match,
+take the minimum across workers. Missing or invalid slot information leaves
+the per-request limit unknown.
 
 ## Memory
 

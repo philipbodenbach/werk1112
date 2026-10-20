@@ -405,6 +405,15 @@ fn capabilities_for_descriptor(
             operations: vec!["thinking".into(), "reasoning_effort".into(), "expert_cache_mb".into(), "ngram_cache_mb".into()],
         },
     );
+    capabilities.insert(
+        "api.chat.token_count".into(),
+        Capability {
+            id: "api.chat.token_count".into(),
+            status: CapabilityStatus::Supported,
+            detail: "POST /werk/v1/chat/count_tokens counts the native chat template including tools and tool-result history, without generation. A backend without an exact native counter returns unsupported; no estimate is reported as an exact count.".into(),
+            operations: vec!["count_tokens".into()],
+        },
+    );
     let memory = memory_status_for(inner);
     capabilities.insert(
         "runtime.memory.telemetry.host".to_string(),
