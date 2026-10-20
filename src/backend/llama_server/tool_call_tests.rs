@@ -492,7 +492,6 @@ fn tool_calls_require_complete_json_and_a_matching_finish_reason() {
     for (arguments, reason, expected) in [
         ("{", "tool_calls", "invalid tool-call arguments"),
         ("[]", "tool_calls", "must be a JSON object"),
-        ("{}", "length", "without a tool_calls finish reason"),
         ("{}", "stop", "without a tool_calls finish reason"),
     ] {
         let events = vec![
@@ -507,6 +506,13 @@ fn tool_calls_require_complete_json_and_a_matching_finish_reason() {
             .err()
             .unwrap();
         assert!(error.to_string().contains(expected), "{error}");
+        let detail = error.to_string();
+        if arguments == "{" {
+            assert!(detail.contains("EOF while parsing"), "{detail}");
+            assert!(detail.contains("finish_reason=tool_calls"), "{detail}");
+            assert!(detail.contains("max_tokens=64"), "{detail}");
+            assert!(detail.contains("completion_tokens=0"), "{detail}");
+        }
         server.join().unwrap();
     }
     let (url, server) = mock_http(vec![(
@@ -522,6 +528,42 @@ fn tool_calls_require_complete_json_and_a_matching_finish_reason() {
         .unwrap();
     assert!(error.to_string().contains("without tool calls"));
     server.join().unwrap();
+}
+
+#[test]
+fn token_limited_tool_calls_preserve_length_without_executable_arguments() {
+    for arguments in [r#"{"content":"unfinished"#, "{}"] {
+        let events = vec![
+            json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"call_partial","type":"function",
+                "function":{"name":"files.write","arguments":arguments}
+            }]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":64}}),
+        ];
+        let (url, server) = mock_http(vec![(
+            "/v1/chat/completions",
+            "text/event-stream",
+            sse(events, true),
+        )]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let completion = complete_request(&url, &tool_request(), Some(tx), Instant::now())
+            .expect("explicit length must not become a JSON parsing error");
+        assert_eq!(completion.finish_reason, "length");
+        assert_eq!(completion.completion_tokens, 64);
+        assert!(completion.assistant_message.is_none());
+        assert!(
+            completion
+                .backend_diagnostics
+                .iter()
+                .any(|detail| detail.contains("max_tokens=64, completion_tokens=64"))
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap().unwrap(),
+            GenerateStreamEvent::ToolCallDelta(_)
+        ));
+        server.join().unwrap();
+    }
 }
 
 #[test]

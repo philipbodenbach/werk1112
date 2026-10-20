@@ -1053,6 +1053,7 @@ impl LlamaServerProcess {
         let reported_prompt_tokens = completion.prompt_tokens;
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
         if completion.text.trim().is_empty()
+            && completion.finish_reason != "length"
             && !completion
                 .assistant_message
                 .as_ref()
@@ -1080,12 +1081,18 @@ impl LlamaServerProcess {
             completion.backend_diagnostics.push(format!(
                 "llama.cpp native KV restore duration: {restore_seconds:.6}s"
             ));
-            let save_started = Instant::now();
-            completion.backend_diagnostics.push(cache.save(self));
-            completion.backend_diagnostics.push(format!(
-                "llama.cpp native KV save duration: {:.6}s",
-                save_started.elapsed().as_secs_f64()
-            ));
+            if completion.finish_reason == "length" {
+                completion
+                    .backend_diagnostics
+                    .push("llama.cpp native KV save skipped: output token limit reached".into());
+            } else {
+                let save_started = Instant::now();
+                completion.backend_diagnostics.push(cache.save(self));
+                completion.backend_diagnostics.push(format!(
+                    "llama.cpp native KV save duration: {:.6}s",
+                    save_started.elapsed().as_secs_f64()
+                ));
+            }
         }
         Ok(completion)
     }
@@ -1485,6 +1492,7 @@ fn complete_request_in_slot(
     let mut sse = SseAccumulator::default();
     let mut finished = false;
     let mut saw_done = false;
+    let mut explicit_finish_reason = None;
     let mut tool_calls = tool_calls::ToolCallAccumulator::default();
 
     stream_body(&mut stream, |bytes| {
@@ -1508,6 +1516,13 @@ fn complete_request_in_slot(
                     .and_then(Value::as_str)
                     .is_some_and(|reason| !reason.is_empty());
             let chunk = if use_chat_endpoint {
+                if let Some(reason) = value
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.is_empty())
+                {
+                    explicit_finish_reason = Some(reason.to_string());
+                }
                 update_chat_completion_from_event(&mut completion, &value);
                 if chat_delta_has_reasoning_content(&value) {
                     completion.saw_reasoning_content = true;
@@ -1543,7 +1558,25 @@ fn complete_request_in_slot(
     if !finished {
         bail!("llama-server stream ended before a completion marker; native snapshot not saved");
     }
-    if let Some(tool_calls) = tool_calls.finish()? {
+    // A token-limited response may end inside a tool argument. Preserve the
+    // upstream finish reason, but never expose these fragments as executable calls.
+    // The default finish_reason is also "length", so require an explicit marker.
+    if explicit_finish_reason.as_deref() == Some("length") {
+        completion.backend_diagnostics.push(format!(
+            "llama.cpp output token limit reached: max_tokens={}, completion_tokens={}; incomplete tool calls discarded",
+            request.max_tokens, completion.completion_tokens
+        ));
+        return Ok(completion);
+    }
+    let calls = tool_calls.finish().map_err(|error| {
+        anyhow!(
+            "{error:#} (finish_reason={}, max_tokens={}, completion_tokens={}); native snapshot not saved",
+            explicit_finish_reason.as_deref().unwrap_or("missing"),
+            request.max_tokens,
+            completion.completion_tokens
+        )
+    })?;
+    if let Some(tool_calls) = calls {
         if completion.finish_reason != "tool_calls" {
             bail!(
                 "llama-server returned tool calls without a tool_calls finish reason; native snapshot not saved"
