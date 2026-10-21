@@ -1178,7 +1178,7 @@ impl LlamaCppBackend {
         request: GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<GenerateResponse> {
-        if !request.image_urls.is_empty() {
+        if request.has_images() {
             bail!(
                 "llama.cpp Rust backend is text-only for now; use a VLM-capable backend/model for image inputs"
             );
@@ -1235,7 +1235,7 @@ impl LlamaCppChatState {
         request: GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<GenerateResponse> {
-        if !request.image_urls.is_empty() {
+        if request.has_images() {
             bail!(
                 "llama.cpp Rust backend is text-only for now; use a VLM-capable backend/model for image inputs"
             );
@@ -1638,7 +1638,7 @@ impl MlxBackend {
         if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
             bail!("mlx backend supports MLX or Hugging Face-style safetensors model directories");
         }
-        if !request.image_urls.is_empty() {
+        if request.has_images() {
             bail!("mlx-lm is text-only; route image input through the mlx-vlm backend");
         }
         let model_dir = resolve_mlx_model_dir(&self.store, manifest)?;
@@ -1664,6 +1664,52 @@ impl MlxBackend {
     fn mlx_generate_command(&self) -> Command {
         self.invocation.command()
     }
+}
+
+fn validate_mlx_image_transport(request: &GenerateRequest) -> Result<()> {
+    use crate::openai::{ImageUrlSpec, MessageContent};
+    let ordered = crate::openai::image_urls_from_messages(&request.messages);
+    if request.messages.is_empty() {
+        return Ok(());
+    } // Native CLI image list.
+    anyhow::ensure!(
+        ordered == request.image_urls,
+        "MLX-VLM image routing metadata differs from the structured message images"
+    );
+    let mut image_messages = 0;
+    for (index, message) in request.messages.iter().enumerate() {
+        let Some(MessageContent::Parts(parts)) = &message.content else {
+            continue;
+        };
+        let mut seen_image = false;
+        for part in parts {
+            if let Some(image) = &part.image_url {
+                seen_image = true;
+                if let ImageUrlSpec::Object(image) = image {
+                    anyhow::ensure!(
+                        image.detail.as_deref().is_none_or(|d| d == "auto"),
+                        "MLX-VLM's CLI adapter cannot preserve the explicit image detail hint; use llama-server or vLLM"
+                    );
+                }
+            } else if seen_image && part.text.as_deref().is_some_and(|s| !s.is_empty()) {
+                bail!(
+                    "MLX-VLM's CLI adapter cannot preserve text/image interleaving; place text before images or use llama-server/vLLM"
+                );
+            }
+        }
+        if seen_image {
+            image_messages += 1;
+            anyhow::ensure!(
+                index + 1 == request.messages.len(),
+                "MLX-VLM's CLI adapter cannot preserve historical image placement across tool/follow-up turns; use llama-server or vLLM"
+            );
+        }
+    }
+    anyhow::ensure!(
+        image_messages <= 1,
+        "MLX-VLM cannot preserve images across multiple chat turns"
+    );
+    Ok(())
 }
 
 impl MlxVlmBackend {
@@ -1707,6 +1753,14 @@ impl MlxVlmBackend {
         request: &GenerateRequest,
         verbose_backend_output: bool,
     ) -> Result<PreparedMlxVlmCommand> {
+        if request.has_images() {
+            anyhow::ensure!(
+                manifest.architecture.as_deref() == Some("gemma4_unified"),
+                "This Werk MLX-VLM adapter only implements the gemma4_unified model path"
+            );
+            super::vision_setup::validate_processor_assets(&self.store, manifest)?;
+            validate_mlx_image_transport(request)?;
+        }
         if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
             bail!(
                 "mlx-vlm backend supports MLX or Hugging Face-style safetensors model directories"
@@ -2381,7 +2435,8 @@ impl GenerationBackend for MlxVlmBackend {
                 manifest.architecture.as_deref().unwrap_or("unknown")
             ))
         } else {
-            let result = Self::probe_for_store(&self.store).map(|_| ());
+            let result = super::vision_setup::validate_processor_assets(&self.store, manifest)
+                .and_then(|_| Self::probe_for_store(&self.store).map(|_| ()));
             installable = result.is_err()
                 && cfg!(all(target_os = "macos", target_arch = "aarch64"))
                 && env::var_os("WERK_MLX_VLM_PYTHON").is_none()
@@ -2392,7 +2447,7 @@ impl GenerationBackend for MlxVlmBackend {
         Some(match readiness {
             Ok(()) => TaskReadiness {
                 status: TaskReadinessStatus::Available,
-                detail: "mlx-vlm can execute image understanding without loading model weights during capability discovery".to_string(),
+                detail: "MLX-VLM local prerequisites checked; inference untested. CLI transport supports one image-containing final turn, text before images and detail=auto; historical images and arbitrary interleaving are unsupported.".to_string(),
                 adapter: Some("mlx-vlm".to_string()),
                 required_backend: None,
                 install_command: None,
@@ -3868,7 +3923,7 @@ mod tests {
     #[test]
     fn mlx_vlm_command_uses_original_model_dir_and_single_image_list() {
         let store = test_store("mlx-vlm-command");
-        let manifest = test_manifest("Gemma4-12B-JANG", "gemma4_unified");
+        let mut manifest = test_manifest("Gemma4-12B-JANG", "gemma4_unified");
         let model_dir = store.model_dir(&manifest.id).join("files");
         fs::create_dir_all(&model_dir).unwrap();
         fs::write(
@@ -3877,6 +3932,16 @@ mod tests {
         )
         .unwrap();
 
+        fs::write(model_dir.join("preprocessor_config.json"), "{}").unwrap();
+        manifest.files.push(crate::model_store::ModelFile {
+            path: "files/preprocessor_config.json".into(),
+            size: 2,
+            checksum: "fixture".into(),
+        });
+        manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::ImageUnderstanding);
         let backend = MlxVlmBackend {
             store,
             python: PathBuf::from("python3"),
@@ -3912,9 +3977,45 @@ mod tests {
     }
 
     #[test]
+    fn mlx_vlm_rejects_unrepresentable_image_semantics() {
+        let mut request = test_request("Inspect");
+        request.image_urls = vec!["https://example.invalid/image.png".into()];
+        let text = serde_json::json!({"type":"text", "text":"Inspect"});
+        let image =
+            serde_json::json!({"type":"image_url", "image_url":{"url":request.image_urls[0]}});
+        request.messages =
+            serde_json::from_value(serde_json::json!([{"role":"user","content":[text, image]}]))
+                .unwrap();
+        validate_mlx_image_transport(&request).unwrap();
+        request.messages = serde_json::from_value(
+            serde_json::json!([{"role":"user","content":[text, image, text]}]),
+        )
+        .unwrap();
+        assert!(
+            validate_mlx_image_transport(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("interleaving")
+        );
+        let mut detailed = image.clone();
+        detailed["image_url"]["detail"] = serde_json::json!("high");
+        request.messages =
+            serde_json::from_value(serde_json::json!([{"role":"user","content":[text, detailed]}]))
+                .unwrap();
+        assert!(
+            validate_mlx_image_transport(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("detail")
+        );
+        request.messages = serde_json::from_value(serde_json::json!([{"role":"user","content":[text, image]}, {"role":"assistant","content":"previous answer"}, {"role":"user","content":"follow-up"}])).unwrap();
+        assert!(validate_mlx_image_transport(&request).is_err());
+    }
+
+    #[test]
     fn mlx_vlm_data_image_is_staged_for_command_lifetime() {
         let store = test_store("mlx-vlm-data-image-command");
-        let manifest = test_manifest("Gemma4-12B-JANG", "gemma4_unified");
+        let mut manifest = test_manifest("Gemma4-12B-JANG", "gemma4_unified");
         let model_dir = store.model_dir(&manifest.id).join("files");
         fs::create_dir_all(&model_dir).unwrap();
         fs::write(
@@ -3923,6 +4024,16 @@ mod tests {
         )
         .unwrap();
 
+        fs::write(model_dir.join("preprocessor_config.json"), "{}").unwrap();
+        manifest.files.push(crate::model_store::ModelFile {
+            path: "files/preprocessor_config.json".into(),
+            size: 2,
+            checksum: "fixture".into(),
+        });
+        manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::ImageUnderstanding);
         let backend = MlxVlmBackend {
             store,
             python: PathBuf::from("python3"),
@@ -4300,7 +4411,22 @@ else:
                     },
                 }),
                 "mlx-vlm" => {
+                    manifest.architecture = Some("gemma4_unified".into());
+                    manifest
+                        .metadata
+                        .tasks
+                        .push(InferenceTask::ImageUnderstanding);
+                    let processor = store
+                        .model_dir(&manifest.id)
+                        .join("files/preprocessor_config.json");
+                    fs::write(&processor, "{}").unwrap();
+                    manifest.files.push(crate::model_store::ModelFile {
+                        path: "files/preprocessor_config.json".into(),
+                        size: 2,
+                        checksum: "fixture".into(),
+                    });
                     request.image_urls = vec!["sample.png".into()];
+                    request.messages = serde_json::from_value(serde_json::json!([{"role":"user", "content":[{"type":"text", "text":request.prompt}, {"type":"image_url", "image_url":{"url":"sample.png"}}]}])).unwrap();
                     Box::new(MlxVlmBackend {
                         store,
                         python: runner.clone(),

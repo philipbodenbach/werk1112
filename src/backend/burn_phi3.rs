@@ -189,7 +189,7 @@ impl<B: Backend> Phi3Generator<B> {
         request: GenerateRequest,
         mut on_token: Option<TokenCallback>,
     ) -> Result<GenerateResponse> {
-        if !request.image_urls.is_empty() {
+        if request.has_images() {
             bail!("Burn Phi-3 backend is text-only for now");
         }
 

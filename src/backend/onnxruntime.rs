@@ -627,7 +627,7 @@ impl OnnxRuntimeBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
-        if !request.image_urls.is_empty() {
+        if request.has_images() {
             bail!(
                 "ONNX Runtime text backend received image inputs; use a VLM-capable model/runtime"
             );

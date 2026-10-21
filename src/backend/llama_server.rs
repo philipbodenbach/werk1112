@@ -239,6 +239,7 @@ impl LlamaServerBackend {
         store: &ModelStore,
         manifest: &ModelManifest,
     ) -> Result<PathBuf> {
+        manifest.require_image_setup()?;
         if manifest.format != ModelFormat::Gguf {
             bail!("llama.cpp image input requires a GGUF model");
         }
@@ -282,7 +283,7 @@ impl LlamaServerBackend {
             );
         }
         Ok(format!(
-            "llama.cpp server {} is ready for image input with projector {}",
+            "llama.cpp server {} advertises the image path and a local projector is selected; architecture/projector compatibility and actual image inference remain untested ({})",
             display_name(mode),
             projector.display()
         ))
@@ -379,8 +380,15 @@ impl LlamaServerBackend {
             .as_deref()
             .context("GGUF manifest has no model_path")?;
         let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
-        let projector_path =
-            discover_multimodal_projector(&self.store, manifest, &absolute_model_path)?;
+        let projector_path = if require_projector {
+            manifest.require_image_setup()?;
+            discover_multimodal_projector(&self.store, manifest, &absolute_model_path)?
+        } else {
+            // Ambiguous/absent optional assets must not break a text preload.
+            discover_multimodal_projector(&self.store, manifest, &absolute_model_path)
+                .ok()
+                .flatten()
+        };
         if require_projector && projector_path.is_none() {
             bail!(
                 "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
@@ -621,7 +629,7 @@ impl GenerationBackend for LlamaServerBackend {
             Ok(()) => TaskReadiness {
                 status: TaskReadinessStatus::Available,
                 detail: format!(
-                    "{} can execute image understanding without loading model weights during capability discovery",
+                    "{} local image prerequisites checked; actual image inference has not been tested by this read-only probe",
                     display_name(self.mode)
                 ),
                 adapter: Some(format!("llama-server-{}", label(self.mode))),
@@ -1850,6 +1858,24 @@ fn discover_multimodal_projector(
     manifest: &ModelManifest,
     model_path: &Path,
 ) -> Result<Option<PathBuf>> {
+    if let Some(setup) = &manifest.metadata.vision_setup {
+        if !setup.enabled {
+            return Ok(None);
+        }
+        if let Some(selected) = &setup.projector {
+            anyhow::ensure!(
+                safe_manifest_relative_path(Path::new(selected))
+                    && manifest.files.iter().any(|f| &f.path == selected),
+                "Selected projector is not a safe manifest-listed file"
+            );
+            let path = store.absolute_model_file(manifest, selected);
+            anyhow::ensure!(
+                path != model_path && path.is_file(),
+                "Selected model-specific projector is missing; run werk artifacts vision MODEL --vision --projector PATH"
+            );
+            return Ok(Some(path));
+        }
+    }
     discover_multimodal_projector_from_files(
         |path| store.absolute_model_file(manifest, path),
         &manifest.files,
@@ -2277,6 +2303,8 @@ pub struct LlamaServerInstallOptions {
     pub cuda_nvfp4: bool,
     /// Automatic model-specific provisioning must not change the default runtime.
     pub preserve_active: bool,
+    /// Reuse a verified image entry point, or stage a replacement separately.
+    pub vision: bool,
 }
 
 pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<PathBuf> {
@@ -2325,8 +2353,37 @@ pub fn install_managed_llama_server_with_options(
     } else {
         base_root
     };
+    if options.vision {
+        let mut candidates = server_candidates_under(&root);
+        if !options.cuda_offload && !options.cuda_nvfp4 {
+            candidates.extend(discover_llama_server(store, mode).path);
+        }
+        if let Some(existing) = candidates.into_iter().find(|path| {
+            path.is_file()
+                && validate_llama_server(path, mode).is_ok()
+                && supported_args(path).mmproj
+                && (!options.cuda_nvfp4 || fp4::validate_runtime(path).is_ok())
+                && (!options.cuda_offload || cuda_offload::validate_runtime(path).is_ok())
+        }) {
+            if !options.preserve_active {
+                select_managed_server_path(&managed_path_file(store, mode), &existing)?;
+            }
+            return Ok(existing);
+        }
+    }
     let source_dir = root.join("llama.cpp");
-    let build_dir = root.join("build");
+    // Keep the old executable and its shared libraries intact until the new
+    // image-capable generation has passed validation and is selected atomically.
+    fs::create_dir_all(&root)?;
+    let build_root = if options.vision {
+        tempfile::Builder::new()
+            .prefix("generation-")
+            .tempdir_in(&root)?
+            .keep()
+    } else {
+        root.clone()
+    };
+    let build_dir = build_root.join("build");
     fs::create_dir_all(&root)
         .with_context(|| format!("failed to create backend cache {}", root.display()))?;
 
@@ -2532,9 +2589,11 @@ pub fn install_managed_llama_server_with_options(
             options.verbose,
         )?;
     }
-    let executable = server_candidates_under(&root)
+    let executable = server_candidates_under(&build_root)
         .into_iter()
-        .find(|path| path.is_file())
+        // A previous published generation can be discovered under this root;
+        // installation must validate the executable from this build directory.
+        .find(|path| path.starts_with(&build_dir) && path.is_file())
         .ok_or_else(|| {
             anyhow!(
                 "llama-server build finished, but no executable was found under {}",
@@ -2542,6 +2601,12 @@ pub fn install_managed_llama_server_with_options(
             )
         })?;
     validate_llama_server(&executable, mode)?;
+    if options.vision {
+        anyhow::ensure!(
+            supported_args(&executable).mmproj,
+            "The built runtime has no --mmproj image entry point; previous installation remains selected"
+        );
+    }
     if options.cuda_nvfp4 {
         fp4::register_runtime(&executable)?;
         fp4::validate_runtime(&executable)?;
@@ -2549,11 +2614,13 @@ pub fn install_managed_llama_server_with_options(
     if options.cuda_offload {
         cuda_offload::validate_runtime(&executable)?;
     }
+    if options.vision && (options.cuda_nvfp4 || options.cuda_offload) {
+        // Model-specific profile discovery must find the validated generation,
+        // not an old fixed build directory or an unvalidated staging directory.
+        select_managed_server_path(&root.join("llama-server.path"), &executable)?;
+    }
     if !options.preserve_active {
-        fs::write(
-            managed_path_file(store, mode),
-            executable.display().to_string(),
-        )?;
+        select_managed_server_path(&managed_path_file(store, mode), &executable)?;
     }
     Ok(executable)
 }
@@ -2914,7 +2981,13 @@ fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
     let source = root.join("llama.cpp");
     let build = root.join("build");
     let exe = default_executable_name();
-    vec![
+    let mut candidates = fs::read_to_string(root.join("llama-server.path"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| PathBuf::from(s.trim()))
+        .into_iter()
+        .collect::<Vec<_>>();
+    candidates.extend([
         root.join(exe),
         root.join("bin").join(exe),
         build.join("bin").join(exe),
@@ -2923,7 +2996,19 @@ fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
         source.join("build").join("bin").join(exe),
         source.join("build").join("bin").join("Release").join(exe),
         source.join("build").join("tools").join("server").join(exe),
-    ]
+    ]);
+    candidates
+}
+
+fn select_managed_server_path(path: &Path, executable: &Path) -> Result<()> {
+    let parent = path.parent().context("runtime path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    use std::io::Write;
+    write!(staged, "{}", executable.display())?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 fn managed_path_file(store: &ModelStore, mode: LlamaCppMode) -> PathBuf {
@@ -3803,6 +3888,40 @@ mod tests {
     use super::*;
     use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn vision_install_reuses_valid_server_and_selects_only_published_generations() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::resolve(Some(tmp.path().join("store"))).unwrap();
+        let root = managed_backend_dir(&store, LlamaCppMode::Cpu);
+        let server = root.join("build/bin/llama-server");
+        fs::create_dir_all(server.parent().unwrap()).unwrap();
+        fs::write(&server, "#!/bin/sh\nprintf '%s\\n' '--mmproj FILE'\n").unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = install_managed_llama_server_with_options(
+            &store,
+            LlamaCppMode::Cpu,
+            LlamaServerInstallOptions {
+                vision: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(installed, server);
+        assert_eq!(find_managed_server(&store, LlamaCppMode::Cpu), Some(server));
+        assert!(
+            !root.join("llama.cpp").exists(),
+            "reusing a valid runtime must not clone/build"
+        );
+        let staged = root.join("generation-test/build/bin/llama-server");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, "unvalidated").unwrap();
+        assert!(!server_candidates_under(&root).contains(&staged));
+        select_managed_server_path(&root.join("llama-server.path"), &staged).unwrap();
+        assert_eq!(server_candidates_under(&root)[0], staged);
+    }
 
     #[test]
     fn parallel_slots_preserve_context_per_sequence_and_disable_single_slot_state() {

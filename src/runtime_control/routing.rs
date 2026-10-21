@@ -566,7 +566,7 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
         options: std::collections::BTreeMap<String, serde_json::Value>,
         tx: Option<tokio::sync::mpsc::Sender<anyhow::Result<serde_json::Value, String>>>,
     ) -> anyhow::Result<serde_json::Value> {
-        let has_images = !request.image_urls.is_empty();
+        let has_images = request.has_images();
         let result = self.backend.generate_api(manifest, request, options, tx);
         if let Ok(adapter) = self
             .backend
@@ -682,7 +682,7 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> anyhow::Result<GenerateResponse> {
-        let has_images = !request.image_urls.is_empty();
+        let has_images = request.has_images();
         let response = self.backend.generate(manifest, request)?;
         // Resolve after execution so process-owning backends expose the worker
         // that actually loaded, including request-specific configuration.
@@ -698,7 +698,7 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
     }
 
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream {
-        let has_images = !request.image_urls.is_empty();
+        let has_images = request.has_images();
         let mut recorded = false;
         let stream = self.backend.generate_stream(manifest.clone(), request);
         let backend = self.backend.clone();

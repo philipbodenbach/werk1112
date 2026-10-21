@@ -248,7 +248,7 @@ fn generate_with_candle(
     request: GenerateRequest,
     mut on_token: Option<TokenCallback>,
 ) -> Result<GenerateResponse> {
-    if !request.image_urls.is_empty() {
+    if request.has_images() {
         bail!(
             "this Candle backend is text-only for now; use a VLM-capable backend/model for image inputs"
         );

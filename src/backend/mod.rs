@@ -19,6 +19,7 @@ mod text_analysis_candle;
 pub(crate) use openai_transport::ApiOptionError;
 mod qwen_tts;
 pub(crate) mod tool_calling;
+pub mod vision_setup;
 mod vllm;
 pub(crate) mod werk_server_client;
 
@@ -365,6 +366,8 @@ const VLLM_ARCHES: &[&str] = &[
     "qwen2_5_vl",
     "qwen3_vl",
     "qwen3_vl_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
     "glm4v",
     "glm4v_moe",
 ];
@@ -1265,6 +1268,14 @@ pub struct GenerateRequest {
 }
 
 impl GenerateRequest {
+    pub fn has_images(&self) -> bool {
+        !self.image_urls.is_empty()
+            || self
+                .messages
+                .iter()
+                .filter_map(|m| m.content.as_ref())
+                .any(|c| !c.image_urls().is_empty())
+    }
     pub fn requires_tool_calling(&self) -> bool {
         self.tool_config.is_some() || self.messages.iter().any(ChatMessage::uses_tool_calling)
     }
@@ -1817,6 +1828,8 @@ mod tests {
             "qwen2_5_vl",
             "qwen3_vl",
             "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
             "glm4v",
             "glm4v_moe",
         ] {
