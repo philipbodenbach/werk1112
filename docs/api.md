@@ -1400,6 +1400,12 @@ output and SSE. Vendor keys remain on the server. See [examples and limitations]
 
 ### Managed reasoning tiers
 
+`GET /werk/v1/chat/limits?model=MODEL` reports the configured per-request context
+and output ceilings without running inference. Clients can increase an initial
+output allowance after truncation while respecting those ceilings and the input
+token count. Unknown limits remain `null`; generation defaults are not ceilings.
+See the [generation limits contract](reference/werk-protocol-v1.md#generation-ceilings).
+
 Use `GET /werk/v1/chat/reasoning?model=MODEL&max_output_tokens=4096` to read the
 running model's tiers, effective default and limits. Send
 `"werk":{"reasoning":{"tier":"default"}}` (or an available tier ID) in chat

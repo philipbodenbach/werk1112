@@ -3,6 +3,7 @@ use crate::{
     observability::ReasoningDefaults,
     reasoning::{BackendReasoning, profile},
 };
+use axum::http::HeaderMap;
 use std::sync::Mutex;
 
 fn manifest() -> ModelManifest {
@@ -36,6 +37,169 @@ fn config(thinking: bool, budget: i64) -> BackendReasoning {
             effort: None,
         },
     }
+}
+
+#[test]
+fn generation_limits_distinguish_defaults_from_ceilings_and_bound_reasoning() {
+    let mut m = manifest();
+    m.metadata
+        .generation_defaults
+        .insert("max_new_tokens".into(), json!(256));
+    assert_eq!(
+        crate::generation_limits::profile(&m, Some(16384)).max_output_tokens,
+        Some(16383)
+    );
+    assert_eq!(
+        crate::generation_limits::profile(&m, None).max_output_tokens,
+        None
+    );
+    m.metadata
+        .parameter_constraints
+        .insert("max_completion_tokens".into(), json!({"max":8192}));
+    m.metadata
+        .parameter_constraints
+        .insert("max_output_tokens".into(), json!(6144));
+    let limits = crate::generation_limits::profile(&m, Some(16384));
+    assert_eq!(limits.max_output_tokens, Some(6144));
+    assert_eq!(limits.context_tokens, Some(16384));
+    let reasoning = profile(&m, Some(&config(true, 8192)), Some(16384), 32768);
+    assert_eq!(reasoning.limits.output_tokens, 6144);
+    assert!(
+        reasoning
+            .tiers
+            .iter()
+            .filter(|tier| tier.available)
+            .all(|tier| tier.minimum_output_tokens <= 6144)
+    );
+}
+
+#[tokio::test]
+async fn generation_limits_alias_uses_smallest_replica_without_advancing_routing() {
+    use crate::api::deployments::Registry;
+    let backend = Arc::new(Recorder::default());
+    let store = test_store();
+    let mut m = manifest();
+    // Explicit deployment context must also work for non-GGUF backends.
+    m.format = ModelFormat::Unknown;
+    fs::create_dir_all(store.model_dir(&m.id)).unwrap();
+    fs::write(
+        store
+            .model_dir(&m.id)
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&m).unwrap(),
+    )
+    .unwrap();
+    let mut entries = Vec::new();
+    for (id, context) in [("a", 16384), ("b", 8192)] {
+        let plan = serde_json::from_value(json!({
+            "profile":{"id":id,"alias":"shared","model":"reasoning-fixture","runtime":"vllm_cuda",
+                "executable":"unused","build":"fixture","gpus":[],"strategy":"single","context":context,
+                "batch":1,"memory":[],"host_bytes":0},
+            "model_identity":"fixture","executable_sha256":"unused","runtime_version":"fixture","devices":[],
+            "strategy":"single","args":[],"environment":{},"fingerprint":"fixture","reasons":[]
+        })).unwrap();
+        entries.push((
+            Arc::new(plan),
+            ApiState::new(store.clone(), backend.clone()).with_chat_context_size(Some(context)),
+        ));
+    }
+    let baseline = Registry::new(entries.clone()).unwrap();
+    let expected_context = baseline
+        .select("shared", &HeaderMap::new())
+        .unwrap()
+        .0
+        .chat_context_size;
+    let registry = Arc::new(Registry::new(entries).unwrap());
+    let mut state = ApiState::new(store, backend.clone());
+    state.deployments = Some(registry.clone());
+    let app = router(state);
+    for _ in 0..3 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/werk/v1/chat/limits?model=shared")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_slice(
+            &body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            value["data"],
+            json!({"schema_version":1,"model":"shared","context_tokens":8192,"max_output_tokens":8191})
+        );
+    }
+    let (selected, _) = registry.select("shared", &HeaderMap::new()).unwrap();
+    assert_eq!(
+        selected.chat_context_size, expected_context,
+        "discovery must not advance round-robin selection"
+    );
+    assert!(backend.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn generation_limits_discovery_and_admission_share_the_model_ceiling() {
+    let backend = Arc::new(Recorder::default());
+    let store = test_store();
+    let mut m = manifest();
+    m.metadata
+        .parameter_constraints
+        .insert("max_output_tokens".into(), json!(8192));
+    fs::create_dir_all(store.model_dir(&m.id)).unwrap();
+    fs::write(
+        store
+            .model_dir(&m.id)
+            .join(crate::model_store::MANIFEST_FILE),
+        serde_json::to_vec(&m).unwrap(),
+    )
+    .unwrap();
+    let mut state = ApiState::new(store, backend.clone());
+    state.chat_context_size = 16384;
+    let app = router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/werk/v1/chat/limits?model=reasoning-fixture")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value["data"],
+        json!({"schema_version":1,"model":"reasoning-fixture","context_tokens":16384,"max_output_tokens":8192})
+    );
+    assert!(
+        backend.calls.lock().unwrap().is_empty(),
+        "discovery must not infer or load a model"
+    );
+    let response = post_json(&app, "/v1/chat/completions", json!({"model":"reasoning-fixture","max_completion_tokens":8193,"messages":[{"role":"user","content":"hi"}]}), None).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["error"]["code"], "output_limit_exceeded");
+    assert!(backend.calls.lock().unwrap().is_empty());
+    let response = post_json(&app, "/v1/chat/completions", json!({"model":"reasoning-fixture","max_completion_tokens":8192,"messages":[{"role":"user","content":"hi"}],"werk":{"reasoning":{"tier":"default"}}}), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 #[test]
 fn reasoning_defaults_and_every_available_tier_obey_limits() {

@@ -31,6 +31,7 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/werk/v1/info", get(info_handler))
         .route("/werk/v1/capabilities", get(capabilities_handler))
         .route("/werk/v1/chat/reasoning", get(reasoning_handler))
+        .route("/werk/v1/chat/limits", get(generation_limits_handler))
         .route("/werk/v1/memory", get(memory_handler))
         .route("/werk/v1/states", get(list_states_handler))
         .route("/werk/v1/experts", get(list_experts_handler));
@@ -55,6 +56,101 @@ pub(super) fn routes() -> Router<ApiState> {
 struct ReasoningQuery {
     model: Option<String>,
     max_output_tokens: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationLimitsQuery {
+    model: Option<String>,
+}
+
+async fn generation_limits_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    query: Result<Query<GenerationLimitsQuery>, QueryRejection>,
+) -> Response {
+    let (request_id, _) = match request_context(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return protocol_error(
+                request_id,
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+            );
+        }
+    };
+    let model = query
+        .model
+        .or_else(|| state.default_model.clone())
+        .unwrap_or_default();
+    if model.is_empty() || model.len() > 512 {
+        return protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "A valid model is required",
+            ),
+        );
+    }
+    let targets = if let Some(registry) = &state.deployments {
+        match registry.preload_targets(&model) {
+            Ok(targets) => targets,
+            Err(error) => {
+                return protocol_error(
+                    request_id,
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+                );
+            }
+        }
+    } else {
+        vec![(model.clone(), state, model.clone())]
+    };
+    let result = crate::logging::spawn_blocking(
+        move || -> anyhow::Result<crate::generation_limits::ChatGenerationLimits> {
+            let mut profiles = Vec::new();
+            for (_, state, physical_model) in targets {
+                let manifest = state.store.get(&physical_model)?;
+                profiles.push(crate::generation_limits::profile(
+                    &manifest,
+                    super::generation::generation_context_size(&state, &manifest),
+                ));
+            }
+            anyhow::ensure!(!profiles.is_empty(), "No matching deployment");
+            // An alias must be safe on every replica. An unknown replica prevents
+            // advertising a verified ceiling; known differing limits use the minimum.
+            let minimum = |values: Vec<Option<usize>>| -> Option<usize> {
+                values
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .min()
+            };
+            Ok(crate::generation_limits::ChatGenerationLimits {
+                schema_version: 1,
+                model,
+                context_tokens: minimum(profiles.iter().map(|p| p.context_tokens).collect()),
+                max_output_tokens: minimum(profiles.iter().map(|p| p.max_output_tokens).collect()),
+            })
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(profile)) => success(request_id, profile),
+        Ok(Err(error)) => protocol_error(
+            request_id,
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+        ),
+        Err(_) => protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "Generation limits lookup failed",
+            ),
+        ),
+    }
 }
 
 async fn reasoning_handler(
@@ -111,10 +207,7 @@ async fn reasoning_handler(
                 let mut profile = crate::reasoning::profile(
                     &manifest,
                     state.backend.reasoning_config(&manifest).as_ref(),
-                    super::generation::effective_chat_context_size(
-                        state.chat_context_size,
-                        &manifest,
-                    ),
+                    super::generation::generation_context_size(&state, &manifest),
                     output,
                 );
                 profile.model = model.clone();

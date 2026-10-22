@@ -45,6 +45,7 @@ pub mod cli;
 pub mod deployments;
 pub mod documents;
 pub(crate) mod file_store;
+pub mod generation_limits;
 pub mod inference;
 pub mod inference_service;
 pub mod logging;

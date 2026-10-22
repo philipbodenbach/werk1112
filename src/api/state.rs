@@ -115,6 +115,7 @@ pub struct ApiState {
     pub(super) default_model: Option<String>,
     pub(super) default_image_model: Option<String>,
     pub(super) chat_context_size: usize,
+    pub(super) explicit_chat_context_size: Option<usize>,
     prompt_options_resolver: Option<PromptOptionsResolver>,
     chat_sessions: Arc<Mutex<ChatSessionCache>>,
     chat_initializations: Arc<crate::backend::runtime_cache::KeyedLocks<ChatSessionKey>>,
@@ -197,6 +198,7 @@ impl ApiState {
             default_model,
             default_image_model: None,
             chat_context_size: 4096,
+            explicit_chat_context_size: None,
             prompt_options_resolver,
             chat_sessions: Arc::new(Mutex::new(ChatSessionCache::default())),
             chat_initializations: Arc::new(Default::default()),
@@ -293,6 +295,7 @@ impl ApiState {
 
     pub fn with_chat_context_size(mut self, context_size: Option<usize>) -> Self {
         self.chat_context_size = context_size.unwrap_or(4096);
+        self.explicit_chat_context_size = context_size.filter(|size| *size > 0);
         self
     }
 

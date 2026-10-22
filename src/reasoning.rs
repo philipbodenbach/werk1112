@@ -57,6 +57,11 @@ pub fn profile(
     context: Option<usize>,
     output: usize,
 ) -> ReasoningProfile {
+    let limits = crate::generation_limits::profile(manifest, context);
+    let context = limits.context_tokens;
+    let output = limits
+        .max_output_tokens
+        .map_or(output, |cap| output.min(cap));
     let output = context.map_or(output, |ctx| output.min(ctx.saturating_sub(512))) as u64;
     let reserve = output.min(512);
     let mut profile = ReasoningProfile {

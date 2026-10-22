@@ -193,6 +193,7 @@ It sends no launch setting to remote vLLM.
 | GET | `/werk/v1/observability` | none | Server-wide chat, worker and memory observations |
 | POST | `/werk/v1/chat/count_tokens` | OpenAI chat request | Exact native input token count |
 | GET | `/werk/v1/chat/reasoning` | `model`, `max_output_tokens` query | Model/runtime tiers, default and effective limits |
+| GET | `/werk/v1/chat/limits` | `model` query | Read-only model/server context and output ceilings |
 | GET | `/werk/v1/states` | query filters | One page of runtime states |
 | POST | `/werk/v1/states/{id}/actions` | State action | Updated/projected state |
 | POST | `/werk/v1/states/prune` | Explicit selector | Match/removal summary |
@@ -641,6 +642,34 @@ The [runtime CLI](cli.md#runtime-control) is a thin pretty-JSON interface over
 this client. ComfyUI uses its own strict Python validator and keeps handoffs in
 an opaque socket; see the
 [custom-node guide](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/README.md#runtime-persistence-experts-and-split-prefilldecode).
+
+### Generation ceilings
+
+Capability `api.chat.limits` (`limits`) advertises
+`GET /werk/v1/chat/limits?model=MODEL`. Authentication, version headers, `no-store`
+and the standard envelope apply. The default model is used when the query omits
+`model`. Discovery reads manifests/configuration without loading or probing a
+model and without running inference or advancing deployment selection.
+
+Example `data`:
+
+```json
+{"schema_version":1,"model":"local-model","context_tokens":16384,"max_output_tokens":16383}
+```
+
+Both limits may be `null` when unknown. Context is per request. Output is the
+minimum of explicit manifest parameter ceilings (`max_output_tokens`,
+`max_completion_tokens`, `max_new_tokens`, scalar or `{ "max": N }`) and context
+minus one when context is known. Generation defaults are not hard ceilings.
+For an alias, known limits use the minimum across replicas; an unknown replica
+makes that field unknown. This endpoint does not predict free GPU memory or
+guarantee that a particular prompt/output pair fits.
+
+Clients must count input and reserve their margin before expanding an initial
+output allowance. Chat admission rejects output above the same ceiling with
+`output_limit_exceeded`; the read-only token counter can still count an oversized
+request. Reasoning profiles use that ceiling as well as the request's output
+budget. Increasing output does not override an explicit reasoning tier.
 
 ### Model-specific reasoning tiers
 

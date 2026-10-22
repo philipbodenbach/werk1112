@@ -201,6 +201,23 @@ pub(super) async fn prepare(
         ));
     }
     let max_tokens = request.max_completion_tokens();
+    let generation_limits =
+        crate::generation_limits::profile(&manifest, generation_context_size(&state, &manifest));
+    if !matches!(context_policy, ContextPolicy::Count)
+        && generation_limits
+            .max_output_tokens
+            .is_some_and(|limit| max_tokens > limit)
+    {
+        return Err(GenerationError::with_code(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Output budget {max_tokens} exceeds the model/server limit {}",
+                generation_limits.max_output_tokens.unwrap()
+            ),
+            Some("max_completion_tokens".into()),
+            Some("output_limit_exceeded".into()),
+        ));
+    }
     if let Some(reasoning) = request
         .werk
         .as_ref()
@@ -217,7 +234,7 @@ pub(super) async fn prepare(
         let profile = crate::reasoning::profile(
             &manifest,
             state.backend.reasoning_config(&manifest).as_ref(),
-            effective_chat_context_size(state.chat_context_size, &manifest),
+            generation_context_size(&state, &manifest),
             max_tokens,
         );
         // Unknown runtimes retain their native default. Explicit tiers require
@@ -245,26 +262,25 @@ pub(super) async fn prepare(
             request.extra.extend(options);
         }
     }
-    let context_size =
-        effective_chat_context_size(state.chat_context_size, &manifest).or_else(|| {
-            if matches!(context_policy, ContextPolicy::Reject) {
-                manifest
-                    .metadata
-                    .parameter_constraints
-                    .get("max_position_embeddings")
-                    .or_else(|| {
-                        manifest
-                            .metadata
-                            .parameter_constraints
-                            .get("model_max_length")
-                    })
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| usize::try_from(v).ok())
-                    .filter(|v| *v > 0)
-            } else {
-                None
-            }
-        });
+    let context_size = generation_context_size(&state, &manifest).or_else(|| {
+        if matches!(context_policy, ContextPolicy::Reject) {
+            manifest
+                .metadata
+                .parameter_constraints
+                .get("max_position_embeddings")
+                .or_else(|| {
+                    manifest
+                        .metadata
+                        .parameter_constraints
+                        .get("model_max_length")
+                })
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|v| *v > 0)
+        } else {
+            None
+        }
+    });
     let needs_context_check = matches!(context_policy, ContextPolicy::Reject)
         || (matches!(context_policy, ContextPolicy::Trim) && request.requires_tool_calling());
     let context_check = if needs_context_check {
@@ -694,6 +710,12 @@ fn tool_calling_parameter(request: &ChatCompletionRequest) -> &'static str {
     } else {
         "messages"
     }
+}
+
+pub(super) fn generation_context_size(state: &ApiState, manifest: &ModelManifest) -> Option<usize> {
+    state
+        .explicit_chat_context_size
+        .or_else(|| effective_chat_context_size(state.chat_context_size, manifest))
 }
 
 pub(super) fn effective_chat_context_size(

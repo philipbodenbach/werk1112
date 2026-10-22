@@ -414,6 +414,11 @@ fn capabilities_for_descriptor(
             operations: vec!["count_tokens".into()],
         },
     );
+    capabilities.insert("api.chat.limits".into(), Capability {
+        id: "api.chat.limits".into(), status: CapabilityStatus::Supported,
+        detail: "GET /werk/v1/chat/limits reports known context and generation ceilings without loading a model. Clients must still count input tokens and reserve output within the context window.".into(),
+        operations: vec!["limits".into()],
+    });
     capabilities.insert("api.chat.reasoning".into(), Capability {
         id: "api.chat.reasoning".into(), status: CapabilityStatus::Supported,
         detail: "GET /werk/v1/chat/reasoning?model=...&max_output_tokens=... reports model/runtime tiers, effective default and limits without loading a model. Send werk.reasoning.tier in chat/count requests; Werk resolves native controls within the request limits.".into(),

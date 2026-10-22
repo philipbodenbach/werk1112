@@ -162,6 +162,7 @@ async fn observability_auth_and_shared_sampling_cache() {
         "/metrics",
         "/werk/v1/observability",
         "/werk/v1/chat/reasoning?model=mock&max_output_tokens=2048",
+        "/werk/v1/chat/limits?model=mock",
     ] {
         assert_eq!(
             app.clone()
