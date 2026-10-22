@@ -35,6 +35,10 @@ fn panel(title: &str, color: Color) -> Block<'static> {
 }
 fn live_panel(title: &str, color: Color, app: &App) -> Block<'static> {
     let block = panel(title, color);
+    if llama(app) && app.sample_age_seconds().is_none_or(|age| age >= 5.) {
+        return block
+            .title(Line::styled(" STALE ", Style::default().fg(PINK)).alignment(Alignment::Right));
+    }
     if !llama(app) || !app.animation || app.paused || app.error.is_some() || app.snapshot.is_none()
     {
         return block;
@@ -335,7 +339,7 @@ fn draw_colored(frame: &mut Frame, app: &App) {
         format!(
             "{} · sample age {}",
             clean(&app.target),
-            number(app.last_received.map(|t| t.elapsed().as_secs_f64()), "s")
+            number(app.sample_age_seconds(), "s")
         )
     };
     frame.render_widget(
@@ -861,6 +865,37 @@ fn offload(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(block, area);
         let resident = native(app, "cpu_expert_resident_bytes");
         let weights = native(app, "cpu_expert_weight_bytes");
+        if resident.is_none() || weights.is_none() {
+            let plot_height = inner.height.saturating_sub(5);
+            frame.render_widget(
+                Paragraph::new("GPU memory used (GiB)").style(Style::default().fg(PINK)),
+                Rect { height: 1, ..inner },
+            );
+            graph(
+                frame,
+                Rect {
+                    y: inner.y + 1,
+                    height: plot_height,
+                    ..inner
+                },
+                &app.gpu_memory_history,
+                PINK,
+            );
+            if inner.height > 1 {
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "CPU expert residency not reported\n{}\nGPU layers requested {gpu}",
+                        gpu_memory_status(app)
+                    )),
+                    Rect {
+                        y: inner.y + 1 + plot_height,
+                        height: inner.height - 1 - plot_height,
+                        ..inner
+                    },
+                );
+            }
+            return;
+        }
         let ratio = resident
             .zip(weights)
             .filter(|(_, w)| *w > 0.)
@@ -1351,6 +1386,42 @@ mod tests {
         assert!(!text.contains("disk-read"));
         assert_eq!(app.expert_ram_history.back(), Some(&Some(59.)));
         assert_eq!(app.prompt_hit_history.back(), Some(&Some(90.)));
+        let with_experts = app.snapshot.clone().unwrap();
+        let mut without_experts = with_experts.clone();
+        without_experts.backends[0]
+            .gauges
+            .remove("cpu_expert_resident_bytes");
+        without_experts.backends[0]
+            .gauges
+            .remove("cpu_expert_weight_bytes");
+        app.update(without_experts);
+        assert_eq!(app.gpu_memory_history.back(), Some(&Some(10.)));
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("GPU memory used (GiB)"));
+        assert!(text.contains("CPU expert residency not reported"));
+        assert!(!text.contains("CPU experts in RAM n/a"));
+        let mut stale = with_experts.clone();
+        stale.observed_at_ms += 10_000;
+        app.update(stale);
+        assert!(app.sample_age_seconds().unwrap() >= 10.);
+        assert_eq!(app.gpu_memory_history.back(), Some(&None));
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("STALE"));
+        app.update(with_experts);
         // Freeze sample age; only the animation tick changes between draws.
         app.last_received = None;
         // All four panels indicate live refresh, including stable memory data.

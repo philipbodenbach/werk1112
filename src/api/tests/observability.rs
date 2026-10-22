@@ -21,8 +21,14 @@ impl GenerationBackend for ObservedBackend {
     }
 }
 fn app() -> (Router, Arc<AtomicUsize>) {
-    let store = test_store();
     let calls = Arc::new(AtomicUsize::new(0));
+    (
+        app_with_backend(Arc::new(ObservedBackend(calls.clone()))),
+        calls,
+    )
+}
+fn app_with_backend(backend: Arc<dyn GenerationBackend>) -> Router {
+    let store = test_store();
     let manifest = ModelManifest {
         storage: Default::default(),
         id: "mock".into(),
@@ -48,13 +54,91 @@ fn app() -> (Router, Arc<AtomicUsize>) {
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
-    (
-        router(
-            ApiState::new(store, Arc::new(ObservedBackend(calls.clone())))
-                .with_api_keys(vec!["test-key".into()]),
-        ),
-        calls,
-    )
+    router(ApiState::new(store, backend).with_api_keys(vec!["test-key".into()]))
+}
+
+struct BlockedTelemetry {
+    calls: Arc<AtomicUsize>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl GenerationBackend for BlockedTelemetry {
+    fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _ = self.release.lock().unwrap().recv();
+        vec![crate::observability::BackendSnapshot {
+            backend: "released-probe".into(),
+            available: true,
+            ..Default::default()
+        }]
+    }
+    fn generate(&self, m: &ModelManifest, r: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+        MockBackend.generate(m, r)
+    }
+    fn generate_stream(&self, m: ModelManifest, r: GenerateRequest) -> GenerateStream {
+        MockBackend.generate_stream(m, r)
+    }
+}
+
+#[tokio::test]
+async fn observability_hung_probe_returns_without_restarting_and_publishes_after_disconnect() {
+    use std::time::Duration;
+    for cancel in [false, true] {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = app_with_backend(Arc::new(BlockedTelemetry {
+            calls: calls.clone(),
+            release: std::sync::Mutex::new(blocked),
+        }));
+        let request = tokio::spawn(app.clone().oneshot(get("/werk/v1/observability", true)));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel {
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+        } else {
+            let response = tokio::time::timeout(Duration::from_secs(4), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        for _ in 0..3 {
+            let response = tokio::time::timeout(
+                Duration::from_millis(500),
+                app.clone().oneshot(get("/werk/v1/observability", true)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let result = response_json(
+                    app.clone()
+                        .oneshot(get("/werk/v1/observability", true))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                if result["data"]["backends"][0]["backend"] == "released-probe" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }
 fn get(path: &str, auth: bool) -> Request<Body> {
     let mut r = Request::builder()

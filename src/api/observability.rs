@@ -38,80 +38,84 @@ async fn collect(state: &ApiState) -> Snapshot {
     let stale = cached
         .as_ref()
         .is_none_or(|c| c.time.elapsed() >= Duration::from_secs(2));
-    if stale {
-        if let Ok(gate) = state.telemetry_cache.gate.clone().try_lock_owned() {
-            // Recheck after acquisition: another scrape may just have filled it.
-            if state
-                .telemetry_cache
-                .data
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_some_and(|c| c.time.elapsed() < Duration::from_secs(2))
-            {
-                return current(state);
-            }
-            let backend = state.backend.clone();
-            let deployments = state.deployments.clone();
-            let Ok((_gate, mut backends, swap, host_free)) =
-                crate::logging::spawn_blocking(move || {
-                    let mut system = sysinfo::System::new();
-                    system.refresh_memory();
-                    (
-                        gate,
-                        deployments.map_or_else(|| backend.telemetry(), |r| r.telemetry()),
-                        sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.used_swap()),
-                        sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.free_memory()),
-                    )
-                })
-                .await
-            else {
-                return current(state);
-            };
-            backends.sort_by(|a, b| (&a.backend, &a.instance).cmp(&(&b.backend, &b.instance)));
-            let timestamp = now_ms();
-            if let Some(previous) = &cached {
-                let elapsed = timestamp.saturating_sub(previous.timestamp) as f64 / 1000.;
-                for current in &mut backends {
-                    if let Some(old) = previous
-                        .backends
-                        .iter()
-                        .find(|b| b.instance == current.instance && b.backend == current.backend)
-                    {
-                        let rates = crate::observability::Rates::between(old, current, elapsed);
-                        for (key, value) in [
-                            ("decode_tokens_per_second_estimate", rates.decode_estimate),
-                            ("expert_cache_hit_ratio", rates.expert_hit_ratio),
-                            ("expert_read_bytes_per_second", rates.read_bytes_per_second),
-                        ] {
-                            if let Some(value) = value {
-                                current.gauges.insert(key.into(), value);
-                            }
-                        }
-                    }
-                }
-            }
-            let memory = state
-                .werk_control
-                .memory_status(ControlContext::local("observability"))
-                .await
-                .ok();
-            *state
-                .telemetry_cache
-                .data
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(Cached {
-                time: Instant::now(),
-                timestamp,
-                swap,
-                host_free,
-                backends,
-                memory,
-            });
+    if stale && let Ok(gate) = state.telemetry_cache.gate.clone().try_lock_owned() {
+        // Recheck after acquisition: another scrape may just have filled it.
+        if state
+            .telemetry_cache
+            .data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|c| c.time.elapsed() < Duration::from_secs(2))
+        {
+            return current(state);
         }
+        // The sampler owns the gate and publishes even if its HTTP caller
+        // disconnects. A hung probe must not create a fresh job per scrape.
+        let task = crate::logging::spawn(refresh(state.clone(), gate, cached));
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
     }
     current(state)
 }
+async fn refresh(state: ApiState, gate: tokio::sync::OwnedMutexGuard<()>, cached: Option<Cached>) {
+    let backend = state.backend.clone();
+    let deployments = state.deployments.clone();
+    let Ok((_gate, mut backends, swap, host_free)) = crate::logging::spawn_blocking(move || {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        (
+            gate,
+            deployments.map_or_else(|| backend.telemetry(), |r| r.telemetry()),
+            sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.used_swap()),
+            sysinfo::IS_SUPPORTED_SYSTEM.then(|| system.free_memory()),
+        )
+    })
+    .await
+    else {
+        return;
+    };
+    backends.sort_by(|a, b| (&a.backend, &a.instance).cmp(&(&b.backend, &b.instance)));
+    let timestamp = now_ms();
+    if let Some(previous) = &cached {
+        let elapsed = timestamp.saturating_sub(previous.timestamp) as f64 / 1000.;
+        for current in &mut backends {
+            if let Some(old) = previous
+                .backends
+                .iter()
+                .find(|b| b.instance == current.instance && b.backend == current.backend)
+            {
+                let rates = crate::observability::Rates::between(old, current, elapsed);
+                for (key, value) in [
+                    ("decode_tokens_per_second_estimate", rates.decode_estimate),
+                    ("expert_cache_hit_ratio", rates.expert_hit_ratio),
+                    ("expert_read_bytes_per_second", rates.read_bytes_per_second),
+                ] {
+                    if let Some(value) = value {
+                        current.gauges.insert(key.into(), value);
+                    }
+                }
+            }
+        }
+    }
+    let memory = state
+        .werk_control
+        .memory_status(ControlContext::local("observability"))
+        .await
+        .ok();
+    *state
+        .telemetry_cache
+        .data
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Cached {
+        time: Instant::now(),
+        timestamp,
+        swap,
+        host_free,
+        backends,
+        memory,
+    });
+}
+
 fn current(state: &ApiState) -> Snapshot {
     let mut snapshot = state.telemetry.snapshot();
     if let Some(c) = state

@@ -139,6 +139,7 @@ struct App {
     read_history: VecDeque<Option<f64>>,
     memory_history: VecDeque<Option<f64>>,
     expert_ram_history: VecDeque<Option<f64>>,
+    gpu_memory_history: VecDeque<Option<f64>>,
     prompt_hit_history: VecDeque<Option<f64>>,
     error: Option<String>,
     last_received: Option<Instant>,
@@ -153,6 +154,14 @@ struct App {
     fields: fields::Selection,
 }
 impl App {
+    fn sample_age_seconds(&self) -> Option<f64> {
+        let snapshot = self.snapshot.as_ref()?;
+        let sampled = snapshot.backend_observed_at_ms?;
+        Some(
+            snapshot.observed_at_ms.saturating_sub(sampled) as f64 / 1000.
+                + self.last_received.map_or(0., |t| t.elapsed().as_secs_f64()),
+        )
+    }
     fn new(args: &TopArgs) -> Self {
         Self {
             snapshot: None,
@@ -163,6 +172,7 @@ impl App {
             read_history: VecDeque::new(),
             memory_history: VecDeque::new(),
             expert_ram_history: VecDeque::new(),
+            gpu_memory_history: VecDeque::new(),
             prompt_hit_history: VecDeque::new(),
             error: None,
             last_received: None,
@@ -199,31 +209,50 @@ impl App {
                 self.read_history.clear();
                 self.memory_history.clear();
                 self.expert_ram_history.clear();
+                self.gpu_memory_history.clear();
                 self.prompt_hit_history.clear();
             }
         }
-        if !self.demo {
-            if let Some(b) = snapshot.backends.get(self.worker) {
-                self.rates = Rates {
-                    decode_estimate: b.gauges.get("decode_tokens_per_second_estimate").copied(),
-                    expert_hit_ratio: b.gauges.get("expert_cache_hit_ratio").copied(),
-                    read_bytes_per_second: b.gauges.get("expert_read_bytes_per_second").copied(),
-                };
-            }
+        if !self.demo
+            && let Some(b) = snapshot.backends.get(self.worker)
+        {
+            self.rates = Rates {
+                decode_estimate: b.gauges.get("decode_tokens_per_second_estimate").copied(),
+                expert_hit_ratio: b.gauges.get("expert_cache_hit_ratio").copied(),
+                read_bytes_per_second: b.gauges.get("expert_read_bytes_per_second").copied(),
+            };
         }
-        let backend = snapshot.backends.get(self.worker).filter(|b| b.available);
+        let fresh = snapshot
+            .backend_observed_at_ms
+            .is_some_and(|sampled| snapshot.observed_at_ms.saturating_sub(sampled) < 5000);
+        if !fresh {
+            self.rates = Rates::default();
+        }
+        let backend = snapshot
+            .backends
+            .get(self.worker)
+            .filter(|b| b.available && fresh);
         let native = |key: &str| backend.and_then(|b| b.gauges.get(key)).copied();
         let memory = if backend.is_some_and(|b| b.backend.starts_with("llama.cpp")) {
             host_used_bytes(&snapshot)
         } else {
             native("expert_cache_resident_bytes")
         };
+        let gpu_memory = snapshot.memory.as_ref().filter(|_| fresh).and_then(|m| {
+            m.accelerator
+                .capacity_bytes
+                .zip(m.accelerator.available_bytes)
+                .map(|(capacity, available)| {
+                    capacity.saturating_sub(available) as f64 / 1073741824.
+                })
+        });
         for (history, value) in [
             (
                 &mut self.prompt_hit_history,
                 native("prompt_cache_hit_ratio").map(|n| n * 100.),
             ),
             (&mut self.memory_history, memory.map(|n| n / 1073741824.)),
+            (&mut self.gpu_memory_history, gpu_memory),
             (
                 &mut self.expert_ram_history,
                 native("cpu_expert_resident_bytes").map(|n| n / 1073741824.),
@@ -387,6 +416,7 @@ pub fn run(args: TopArgs) -> Result<()> {
                             app.read_history.clear();
                             app.memory_history.clear();
                             app.expert_ram_history.clear();
+                            app.gpu_memory_history.clear();
                             app.prompt_hit_history.clear();
                             app.rates = Rates::default();
                         }
@@ -579,6 +609,7 @@ mod observability_tests {
         assert_eq!(app.memory_history.len(), 90);
         assert_eq!(app.prompt_hit_history.len(), 90);
         assert_eq!(app.expert_ram_history.len(), 90);
+        assert_eq!(app.gpu_memory_history.len(), 90);
         let mut restarted = demo(1.);
         restarted.server_started_ms += 1;
         app.update(restarted);
@@ -586,5 +617,6 @@ mod observability_tests {
         assert_eq!(app.memory_history.len(), 1);
         assert_eq!(app.prompt_hit_history.len(), 1);
         assert_eq!(app.expert_ram_history.len(), 1);
+        assert_eq!(app.gpu_memory_history.len(), 1);
     }
 }

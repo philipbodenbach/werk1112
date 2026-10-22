@@ -67,10 +67,13 @@ with one GPU slot. It is a process-local RAM cache, independent of `serve
 cross-restart persistence. Actual hits still depend on matching prompt tokens,
 available cache space and the native model's checkpoint support.
 
-Werk disables automatic idle-slot caching and sets slot similarity selection to
-zero. Ordinary API calls let llama.cpp choose the slot and load the best RAM
-entry; named runtime-state and persistent terminal-chat calls pin their slot so
-automatic cache lookup cannot substitute for an explicitly restored snapshot.
+Werk disables automatic idle-slot caching. With one slot, it sets slot similarity
+selection to zero: ordinary API calls load the best RAM entry, while named
+runtime-state and persistent terminal-chat calls pin their slot so automatic
+cache lookup cannot substitute for an explicitly restored snapshot.
+With multiple slots, Werk retains native similarity selection so a growing
+conversation can reuse its existing slot rather than move through the RAM cache
+on every turn. Named runtime-state operations remain unavailable in this mode.
 Older runtimes without these controls retain the previous isolated-slot policy.
 
 Use `WERK_LLAMA_ARGS='--cache-ram 2048'` to lower the RAM cache limit or

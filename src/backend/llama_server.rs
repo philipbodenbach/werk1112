@@ -1394,10 +1394,12 @@ fn llama_server_args_with_state(
         args.push("--slot-save-path".to_string());
         args.push(snapshot_dir.display().to_string());
         if supported.cache_ram {
-            // Preserve different API conversations in native RAM even with a
-            // single GPU slot. Disable similarity selection so explicit
-            // id_slot requests used by runtime-state operations bypass native
-            // cache save/load, while unpinned API requests use its LRU path.
+            // The private runtime-state API is supported only with one slot.
+            // There, disable similarity selection so pinned state operations
+            // bypass native RAM cache save/load. With multiple slots, retain
+            // native similarity selection: forcing LRU would move a growing
+            // conversation between slots and save/load its state every turn.
+            let private_slot = runtime_options.parallel.unwrap_or(1) == 1;
             let isolated_cache = supported.slot_prompt_similarity && supported.cache_idle_slots;
             args.push("--cache-ram".to_string());
             args.push(
@@ -1408,7 +1410,7 @@ fn llama_server_args_with_state(
                 }
                 .to_string(),
             );
-            if isolated_cache {
+            if private_slot && isolated_cache {
                 args.extend(["--slot-prompt-similarity".to_string(), "0".to_string()]);
             }
         }
@@ -4809,6 +4811,48 @@ Agent 3
                 assert!(args.iter().any(|v| v == "--no-cache-idle-slots"));
                 assert!(llama_state_args_are_effective(
                     &args, snapshots, model, 12345
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_prompt_cache_keeps_similarity_routing_for_growing_tool_conversations() {
+        let supported = supported_args_from_help(
+            "--mmproj --slots --slot-save-path --parallel --cache-ram --cache-idle-slots --slot-prompt-similarity",
+        );
+        for slots in [2, 4] {
+            for projector in [None, Some(Path::new("/mmproj.gguf"))] {
+                let args = llama_server_args_with_state(
+                    LlamaCppMode::Cuda,
+                    Path::new("/model.gguf"),
+                    projector,
+                    12345,
+                    &LlamaRuntimeOptions {
+                        parallel: Some(slots),
+                        ctx_size: Some(32768),
+                        ..Default::default()
+                    },
+                    &supported,
+                    false,
+                    Some(Path::new("/private")),
+                );
+                assert!(!args.iter().any(|arg| arg == "--slot-prompt-similarity"));
+                assert_eq!(
+                    args.iter().any(|arg| arg == "--mmproj"),
+                    projector.is_some()
+                );
+                assert!(args.windows(2).any(|pair| pair == ["--cache-ram", "8192"]));
+                assert!(args.iter().any(|arg| arg == "--no-cache-idle-slots"));
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair[0] == "-c" && pair[1] == (32768 * slots).to_string())
+                );
+                assert!(!llama_state_args_are_effective(
+                    &args,
+                    Path::new("/private"),
+                    Path::new("/model.gguf"),
+                    12345
                 ));
             }
         }
