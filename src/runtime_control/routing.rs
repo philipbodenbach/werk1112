@@ -547,6 +547,9 @@ impl Drop for StateRouteReservation<'_> {
 }
 
 impl GenerationBackend for RuntimeRoutedGenerationBackend {
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        self.backend.inference_capacity(manifest)
+    }
     fn reasoning_config(
         &self,
         manifest: &ModelManifest,

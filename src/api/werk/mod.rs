@@ -113,10 +113,12 @@ async fn generation_limits_handler(
             let mut profiles = Vec::new();
             for (_, state, physical_model) in targets {
                 let manifest = state.store.get(&physical_model)?;
-                profiles.push(crate::generation_limits::profile(
+                let mut profile = crate::generation_limits::profile(
                     &manifest,
                     super::generation::generation_context_size(&state, &manifest),
-                ));
+                );
+                profile.max_concurrent_requests = state.backend.inference_capacity(&manifest);
+                profiles.push(profile);
             }
             anyhow::ensure!(!profiles.is_empty(), "No matching deployment");
             // An alias must be safe on every replica. An unknown replica prevents
@@ -133,6 +135,9 @@ async fn generation_limits_handler(
                 model,
                 context_tokens: minimum(profiles.iter().map(|p| p.context_tokens).collect()),
                 max_output_tokens: minimum(profiles.iter().map(|p| p.max_output_tokens).collect()),
+                max_concurrent_requests: minimum(
+                    profiles.iter().map(|p| p.max_concurrent_requests).collect(),
+                ),
             })
         },
     )

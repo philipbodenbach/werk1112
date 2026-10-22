@@ -193,7 +193,7 @@ It sends no launch setting to remote vLLM.
 | GET | `/werk/v1/observability` | none | Server-wide chat, worker and memory observations |
 | POST | `/werk/v1/chat/count_tokens` | OpenAI chat request | Exact native input token count |
 | GET | `/werk/v1/chat/reasoning` | `model`, `max_output_tokens` query | Model/runtime tiers, default and effective limits |
-| GET | `/werk/v1/chat/limits` | `model` query | Read-only model/server context and output ceilings |
+| GET | `/werk/v1/chat/limits` | `model` query | Read-only model/server context, output and concurrency limits |
 | GET | `/werk/v1/states` | query filters | One page of runtime states |
 | POST | `/werk/v1/states/{id}/actions` | State action | Updated/projected state |
 | POST | `/werk/v1/states/prune` | Explicit selector | Match/removal summary |
@@ -654,16 +654,25 @@ model and without running inference or advancing deployment selection.
 Example `data`:
 
 ```json
-{"schema_version":1,"model":"local-model","context_tokens":16384,"max_output_tokens":16383}
+{"schema_version":1,"model":"local-model","context_tokens":16384,"max_output_tokens":16383,"max_concurrent_requests":2}
 ```
 
-Both limits may be `null` when unknown. Context is per request. Output is the
+Fields may be `null` when unknown. Context is per request. Output is the
 minimum of explicit manifest parameter ceilings (`max_output_tokens`,
 `max_completion_tokens`, `max_new_tokens`, scalar or `{ "max": N }`) and context
 minus one when context is known. Generation defaults are not hard ceilings.
 For an alias, known limits use the minimum across replicas; an unknown replica
 makes that field unknown. This endpoint does not predict free GPU memory or
 guarantee that a particular prompt/output pair fits.
+
+`max_concurrent_requests` reports configured concurrent inference capacity, not
+currently free/busy slots. For running llama.cpp workers it is read from the
+actual native launch arguments (`--parallel` / `-np`, including trailing
+`WERK_LLAMA_ARGS` overrides), without querying inference or telemetry endpoints.
+Unknown/auto capacity and cold models report `null`. Multiple matching workers
+and alias replicas use the conservative minimum, never an assumed sum. An
+unknown replica makes the alias capacity unknown. Other backends may leave this
+optional field unknown. Clients may refresh it without generating tokens.
 
 Clients must count input and reserve their margin before expanding an initial
 output allowance. Chat admission rejects output above the same ceiling with

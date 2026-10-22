@@ -9,6 +9,9 @@ pub struct ChatGenerationLimits {
     pub model: String,
     pub context_tokens: Option<usize>,
     pub max_output_tokens: Option<usize>,
+    /// Configured concurrent requests for the selected model. Not free slots.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
 }
 
 pub fn profile(manifest: &ModelManifest, context: Option<usize>) -> ChatGenerationLimits {
@@ -44,5 +47,6 @@ pub fn profile(manifest: &ModelManifest, context: Option<usize>) -> ChatGenerati
         model: manifest.id.clone(),
         context_tokens: context,
         max_output_tokens: maximum,
+        max_concurrent_requests: None,
     }
 }

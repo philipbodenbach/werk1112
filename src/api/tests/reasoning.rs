@@ -133,7 +133,7 @@ async fn generation_limits_alias_uses_smallest_replica_without_advancing_routing
         .unwrap();
         assert_eq!(
             value["data"],
-            json!({"schema_version":1,"model":"shared","context_tokens":8192,"max_output_tokens":8191})
+            json!({"schema_version":1,"model":"shared","context_tokens":8192,"max_output_tokens":8191,"max_concurrent_requests":2})
         );
     }
     let (selected, _) = registry.select("shared", &HeaderMap::new()).unwrap();
@@ -182,7 +182,7 @@ async fn generation_limits_discovery_and_admission_share_the_model_ceiling() {
     .unwrap();
     assert_eq!(
         value["data"],
-        json!({"schema_version":1,"model":"reasoning-fixture","context_tokens":16384,"max_output_tokens":8192})
+        json!({"schema_version":1,"model":"reasoning-fixture","context_tokens":16384,"max_output_tokens":8192,"max_concurrent_requests":2})
     );
     assert!(
         backend.calls.lock().unwrap().is_empty(),
@@ -299,6 +299,9 @@ struct Recorder {
     calls: Mutex<Vec<BTreeMap<String, Value>>>,
 }
 impl GenerationBackend for Recorder {
+    fn inference_capacity(&self, _: &ModelManifest) -> Option<usize> {
+        Some(2)
+    }
     fn reasoning_config(&self, _: &ModelManifest) -> Option<BackendReasoning> {
         Some(config(true, 2048))
     }

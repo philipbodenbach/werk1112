@@ -516,6 +516,24 @@ impl GenerationBackend for LlamaServerBackend {
         telemetry::sample(self)
     }
 
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        let workers: Vec<_> = self
+            .servers
+            .snapshot()
+            .into_iter()
+            .filter(|server| server.model_id == manifest.id && server.is_running())
+            .collect();
+        if workers.is_empty() {
+            return None;
+        }
+        workers
+            .iter()
+            .map(|server| telemetry::configured_slots(&server.args))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()
+    }
+
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
         true
     }

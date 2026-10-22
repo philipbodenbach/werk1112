@@ -4,6 +4,23 @@ use crate::observability::{BackendSnapshot, ReasoningDefaults};
 use serde_json::Value;
 use std::{io::Read, time::Duration};
 
+/// Native arguments are authoritative, including trailing WERK_LLAMA_ARGS.
+pub(super) fn configured_slots(args: &[String]) -> Option<usize> {
+    let mut slots = None;
+    for (index, arg) in args.iter().enumerate() {
+        let value = if matches!(arg.as_str(), "--parallel" | "-np") {
+            Some(args.get(index + 1).map(String::as_str).unwrap_or(""))
+        } else {
+            arg.strip_prefix("--parallel=")
+                .or_else(|| arg.strip_prefix("-np="))
+        };
+        if let Some(value) = value {
+            slots = value.parse().ok().filter(|n| (1..=65536).contains(n));
+        }
+    }
+    slots
+}
+
 pub(super) fn sample(backend: &LlamaServerBackend) -> Vec<BackendSnapshot> {
     // Never hold the registry or generation/state gate during monitoring I/O.
     let servers = backend.servers.snapshot();
@@ -400,6 +417,27 @@ mod observability_tests {
             let mut invalid = BackendSnapshot::default();
             assert!(!parse_slots(&mut invalid, &slots));
             assert!(!invalid.gauges.contains_key("context_per_request_tokens"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::configured_slots;
+    #[test]
+    fn captured_parallel_arguments_respect_native_overrides_and_unknowns() {
+        for (args, expected) in [
+            (vec!["-np", "2"], Some(2)),
+            (vec!["--parallel=4"], Some(4)),
+            (vec!["-np", "2", "--parallel", "1"], Some(1)),
+            (vec!["-np", "2", "--parallel=0"], None),
+            (vec!["--parallel"], None),
+            (vec![], None),
+        ] {
+            assert_eq!(
+                configured_slots(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()),
+                expected
+            );
         }
     }
 }

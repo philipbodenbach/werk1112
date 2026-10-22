@@ -1458,6 +1458,10 @@ impl std::fmt::Display for UnsupportedTokenCounting {
 impl std::error::Error for UnsupportedTokenCounting {}
 
 pub trait GenerationBackend: Send + Sync {
+    /// Captured model capacity; never load a model or scrape telemetry here.
+    fn inference_capacity(&self, _manifest: &ModelManifest) -> Option<usize> {
+        None
+    }
     /// Read captured configuration only; no model loading, runtime probing or I/O.
     fn reasoning_config(
         &self,

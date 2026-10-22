@@ -9554,6 +9554,13 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        let backends: Vec<_> = self.backends.lock().ok()?.values().cloned().collect();
+        backends
+            .iter()
+            .filter_map(|backend| backend.inference_capacity(manifest))
+            .min()
+    }
     fn reasoning_config(
         &self,
         manifest: &ModelManifest,
@@ -9875,6 +9882,13 @@ impl GgufPreferredBackend {
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        let backends: Vec<_> = self.backends.lock().ok()?.values().cloned().collect();
+        backends
+            .iter()
+            .filter_map(|backend| backend.inference_capacity(manifest))
+            .min()
+    }
     fn reasoning_config(
         &self,
         manifest: &ModelManifest,
@@ -10364,6 +10378,13 @@ impl VllmPreferredBackend {
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        let backends: Vec<_> = self.backends.lock().ok()?.values().cloned().collect();
+        backends
+            .iter()
+            .filter_map(|backend| backend.inference_capacity(manifest))
+            .min()
+    }
     fn reasoning_config(
         &self,
         manifest: &ModelManifest,
