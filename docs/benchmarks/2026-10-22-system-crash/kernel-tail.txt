@@ -1,0 +1,60 @@
+Oct 22 13:12:24 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:24 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:24 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:27 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:27 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:27 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:31 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgvmb_send_sync_msg: wait_for_completion failed: fffffe00
+Oct 22 13:12:31 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_query_adapter_info: Ioctl failed: -512
+Oct 22 13:12:32 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: process_completion_packet: did not find packet to complete
+Oct 22 13:12:37 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgvmb_send_sync_msg: wait_for_completion failed: fffffe00
+Oct 22 13:12:37 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_query_adapter_info: Ioctl failed: -512
+Oct 22 13:12:39 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: process_completion_packet: did not find packet to complete
+Oct 22 13:12:41 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:41 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:41 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:43 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:43 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:43 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:48 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:48 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:48 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:12:52 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgvmb_send_sync_msg: wait_for_completion failed: fffffe00
+Oct 22 13:12:52 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_query_adapter_info: Ioctl failed: -512
+Oct 22 13:12:59 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgvmb_send_sync_msg: wait_for_completion failed: fffffe00
+Oct 22 13:12:59 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_query_adapter_info: Ioctl failed: -512
+Oct 22 13:13:01 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: process_completion_packet: did not find packet to complete
+Oct 22 13:13:06 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgvmb_send_sync_msg: wait_for_completion failed: fffffe00
+Oct 22 13:13:06 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_query_adapter_info: Ioctl failed: -512
+Oct 22 13:13:13 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgvmb_send_sync_msg: wait_for_completion failed: fffffe00
+Oct 22 13:13:13 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_query_adapter_info: Ioctl failed: -512
+Oct 22 13:13:16 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: process_completion_packet: did not find packet to complete
+Oct 22 13:13:16 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: process_completion_packet: did not find packet to complete
+Oct 22 13:13:16 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: process_completion_packet: did not find packet to complete
+Oct 22 13:13:18 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:18 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:18 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:21 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:21 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:21 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:23 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:23 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:23 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:25 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:25 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:25 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:27 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:27 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:27 DESKTOP-ANQ88D8 kernel: misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: llama-server: llama-server: potentially unexpected fatal signal 6.
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: CPU: 2 UID: 1000 PID: 47695 Comm: llama-server Not tainted 6.18.54.1-microsoft-standard-WSL2 #1 PREEMPT(none) 
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: RIP: 0033:0x7699286969bc
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: Code: 41 89 c5 41 f7 dd eb 80 66 0f 1f 44 00 00 b8 ba 00 00 00 0f 05 89 c5 e8 52 56 05 00 44 89 e2 89 ee 89 c7 b8 ea 00 00 00 0f 05 <41> 89 c5 41 f7 dd 3d 00 f0 ff ff b8 00 00 00 00 44 0f 46 e8 e9 6d
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: RSP: 002b:00007fff78d3c760 EFLAGS: 00000246 ORIG_RAX: 00000000000000ea
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: RAX: 0000000000000000 RBX: 0000769928516000 RCX: 00007699286969bc
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: RDX: 0000000000000006 RSI: 00000000001c571c RDI: 00000000001c571c
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: RBP: 00000000001c571c R08: 00007fff78d3c830 R09: 00005654d753e1d0
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: R10: 0000000000000008 R11: 0000000000000246 R12: 0000000000000006
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: R13: 0000000000000016 R14: 000076992388d8c8 R15: 00005654b25a8950
+Oct 22 13:13:28 DESKTOP-ANQ88D8 kernel: FS:  0000769928516000 GS:  0000000000000000
+Oct 22 13:13:28 DESKTOP-ANQ88D8 unknown: WSL (367 - CaptureCrash): Capturing crash for pid: 1857308, executable: !home!philipbodenbach!.local!share!werk1112!backends!llama-cuda!upstream-ec928150501c!build!bin!llama-server, signal: 6, port: 50005

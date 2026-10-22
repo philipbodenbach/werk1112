@@ -119,7 +119,13 @@ already-running workers; unsupported values remain absent, not fabricated zeroes
   pinning tensor payload. It
   requires unambiguous mmap placement and owned files; unsupported or changed
   files leave residency unavailable. This is CPU/RAM placement, not SSD expert
-  streaming. The graph reports resident GiB. Memory/cache/offload histories keep
+  streaming. The graph reports resident GiB in the `CPU EXPERT RAM` panel.
+  Without expert residency (for example a dense model fully placed on the GPU),
+  the panel is labelled `RAM / GPU MEMORY` and graphs worker process RSS when
+  available, falling back to device-wide GPU usage. RSS includes process memory
+  and resident mappings; it is not a measurement of CPU-offloaded model weights.
+  Passive RAM observations remain visible when the native `/slots` request fails.
+  Missing GPU measurements are not reported as zero. Memory/cache/offload histories keep
   90 samples, with panel activity markers controlled by the animation toggle.
   Host occupancy includes reclaimable cache; host availability includes memory
   reclaimable from that cache. Host and GPU pressure are labelled separately.

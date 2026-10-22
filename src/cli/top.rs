@@ -139,6 +139,7 @@ struct App {
     read_history: VecDeque<Option<f64>>,
     memory_history: VecDeque<Option<f64>>,
     expert_ram_history: VecDeque<Option<f64>>,
+    worker_ram_history: VecDeque<Option<f64>>,
     gpu_memory_history: VecDeque<Option<f64>>,
     prompt_hit_history: VecDeque<Option<f64>>,
     error: Option<String>,
@@ -172,6 +173,7 @@ impl App {
             read_history: VecDeque::new(),
             memory_history: VecDeque::new(),
             expert_ram_history: VecDeque::new(),
+            worker_ram_history: VecDeque::new(),
             gpu_memory_history: VecDeque::new(),
             prompt_hit_history: VecDeque::new(),
             error: None,
@@ -209,6 +211,7 @@ impl App {
                 self.read_history.clear();
                 self.memory_history.clear();
                 self.expert_ram_history.clear();
+                self.worker_ram_history.clear();
                 self.gpu_memory_history.clear();
                 self.prompt_hit_history.clear();
             }
@@ -228,12 +231,13 @@ impl App {
         if !fresh {
             self.rates = Rates::default();
         }
-        let backend = snapshot
-            .backends
-            .get(self.worker)
-            .filter(|b| b.available && fresh);
+        let sampled_backend = snapshot.backends.get(self.worker).filter(|_| fresh);
+        let backend = sampled_backend.filter(|b| b.available);
         let native = |key: &str| backend.and_then(|b| b.gauges.get(key)).copied();
-        let memory = if backend.is_some_and(|b| b.backend.starts_with("llama.cpp")) {
+        // Process/file residency is sampled independently of the native /slots
+        // endpoint. A busy inference loop must not hide valid RAM observations.
+        let resource = |key: &str| sampled_backend.and_then(|b| b.gauges.get(key)).copied();
+        let memory = if sampled_backend.is_some_and(|b| b.backend.starts_with("llama.cpp")) {
             host_used_bytes(&snapshot)
         } else {
             native("expert_cache_resident_bytes")
@@ -254,8 +258,12 @@ impl App {
             (&mut self.memory_history, memory.map(|n| n / 1073741824.)),
             (&mut self.gpu_memory_history, gpu_memory),
             (
+                &mut self.worker_ram_history,
+                resource("process_resident_bytes").map(|n| n / 1073741824.),
+            ),
+            (
                 &mut self.expert_ram_history,
-                native("cpu_expert_resident_bytes").map(|n| n / 1073741824.),
+                resource("cpu_expert_resident_bytes").map(|n| n / 1073741824.),
             ),
             (&mut self.history, self.rates.decode_estimate),
             (
@@ -609,6 +617,7 @@ mod observability_tests {
         assert_eq!(app.memory_history.len(), 90);
         assert_eq!(app.prompt_hit_history.len(), 90);
         assert_eq!(app.expert_ram_history.len(), 90);
+        assert_eq!(app.worker_ram_history.len(), 90);
         assert_eq!(app.gpu_memory_history.len(), 90);
         let mut restarted = demo(1.);
         restarted.server_started_ms += 1;
@@ -617,6 +626,7 @@ mod observability_tests {
         assert_eq!(app.memory_history.len(), 1);
         assert_eq!(app.prompt_hit_history.len(), 1);
         assert_eq!(app.expert_ram_history.len(), 1);
+        assert_eq!(app.worker_ram_history.len(), 1);
         assert_eq!(app.gpu_memory_history.len(), 1);
     }
 }

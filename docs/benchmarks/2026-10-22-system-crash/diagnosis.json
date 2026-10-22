@@ -1,0 +1,768 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-22",
+  "timezone": "Europe/Berlin",
+  "source_heads": {
+    "werk1112": "11d4ac4fcf0e01ce1954280058ba3d782c22154d",
+    "werkWorker": "b16fc65dcd655f141161c928a9ea76b6dfad6d6e"
+  },
+  "prior_chats": [
+    "01a162bb-5ec6-70e2-8a78-39e6ed314b4c",
+    "01a162d4-d31d-7bb0-8c44-f7166eff35ad",
+    "01a15e8b-1903-7471-aadb-123c1647b506"
+  ],
+  "prior_server_log_attachments": [
+    "4866c08d-918f-4d1e-ab70-6495beb09c8b",
+    "0294d21d-9297-4f28-a23f-dd7f9b35f1a5"
+  ],
+  "installed_before": {
+    "path": "/home/philipbodenbach/.cargo/bin/werk",
+    "modified_at": "2026-10-22T11:35:29.726339+02:00",
+    "sha256": "8307900be061bf584908023b0a93451c3677f4b67bff4cd809ea3798c3a7422b",
+    "markers": {
+      "werk-memory-probe": false,
+      "GPU memory used (GiB)": false,
+      "CPU expert residency not reported": false
+    }
+  },
+  "worker_session": "session_23ee6f80-e09f-455f-80bb-2e706816c0e9",
+  "worker_database": "~/.local/state/werk-worker/sessions.sqlite (read-only, WAL included)",
+  "worker_runs": [
+    {
+      "id": "run_84a5156e-5880-4e44-a442-1999cc06b0df",
+      "status_at_crash": "running",
+      "metrics": {
+        "steps": 11,
+        "model_requests": 11,
+        "tool_invocations": 10,
+        "first_text_ms": 14123,
+        "first_tool_ms": 14165,
+        "approval_wait_ms": 7098,
+        "total_ms": null,
+        "input_tokens": 53470,
+        "output_tokens": 656,
+        "estimated_input_tokens": 9663
+      },
+      "attempt_count": 11,
+      "failed_attempts": [],
+      "image_count": 1
+    }
+  ],
+  "worker_events": [
+    {
+      "at": "2026-10-22T13:10:42.924000+02:00",
+      "type": "run_state",
+      "data": {
+        "status": "queued"
+      }
+    },
+    {
+      "at": "2026-10-22T13:10:42.932000+02:00",
+      "type": "run_state",
+      "data": {
+        "status": "running"
+      }
+    },
+    {
+      "at": "2026-10-22T13:10:46.813000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:10:46.813000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 11068,
+      "message_count": 2,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:10:46.832000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_62606f55-32b2-4614-85c8-d317618f57f3"
+    },
+    {
+      "at": "2026-10-22T13:10:57.079000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_62606f55-32b2-4614-85c8-d317618f57f3",
+      "usage": {
+        "input_tokens": 3063,
+        "output_tokens": 63,
+        "cached_tokens": 0
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 0,
+            "decode_seconds": 1.787637,
+            "first_token_seconds": 3.871380135,
+            "load_seconds": 0.0,
+            "prompt_seconds": 3.802281,
+            "total_seconds": 7.48925963,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:10:58.020000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:10:58.020000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 4004,
+      "message_count": 4,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:10:58.033000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_397fe706-4eb3-4b6f-9e03-6bcb5030663f"
+    },
+    {
+      "at": "2026-10-22T13:11:06.841000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_397fe706-4eb3-4b6f-9e03-6bcb5030663f",
+      "usage": {
+        "input_tokens": 3492,
+        "output_tokens": 26,
+        "cached_tokens": 0
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 0,
+            "decode_seconds": 0.7212820000000001,
+            "first_token_seconds": 4.16889744,
+            "load_seconds": 0.0,
+            "prompt_seconds": 3.383665,
+            "total_seconds": 4.633762546,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:10.353000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:10.353000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 4089,
+      "message_count": 6,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:11:10.365000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_a290d238-6ed3-43d4-805b-ebbd64e1f22c"
+    },
+    {
+      "at": "2026-10-22T13:11:18.028000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_a290d238-6ed3-43d4-805b-ebbd64e1f22c",
+      "usage": {
+        "input_tokens": 3577,
+        "output_tokens": 30,
+        "cached_tokens": 3125
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 3125,
+            "decode_seconds": 1.031144,
+            "first_token_seconds": 2.756180643,
+            "load_seconds": 0.0,
+            "prompt_seconds": 1.079603,
+            "total_seconds": 3.44289973,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:18.994000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:18.994000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 4170,
+      "message_count": 8,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:11:19.003000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_e5cfa12f-2433-49eb-8625-09d0cfebf88c"
+    },
+    {
+      "at": "2026-10-22T13:11:25.621000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_e5cfa12f-2433-49eb-8625-09d0cfebf88c",
+      "usage": {
+        "input_tokens": 3658,
+        "output_tokens": 29,
+        "cached_tokens": 3517
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 3517,
+            "decode_seconds": 0.8497480000000001,
+            "first_token_seconds": 1.762088299,
+            "load_seconds": 0.0,
+            "prompt_seconds": 0.753064,
+            "total_seconds": 2.36277217,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:31.021000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:31.021000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 4516,
+      "message_count": 10,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:11:31.047000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_a4de9273-33e7-43bc-94e6-f274edf82185"
+    },
+    {
+      "at": "2026-10-22T13:11:38.484000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_a4de9273-33e7-43bc-94e6-f274edf82185",
+      "usage": {
+        "input_tokens": 4004,
+        "output_tokens": 30,
+        "cached_tokens": 3573
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 3573,
+            "decode_seconds": 0.845521,
+            "first_token_seconds": 2.682097984,
+            "load_seconds": 0.0,
+            "prompt_seconds": 1.031182,
+            "total_seconds": 3.253889813,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:39.395000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:39.395000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 5612,
+      "message_count": 12,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:11:39.402000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_6e36f5c5-aae3-4b36-9e1c-4d7e1f7faa57"
+    },
+    {
+      "at": "2026-10-22T13:11:48.186000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_6e36f5c5-aae3-4b36-9e1c-4d7e1f7faa57",
+      "usage": {
+        "input_tokens": 5100,
+        "output_tokens": 43,
+        "cached_tokens": 3654
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 3654,
+            "decode_seconds": 1.188587,
+            "first_token_seconds": 3.325835269,
+            "load_seconds": 0.0,
+            "prompt_seconds": 1.5868019999999998,
+            "total_seconds": 4.261401736,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:49.137000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:49.137000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 5784,
+      "message_count": 14,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:11:49.146000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_ab22259f-cfe5-4ec2-81df-f938489f8fc8"
+    },
+    {
+      "at": "2026-10-22T13:11:57.710000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_ab22259f-cfe5-4ec2-81df-f938489f8fc8",
+      "usage": {
+        "input_tokens": 5272,
+        "output_tokens": 31,
+        "cached_tokens": 4033
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 4033,
+            "decode_seconds": 0.855307,
+            "first_token_seconds": 3.868639152,
+            "load_seconds": 0.0,
+            "prompt_seconds": 1.464519,
+            "total_seconds": 4.471547286,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:58.711000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:11:58.711000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 8653,
+      "message_count": 16,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:11:58.722000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_0046e2e2-4bc8-48d8-bfcd-c1b6a552523d"
+    },
+    {
+      "at": "2026-10-22T13:12:08.683000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_0046e2e2-4bc8-48d8-bfcd-c1b6a552523d",
+      "usage": {
+        "input_tokens": 8141,
+        "output_tokens": 52,
+        "cached_tokens": 5142
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 5142,
+            "decode_seconds": 1.511636,
+            "first_token_seconds": 4.061860195,
+            "load_seconds": 0.0,
+            "prompt_seconds": 2.704473,
+            "total_seconds": 7.10998379,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:12:09.684000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:12:09.684000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 8987,
+      "message_count": 18,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:12:09.694000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_32d6ee71-0b55-44b4-a11a-fc4d14966273"
+    },
+    {
+      "at": "2026-10-22T13:12:20.626000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_32d6ee71-0b55-44b4-a11a-fc4d14966273",
+      "usage": {
+        "input_tokens": 8475,
+        "output_tokens": 38,
+        "cached_tokens": 5302
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 5302,
+            "decode_seconds": 1.033258,
+            "first_token_seconds": 5.6163884920000005,
+            "load_seconds": 0.0,
+            "prompt_seconds": 2.949629,
+            "total_seconds": 6.399251492,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:12:21.604000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:12:21.604000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 9200,
+      "message_count": 20,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:12:21.616000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_6032a9ee-2369-4bee-b801-3571bb1cca86"
+    },
+    {
+      "at": "2026-10-22T13:12:40.571000+02:00",
+      "type": "model_completed",
+      "attempt_id": "attempt_6032a9ee-2369-4bee-b801-3571bb1cca86",
+      "usage": {
+        "input_tokens": 8688,
+        "output_tokens": 314,
+        "cached_tokens": 8137
+      },
+      "metadata": {
+        "werk": {
+          "timings": {
+            "cached_prompt_tokens": 8137,
+            "decode_seconds": 8.846726,
+            "first_token_seconds": 4.233694491,
+            "load_seconds": 0.0,
+            "prompt_seconds": 0.937178,
+            "total_seconds": 16.096911836,
+            "warmup_seconds": 0.0
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-10-22T13:12:41.563000+02:00",
+      "type": "diagnostic",
+      "data": {
+        "code": "input_tokens_native_text_plus_image_estimate"
+      }
+    },
+    {
+      "at": "2026-10-22T13:12:41.563000+02:00",
+      "type": "context_planned",
+      "estimated_tokens": 9663,
+      "message_count": 22,
+      "omitted_messages": 0
+    },
+    {
+      "at": "2026-10-22T13:12:41.574000+02:00",
+      "type": "model_request",
+      "attempt_id": "attempt_d6b5a328-bee5-461f-b79d-a8ede821b1c5"
+    }
+  ],
+  "last_worker_event": {
+    "at": "2026-10-22T13:13:27.974000+02:00",
+    "type": "tool_delta"
+  },
+  "windows_events": [
+    {
+      "at_utc": "2026-10-22T11:17:10.5961332Z",
+      "provider": "Microsoft-Windows-Kernel-Power",
+      "event_id": "41",
+      "data": [
+        {
+          "name": "BugcheckCode",
+          "value": "0"
+        },
+        {
+          "name": "BugcheckParameter1",
+          "value": "0x0"
+        },
+        {
+          "name": "BugcheckParameter2",
+          "value": "0x0"
+        },
+        {
+          "name": "BugcheckParameter3",
+          "value": "0x0"
+        },
+        {
+          "name": "BugcheckParameter4",
+          "value": "0x0"
+        },
+        {
+          "name": "SleepInProgress",
+          "value": "0"
+        },
+        {
+          "name": "PowerButtonTimestamp",
+          "value": "0"
+        },
+        {
+          "name": "BootAppStatus",
+          "value": "0"
+        },
+        {
+          "name": "Checkpoint",
+          "value": "0"
+        },
+        {
+          "name": "ConnectedStandbyInProgress",
+          "value": "false"
+        },
+        {
+          "name": "SystemSleepTransitionsToOn",
+          "value": "0"
+        },
+        {
+          "name": "CsEntryScenarioInstanceId",
+          "value": "20"
+        },
+        {
+          "name": "BugcheckInfoFromEFI",
+          "value": "false"
+        },
+        {
+          "name": "CheckpointStatus",
+          "value": "0"
+        },
+        {
+          "name": "CsEntryScenarioInstanceIdV2",
+          "value": "532"
+        },
+        {
+          "name": "LongPowerButtonPressDetected",
+          "value": "false"
+        },
+        {
+          "name": "LidReliability",
+          "value": "false"
+        },
+        {
+          "name": "InputSuppressionState",
+          "value": "0"
+        },
+        {
+          "name": "PowerButtonSuppressionState",
+          "value": "0"
+        },
+        {
+          "name": "LidState",
+          "value": "3"
+        },
+        {
+          "name": "WHEABootErrorCount",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "at_utc": "2026-10-22T11:13:57.9967257Z",
+      "provider": "nvlddmkm",
+      "event_id": "153",
+      "data": [
+        {
+          "name": null,
+          "value": "\\Device\\00000795"
+        },
+        {
+          "name": null,
+          "value": "Restarting TDR occurred on GPUID:300"
+        }
+      ]
+    },
+    {
+      "at_utc": "2026-10-22T11:13:57.8978769Z",
+      "provider": "nvlddmkm",
+      "event_id": "153",
+      "data": [
+        {
+          "name": null,
+          "value": "\\Device\\00000795"
+        },
+        {
+          "name": null,
+          "value": "Reset TDR occurred on GPUID:300"
+        }
+      ]
+    },
+    {
+      "at_utc": "2026-10-22T11:13:29.9040686Z",
+      "provider": "nvlddmkm",
+      "event_id": "153",
+      "data": [
+        {
+          "name": null,
+          "value": "\\Device\\00000795"
+        },
+        {
+          "name": null,
+          "value": "Resetting TDR occurred on GPUID:300"
+        }
+      ]
+    },
+    {
+      "at_utc": "2026-10-22T11:13:27.9558893Z",
+      "provider": "nvlddmkm",
+      "event_id": "153",
+      "data": [
+        {
+          "name": null,
+          "value": "\\Device\\00000795"
+        },
+        {
+          "name": null,
+          "value": "UCodeReset TDR occurred on GPUID:300"
+        }
+      ]
+    },
+    {
+      "at_utc": "2026-10-22T11:13:27.9558893Z",
+      "provider": "nvlddmkm",
+      "event_id": "14",
+      "data": [
+        {
+          "name": null,
+          "value": "\\Device\\00000795"
+        },
+        {
+          "name": null,
+          "value": "324f811e 00008c70 00000000 202be6a6 202c85ee 2028b72a 00000000 00000000"
+        }
+      ]
+    }
+  ],
+  "findings": [
+    "The installed Werk binary predates and lacks the October 22 13:00 source fixes for telemetry and fallback graphs.",
+    "The last run contains 11 sequential model attempts, no failed attempt or retry, and no omitted context messages.",
+    "The last streamed tool delta coincides with NVIDIA TDR events; the subsequent llama-server abort is recorded in the kernel log.",
+    "The supplied command fully offloads a dense Qwen model; CPU MoE expert residency is not an applicable metric.",
+    "The exact GPU hang trigger is unproven. Old prompt-cache routing, high VRAM use, and driver/backend behavior remain separate hypotheses."
+  ],
+  "gpu_inference_replayed": false,
+  "prompt_or_generated_content_included": false,
+  "validation": {
+    "observability_tests": {
+      "passed": 39,
+      "failed": 0,
+      "ignored_live_tests": 2,
+      "log": "observability-tests.log"
+    },
+    "memory_probe_tests": {
+      "passed": 3,
+      "failed": 0
+    },
+    "parallel_prompt_cache_tests": {
+      "passed": 1,
+      "failed": 0
+    },
+    "rustfmt_changed_files": "passed",
+    "git_diff_check": "passed",
+    "gpu_inference_replayed": false,
+    "release_build": "passed (offline, release-linux, 2 jobs)",
+    "installed_after": {
+      "path": "/home/philipbodenbach/.cargo/bin/werk",
+      "sha256": "88127759581a132a935aa5b40f0388cbfa2672bddc2f3a7ec2f694c9d5a03398",
+      "version": "werk 1.9.1",
+      "features": [
+        "release-linux"
+      ],
+      "markers": {
+        "werk-memory-probe": true,
+        "Worker RAM (RSS, GiB)": true,
+        "CPU EXPERT RAM": true,
+        "GPU memory used (GiB)": true
+      },
+      "backup": "/home/philipbodenbach/.local/state/werk1112/backups/werk-20261022-8307900be061",
+      "installed_at": "2026-10-22T13:51:58.432120+02:00"
+    },
+    "release_cli_smoke": "passed before and after installation against a local HTTP fixture with unavailable slots, missing GPU telemetry and valid RAM; no inference"
+  },
+  "history": [
+    {
+      "date": "2026-10-21",
+      "commit": "bb96d5f",
+      "change": "Unified adaptive WerkWorker harness, recovery, project context and protocol diagnostics."
+    },
+    {
+      "date": "2026-10-21",
+      "commit": "c6f237c",
+      "change": "Harness follow-up, smaller default profiles and scoped project instructions."
+    },
+    {
+      "date": "2026-10-22",
+      "commit": "58b0f57",
+      "change": "Recovery continuation and cumulative context compaction; token counting batching."
+    },
+    {
+      "date": "2026-10-22",
+      "commit": "b16fc65",
+      "change": "Worker prevents immediate retries after uncertain inference timeout; installed Worker dated 12:31."
+    },
+    {
+      "date": "2026-10-22",
+      "commit": "11d4ac4",
+      "change": "Werk telemetry single-flight, bounded GPU probe cleanup, multi-slot cache routing and fallback graph; absent from installed 11:35 Werk."
+    }
+  ],
+  "limitations": [
+    "The previous terminal server logs were recovered from user attachments in earlier chats. No current persistent Werk server JSONL file covering the final crash was found.",
+    "Kernel/TDR evidence identifies the GPU/driver failure domain, but does not prove whether pressure, a native kernel, cache operations, or another host GPU workload triggered it.",
+    "No GPU inference or live crash replay was performed."
+  ],
+  "changes_this_task": [
+    "Use a correctly labelled worker-RSS graph when dense/full-GPU models do not expose CPU MoE expert residency.",
+    "Retain passive RAM observations when native slots are unavailable, with stale samples left as gaps.",
+    "Preserve the prior source fixes and make them available in the normal installed command; no change to model context, slots, precision or CUDA runtime."
+  ],
+  "source_references": {
+    "ram_history": "src/cli/top.rs",
+    "ram_panel": "src/cli/top/ui.rs",
+    "existing_sampling_guard": "src/api/observability.rs",
+    "existing_gpu_probe_guard": "src/runtime_control/local.rs",
+    "existing_parallel_cache_fix": "src/backend/llama_server.rs"
+  }
+}

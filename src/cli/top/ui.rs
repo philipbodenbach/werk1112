@@ -75,6 +75,15 @@ fn native(app: &App, key: &str) -> Option<f64> {
         .get(key)
         .copied()
 }
+fn resource(app: &App, key: &str) -> Option<f64> {
+    app.snapshot
+        .as_ref()?
+        .backends
+        .get(app.worker)?
+        .gauges
+        .get(key)
+        .copied()
+}
 fn llama(app: &App) -> bool {
     app.snapshot
         .as_ref()
@@ -661,7 +670,7 @@ fn memory(frame: &mut Frame, area: Rect, app: &App) {
             format!(
                 "Worker RSS {}",
                 number(
-                    native(app, "process_resident_bytes").map(|n| n / 1073741824.),
+                    resource(app, "process_resident_bytes").map(|n| n / 1073741824.),
                     "GiB"
                 )
             )
@@ -850,25 +859,43 @@ fn gpu_memory_status(app: &App) -> String {
 
 fn offload(frame: &mut Frame, area: Rect, app: &App) {
     if llama(app) {
-        let cpu = if native(app, "cpu_moe_all") == Some(1.) {
+        let cpu = if resource(app, "cpu_moe_all") == Some(1.) {
             "all".into()
         } else {
-            native(app, "cpu_moe_layers")
+            resource(app, "cpu_moe_layers")
                 .map(|n| format!("{n:.0}"))
                 .unwrap_or_else(|| "default".into())
         };
-        let gpu = native(app, "gpu_layers_requested")
+        let gpu = resource(app, "gpu_layers_requested")
             .map(|n| format!("{n:.0}"))
             .unwrap_or_else(|| "default".into());
-        let block = live_panel("CPU / RAM OFFLOAD", PINK, app);
+        let resident = resource(app, "cpu_expert_resident_bytes");
+        let weights = resource(app, "cpu_expert_weight_bytes");
+        let title = if resident.is_some() && weights.is_some() {
+            "CPU EXPERT RAM"
+        } else {
+            "RAM / GPU MEMORY"
+        };
+        let block = live_panel(title, PINK, app);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let resident = native(app, "cpu_expert_resident_bytes");
-        let weights = native(app, "cpu_expert_weight_bytes");
         if resident.is_none() || weights.is_none() {
+            let (label, history, detail) = if resource(app, "process_resident_bytes").is_some() {
+                (
+                    "Worker RAM (RSS, GiB)",
+                    &app.worker_ram_history,
+                    "Process RAM; CPU offload not measured",
+                )
+            } else {
+                (
+                    "GPU memory used (GiB)",
+                    &app.gpu_memory_history,
+                    "CPU expert residency not reported",
+                )
+            };
             let plot_height = inner.height.saturating_sub(5);
             frame.render_widget(
-                Paragraph::new("GPU memory used (GiB)").style(Style::default().fg(PINK)),
+                Paragraph::new(label).style(Style::default().fg(PINK)),
                 Rect { height: 1, ..inner },
             );
             graph(
@@ -878,13 +905,13 @@ fn offload(frame: &mut Frame, area: Rect, app: &App) {
                     height: plot_height,
                     ..inner
                 },
-                &app.gpu_memory_history,
+                history,
                 PINK,
             );
             if inner.height > 1 {
                 frame.render_widget(
                     Paragraph::new(format!(
-                        "CPU expert residency not reported\n{}\nGPU layers requested {gpu}",
+                        "{detail}\n{}\nGPU layers requested {gpu}",
                         gpu_memory_status(app)
                     )),
                     Rect {
@@ -1404,8 +1431,9 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("GPU memory used (GiB)"));
-        assert!(text.contains("CPU expert residency not reported"));
+        assert!(text.contains("RAM / GPU MEMORY"));
+        assert!(text.contains("Worker RAM (RSS, GiB)"));
+        assert!(text.contains("Process RAM; CPU offload not measured"));
         assert!(!text.contains("CPU experts in RAM n/a"));
         let mut stale = with_experts.clone();
         stale.observed_at_ms += 10_000;
@@ -1440,6 +1468,75 @@ mod tests {
         app.tick = 16;
         terminal.draw(|f| draw(f, &app)).unwrap();
         assert_eq!(&still, terminal.backend().buffer());
+    }
+
+    #[test]
+    fn observability_dense_worker_ram_graph_survives_missing_gpu_and_busy_slots() {
+        let args = super::super::TopArgs {
+            url: "http://localhost:11434".into(),
+            api_key: None,
+            interval_ms: 2000,
+            once: false,
+            json: false,
+            no_animation: true,
+            demo: false,
+        };
+        for available in [true, false] {
+            let mut app = App::new(&args);
+            for n in 1..=3 {
+                let mut snapshot = super::super::demo(n as f64);
+                let worker = &mut snapshot.backends[0];
+                worker.backend = "llama.cpp / CUDA".into();
+                worker.available = available;
+                worker.gauges.clear();
+                worker
+                    .gauges
+                    .insert("process_resident_bytes".into(), n as f64 * 1073741824.);
+                worker.gauges.insert("gpu_layers_requested".into(), 999.);
+                // GPU telemetry can be missing while passive process RAM is valid.
+                snapshot.memory = None;
+                app.update(snapshot);
+            }
+            assert_eq!(
+                app.worker_ram_history,
+                VecDeque::from([Some(1.), Some(2.), Some(3.)])
+            );
+            assert!(app.expert_ram_history.iter().all(Option::is_none));
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal.draw(|f| offload(f, f.area(), &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = buffer
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("RAM / GPU MEMORY"));
+            assert!(text.contains("Worker RAM (RSS, GiB)"));
+            assert!(text.contains("Process RAM; CPU offload not measured"));
+            assert!(text.contains("GPU layers requested 999"));
+            assert!(!text.contains("CPU experts in RAM"));
+            assert!(!text.contains("GPU memory 0.0"));
+            // Inspect the actual plot, excluding titles and numeric labels.
+            for x in 76..=78 {
+                assert!((2..=6).any(|y| matches!(
+                    buffer[(x, y)].symbol(),
+                    "▁" | "▂" | "▃" | "▄" | "▅" | "▆" | "▇" | "█"
+                )));
+            }
+            let mut stale = app.snapshot.clone().unwrap();
+            stale.observed_at_ms += 10_000;
+            app.update(stale);
+            assert_eq!(app.worker_ram_history.back(), Some(&None));
+            terminal.draw(|f| offload(f, f.area(), &app)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("STALE"));
+        }
     }
 
     #[test]
