@@ -192,6 +192,7 @@ It sends no launch setting to remote vLLM.
 | GET | `/werk/v1/memory` | none | Memory telemetry and accounting |
 | GET | `/werk/v1/observability` | none | Server-wide chat, worker and memory observations |
 | POST | `/werk/v1/chat/count_tokens` | OpenAI chat request | Exact native input token count |
+| GET | `/werk/v1/chat/reasoning` | `model`, `max_output_tokens` query | Model/runtime tiers, default and effective limits |
 | GET | `/werk/v1/states` | query filters | One page of runtime states |
 | POST | `/werk/v1/states/{id}/actions` | State action | Updated/projected state |
 | POST | `/werk/v1/states/prune` | Explicit selector | Match/removal summary |
@@ -640,3 +641,68 @@ The [runtime CLI](cli.md#runtime-control) is a thin pretty-JSON interface over
 this client. ComfyUI uses its own strict Python validator and keeps handoffs in
 an opaque socket; see the
 [custom-node guide](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/README.md#runtime-persistence-experts-and-split-prefilldecode).
+
+### Model-specific reasoning tiers
+
+Capability `api.chat.reasoning` (`profile`, `tiers`) advertises
+`GET /werk/v1/chat/reasoning?model=MODEL&max_output_tokens=4096`. The response uses
+the standard authenticated protocol envelope, `no-store`, and version headers.
+The output limit defaults to 256, matching chat requests. Querying does not load
+models, probe GPU capabilities, count tokens, or generate text. Only verified
+configuration of running workers is reported. Unknown/cold runtimes return
+`supported:false`, an empty `tiers` list, and `default_tier:null`. Deployment
+aliases require agreeing profiles across replicas; otherwise select an ID.
+
+Example `data` for thinking enabled, a 2048-token launch budget and 2048 output:
+
+```json
+{
+  "schema_version": 1,
+  "model": "my-model",
+  "backend": "llama.cpp",
+  "supported": true,
+  "source": "worker_launch_configuration",
+  "default_tier": "medium",
+  "default_adjusted_to_limits": true,
+  "limits": {
+    "context_tokens": 32768,
+    "output_tokens": 2048,
+    "answer_reserve_tokens": 512,
+    "reasoning_tokens": 1536
+  },
+  "tiers": [
+    {"id":"none","label":"Off","available":true,"reasoning_tokens":0,"minimum_output_tokens":1},
+    {"id":"low","label":"Low","available":true,"reasoning_tokens":512,"minimum_output_tokens":1024},
+    {"id":"medium","label":"Medium","available":true,"reasoning_tokens":1024,"minimum_output_tokens":1536},
+    {"id":"high","label":"High","available":false,"reasoning_tokens":2048,"minimum_output_tokens":2560},
+    {"id":"max","label":"Max","available":false,"reasoning_tokens":4096,"minimum_output_tokens":4608},
+    {"id":"ultra","label":"Ultra","available":false,"reasoning_tokens":8192,"minimum_output_tokens":8704}
+  ]
+}
+```
+
+Clients send `"werk":{"reasoning":{"tier":"medium"}}` in both chat and
+`/werk/v1/chat/count_tokens` requests. `"default"` resolves the current server
+default on every request; clients must not freeze the reported default as an
+explicit tier. An unsupported runtime preserves its native default for this
+sentinel; explicit IDs require a verified profile. Unknown IDs, unavailable tiers
+and combinations with native `reasoning_effort` or `werk.omlx` thinking/effort
+controls fail before generation. OpenAI chat errors use `invalid_reasoning_tier`.
+
+For llama.cpp with verified budget control, these are Werk-owned budget tiers,
+not a claim that every template supports native effort strings with these names.
+The resolver uses the smaller of the launch budget (nonnegative values) and the
+output limit minus a 512-token answer reserve. It conservatively limits output
+to context minus 512 tokens; ordinary prompt/context admission still applies.
+A named launch effort matching a tier is retained or reduced to fit. Otherwise
+the enabled default is the highest available tier; a disabled launch default
+remains `none`. A tier is a ceiling, not a guarantee that all tokens are used or
+that the final answer fits. Unlimited launch budgets remain bounded by output.
+Werk forwards the resolved budget and thinking switch to llama.cpp.
+
+Native effort backends use their verified vocabulary, narrowed by model
+`parameter_constraints.reasoning_effort.enum` when present. They report
+`reasoning_tokens:null` and no guaranteed answer reserve; the total output cap
+still applies. Explicit native `reasoning_effort` remains a separate legacy API
+and bypasses managed tier resolution. Clients must consume the reported list
+rather than hardcode a universal vocabulary or numeric mapping.

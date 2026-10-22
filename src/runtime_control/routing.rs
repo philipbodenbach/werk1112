@@ -547,6 +547,12 @@ impl Drop for StateRouteReservation<'_> {
 }
 
 impl GenerationBackend for RuntimeRoutedGenerationBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        self.backend.reasoning_config(manifest)
+    }
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         self.backend.telemetry()
     }
@@ -1946,6 +1952,7 @@ mod tests {
             "default-instance"
         );
         let controls = crate::openai::ChatRuntimeOptions {
+            reasoning: None,
             documents: None,
             omlx: Some(crate::openai::OmlxChatOptions {
                 reasoning_effort: None,

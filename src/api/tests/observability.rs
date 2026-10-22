@@ -6,6 +6,12 @@ impl GenerationBackend for ObservedBackend {
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         self.0.fetch_add(1, Ordering::Relaxed);
         vec![crate::observability::BackendSnapshot {
+            reasoning_defaults: Some(crate::observability::ReasoningDefaults {
+                source: "worker_launch_configuration".into(),
+                effort: Some(serde_json::json!("low")),
+                thinking: Some(true),
+                budget_tokens: Some(2048),
+            }),
             backend: "mock".into(),
             instance: "worker-1".into(),
             model: "mock".into(),
@@ -152,7 +158,11 @@ fn get(path: &str, auth: bool) -> Request<Body> {
 #[tokio::test]
 async fn observability_auth_and_shared_sampling_cache() {
     let (app, calls) = app();
-    for path in ["/metrics", "/werk/v1/observability"] {
+    for path in [
+        "/metrics",
+        "/werk/v1/observability",
+        "/werk/v1/chat/reasoning?model=mock&max_output_tokens=2048",
+    ] {
         assert_eq!(
             app.clone()
                 .oneshot(get(path, false))
@@ -172,6 +182,10 @@ async fn observability_auth_and_shared_sampling_cache() {
     let data = response_json(response).await;
     assert_eq!(data["data"]["schema_version"], 1);
     assert_eq!(data["data"]["backends"][0]["backend"], "mock");
+    assert_eq!(
+        data["data"]["backends"][0]["reasoning_defaults"]["budget_tokens"],
+        2048
+    );
     let response = app.oneshot(get("/metrics", true)).await.unwrap();
     assert!(
         response.headers()[header::CONTENT_TYPE]

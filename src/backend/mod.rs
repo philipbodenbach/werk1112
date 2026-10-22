@@ -1458,6 +1458,13 @@ impl std::fmt::Display for UnsupportedTokenCounting {
 impl std::error::Error for UnsupportedTokenCounting {}
 
 pub trait GenerationBackend: Send + Sync {
+    /// Read captured configuration only; no model loading, runtime probing or I/O.
+    fn reasoning_config(
+        &self,
+        _manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        None
+    }
     /// Read only: sample already-running workers; never load or prepare models.
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         Vec::new()

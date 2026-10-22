@@ -1,6 +1,6 @@
 //! Content-free snapshots of already running llama.cpp workers.
 use super::LlamaServerBackend;
-use crate::observability::BackendSnapshot;
+use crate::observability::{BackendSnapshot, ReasoningDefaults};
 use serde_json::Value;
 use std::{io::Read, time::Duration};
 
@@ -26,6 +26,7 @@ pub(super) fn sample(backend: &LlamaServerBackend) -> Vec<BackendSnapshot> {
             if !server.is_running() {
                 return sample;
             }
+            sample.reasoning_defaults = server.reasoning_defaults.clone();
             let pid = sysinfo::Pid::from_u32(server.pid);
             let mut system = sysinfo::System::new();
             system.refresh_processes_specifics(
@@ -50,6 +51,78 @@ pub(super) fn sample(backend: &LlamaServerBackend) -> Vec<BackendSnapshot> {
             sample
         })
         .collect()
+}
+
+/// Capture the native launch configuration once. No subprocess, GPU probe or
+/// additional HTTP request is needed. Environment defaults precede CLI options.
+pub(super) fn reasoning_defaults(
+    args: &[String],
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<ReasoningDefaults> {
+    let mut defaults = ReasoningDefaults {
+        source: "worker_launch_configuration".into(),
+        ..Default::default()
+    };
+    for (variable, option) in [
+        ("LLAMA_ARG_CHAT_TEMPLATE_KWARGS", "--chat-template-kwargs"),
+        ("LLAMA_ARG_REASONING", "--reasoning"),
+        ("LLAMA_ARG_REASONING_EFFORT", "--reasoning-effort"),
+        ("LLAMA_ARG_THINK_BUDGET", "--reasoning-budget"),
+    ] {
+        if let Some(value) = env(variable) {
+            apply_reasoning_option(&mut defaults, option, &value);
+        }
+    }
+    for (index, arg) in args.iter().enumerate() {
+        if let Some((key, value)) = arg.split_once('=') {
+            apply_reasoning_option(&mut defaults, key, value);
+        } else if let Some(value) = args.get(index + 1) {
+            apply_reasoning_option(&mut defaults, arg, value);
+        }
+    }
+    (defaults.effort.is_some() || defaults.thinking.is_some() || defaults.budget_tokens.is_some())
+        .then_some(defaults)
+}
+
+fn apply_reasoning_option(defaults: &mut ReasoningDefaults, key: &str, value: &str) {
+    match key {
+        "--reasoning" | "-rea" => {
+            defaults.thinking = match value {
+                "on" | "true" | "1" => Some(true),
+                "off" | "false" | "0" => Some(false),
+                _ => None,
+            };
+        }
+        "--reasoning-effort" => {
+            defaults.effort = (value != "default"
+                && !value.is_empty()
+                && value.len() <= 256
+                && !value.chars().any(char::is_control))
+            .then(|| value.into());
+        }
+        "--reasoning-budget" => {
+            defaults.budget_tokens = value
+                .parse::<i32>()
+                .ok()
+                .filter(|n| *n >= -1)
+                .map(i64::from);
+        }
+        "--chat-template-kwargs" if value.len() <= 65536 => {
+            if let Ok(Value::Object(kwargs)) = serde_json::from_str::<Value>(value) {
+                if let Some(value) = kwargs.get("enable_thinking") {
+                    defaults.thinking = value.as_bool();
+                }
+                if let Some(value) = kwargs.get("reasoning_effort") {
+                    defaults.effort = (value.is_number()
+                        || value.as_str().is_some_and(|s| {
+                            !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)
+                        }))
+                    .then(|| value.clone());
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn fetch_slots(client: &reqwest::blocking::Client, url: &str) -> Option<Value> {
@@ -170,6 +243,51 @@ fn parse_slots(sample: &mut BackendSnapshot, value: &Value) -> bool {
 #[cfg(test)]
 mod observability_tests {
     use super::*;
+    #[test]
+    fn observability_reasoning_defaults_use_launch_precedence_and_exclude_other_settings() {
+        let args = super::super::split_args(
+            r#"--reasoning-budget 2048 --reasoning-effort=low --reasoning off --chat-template-kwargs '{"reasoning_effort":"high","enable_thinking":true,"private":"do-not-expose"}'"#,
+        );
+        let defaults = reasoning_defaults(&args, |name| match name {
+            "LLAMA_ARG_THINK_BUDGET" => Some("99".into()),
+            "LLAMA_ARG_REASONING_EFFORT" => Some("medium".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(defaults.budget_tokens, Some(2048));
+        assert_eq!(defaults.effort, Some(serde_json::json!("high")));
+        assert_eq!(defaults.thinking, Some(true));
+        assert!(
+            !serde_json::to_string(&defaults)
+                .unwrap()
+                .contains("do-not-expose")
+        );
+        assert_eq!(defaults.source, "worker_launch_configuration");
+        assert!(reasoning_defaults(&[], |_| None).is_none());
+        assert!(
+            reasoning_defaults(
+                &super::super::split_args("--reasoning-effort high --reasoning-effort default"),
+                |_| None
+            )
+            .is_none()
+        );
+        let numeric = reasoning_defaults(
+            &super::super::split_args(
+                r#"--chat-template-kwargs '{"reasoning_effort":0.75}' --reasoning-budget=-1"#,
+            ),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(numeric.effort, Some(serde_json::json!(0.75)));
+        assert_eq!(numeric.budget_tokens, Some(-1));
+        assert!(numeric.thinking.is_none());
+        let from_env = reasoning_defaults(&[], |name| {
+            (name == "LLAMA_ARG_REASONING").then(|| "off".into())
+        })
+        .unwrap();
+        assert_eq!(from_env.thinking, Some(false));
+        assert!(from_env.effort.is_none());
+    }
     #[test]
     fn observability_enables_slots_without_persistence() {
         for persistence in [None, Some(std::path::Path::new("/tmp/state"))] {

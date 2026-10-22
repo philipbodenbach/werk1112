@@ -30,6 +30,7 @@ pub(super) fn routes() -> Router<ApiState> {
     let reads = Router::new()
         .route("/werk/v1/info", get(info_handler))
         .route("/werk/v1/capabilities", get(capabilities_handler))
+        .route("/werk/v1/chat/reasoning", get(reasoning_handler))
         .route("/werk/v1/memory", get(memory_handler))
         .route("/werk/v1/states", get(list_states_handler))
         .route("/werk/v1/experts", get(list_experts_handler));
@@ -47,6 +48,103 @@ pub(super) fn routes() -> Router<ApiState> {
         .layer(DefaultBodyLimit::max(MAX_WERK_BODY_BYTES));
 
     reads.merge(writes)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReasoningQuery {
+    model: Option<String>,
+    max_output_tokens: Option<usize>,
+}
+
+async fn reasoning_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    query: Result<Query<ReasoningQuery>, QueryRejection>,
+) -> Response {
+    let (request_id, _) = match request_context(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return protocol_error(
+                request_id,
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+            );
+        }
+    };
+    let model = query
+        .model
+        .or_else(|| state.default_model.clone())
+        .unwrap_or_default();
+    let output = query.max_output_tokens.unwrap_or(256);
+    if model.is_empty() || model.len() > 512 || output == 0 || output > 2_000_000 {
+        return protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "model and max_output_tokens (1..2000000) are required",
+            ),
+        );
+    }
+    // Expand aliases read-only: do not take inference permits or move routing cursors.
+    let targets = if let Some(registry) = &state.deployments {
+        match registry.preload_targets(&model) {
+            Ok(targets) => targets,
+            Err(error) => {
+                return protocol_error(
+                    request_id,
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+                );
+            }
+        }
+    } else {
+        vec![(model.clone(), state, model.clone())]
+    };
+    let result = crate::logging::spawn_blocking(
+        move || -> anyhow::Result<crate::reasoning::ReasoningProfile> {
+            let mut profiles = Vec::new();
+            for (_, state, physical_model) in targets {
+                let manifest = state.store.get(&physical_model)?;
+                let mut profile = crate::reasoning::profile(
+                    &manifest,
+                    state.backend.reasoning_config(&manifest).as_ref(),
+                    super::generation::effective_chat_context_size(
+                        state.chat_context_size,
+                        &manifest,
+                    ),
+                    output,
+                );
+                profile.model = model.clone();
+                profiles.push(profile);
+            }
+            let first = profiles
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("No matching deployment"))?;
+            anyhow::ensure!(
+                profiles.iter().all(|p| p == first),
+                "Deployment replicas report different reasoning profiles; select a deployment ID"
+            );
+            Ok(profiles.remove(0))
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(profile)) => success(request_id, profile),
+        Ok(Err(error)) => protocol_error(
+            request_id,
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+        ),
+        Err(_) => protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "Reasoning profile lookup failed",
+            ),
+        ),
+    }
 }
 
 async fn chat_count_tokens_handler(

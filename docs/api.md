@@ -1397,3 +1397,15 @@ vendor/task schemas; existing OpenAI-compatible routes retain their contracts.
 
 Registered Mistral Large 4 uses `/v1/chat/completions`, including tools, structured
 output and SSE. Vendor keys remain on the server. See [examples and limitations](model-support-matrix.md).
+
+### Managed reasoning tiers
+
+Use `GET /werk/v1/chat/reasoning?model=MODEL&max_output_tokens=4096` to read the
+running model's tiers, effective default and limits. Send
+`"werk":{"reasoning":{"tier":"default"}}` (or an available tier ID) in chat
+requests. Werk1112 resolves the tier for the actual output limit; the same
+resolution is used by `/werk/v1/chat/count_tokens`. Unknown runtimes preserve
+the native default and do not advertise fabricated choices. Explicit native
+`reasoning_effort` cannot be combined with this control. See the
+[reasoning protocol contract](reference/werk-protocol-v1.md#model-specific-reasoning-tiers)
+for budget mappings, availability and backward compatibility.

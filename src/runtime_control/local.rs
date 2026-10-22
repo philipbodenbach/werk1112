@@ -414,6 +414,11 @@ fn capabilities_for_descriptor(
             operations: vec!["count_tokens".into()],
         },
     );
+    capabilities.insert("api.chat.reasoning".into(), Capability {
+        id: "api.chat.reasoning".into(), status: CapabilityStatus::Supported,
+        detail: "GET /werk/v1/chat/reasoning?model=...&max_output_tokens=... reports model/runtime tiers, effective default and limits without loading a model. Send werk.reasoning.tier in chat/count requests; Werk resolves native controls within the request limits.".into(),
+        operations: vec!["profile".into(), "tiers".into()],
+    });
     let memory = memory_status_for(inner);
     capabilities.insert(
         "runtime.memory.telemetry.host".to_string(),

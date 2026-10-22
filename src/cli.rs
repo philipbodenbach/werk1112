@@ -9554,6 +9554,28 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        let mut configs: Vec<_> = backends
+            .iter()
+            .filter_map(|b| b.reasoning_config(manifest))
+            .collect();
+        let omlx = self
+            .omlx_backends
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        configs.extend(omlx.iter().filter_map(|b| b.reasoning_config(manifest)));
+        crate::reasoning::consistent(configs)
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         let backends: Vec<_> = self
             .backends
@@ -9853,6 +9875,28 @@ impl GgufPreferredBackend {
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        let mut configs: Vec<_> = backends
+            .iter()
+            .filter_map(|b| b.reasoning_config(manifest))
+            .collect();
+        let omlx = self
+            .omlx_backends
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        configs.extend(omlx.iter().filter_map(|b| b.reasoning_config(manifest)));
+        crate::reasoning::consistent(configs)
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         let backends: Vec<_> = self
             .backends
@@ -10082,6 +10126,20 @@ impl MlxPreferredBackend {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        crate::reasoning::consistent(
+            [
+                self.text_backend.reasoning_config(manifest),
+                self.vision_backend.reasoning_config(manifest),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         let mut samples = self.text_backend.telemetry();
         samples.extend(self.vision_backend.telemetry());
@@ -10306,6 +10364,22 @@ impl VllmPreferredBackend {
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        let configs: Vec<_> = backends
+            .iter()
+            .filter_map(|b| b.reasoning_config(manifest))
+            .collect();
+        crate::reasoning::consistent(configs)
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         let backends: Vec<_> = self
             .backends
@@ -15483,6 +15557,7 @@ mod tests {
         let store = test_store("omlx-node-explicit-backend");
         let model = test_manifest(ModelFormat::Mlx, Some("deepseek_v4"));
         let controls = crate::openai::ChatRuntimeOptions {
+            reasoning: None,
             documents: None,
             omlx: Some(crate::openai::OmlxChatOptions {
                 reasoning_effort: None,
@@ -15526,6 +15601,7 @@ mod tests {
             SelectionOptions::default(),
         );
         let controls = crate::openai::ChatRuntimeOptions {
+            reasoning: None,
             documents: None,
             omlx: Some(crate::openai::OmlxChatOptions {
                 reasoning_effort: None,

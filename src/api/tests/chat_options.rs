@@ -185,6 +185,7 @@ async fn omlx_chat_options_are_request_scoped_on_json_and_streaming_paths() {
         assert_eq!(
             selected,
             &Some(ChatRuntimeOptions {
+                reasoning: None,
                 documents: None,
                 omlx: Some(OmlxChatOptions {
                     reasoning_effort: Some(crate::openai::OmlxReasoningEffort::Low),

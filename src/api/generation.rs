@@ -201,6 +201,50 @@ pub(super) async fn prepare(
         ));
     }
     let max_tokens = request.max_completion_tokens();
+    if let Some(reasoning) = request
+        .werk
+        .as_ref()
+        .and_then(|options| options.reasoning.as_ref())
+    {
+        if request.extra.contains_key("reasoning_effort") {
+            return Err(GenerationError::with_code(
+                StatusCode::BAD_REQUEST,
+                "werk.reasoning cannot be combined with native reasoning_effort".into(),
+                Some("werk.reasoning".into()),
+                Some("invalid_reasoning_tier".into()),
+            ));
+        }
+        let profile = crate::reasoning::profile(
+            &manifest,
+            state.backend.reasoning_config(&manifest).as_ref(),
+            effective_chat_context_size(state.chat_context_size, &manifest),
+            max_tokens,
+        );
+        // Unknown runtimes retain their native default. Explicit tiers require
+        // verified controls; neither discovery nor default resolution loads a model.
+        if profile.supported || reasoning.tier != "default" {
+            let options = profile.resolve(&reasoning.tier).map_err(|error| {
+                GenerationError::with_code(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "{error}; available tiers: {}; output limit: {}; reasoning limit: {:?}",
+                        profile
+                            .tiers
+                            .iter()
+                            .filter(|t| t.available)
+                            .map(|t| t.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        profile.limits.output_tokens,
+                        profile.limits.reasoning_tokens
+                    ),
+                    Some("werk.reasoning.tier".into()),
+                    Some("invalid_reasoning_tier".into()),
+                )
+            })?;
+            request.extra.extend(options);
+        }
+    }
     let context_size =
         effective_chat_context_size(state.chat_context_size, &manifest).or_else(|| {
             if matches!(context_policy, ContextPolicy::Reject) {
@@ -652,7 +696,10 @@ fn tool_calling_parameter(request: &ChatCompletionRequest) -> &'static str {
     }
 }
 
-fn effective_chat_context_size(configured: usize, manifest: &ModelManifest) -> Option<usize> {
+pub(super) fn effective_chat_context_size(
+    configured: usize,
+    manifest: &ModelManifest,
+) -> Option<usize> {
     if manifest.format != crate::model_store::ModelFormat::Gguf {
         return None;
     }

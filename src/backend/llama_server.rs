@@ -65,6 +65,8 @@ const API_OPTIONS: &[&str] = &[
     "top_logprobs",
     "top_k",
     "reasoning_effort",
+    "reasoning_budget_tokens",
+    "__werk_thinking",
 ];
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -99,6 +101,8 @@ struct LlamaServerProcess {
     executable: PathBuf,
     discovery_source: String,
     args: Vec<String>,
+    reasoning_defaults: Option<crate::observability::ReasoningDefaults>,
+    reasoning_budget_supported: bool,
     execution: fp4::Execution,
     model_path: PathBuf,
     projector_path: Option<PathBuf>,
@@ -480,6 +484,26 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        crate::reasoning::consistent(
+            self.servers
+                .snapshot()
+                .into_iter()
+                .filter(|server| server.model_id == manifest.id && server.is_running())
+                .filter_map(|server| {
+                    let defaults = server.reasoning_defaults.clone()?;
+                    Some(crate::reasoning::BackendReasoning {
+                        backend: "llama.cpp".into(),
+                        defaults,
+                        budget_control: server.reasoning_budget_supported,
+                        native_efforts: vec![],
+                    })
+                }),
+        )
+    }
     fn preload(
         &self,
         manifest: &ModelManifest,
@@ -503,6 +527,15 @@ impl GenerationBackend for LlamaServerBackend {
         options: &std::collections::BTreeMap<String, Value>,
     ) -> Result<()> {
         super::openai_transport::validate_api_options(options, API_OPTIONS)?;
+        if let Some(budget) = options.get("reasoning_budget_tokens") {
+            anyhow::ensure!(
+                budget.as_u64().is_some_and(|n| n <= i32::MAX as u64),
+                "Invalid resolved reasoning budget"
+            );
+        }
+        if let Some(thinking) = options.get("__werk_thinking") {
+            anyhow::ensure!(thinking.is_boolean(), "Invalid resolved thinking control");
+        }
         if let Some(effort) = options.get("reasoning_effort")
             && !effort.is_string()
         {
@@ -941,6 +974,8 @@ impl LlamaServerProcess {
             expert_memory: expert_memory::State::new(model_path, &args, &supported),
             executable,
             discovery_source: discovery.source,
+            reasoning_defaults: telemetry::reasoning_defaults(&args, |name| env::var(name).ok()),
+            reasoning_budget_supported: supported.reasoning_budget,
             args,
             execution,
             model_path: model_path.to_path_buf(),
@@ -1656,11 +1691,16 @@ fn chat_template_body(request: &GenerateRequest) -> Value {
 
 fn apply_chat_api_options(
     body: &mut Value,
-    options: std::collections::BTreeMap<String, Value>,
+    mut options: std::collections::BTreeMap<String, Value>,
 ) -> Result<()> {
-    let thinking = options
-        .get("reasoning_effort")
-        .and_then(super::openai_transport::reasoning_effort_thinking);
+    let tier_thinking = options
+        .remove("__werk_thinking")
+        .and_then(|value| value.as_bool());
+    let thinking = tier_thinking.or_else(|| {
+        options
+            .get("reasoning_effort")
+            .and_then(super::openai_transport::reasoning_effort_thinking)
+    });
     super::openai_transport::apply_api_options(body, options, API_OPTIONS)?;
     if let Some(enabled) = thinking {
         // Standard effort levels override the server's thinking default.
@@ -2235,6 +2275,7 @@ struct SupportedArgs {
     no_warmup: bool,
     warmup: bool,
     reasoning: bool,
+    reasoning_budget: bool,
     chat_template_kwargs: bool,
     jinja: bool,
     mmproj: bool,
@@ -2274,6 +2315,7 @@ fn supported_args_from_help(text: &str) -> SupportedArgs {
         no_warmup: help_has_exact_option(&text, "--no-warmup"),
         warmup: help_has_exact_option(&text, "--warmup"),
         reasoning: text.contains("--reasoning ") || text.contains("-rea,"),
+        reasoning_budget: help_has_exact_option(text, "--reasoning-budget"),
         chat_template_kwargs: text.contains("--chat-template-kwargs"),
         jinja: help_has_exact_option(text, "--jinja"),
         mmproj: text.split_whitespace().any(|argument| {
@@ -3892,6 +3934,25 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
+    #[test]
+    fn reasoning_tier_native_payload_preserves_other_template_options() {
+        let mut body = json!({"chat_template_kwargs":{"custom":true}});
+        apply_chat_api_options(
+            &mut body,
+            std::collections::BTreeMap::from([
+                ("reasoning_budget_tokens".into(), json!(1024)),
+                ("__werk_thinking".into(), json!(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(body["reasoning_budget_tokens"], 1024);
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"custom":true,"enable_thinking":true})
+        );
+        assert!(body.get("__werk_thinking").is_none());
+    }
+
     #[test]
     fn vision_install_reuses_valid_server_and_selects_only_published_generations() {
         use std::os::unix::fs::PermissionsExt;
