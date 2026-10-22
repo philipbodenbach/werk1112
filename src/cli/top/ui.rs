@@ -824,6 +824,26 @@ fn cache(frame: &mut Frame, area: Rect, app: &App) {
         );
     }
 }
+fn gpu_memory_status(app: &App) -> String {
+    let accelerator = app
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.memory.as_ref())
+        .map(|m| &m.accelerator);
+    let capacity = accelerator.and_then(|m| m.capacity_bytes);
+    let used = capacity
+        .zip(accelerator.and_then(|m| m.available_bytes))
+        .map(|(c, a)| c.saturating_sub(a));
+    let pressure = accelerator
+        .map(|m| format!("{:?}", m.pressure).to_uppercase())
+        .unwrap_or_else(|| "N/A".into());
+    format!(
+        "GPU memory {} / {}\nGPU pressure {pressure}",
+        number(used.map(|n| n as f64 / 1073741824.), "GiB"),
+        number(capacity.map(|n| n as f64 / 1073741824.), "GiB")
+    )
+}
+
 fn offload(frame: &mut Frame, area: Rect, app: &App) {
     if llama(app) {
         let cpu = if native(app, "cpu_moe_all") == Some(1.) {
@@ -836,15 +856,6 @@ fn offload(frame: &mut Frame, area: Rect, app: &App) {
         let gpu = native(app, "gpu_layers_requested")
             .map(|n| format!("{n:.0}"))
             .unwrap_or_else(|| "default".into());
-        let accelerator = app
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.memory.as_ref())
-            .map(|m| &m.accelerator);
-        let capacity = accelerator.and_then(|m| m.capacity_bytes);
-        let used = capacity
-            .zip(accelerator.and_then(|m| m.available_bytes))
-            .map(|(c, a)| c.saturating_sub(a));
         let block = live_panel("CPU / RAM OFFLOAD", PINK, app);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -876,21 +887,47 @@ fn offload(frame: &mut Frame, area: Rect, app: &App) {
             &app.expert_ram_history,
             PINK,
         );
-        let pressure = accelerator
-            .map(|m| format!("{:?}", m.pressure).to_uppercase())
-            .unwrap_or_else(|| "N/A".into());
         if inner.height > 1 {
-            frame.render_widget(Paragraph::new(format!(
-                "CPU expert layers {cpu} · mmap RAM\nGPU memory {} / {}\nGPU pressure {pressure}\nGPU layers requested {gpu}",
-                number(used.map(|n| n as f64 / 1073741824.), "GiB"),
-                number(capacity.map(|n| n as f64 / 1073741824.), "GiB"))),
-                Rect { y: inner.y + 1 + plot_height, height: inner.height - 1 - plot_height, ..inner });
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "CPU expert layers {cpu} · mmap RAM\n{}\nGPU layers requested {gpu}",
+                    gpu_memory_status(app)
+                )),
+                Rect {
+                    y: inner.y + 1 + plot_height,
+                    height: inner.height - 1 - plot_height,
+                    ..inner
+                },
+            );
         }
         return;
     }
     let block = live_panel("OFFLOAD", PINK, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // Expert reads are an optional native metric, not a GPU-offload indicator.
+    // In particular, an absent worker must not look like an idle oMLX worker.
+    let expert_reads_reported = app
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.backends.get(app.worker))
+        .filter(|b| b.available)
+        .is_some_and(|b| {
+            b.counters.contains_key("expert_read_bytes_total")
+                || b.gauges.contains_key("expert_read_bytes_per_second")
+        });
+    if !expert_reads_reported {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Offload telemetry unavailable\n{}\nMissing metrics do not mean offload is disabled.",
+                gpu_memory_status(app)
+            ))
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .style(Style::default().fg(PINK)),
+            inner,
+        );
+        return;
+    }
     frame.render_widget(
         Paragraph::new(format!(
             "Expert reads {}",
@@ -1332,6 +1369,88 @@ mod tests {
         app.tick = 16;
         terminal.draw(|f| draw(f, &app)).unwrap();
         assert_eq!(&still, terminal.backend().buffer());
+    }
+
+    #[test]
+    fn observability_missing_offload_metrics_keep_gpu_pressure_visible() {
+        use crate::werk_protocol::{MemoryStatusResponse, MemoryTierStatus, PressureLevel};
+        let args = super::super::TopArgs {
+            url: "http://localhost:11434".into(),
+            api_key: None,
+            interval_ms: 2000,
+            once: false,
+            json: false,
+            no_animation: true,
+            demo: false,
+        };
+        // Missing workers, unsupported metrics and failed samples all used to
+        // show the misleading "Expert reads n/a" panel from the incident.
+        for case in 0..3 {
+            let mut app = App::new(&args);
+            let mut snapshot = super::super::demo(1.);
+            match case {
+                0 => snapshot.backends.clear(),
+                1 => {
+                    // Other panels can remain populated while just this
+                    // optional counter is missing (as reported by the user).
+                    snapshot.backends[0]
+                        .counters
+                        .remove("expert_read_bytes_total");
+                    snapshot.backends[0]
+                        .gauges
+                        .insert("decode_tokens_per_second_estimate".into(), 37.);
+                }
+                _ => snapshot.backends[0].available = false,
+            }
+            let tier = MemoryTierStatus {
+                capacity_bytes: Some(24 * 1073741824),
+                available_bytes: Some(1073741824),
+                managed_bytes: 0,
+                reserved_bytes: 0,
+                pressure: PressureLevel::Emergency,
+            };
+            snapshot.memory = Some(MemoryStatusResponse {
+                observed_at_unix_ms: 0,
+                overall_pressure: PressureLevel::Emergency,
+                topology: "discrete".into(),
+                host: tier.clone(),
+                accelerator: tier,
+                last_action_unix_ms: None,
+                counters: Default::default(),
+            });
+            app.update(snapshot);
+            if case == 1 {
+                assert_eq!(app.rates.decode_estimate, Some(37.));
+                assert!(native(&app, "expert_cache_resident_bytes").is_some());
+                assert!(app.rates.read_bytes_per_second.is_none());
+            }
+            let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+            terminal.draw(|f| offload(f, f.area(), &app)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("Offload telemetry unavailable"));
+            assert!(text.contains("GPU memory 23.0 GiB / 24.0 GiB"));
+            assert!(text.contains("GPU pressure EMERGENCY"));
+            assert!(!text.contains("Expert reads"));
+            assert!(!text.contains("Logical reads"));
+
+            app.snapshot.as_mut().unwrap().memory = None;
+            terminal.draw(|f| offload(f, f.area(), &app)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("GPU memory n/a / n/a"));
+            assert!(!text.contains("0.0 GiB"));
+        }
     }
 
     #[test]
