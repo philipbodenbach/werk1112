@@ -3933,7 +3933,6 @@ mod tests {
     use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[cfg(unix)]
     #[test]
     fn reasoning_tier_native_payload_preserves_other_template_options() {
         let mut body = json!({"chat_template_kwargs":{"custom":true}});
@@ -3953,6 +3952,7 @@ mod tests {
         assert!(body.get("__werk_thinking").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn vision_install_reuses_valid_server_and_selects_only_published_generations() {
         use std::os::unix::fs::PermissionsExt;
