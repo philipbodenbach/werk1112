@@ -680,6 +680,16 @@ output allowance. Chat admission rejects output above the same ceiling with
 request. Reasoning profiles use that ceiling as well as the request's output
 budget. Increasing output does not override an explicit reasoning tier.
 
+File-editing clients can use these ceilings to plan complete sections across
+multiple calls: reserve input and safety margin, then divide the actual output
+allowance between reasoning, tool JSON and file content. Resolve numeric
+reasoning from the selected/default available tier in the reasoning profile for
+that output allowance. A character target is only a heuristic: the protocol
+does not advertise a universal tokens-to-characters ratio or a maximum file-edit
+character count. Unknown numeric reasoning must remain unknown. Paginated tool
+reads and atomic section writes are client tool behavior, not extra inference
+slots or server-side continuation of an incomplete tool call.
+
 ### Model-specific reasoning tiers
 
 Capability `api.chat.reasoning` (`profile`, `tiers`) advertises
