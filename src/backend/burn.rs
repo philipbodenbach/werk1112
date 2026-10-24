@@ -380,6 +380,10 @@ impl BurnBackend {
         request: GenerateRequest,
         on_token: Option<Box<dyn FnMut(String) + Send>>,
     ) -> Result<GenerateResponse> {
+        anyhow::ensure!(
+            !request.has_images(),
+            "Burn's implemented chat adapter is text-only; image parts cannot be discarded"
+        );
         self.with_model(manifest, |model| {
             let _ = (&model.architecture, &model.tokenizer, &model.prompt_smoke);
             #[cfg(feature = "burn-runtime")]

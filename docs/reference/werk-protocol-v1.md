@@ -191,6 +191,9 @@ It sends no launch setting to remote vLLM.
 | GET | `/werk/v1/capabilities` | none | Capability array |
 | GET | `/werk/v1/memory` | none | Memory telemetry and accounting |
 | GET | `/werk/v1/observability` | none | Server-wide chat, worker and memory observations |
+| POST | `/werk/v1/chat/count_tokens` | OpenAI chat request | Exact native input token count |
+| GET | `/werk/v1/chat/reasoning` | `model`, `max_output_tokens` query | Model/runtime tiers, default and effective limits |
+| GET | `/werk/v1/chat/limits` | `model` query | Read-only model/server context, output and concurrency limits |
 | GET | `/werk/v1/states` | query filters | One page of runtime states |
 | POST | `/werk/v1/states/{id}/actions` | State action | Updated/projected state |
 | POST | `/werk/v1/states/prune` | Explicit selector | Match/removal summary |
@@ -199,9 +202,49 @@ It sends no launch setting to remote vLLM.
 | POST | `/werk/v1/prefill` | Input and persistence policy | Opaque handoff and state metadata |
 | POST | `/werk/v1/decode` | Opaque handoff and decode options | Completion and optional next handoff |
 
-All five POST routes have a fixed 1 MiB HTTP body limit. Individual DTOs have
+All listed POST routes have a fixed 1 MiB HTTP body limit. Individual DTOs have
 tighter semantic limits where described below. Unknown fields are rejected on
 the mutation, prefill and decode request DTOs.
+
+## Native chat token count
+
+This is an optional control-plane extension. Existing OpenAI-compatible and
+Anthropic-compatible generation routes keep their request/response formats and
+do not require a Werk handshake, version header or prior counting call. Clients
+may ignore this capability; generation still performs its own context admission.
+
+`api.chat.token_count` with status `supported` and operation `count_tokens`
+advertises `POST /werk/v1/chat/count_tokens`. This additive route accepts the
+same chat request as `/v1/chat/completions`, including tool definitions,
+assistant tool calls, their results and supported template/API options. It
+counts the selected backend's actual chat template without trimming history or
+generating output. `stream` is ignored; the response is always a protocol JSON
+envelope:
+
+~~~json
+{"protocol":{"major":1,"minor":0},"request_id":"req_example",
+ "data":{"model":"selected-model-or-alias","input_tokens":3012}}
+~~~
+
+The count excludes the reserved output budget. Clients must add their output
+reserve and margin before context admission. Cache counts only for the exact
+model, messages, tools and options. The server validates context again during
+generation; a count does not reserve capacity or promise a reusable state.
+The selected model may be prepared to access its tokenizer.
+
+An unsupported native counter returns the typed `unsupported` error, never
+an estimate labeled as an exact count. Temporary native failures return
+`unavailable` with `retryable: true`; clients may retry this read-only operation
+with a bounded backoff. Authentication, versioning and the 1 MiB request bound
+are the same as other protocol routes.
+
+For existing local llama.cpp workers, `/werk/v1/observability` also reports
+`context_per_request_tokens`: the **minimum** `n_ctx` across all validated native
+slots. `context_capacity_tokens` remains the sum across slots and must not be
+used as an individual request limit or divided to infer a minimum. Use only
+fresh, available samples for the selected model. If several workers match,
+take the minimum across workers. Missing or invalid slot information leaves
+the per-request limit unknown.
 
 ## Memory
 
@@ -599,3 +642,115 @@ The [runtime CLI](cli.md#runtime-control) is a thin pretty-JSON interface over
 this client. ComfyUI uses its own strict Python validator and keeps handoffs in
 an opaque socket; see the
 [custom-node guide](https://github.com/philipbodenbach/werk1112/blob/main/utils/comfyUI/README.md#runtime-persistence-experts-and-split-prefilldecode).
+
+### Generation ceilings
+
+Capability `api.chat.limits` (`limits`) advertises
+`GET /werk/v1/chat/limits?model=MODEL`. Authentication, version headers, `no-store`
+and the standard envelope apply. The default model is used when the query omits
+`model`. Discovery reads manifests/configuration without loading or probing a
+model and without running inference or advancing deployment selection.
+
+Example `data`:
+
+```json
+{"schema_version":1,"model":"local-model","context_tokens":16384,"max_output_tokens":16383,"max_concurrent_requests":2}
+```
+
+Fields may be `null` when unknown. Context is per request. Output is the
+minimum of explicit manifest parameter ceilings (`max_output_tokens`,
+`max_completion_tokens`, `max_new_tokens`, scalar or `{ "max": N }`) and context
+minus one when context is known. Generation defaults are not hard ceilings.
+For an alias, known limits use the minimum across replicas; an unknown replica
+makes that field unknown. This endpoint does not predict free GPU memory or
+guarantee that a particular prompt/output pair fits.
+
+`max_concurrent_requests` reports configured concurrent inference capacity, not
+currently free/busy slots. For running llama.cpp workers it is read from the
+actual native launch arguments (`--parallel` / `-np`, including trailing
+`WERK_LLAMA_ARGS` overrides), without querying inference or telemetry endpoints.
+Unknown/auto capacity and cold models report `null`. Multiple matching workers
+and alias replicas use the conservative minimum, never an assumed sum. An
+unknown replica makes the alias capacity unknown. Other backends may leave this
+optional field unknown. Clients may refresh it without generating tokens.
+
+Clients must count input and reserve their margin before expanding an initial
+output allowance. Chat admission rejects output above the same ceiling with
+`output_limit_exceeded`; the read-only token counter can still count an oversized
+request. Reasoning profiles use that ceiling as well as the request's output
+budget. Increasing output does not override an explicit reasoning tier.
+
+File-editing clients can use these ceilings to plan complete sections across
+multiple calls: reserve input and safety margin, then divide the actual output
+allowance between reasoning, tool JSON and file content. Resolve numeric
+reasoning from the selected/default available tier in the reasoning profile for
+that output allowance. A character target is only a heuristic: the protocol
+does not advertise a universal tokens-to-characters ratio or a maximum file-edit
+character count. Unknown numeric reasoning must remain unknown. Paginated tool
+reads and atomic section writes are client tool behavior, not extra inference
+slots or server-side continuation of an incomplete tool call.
+
+### Model-specific reasoning tiers
+
+Capability `api.chat.reasoning` (`profile`, `tiers`) advertises
+`GET /werk/v1/chat/reasoning?model=MODEL&max_output_tokens=4096`. The response uses
+the standard authenticated protocol envelope, `no-store`, and version headers.
+The output limit defaults to 256, matching chat requests. Querying does not load
+models, probe GPU capabilities, count tokens, or generate text. Only verified
+configuration of running workers is reported. Unknown/cold runtimes return
+`supported:false`, an empty `tiers` list, and `default_tier:null`. Deployment
+aliases require agreeing profiles across replicas; otherwise select an ID.
+
+Example `data` for thinking enabled, a 2048-token launch budget and 2048 output:
+
+```json
+{
+  "schema_version": 1,
+  "model": "my-model",
+  "backend": "llama.cpp",
+  "supported": true,
+  "source": "worker_launch_configuration",
+  "default_tier": "medium",
+  "default_adjusted_to_limits": true,
+  "limits": {
+    "context_tokens": 32768,
+    "output_tokens": 2048,
+    "answer_reserve_tokens": 512,
+    "reasoning_tokens": 1536
+  },
+  "tiers": [
+    {"id":"none","label":"Off","available":true,"reasoning_tokens":0,"minimum_output_tokens":1},
+    {"id":"low","label":"Low","available":true,"reasoning_tokens":512,"minimum_output_tokens":1024},
+    {"id":"medium","label":"Medium","available":true,"reasoning_tokens":1024,"minimum_output_tokens":1536},
+    {"id":"high","label":"High","available":false,"reasoning_tokens":2048,"minimum_output_tokens":2560},
+    {"id":"max","label":"Max","available":false,"reasoning_tokens":4096,"minimum_output_tokens":4608},
+    {"id":"ultra","label":"Ultra","available":false,"reasoning_tokens":8192,"minimum_output_tokens":8704}
+  ]
+}
+```
+
+Clients send `"werk":{"reasoning":{"tier":"medium"}}` in both chat and
+`/werk/v1/chat/count_tokens` requests. `"default"` resolves the current server
+default on every request; clients must not freeze the reported default as an
+explicit tier. An unsupported runtime preserves its native default for this
+sentinel; explicit IDs require a verified profile. Unknown IDs, unavailable tiers
+and combinations with native `reasoning_effort` or `werk.omlx` thinking/effort
+controls fail before generation. OpenAI chat errors use `invalid_reasoning_tier`.
+
+For llama.cpp with verified budget control, these are Werk-owned budget tiers,
+not a claim that every template supports native effort strings with these names.
+The resolver uses the smaller of the launch budget (nonnegative values) and the
+output limit minus a 512-token answer reserve. It conservatively limits output
+to context minus 512 tokens; ordinary prompt/context admission still applies.
+A named launch effort matching a tier is retained or reduced to fit. Otherwise
+the enabled default is the highest available tier; a disabled launch default
+remains `none`. A tier is a ceiling, not a guarantee that all tokens are used or
+that the final answer fits. Unlimited launch budgets remain bounded by output.
+Werk forwards the resolved budget and thinking switch to llama.cpp.
+
+Native effort backends use their verified vocabulary, narrowed by model
+`parameter_constraints.reasoning_effort.enum` when present. They report
+`reasoning_tokens:null` and no guaranteed answer reserve; the total output cap
+still applies. Explicit native `reasoning_effort` remains a separate legacy API
+and bypasses managed tier resolution. Clients must consume the reported list
+rather than hardcode a universal vocabulary or numeric mapping.

@@ -1,0 +1,49 @@
+   Compiling werk1112 v1.9.1 (/home/philipbodenbach/werk1112)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.30s
+     Running unittests src/lib.rs (target/debug/deps/werk1112-cf0c2518699150ef)
+
+running 41 tests
+test api::tests::observability::observability_auth_and_shared_sampling_cache ... ok
+test api::tests::observability::observability_counts_both_protocols_and_stream_modes_without_content ... ok
+test api::tests::observability::operational_logging_correlates_both_protocols_and_keeps_metrics_content_free ... ok
+test api::tests::text_analysis::observability_analysis_routes_report_active_and_completed_requests_without_content ... ok
+test backend::llama_server::expert_memory::observability_tests::expert_residency_counts_only_tensor_bytes_on_shared_pages ... ok
+test backend::llama_server::expert_memory::observability_tests::expert_residency_reads_cache_without_changing_file_and_rejects_replacement ... ok
+test backend::llama_server::expert_memory::observability_tests::observability_live_cpu_expert_ram ... ignored, requires WERK_TEST_GGUF_PATH; only reads metadata and page residency
+test backend::llama_server::telemetry::observability_tests::native_slots_provide_live_counts_without_content ... ok
+test backend::llama_server::telemetry::observability_tests::observability_enables_slots_without_persistence ... ok
+test backend::llama_server::telemetry::observability_tests::observability_live_slots ... ignored, requires WERK_TEST_LLAMA_URL pointing to a running llama-server
+test backend::llama_server::telemetry::observability_tests::observability_missing_slot_counts_are_not_zeroes ... ok
+test backend::llama_server::telemetry::observability_tests::per_request_context_is_minimum_not_average_and_requires_all_slots ... ok
+test backend::omlx::telemetry::observability_tests::missing_and_invalid_native_values_are_not_zero_metrics ... ok
+test cli::top::fields::observability_tests::placement_swaps_neighbours_and_respects_rows_columns_and_boundaries ... ok
+test cli::top::fields::observability_tests::selection_is_optional_cancellable_and_session_local ... ok
+test cli::top::observability_tests::client_rejects_embedded_credentials_and_api_paths ... ok
+test cli::top::observability_tests::client_roundtrip_uses_werk_protocol_and_bearer_auth ... ok
+test cli::top::observability_tests::history_stays_bounded_and_resets_on_server_restart ... ok
+test cli::top::ui::tests::observability_analysis_panels_follow_selected_request_and_resize ... ok
+test cli::top::ui::tests::observability_dense_worker_ram_graph_survives_missing_gpu_and_busy_slots ... ok
+test cli::top::ui::tests::observability_layouts_render_at_small_medium_and_large_sizes ... ok
+test api::tests::observability::observability_hung_probe_returns_without_restarting_and_publishes_after_disconnect ... ok
+test cli::top::ui::tests::observability_missing_offload_metrics_keep_gpu_pressure_visible ... ok
+test cli::top::ui::tests::observability_omlx_keeps_existing_mac_panels_and_layout ... ok
+test observability::prometheus::tests::labels_are_escaped_and_missing_values_omitted ... ok
+test observability::prometheus::tests::mixed_tasks_preserve_existing_metrics_and_omit_inapplicable_samples ... ok
+test observability::tests::analysis_failure_cancellation_and_old_snapshots_keep_the_shared_contract ... ok
+test observability::tests::analysis_requests_share_accounting_without_fabricating_generation_metrics ... ok
+test observability::tests::cancelled_stream_and_premature_eof_are_distinct ... ok
+test observability::tests::interval_resets_and_idle_are_not_hits ... ok
+test observability::tests::observability_llama_decode_uses_task_identity_and_excludes_prefill ... ok
+test observability::tests::raw_completion_preserves_backend_rates ... ok
+test observability::tests::raw_completion_without_valid_timings_keeps_rates_unavailable ... ok
+test observability::tests::raw_omlx_usage_timings_survive_partial_and_invalid_usage_chunks ... ok
+test observability::tests::raw_stream_retains_timings_across_separate_usage_and_finish_chunks ... ok
+test observability::tests::records_are_bounded_and_cancellation_is_accounted ... ok
+test observability::tests::rich_stream_finishes_after_usage_and_reports_incomplete_choices ... ok
+test observability::tests::stream_counts_tokens_from_usage_not_chunks ... ok
+test observability::tests::typed_backend_timings_reach_both_completed_request_paths ... ok
+test runtime_control::local::tests::observability_memory_observation_reports_bounded_available_memory ... ok
+test cli::top::ui::tests::observability_llama_panels_show_context_memory_and_placement ... ok
+
+test result: ok. 39 passed; 0 failed; 2 ignored; 0 measured; 1292 filtered out; finished in 3.42s
+

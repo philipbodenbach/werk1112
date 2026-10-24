@@ -405,6 +405,25 @@ fn capabilities_for_descriptor(
             operations: vec!["thinking".into(), "reasoning_effort".into(), "expert_cache_mb".into(), "ngram_cache_mb".into()],
         },
     );
+    capabilities.insert(
+        "api.chat.token_count".into(),
+        Capability {
+            id: "api.chat.token_count".into(),
+            status: CapabilityStatus::Supported,
+            detail: "POST /werk/v1/chat/count_tokens counts the native chat template including tools and tool-result history, without generation. A backend without an exact native counter returns unsupported; no estimate is reported as an exact count.".into(),
+            operations: vec!["count_tokens".into()],
+        },
+    );
+    capabilities.insert("api.chat.limits".into(), Capability {
+        id: "api.chat.limits".into(), status: CapabilityStatus::Supported,
+        detail: "GET /werk/v1/chat/limits reports known context and generation ceilings without loading a model. Clients must still count input tokens and reserve output within the context window.".into(),
+        operations: vec!["limits".into()],
+    });
+    capabilities.insert("api.chat.reasoning".into(), Capability {
+        id: "api.chat.reasoning".into(), status: CapabilityStatus::Supported,
+        detail: "GET /werk/v1/chat/reasoning?model=...&max_output_tokens=... reports model/runtime tiers, effective default and limits without loading a model. Send werk.reasoning.tier in chat/count requests; Werk resolves native controls within the request limits.".into(),
+        operations: vec!["profile".into(), "tiers".into()],
+    });
     let memory = memory_status_for(inner);
     capabilities.insert(
         "runtime.memory.telemetry.host".to_string(),
@@ -3307,6 +3326,59 @@ fn bounded_command_stdout(
     timeout: Duration,
     max_stdout_bytes: usize,
 ) -> Option<Vec<u8>> {
+    // Killing a process stuck in a driver syscall does not bound wait() or a
+    // pipe read. Isolate cleanup from callers and retain the single-flight
+    // guard until it really finishes, rather than accumulate stuck probes.
+    static PROBE: std::sync::OnceLock<CommandProbe> = std::sync::OnceLock::new();
+    let program = program.to_owned();
+    let arguments: Vec<String> = arguments.iter().map(|s| (*s).to_owned()).collect();
+    PROBE
+        .get_or_init(CommandProbe::default)
+        .run(timeout, move || {
+            command_stdout_worker(&program, &arguments, timeout, max_stdout_bytes)
+        })
+}
+
+#[derive(Default)]
+struct CommandProbe {
+    busy: Arc<AtomicBool>,
+}
+
+struct ProbeGuard(Arc<AtomicBool>);
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl CommandProbe {
+    fn run<F>(&self, timeout: Duration, operation: F) -> Option<Vec<u8>>
+    where
+        F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
+    {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        let guard = ProbeGuard(self.busy.clone());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("werk-memory-probe".into())
+            .spawn(move || {
+                let result = operation();
+                drop(guard);
+                let _ = tx.send(result);
+            })
+            .ok()?;
+        rx.recv_timeout(timeout).ok().flatten()
+    }
+}
+
+fn command_stdout_worker(
+    program: &str,
+    arguments: &[String],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+) -> Option<Vec<u8>> {
     let mut child = Command::new(program)
         .args(arguments)
         .stdout(Stdio::piped())
@@ -3315,8 +3387,14 @@ fn bounded_command_stdout(
         .ok()?;
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait().ok()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -3377,6 +3455,59 @@ mod tests {
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn timed_out_memory_probe_keeps_one_worker_until_cleanup_finishes() {
+        let probe = CommandProbe::default();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        assert!(
+            probe
+                .run(Duration::from_millis(30), move || {
+                    let _ = blocked.recv();
+                    Some(vec![1])
+                })
+                .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        for _ in 0..10 {
+            assert!(
+                probe
+                    .run(Duration::from_millis(30), || {
+                        panic!("must not start another probe while cleanup is blocked")
+                    })
+                    .is_none()
+            );
+        }
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while probe.busy.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            probe.run(Duration::from_secs(1), || Some(vec![2])),
+            Some(vec![2])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_probe_command_bounds_output_and_reaps_a_timeout() {
+        let run = |command: &str, limit| {
+            command_stdout_worker(
+                "sh",
+                &["-c".into(), command.into()],
+                Duration::from_millis(50),
+                limit,
+            )
+        };
+        assert_eq!(run("printf 1234", 4), Some(b"1234".to_vec()));
+        assert!(run("printf 12345", 4).is_none());
+        assert!(run("exit 1", 4).is_none());
+        let started = Instant::now();
+        assert!(run("exec sleep 5", 4).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

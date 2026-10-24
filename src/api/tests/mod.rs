@@ -17,3 +17,5 @@ mod tools;
 mod vllm_tools;
 
 mod providers;
+
+mod reasoning;

@@ -87,6 +87,8 @@ pub(crate) const VLLM_VISION_ARCHITECTURES: &[&str] = &[
     "qwen2_5_vl",
     "qwen3_vl",
     "qwen3_vl_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
     "glm4v",
     "glm4v_moe",
 ];
@@ -151,6 +153,7 @@ struct VllmProcess {
 struct VllmChatSession {
     server: Arc<VllmProcess>,
     architecture: Option<String>,
+    image_setup_error: Option<String>,
 }
 
 pub(crate) fn vllm_architecture_supports_images(architecture: Option<&str>) -> bool {
@@ -241,6 +244,20 @@ pub enum VllmCommand {
 }
 
 impl VllmBackend {
+    pub(crate) fn validate_image_assets(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+    ) -> Result<()> {
+        manifest.require_image_setup()?;
+        // A configured remote endpoint owns its model repository. Requiring a
+        // second local copy would neither validate nor repair its processor.
+        // Inspect configuration only: model setup with --offline must not
+        // probe a configured endpoint or start a Python/runtime discovery.
+        if configured_remote_vllm_from_env()?.is_none() {
+            super::vision_setup::validate_processor_assets(store, manifest)?;
+        }
+        Ok(())
+    }
     pub fn new(store: ModelStore) -> Self {
         Self::new_with_accelerator(store, VllmAccelerator::Cuda)
     }
@@ -495,6 +512,9 @@ impl VllmBackend {
         request: GenerateRequest,
         tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
     ) -> Result<GenerateResponse> {
+        if request.has_images() {
+            Self::validate_image_assets(&self.store, manifest)?;
+        }
         validate_vllm_image_request(manifest.architecture.as_deref(), &request)?;
 
         let total_started = Instant::now();
@@ -555,6 +575,9 @@ impl GenerationBackend for VllmBackend {
         request: &GenerateRequest,
         options: &std::collections::BTreeMap<String, Value>,
     ) -> Result<()> {
+        if request.has_images() {
+            Self::validate_image_assets(&self.store, manifest)?;
+        }
         super::openai_transport::validate_api_options(options, API_OPTIONS)?;
         if crate::model_support::is_kolibri(manifest)
             && let Some(effort) = options.get("reasoning_effort")
@@ -649,6 +672,7 @@ impl GenerationBackend for VllmBackend {
         Ok(Some(Box::new(VllmChatSession {
             server,
             architecture: manifest.architecture.clone(),
+            image_setup_error: manifest.require_image_setup().err().map(|e| e.to_string()),
         })))
     }
 
@@ -679,14 +703,14 @@ impl GenerationBackend for VllmBackend {
                 VllmAccelerator::Cuda => Self::probe(&self.store),
                 VllmAccelerator::Rocm => Self::probe_rocm(&self.store),
             }
-            .map(|_| ())
+            .and_then(|_| Self::validate_image_assets(&self.store, manifest))
         };
         let adapter = self.accelerator.backend_label().to_string();
         Some(match readiness {
             Ok(()) => TaskReadiness {
                 status: TaskReadinessStatus::Available,
                 detail: format!(
-                    "{} can route image understanding for architecture '{}' without loading model weights during capability discovery",
+                    "{} image prerequisites checked for architecture '{}'; actual image inference has not been tested by this read-only probe",
                     self.accelerator.backend_label(),
                     manifest.architecture.as_deref().unwrap_or("unknown")
                 ),
@@ -734,6 +758,11 @@ impl ChatGenerationSession for VllmChatSession {
         self.server.child.is_none() || matches!(self.server.try_wait_status(), Ok(None))
     }
     fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
+        if request.has_images()
+            && let Some(error) = &self.image_setup_error
+        {
+            bail!("{error}");
+        }
         validate_vllm_image_request(self.architecture.as_deref(), &request)?;
         let total_started = Instant::now();
         self.server.print_debug(&request, true);
@@ -761,32 +790,39 @@ impl ChatGenerationSession for VllmChatSession {
     fn generate_stream(&self, request: GenerateRequest) -> GenerateStream {
         let server = self.server.clone();
         let architecture = self.architecture.clone();
+        let image_setup_error = self.image_setup_error.clone();
         let (tx, rx) = mpsc::channel(16);
         tokio::task::spawn_blocking(move || {
             let total_started = Instant::now();
             server.print_debug(&request, true);
-            let result = validate_vllm_image_request(architecture.as_deref(), &request)
-                .and_then(|()| server.complete(&request, Some(tx.clone())))
-                .map(|completion| {
-                    let assistant_message = completion.assistant_message();
-                    GenerateResponse {
-                        text: completion.text,
-                        assistant_message: Some(assistant_message),
-                        prompt_tokens: completion.prompt_tokens,
-                        completion_tokens: completion.completion_tokens,
-                        finish_reason: completion.finish_reason,
-                        timings: GenerationTimings {
-                            cached_prompt_tokens: None,
-                            load_seconds: 0.0,
-                            warmup_seconds: 0.0,
-                            first_token_seconds: completion.first_token_seconds,
-                            prompt_seconds: completion.prompt_seconds,
-                            decode_seconds: completion.decode_seconds,
-                            total_seconds: total_started.elapsed().as_secs_f64(),
-                        },
-                        backend_diagnostics: Vec::new(),
-                    }
-                });
+            let result = if request.has_images()
+                && let Some(error) = image_setup_error
+            {
+                Err(anyhow!(error))
+            } else {
+                validate_vllm_image_request(architecture.as_deref(), &request)
+            }
+            .and_then(|()| server.complete(&request, Some(tx.clone())))
+            .map(|completion| {
+                let assistant_message = completion.assistant_message();
+                GenerateResponse {
+                    text: completion.text,
+                    assistant_message: Some(assistant_message),
+                    prompt_tokens: completion.prompt_tokens,
+                    completion_tokens: completion.completion_tokens,
+                    finish_reason: completion.finish_reason,
+                    timings: GenerationTimings {
+                        cached_prompt_tokens: None,
+                        load_seconds: 0.0,
+                        warmup_seconds: 0.0,
+                        first_token_seconds: completion.first_token_seconds,
+                        prompt_seconds: completion.prompt_seconds,
+                        decode_seconds: completion.decode_seconds,
+                        total_seconds: total_started.elapsed().as_secs_f64(),
+                    },
+                    backend_diagnostics: Vec::new(),
+                }
+            });
             send_stream_result(tx, result);
         });
         Box::pin(ReceiverStream::new(rx))
@@ -1602,6 +1638,13 @@ pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
     }
 
     let root = managed_vllm_dir(store);
+    let existing_python = managed_vllm_python(store);
+    if existing_python.is_file() && validate_vllm_python(&existing_python).is_ok() {
+        crate::ui_eprintln!(
+            "Reusing the installed vLLM runtime; concrete image-model compatibility still needs validation."
+        );
+        return Ok(existing_python);
+    }
     let venv = root.join("venv");
     fs::create_dir_all(&root)
         .with_context(|| format!("failed to create vLLM backend cache {}", root.display()))?;

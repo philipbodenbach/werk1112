@@ -168,6 +168,13 @@ impl GenerationBackend for FailingAfterFragmentBackend {
         Box::pin(tokio_stream::iter(vec![
             Ok(fragment),
             Err("simulated backend failure after fragment".to_string()),
+            Ok(GenerateStreamEvent::Done {
+                finish_reason: "stop".into(),
+                prompt_tokens: 12,
+                completion_tokens: 9,
+                timings: GenerationTimings::default(),
+                backend_diagnostics: Vec::new(),
+            }),
         ]))
     }
 }
@@ -502,6 +509,7 @@ async fn streaming_backend_failure_never_restarts_after_text_or_tool_fragments()
         let mut request = json!({
             "model": "tool-model",
             "stream": true,
+            "stream_options": {"include_usage": true},
             "messages": [{"role": "user", "content": "Weather?"}]
         });
         if tool_fragment {
@@ -520,8 +528,8 @@ async fn streaming_backend_failure_never_restarts_after_text_or_tool_fragments()
             .lines()
             .filter_map(|line| line.strip_prefix("data: "))
             .collect::<Vec<_>>();
-        assert_eq!(data.last().copied(), Some("[DONE]"));
-        let chunks = data[..data.len() - 1]
+        assert!(!data.contains(&"[DONE]"));
+        let chunks = data
             .iter()
             .map(|value| serde_json::from_str::<Value>(value).unwrap())
             .collect::<Vec<_>>();
@@ -541,6 +549,7 @@ async fn streaming_backend_failure_never_restarts_after_text_or_tool_fragments()
             chunks[2]["error"]["message"],
             "simulated backend failure after fragment"
         );
+        assert_eq!(chunks[2]["error"]["type"], "server_error");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

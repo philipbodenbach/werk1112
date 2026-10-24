@@ -583,6 +583,31 @@ impl OmlxBackend {
 }
 
 impl GenerationBackend for OmlxBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        crate::reasoning::consistent(
+            self.servers
+                .snapshot()
+                .into_iter()
+                .filter(|server| {
+                    server.logical_model_id.as_deref() == Some(&manifest.id) && server.is_running()
+                })
+                .filter(|server| server.reasoning_effort.is_some())
+                .map(|server| crate::reasoning::BackendReasoning {
+                    backend: "omlx".into(),
+                    budget_control: false,
+                    defaults: crate::observability::ReasoningDefaults {
+                        source: "worker_launch_configuration".into(),
+                        effort: server.reasoning_effort.map(|effort| json!(effort)),
+                        thinking: server.thinking,
+                        budget_tokens: None,
+                    },
+                    native_efforts: vec![json!("none"), json!("low"), json!("high"), json!("max")],
+                }),
+        )
+    }
     fn preload(
         &self,
         manifest: &ModelManifest,

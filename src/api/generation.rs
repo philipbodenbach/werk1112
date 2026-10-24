@@ -201,26 +201,86 @@ pub(super) async fn prepare(
         ));
     }
     let max_tokens = request.max_completion_tokens();
-    let context_size =
-        effective_chat_context_size(state.chat_context_size, &manifest).or_else(|| {
-            if matches!(context_policy, ContextPolicy::Reject) {
-                manifest
-                    .metadata
-                    .parameter_constraints
-                    .get("max_position_embeddings")
-                    .or_else(|| {
-                        manifest
-                            .metadata
-                            .parameter_constraints
-                            .get("model_max_length")
-                    })
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| usize::try_from(v).ok())
-                    .filter(|v| *v > 0)
-            } else {
-                None
-            }
-        });
+    let generation_limits =
+        crate::generation_limits::profile(&manifest, generation_context_size(&state, &manifest));
+    if !matches!(context_policy, ContextPolicy::Count)
+        && generation_limits
+            .max_output_tokens
+            .is_some_and(|limit| max_tokens > limit)
+    {
+        return Err(GenerationError::with_code(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Output budget {max_tokens} exceeds the model/server limit {}",
+                generation_limits.max_output_tokens.unwrap()
+            ),
+            Some("max_completion_tokens".into()),
+            Some("output_limit_exceeded".into()),
+        ));
+    }
+    if let Some(reasoning) = request
+        .werk
+        .as_ref()
+        .and_then(|options| options.reasoning.as_ref())
+    {
+        if request.extra.contains_key("reasoning_effort") {
+            return Err(GenerationError::with_code(
+                StatusCode::BAD_REQUEST,
+                "werk.reasoning cannot be combined with native reasoning_effort".into(),
+                Some("werk.reasoning".into()),
+                Some("invalid_reasoning_tier".into()),
+            ));
+        }
+        let profile = crate::reasoning::profile(
+            &manifest,
+            state.backend.reasoning_config(&manifest).as_ref(),
+            generation_context_size(&state, &manifest),
+            max_tokens,
+        );
+        // Unknown runtimes retain their native default. Explicit tiers require
+        // verified controls; neither discovery nor default resolution loads a model.
+        if profile.supported || reasoning.tier != "default" {
+            let options = profile.resolve(&reasoning.tier).map_err(|error| {
+                GenerationError::with_code(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "{error}; available tiers: {}; output limit: {}; reasoning limit: {:?}",
+                        profile
+                            .tiers
+                            .iter()
+                            .filter(|t| t.available)
+                            .map(|t| t.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        profile.limits.output_tokens,
+                        profile.limits.reasoning_tokens
+                    ),
+                    Some("werk.reasoning.tier".into()),
+                    Some("invalid_reasoning_tier".into()),
+                )
+            })?;
+            request.extra.extend(options);
+        }
+    }
+    let context_size = generation_context_size(&state, &manifest).or_else(|| {
+        if matches!(context_policy, ContextPolicy::Reject) {
+            manifest
+                .metadata
+                .parameter_constraints
+                .get("max_position_embeddings")
+                .or_else(|| {
+                    manifest
+                        .metadata
+                        .parameter_constraints
+                        .get("model_max_length")
+                })
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|v| *v > 0)
+        } else {
+            None
+        }
+    });
     let needs_context_check = matches!(context_policy, ContextPolicy::Reject)
         || (matches!(context_policy, ContextPolicy::Trim) && request.requires_tool_calling());
     let context_check = if needs_context_check {
@@ -652,7 +712,16 @@ fn tool_calling_parameter(request: &ChatCompletionRequest) -> &'static str {
     }
 }
 
-fn effective_chat_context_size(configured: usize, manifest: &ModelManifest) -> Option<usize> {
+pub(super) fn generation_context_size(state: &ApiState, manifest: &ModelManifest) -> Option<usize> {
+    state
+        .explicit_chat_context_size
+        .or_else(|| effective_chat_context_size(state.chat_context_size, manifest))
+}
+
+pub(super) fn effective_chat_context_size(
+    configured: usize,
+    manifest: &ModelManifest,
+) -> Option<usize> {
     if manifest.format != crate::model_store::ModelFormat::Gguf {
         return None;
     }

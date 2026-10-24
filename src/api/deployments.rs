@@ -161,12 +161,22 @@ impl Registry {
             .values()
             .flat_map(|i| {
                 let mut workers = i.state.backend.telemetry();
+                let reasoning_defaults = workers.first().and_then(|first| {
+                    let defaults = first.reasoning_defaults.as_ref()?;
+                    workers
+                        .iter()
+                        .all(|worker| {
+                            worker.available && worker.reasoning_defaults.as_ref() == Some(defaults)
+                        })
+                        .then(|| defaults.clone())
+                });
                 workers.push(crate::observability::BackendSnapshot {
                     backend: "deployment".into(),
                     instance: i.plan.profile.id.clone(),
                     model: i.plan.profile.alias.clone(),
                     available: true,
                     counters: Default::default(),
+                    reasoning_defaults,
                     gauges: BTreeMap::from([
                         ("gpu_count".into(), i.plan.devices.len() as f64),
                         ("slots_available".into(), i.slots.available_permits() as f64),

@@ -3809,6 +3809,8 @@ mod tests {
         )
         .unwrap();
         LlamaServerProcess {
+            reasoning_defaults: None,
+            reasoning_budget_supported: false,
             _reservation: Mutex::new(None),
             #[cfg(target_os = "linux")]
             _model_file_cache: None,

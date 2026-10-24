@@ -276,6 +276,46 @@ pub(super) struct GgufInspection {
     pub architecture: Option<String>,
 }
 
+/// Bounded metadata-only identity check, independent of tensor quantization.
+pub(super) fn gguf_model_identity(path: &Path) -> Result<Option<String>> {
+    let file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut r = GgufReader {
+        reader: BufReader::new(file),
+        size,
+        position: 0,
+    };
+    anyhow::ensure!(
+        r.bytes::<4>()? == *b"GGUF" && matches!(r.u32()?, 2 | 3),
+        "Invalid GGUF header"
+    );
+    let _tensors = r.u64()?;
+    let count = r.u64()?;
+    anyhow::ensure!(count <= 1_000_000, "Invalid GGUF metadata count");
+    let mut name = None;
+    let mut base = None;
+    for _ in 0..count {
+        let key = r.string()?;
+        let kind = r.u32()?;
+        if kind == 8 && matches!(key.as_str(), "general.name" | "general.base_model.0.name") {
+            let value = r.string()?;
+            if key == "general.name" {
+                name = Some(value);
+            } else {
+                base = Some(value);
+            }
+        } else {
+            r.skip_value(kind, 0)?;
+        }
+    }
+    Ok(base.or(name).map(|s| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }))
+}
+
 /// Read only metadata and tensor descriptors. Tensor payloads are never loaded.
 /// Bounded header counts/strings, checked arithmetic and payload bounds make this
 /// usable for imported files as well as freshly converted output.

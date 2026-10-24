@@ -5,6 +5,7 @@ use crate::capabilities::{
 mod import_collection;
 pub use import_collection::ModelImportCandidate;
 mod gguf_conversion;
+mod vision;
 pub use gguf_conversion::GgufConversionOptions;
 mod quantization;
 pub use quantization::{
@@ -184,6 +185,8 @@ pub struct ResolvedChatTemplate {
 /// compatibility field on `ModelManifest` constructors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_setup: Option<crate::backend::vision_setup::ModelVisionSetup>,
     #[serde(default = "legacy_manifest_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
@@ -218,6 +221,7 @@ impl Default for ModelMetadata {
     fn default() -> Self {
         Self {
             schema_version: CURRENT_MANIFEST_SCHEMA_VERSION,
+            vision_setup: None,
             family: None,
             repository_layout: RepositoryLayout::Custom,
             tasks: Vec::new(),
@@ -276,6 +280,19 @@ pub struct ModelManifest {
 impl ModelManifest {
     pub fn supports_task(&self, task: InferenceTask) -> bool {
         self.metadata.tasks.contains(&task)
+    }
+    pub fn require_image_setup(&self) -> Result<()> {
+        if self
+            .metadata
+            .vision_setup
+            .as_ref()
+            .is_some_and(|s| !s.enabled)
+        {
+            bail!(
+                "Image input was skipped for this model. Set up its existing/matching assets with werk artifacts vision MODEL --vision; text requests remain available"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -862,10 +879,35 @@ impl ModelStore {
         repo: &str,
         name: Option<&str>,
         file: Option<&str>,
+        progress: F,
+    ) -> Result<ModelManifest>
+    where
+        F: FnMut(PullProgress),
+    {
+        self.pull_from_huggingface_with_vision(
+            repo,
+            name,
+            file,
+            None,
+            false,
+            |_| Ok(false),
+            progress,
+        )
+    }
+
+    pub fn pull_from_huggingface_with_vision<F, C>(
+        &self,
+        repo: &str,
+        name: Option<&str>,
+        file: Option<&str>,
+        projector: Option<&str>,
+        require_vision: bool,
+        mut choose_vision: C,
         mut progress: F,
     ) -> Result<ModelManifest>
     where
         F: FnMut(PullProgress),
+        C: FnMut(&str) -> Result<bool>,
     {
         self.ensure()?;
         validate_hf_repo(repo)?;
@@ -926,7 +968,46 @@ impl ModelStore {
             None
         };
         let include_file = explicit_file.or(auto_file);
-        let include_files = selected_lfs_include_files(&tmp, include_file.as_deref())?;
+        let revision_output = Command::new("git")
+            .arg("-C")
+            .arg(&tmp)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        anyhow::ensure!(
+            revision_output.status.success(),
+            "Cannot determine model repository revision"
+        );
+        let revision = String::from_utf8(revision_output.stdout)?.trim().to_owned();
+        let vision_backend = vision::pull_vision_backend(&tmp, include_file.as_deref())?;
+        anyhow::ensure!(
+            projector.is_none() || vision_backend == Some("llama-server"),
+            "--projector applies only to a supported GGUF/llama-server repository"
+        );
+        let enabled = match vision_backend {
+            Some(backend) => choose_vision(&vision::pull_vision_description(
+                &tmp,
+                repo,
+                &revision,
+                &self.model_dir(id),
+                backend,
+            )?)?,
+            None => {
+                anyhow::ensure!(
+                    projector.is_none() && !require_vision,
+                    "This repository has no supported image setup"
+                );
+                false
+            }
+        };
+        let selected_projector = if enabled && vision_backend == Some("llama-server") {
+            Some(vision::select_projector(&tmp, projector)?.context("No matching projector in the selected repository; text-only pull remains available")?)
+        } else {
+            None
+        };
+        let mut include_files = selected_lfs_include_files(&tmp, include_file.as_deref())?;
+        if let Some(projector) = &selected_projector {
+            include_files.push(projector.clone());
+        }
 
         if tmp.join(".gitattributes").is_file() {
             let mut lfs_install_command = Command::new("git");
@@ -1000,6 +1081,9 @@ impl ModelStore {
         for include_file in &include_files {
             ensure_lfs_file_downloaded(&tmp, include_file)?;
         }
+        if let (Some(main), Some(projector)) = (&include_file, &selected_projector) {
+            vision::validate_projector_identity(&tmp.join(main), &tmp.join(projector))?;
+        }
         let import_tmp = tmp.with_file_name(format!(
             "{}-import",
             tmp.file_name()
@@ -1025,7 +1109,34 @@ impl ModelStore {
         );
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_dir_all(&import_tmp);
-        let manifest = manifest?;
+        let mut manifest = manifest?;
+        if let Some(backend) = vision_backend {
+            // Repository evidence of a VLM is independent of downloading its
+            // optional projector. Retain it for later setup and diagnostics.
+            push_unique(
+                &mut manifest.metadata.tasks,
+                InferenceTask::ImageUnderstanding,
+            );
+            push_unique(
+                &mut manifest.metadata.input_modalities,
+                InputModality::Image,
+            );
+            manifest.metadata.vision_setup = Some(crate::backend::vision_setup::ModelVisionSetup {
+                enabled,
+                backend: backend.into(),
+                projector: selected_projector.map(|path| format!("files/{path}")),
+                source_revision: Some(revision),
+            });
+            crate::backend::vision_setup::atomic_json(
+                &self.model_dir(id).join(MANIFEST_FILE),
+                &manifest,
+            )
+            .inspect_err(|_| {
+                // This call reserved a new id; never leave a successful-looking
+                // legacy manifest if recording its chosen setup scope fails.
+                let _ = fs::remove_dir_all(self.model_dir(id));
+            })?;
+        }
         progress(PullProgress::Finished {
             files: manifest.files.len(),
             bytes: manifest.files.iter().map(|file| file.size).sum(),
@@ -2071,14 +2182,7 @@ fn selected_lfs_include_files(root: &Path, primary: Option<&str>) -> Result<Vec<
     let Some(primary) = primary else {
         return Ok(Vec::new());
     };
-    let mut selected = vec![primary.to_string()];
-    if extension_eq(Path::new(primary), "gguf") && !is_gguf_projector_path(primary) {
-        let mut files = Vec::new();
-        collect_files(root, &mut files)?;
-        if let Some(projector) = first_gguf_projector_path(root, &files) {
-            selected.push(projector);
-        }
-    }
+    let selected = vec![primary.to_string()];
 
     let mut included = Vec::new();
     for file in selected {
@@ -2686,6 +2790,10 @@ fn is_gguf_projector_path(path: &str) -> bool {
 
 fn gguf_projector_priority(path: &str) -> usize {
     let lower = path.to_ascii_lowercase();
+    // bf16 contains f16 as a substring but is a different precision.
+    if lower.contains("bf16") {
+        return 1;
+    }
     ["f16", "bf16", "q8_0", "f32"]
         .iter()
         .position(|kind| lower.contains(kind))
@@ -2939,7 +3047,9 @@ fn refresh_manifest_metadata(
     manifest: &mut ModelManifest,
     curated: CuratedMetadataOverrides,
 ) {
+    let vision_setup = manifest.metadata.vision_setup.clone();
     manifest.metadata = ModelMetadata::default();
+    manifest.metadata.vision_setup = vision_setup;
     enrich_manifest_metadata(model_dir, manifest);
 
     if let Some(family) = curated.family {
@@ -4311,7 +4421,10 @@ fn infer_inference_tasks(
             "gemma4",
         ],
     ) || (!audio && hint.contains("vlm"))
-        || root_config.is_some_and(|config| config.get("vision_config").is_some())
+        || root_config.is_some_and(|config| {
+            config.get("vision_config").is_some_and(Value::is_object)
+                && config.get("language_model_only") != Some(&Value::Bool(true))
+        })
         || (manifest.format == ModelFormat::Gguf
             && manifest
                 .files
@@ -7355,7 +7468,7 @@ mod tests {
     }
 
     #[test]
-    fn gguf_selection_excludes_projector_and_pull_includes_it() {
+    fn gguf_selection_excludes_projector_without_explicit_opt_in() {
         let tmp = test_dir("gguf-vlm-pull-files");
         let source = tmp.join("source");
         fs::create_dir_all(&source).unwrap();
@@ -7367,10 +7480,7 @@ mod tests {
         assert_eq!(primary, "Qwen3-VL-Q4_K_M.gguf");
         assert_eq!(
             selected_lfs_include_files(&source, Some(&primary)).unwrap(),
-            vec![
-                "Qwen3-VL-Q4_K_M.gguf".to_string(),
-                "mmproj-Qwen3-VL-f16.gguf".to_string(),
-            ]
+            vec!["Qwen3-VL-Q4_K_M.gguf".to_string()]
         );
 
         let _ = fs::remove_dir_all(tmp);
@@ -7402,7 +7512,7 @@ mod tests {
     }
 
     #[test]
-    fn split_gguf_pull_includes_complete_family_and_projector() {
+    fn split_gguf_pull_includes_complete_family_without_optional_projector() {
         let tmp = test_dir("split-gguf-pull-files");
         let source = tmp.join("source");
         fs::create_dir_all(source.join("Q2_K_S")).unwrap();
@@ -7428,10 +7538,10 @@ mod tests {
 
         for primary in [first, second] {
             let selected = selected_lfs_include_files(&source, Some(primary)).unwrap();
-            assert_eq!(selected, vec![first, second, projector]);
+            assert_eq!(selected, vec![first, second]);
             assert_eq!(
                 lfs_pointer_total_for_files(&source, &selected).unwrap(),
-                Some(99_505_250_000)
+                Some(98_605_250_000)
             );
         }
 
