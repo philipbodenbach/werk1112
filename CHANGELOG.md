@@ -5,6 +5,30 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-10-26
+
+### Changes
+
+- fix(): readme and reference (`ac4886242147`)
+- fix(): readme and reference (`0afca26dc2d1`)
+- fix(): readme and reference (`28142a3f9b85`)
+- fix(): readme and reference (`9b195c9b1f60`)
+- fix(): banner fix (`26b6fcd03f15`)
+- fix(): banner fix (`9da9c601fe0c`)
+- fix(): finish reason fix (`7b901a67a059`)
+- fix(): finish reason fix (`370685f59f46`)
+- fix(): finish reason fix (`193f8cd3e331`)
+- fix(): finish reason fix (`521cf96d5862`)
+- fix(): finish reason fix (`11d4ac4fcf0e`)
+- fix(): finish reason fix (`67c31b5987f7`)
+- fix(): finish reason fix (`95c8fdfee2fe`)
+- fix(): finish reason fix (`3b232eb41519`)
+- fix(): finish reason fix (`b4550bb084fb`)
+- fix(): finish reason fix (`90d98063ca6c`)
+- fix(): finish reason fix (`91f841a33691`)
+- fix(): finish reason fix (`1631d955b25c`)
+- fix(): finish reason fix (`ad738ef49770`)
+
 ## [1.9.1] - 2026-10-14
 
 - Add evidence-backed model discovery and optional Mistral Large 4, FLUX 3 Image
@@ -474,7 +498,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.9.1...HEAD
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/philipbodenbach/werk1112/compare/v1.9.1...v1.10.0
 [1.9.1]: https://github.com/philipbodenbach/werk1112/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/philipbodenbach/werk1112/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/philipbodenbach/werk1112/compare/v1.7.1...v1.8.0
