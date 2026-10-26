@@ -236,22 +236,18 @@ are unavailable upstream. Use `werk support list` and the
 [implementation report](docs/model-support-implementation.md) for exact identities,
 requirements and blockers. FLUX.1 Schnell retains its existing Diffusers path.
 
-## What’s new in v1.9.1
+## What’s new in v1.10.0
 
-Werk Core, Media Companion, ComfyUI and n8n share release version **1.9.1**.
+Werk Core, Media Companion, ComfyUI and n8n share release version **1.10.0**.
 ComfyUI and n8n remain Beta integrations.
 
-- Add evidence-backed model discovery and optional Mistral Large 4, FLUX 3 Image
-  and Eleven v4 provider adapters, plus Kolibri vLLM plugin routing and typed
-  FLUX 3 Action DROID predictions. Actual inference remains unverified; see the
-  [model-support matrix](docs/model-support-matrix.md) for upstream and access blockers.
-- Extend startup preload with resident DROID warmup and explicitly non-billable
-  hosted-client preparation, preserving existing text preload and Schnell paths.
-- Add `serve --preload MODEL...` for ordered, best-effort loading and warmup of
-  supported resident text models within available resources, with retained cache
-  slots, deployment replica support and per-model startup diagnostics.
+- fix(): readme and reference (`ac4886242147`)
+- fix(): readme and reference (`0afca26dc2d1`)
+- fix(): readme and reference (`28142a3f9b85`)
+- fix(): readme and reference (`9b195c9b1f60`)
+- fix(): banner fix (`26b6fcd03f15`)
 
-See the [v1.9.1 changelog](CHANGELOG.md#191---2026-10-14) for all changes and compatibility notes.
+See the [v1.10.0 changelog](CHANGELOG.md#1100---2026-10-26) for all changes and compatibility notes.
 
 ## Documentation
 
