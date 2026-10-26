@@ -1119,6 +1119,9 @@ pub enum Commands {
             help = "Register the existing model in place without copying its files"
         )]
         link: bool,
+
+        #[command(flatten)]
+        vision: crate::backend::vision_setup::VisionOptions,
     },
 
     #[command(about = "Convert an installed NVFP4 Hugging Face model to a separate GGUF model")]
@@ -1153,6 +1156,14 @@ pub enum Commands {
             help = "Download a repository file, for example model.Q4_K_M.gguf; matching GGUF shards are included automatically"
         )]
         file: Option<String>,
+        #[command(flatten)]
+        vision: crate::backend::vision_setup::VisionOptions,
+        #[arg(
+            long,
+            requires = "vision",
+            help = "Select an exact model-specific projector file from this repository"
+        )]
+        projector: Option<String>,
     },
 
     #[command(
@@ -1251,6 +1262,8 @@ pub enum BackendCommands {
             help = "Backend to install, for example llama-cuda, onnx-cuda, vllm, or qwen-tts"
         )]
         target: BackendInstallArg,
+        #[command(flatten)]
+        vision: crate::backend::vision_setup::VisionOptions,
     },
 
     #[command(about = "List discovered runtime backends")]
@@ -1268,6 +1281,33 @@ pub enum BackendCommands {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ArtifactCommands {
+    #[command(
+        about = "Opt in to image input using existing model assets; never downloads the main model"
+    )]
+    Vision {
+        model: String,
+        #[command(flatten)]
+        vision: crate::backend::vision_setup::VisionOptions,
+        #[arg(
+            long,
+            requires = "vision",
+            help = "Explicitly associate a matching local GGUF projector with this model"
+        )]
+        projector: Option<PathBuf>,
+        #[arg(
+            long,
+            requires = "vision",
+            conflicts_with = "projector",
+            help = "Download only a projector from this model's recorded source revision"
+        )]
+        download: bool,
+        #[arg(
+            long,
+            requires = "download",
+            help = "Exact projector filename at the recorded repository revision"
+        )]
+        file: Option<String>,
+    },
     #[command(about = "Build missing optimized artifacts for an installed model")]
     Build {
         #[arg(help = "Installed model id")]
@@ -2172,12 +2212,22 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Backend { command } => {
             let store = ModelStore::resolve(model_home)?;
             match command {
-                BackendCommands::Install { target } => {
+                BackendCommands::Install { target, vision } => {
+                    anyhow::ensure!(
+                        !vision.offline,
+                        "Offline mode does not install runtimes; inspect existing components with werk backend doctor"
+                    );
+                    let target_name = target.to_possible_value().expect("install target");
                     crate::backend::python_install::ensure_install_platform(
                         target
                             .to_possible_value()
                             .expect("install target")
                             .get_name(),
+                    )?;
+                    let vision_choice = crate::backend::vision_setup::installer_choice(
+                        &store,
+                        target_name.get_name(),
+                        &vision,
                     )?;
                     if let Some(mode) = target.mode() {
                         let executable = install_managed_llama_server_with_options(
@@ -2187,6 +2237,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 verbose: true,
                                 cuda_offload: target == BackendInstallArg::LlamaCudaOffload,
                                 cuda_nvfp4: target == BackendInstallArg::LlamaCudaNvfp4,
+                                vision: vision_choice == Some(true),
                                 ..Default::default()
                             },
                         )?;
@@ -2203,7 +2254,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                             executable.display()
                         );
                     } else if let Some(backend) = target.python_backend() {
-                        let python = backend.install(&store)?;
+                        let python = if vision_choice == Some(true)
+                            && MlxVlmBackend::probe_for_store(&store).is_ok()
+                        {
+                            crate::ui_eprintln!(
+                                "Reusing the configured MLX-VLM runtime; model assets are configured separately."
+                            );
+                            backend.discover_python(&store)
+                        } else {
+                            backend.install(&store)?
+                        };
                         crate::ui_println!(
                             "Installed {} backend: {}",
                             backend.target(),
@@ -2227,6 +2287,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                         let python = crate::backend::text_analysis::install(&store)?;
                         crate::ui_println!("Installed text-analysis backend: {}", python.display());
                     }
+                    if let Some(enabled) = vision_choice {
+                        crate::backend::vision_setup::save_installer_choice(
+                            &store,
+                            target_name.get_name(),
+                            enabled,
+                        )?;
+                        crate::ui_println!(
+                            "Image setup choice saved for {}. Model artifacts and actual image inference are checked separately with werk artifacts vision MODEL and werk doctor --model MODEL --task image-understanding.",
+                            target_name.get_name()
+                        );
+                    }
                     Ok(())
                 }
                 BackendCommands::List => {
@@ -2242,6 +2313,42 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Artifacts { command } => {
             let store = ModelStore::resolve(model_home)?;
             match command {
+                ArtifactCommands::Vision {
+                    model,
+                    vision,
+                    projector,
+                    download,
+                    file,
+                } => {
+                    if download {
+                        anyhow::ensure!(
+                            !vision.offline,
+                            "Offline mode forbids projector downloads; select an existing local file"
+                        );
+                        let manifest = store.download_vision_projector(
+                            &model,
+                            file.as_deref(),
+                            |description| vision.decide(description, None),
+                        )?;
+                        print_manifest_summary(
+                            "Configured image assets; inference not yet tested",
+                            &manifest,
+                        );
+                        return Ok(());
+                    }
+                    let manifest = store.get(&model)?;
+                    if projector.is_none() {
+                        manifest.vision_setup_backend()?;
+                    }
+                    let previous = manifest.metadata.vision_setup.as_ref().map(|s| s.enabled);
+                    let enabled = vision.decide(&format!("Image setup for model {model}. Reuse existing model files; a supplied --projector is an explicit association and must come from this exact model's source/revision. No runtime or model download is performed."), previous)?;
+                    let manifest = store.configure_vision(&model, enabled, projector.as_deref())?;
+                    print_manifest_summary(
+                        "Configured image input; inference not yet tested",
+                        &manifest,
+                    );
+                    Ok(())
+                }
                 ArtifactCommands::Build { model } => {
                     let artifact = store.build_onnx_artifact(&model, false)?;
                     print_artifact_result("Built", &model, &artifact);
@@ -2446,6 +2553,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             name,
             all,
             link,
+            vision,
         } => {
             let store = ModelStore::resolve(model_home)?;
             let manifests = if all {
@@ -2459,7 +2567,27 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }]
             };
             let action = if link { "Linked" } else { "Imported" };
-            for manifest in &manifests {
+            for original in &manifests {
+                let configured;
+                let manifest = if original.vision_setup_backend().is_ok() {
+                    let previous = original.metadata.vision_setup.as_ref().map(|s| s.enabled);
+                    if previous.is_none() {
+                        // Import has already registered the local files. If the
+                        // subsequent choice is cancelled or setup fails, keep
+                        // this new model text-only rather than legacy-enabled.
+                        store.configure_vision(&original.id, false, None)?;
+                    }
+                    let enabled = vision.decide(&format!("Image setup for imported model {}: reuse local matching assets; no model or runtime download. Missing assets can be configured later with werk artifacts vision.", original.id), previous)?;
+                    configured = store.configure_vision(&original.id, enabled, None)?;
+                    &configured
+                } else {
+                    anyhow::ensure!(
+                        !vision.vision,
+                        "Image setup is not supported for imported model {}",
+                        original.id
+                    );
+                    original
+                };
                 print_manifest_summary(action, manifest);
                 if link {
                     crate::ui_println!(
@@ -2494,13 +2622,26 @@ pub async fn run(cli: Cli) -> Result<()> {
             print_manifest_summary("Converted", &manifest);
             Ok(())
         }
-        Commands::Pull { repo, name, file } => {
+        Commands::Pull {
+            repo,
+            name,
+            file,
+            vision,
+            projector,
+        } => {
+            anyhow::ensure!(
+                !vision.offline,
+                "Offline mode does not pull repositories; use werk artifacts vision MODEL --offline for existing assets"
+            );
             let store = ModelStore::resolve(model_home)?;
             let progress = pull_progress_bar();
-            let manifest = store.pull_from_huggingface_with_progress(
+            let manifest = store.pull_from_huggingface_with_vision(
                 &repo,
                 name.as_deref(),
                 file.as_deref(),
+                projector.as_deref(),
+                vision.vision,
+                |description| vision.decide(description, None),
                 |event| {
                     update_pull_progress(&progress, event);
                 },
@@ -9413,6 +9554,35 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        let backends: Vec<_> = self.backends.lock().ok()?.values().cloned().collect();
+        backends
+            .iter()
+            .filter_map(|backend| backend.inference_capacity(manifest))
+            .min()
+    }
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        let mut configs: Vec<_> = backends
+            .iter()
+            .filter_map(|b| b.reasoning_config(manifest))
+            .collect();
+        let omlx = self
+            .omlx_backends
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        configs.extend(omlx.iter().filter_map(|b| b.reasoning_config(manifest)));
+        crate::reasoning::consistent(configs)
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         let backends: Vec<_> = self
             .backends
@@ -9439,7 +9609,7 @@ impl GenerationBackend for AutoBackend {
     ) -> Result<()> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .validate_api_options(manifest, request, options)
@@ -9454,7 +9624,7 @@ impl GenerationBackend for AutoBackend {
     ) -> Result<serde_json::Value> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .generate_api(manifest, request, options, tx)
@@ -9463,7 +9633,7 @@ impl GenerationBackend for AutoBackend {
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .count_tokens(manifest, request)
@@ -9476,7 +9646,7 @@ impl GenerationBackend for AutoBackend {
     ) -> anyhow::Result<usize> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .count_api_tokens(manifest, request, options)
@@ -9582,7 +9752,7 @@ impl GenerationBackend for AutoBackend {
     ) -> Result<crate::backend::GenerateResponse> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .generate(manifest, request)
@@ -9595,7 +9765,7 @@ impl GenerationBackend for AutoBackend {
     ) -> crate::backend::GenerateStream {
         match self.backend_for_execution(
             &manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         ) {
             Ok(backend) => backend.generate_stream(manifest, request),
@@ -9712,6 +9882,35 @@ impl GgufPreferredBackend {
 }
 
 impl GenerationBackend for GgufPreferredBackend {
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        let backends: Vec<_> = self.backends.lock().ok()?.values().cloned().collect();
+        backends
+            .iter()
+            .filter_map(|backend| backend.inference_capacity(manifest))
+            .min()
+    }
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        let mut configs: Vec<_> = backends
+            .iter()
+            .filter_map(|b| b.reasoning_config(manifest))
+            .collect();
+        let omlx = self
+            .omlx_backends
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        configs.extend(omlx.iter().filter_map(|b| b.reasoning_config(manifest)));
+        crate::reasoning::consistent(configs)
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         let backends: Vec<_> = self
             .backends
@@ -9738,7 +9937,7 @@ impl GenerationBackend for GgufPreferredBackend {
     ) -> Result<()> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .validate_api_options(manifest, request, options)
@@ -9753,7 +9952,7 @@ impl GenerationBackend for GgufPreferredBackend {
     ) -> Result<serde_json::Value> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .generate_api(manifest, request, options, tx)
@@ -9762,7 +9961,7 @@ impl GenerationBackend for GgufPreferredBackend {
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .count_tokens(manifest, request)
@@ -9775,7 +9974,7 @@ impl GenerationBackend for GgufPreferredBackend {
     ) -> anyhow::Result<usize> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .count_api_tokens(manifest, request, options)
@@ -9866,7 +10065,7 @@ impl GenerationBackend for GgufPreferredBackend {
     ) -> Result<crate::backend::GenerateResponse> {
         self.backend_for_execution(
             manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         )?
         .generate(manifest, request)
@@ -9879,7 +10078,7 @@ impl GenerationBackend for GgufPreferredBackend {
     ) -> crate::backend::GenerateStream {
         match self.backend_for_execution(
             &manifest,
-            !request.image_urls.is_empty(),
+            request.has_images(),
             request.requires_tool_calling(),
         ) {
             Ok(backend) => backend.generate_stream(manifest, request),
@@ -9941,6 +10140,20 @@ impl MlxPreferredBackend {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        crate::reasoning::consistent(
+            [
+                self.text_backend.reasoning_config(manifest),
+                self.vision_backend.reasoning_config(manifest),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         let mut samples = self.text_backend.telemetry();
         samples.extend(self.vision_backend.telemetry());
@@ -9953,7 +10166,7 @@ impl GenerationBackend for MlxPreferredBackend {
         request: &GenerateRequest,
         options: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .validate_api_options(manifest, request, options)
     }
 
@@ -9964,12 +10177,12 @@ impl GenerationBackend for MlxPreferredBackend {
         options: std::collections::BTreeMap<String, serde_json::Value>,
         tx: Option<tokio::sync::mpsc::Sender<Result<serde_json::Value, String>>>,
     ) -> Result<serde_json::Value> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .generate_api(manifest, request, options, tx)
     }
 
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .count_tokens(manifest, request)
     }
     fn count_api_tokens(
@@ -9978,7 +10191,7 @@ impl GenerationBackend for MlxPreferredBackend {
         request: GenerateRequest,
         options: std::collections::BTreeMap<String, serde_json::Value>,
     ) -> anyhow::Result<usize> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .count_api_tokens(manifest, request, options)
     }
 
@@ -10048,7 +10261,7 @@ impl GenerationBackend for MlxPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .generate(manifest, request)
     }
 
@@ -10057,7 +10270,7 @@ impl GenerationBackend for MlxPreferredBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+        match self.backend_for_request(&manifest, request.has_images()) {
             Ok(backend) => backend.generate_stream(manifest, request),
             Err(error) => Box::pin(tokio_stream::iter(vec![Err(format!("{error:#}"))])),
         }
@@ -10165,6 +10378,29 @@ impl VllmPreferredBackend {
 }
 
 impl GenerationBackend for VllmPreferredBackend {
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        let backends: Vec<_> = self.backends.lock().ok()?.values().cloned().collect();
+        backends
+            .iter()
+            .filter_map(|backend| backend.inference_capacity(manifest))
+            .min()
+    }
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        let backends: Vec<_> = self
+            .backends
+            .lock()
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        let configs: Vec<_> = backends
+            .iter()
+            .filter_map(|b| b.reasoning_config(manifest))
+            .collect();
+        crate::reasoning::consistent(configs)
+    }
+
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         let backends: Vec<_> = self
             .backends
@@ -10180,7 +10416,7 @@ impl GenerationBackend for VllmPreferredBackend {
         request: &GenerateRequest,
         options: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .validate_api_options(manifest, request, options)
     }
 
@@ -10191,12 +10427,12 @@ impl GenerationBackend for VllmPreferredBackend {
         options: std::collections::BTreeMap<String, serde_json::Value>,
         tx: Option<tokio::sync::mpsc::Sender<Result<serde_json::Value, String>>>,
     ) -> Result<serde_json::Value> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .generate_api(manifest, request, options, tx)
     }
 
     fn count_tokens(&self, manifest: &ModelManifest, request: GenerateRequest) -> Result<usize> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .count_tokens(manifest, request)
     }
     fn count_api_tokens(
@@ -10205,7 +10441,7 @@ impl GenerationBackend for VllmPreferredBackend {
         request: GenerateRequest,
         options: std::collections::BTreeMap<String, serde_json::Value>,
     ) -> anyhow::Result<usize> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .count_api_tokens(manifest, request, options)
     }
 
@@ -10296,7 +10532,7 @@ impl GenerationBackend for VllmPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
-        self.backend_for_request(manifest, !request.image_urls.is_empty())?
+        self.backend_for_request(manifest, request.has_images())?
             .generate(manifest, request)
     }
 
@@ -10305,7 +10541,7 @@ impl GenerationBackend for VllmPreferredBackend {
         manifest: ModelManifest,
         request: GenerateRequest,
     ) -> crate::backend::GenerateStream {
-        match self.backend_for_request(&manifest, !request.image_urls.is_empty()) {
+        match self.backend_for_request(&manifest, request.has_images()) {
             Ok(backend) => backend.generate_stream(manifest, request),
             Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
         }
@@ -10860,6 +11096,14 @@ fn backend_unavailability_reason_for_request(
     has_images: bool,
     selection_options: SelectionOptions,
 ) -> Option<String> {
+    // A normal image request is never consent to install or upgrade a runtime.
+    let selection_options = SelectionOptions {
+        provision_missing_backends: selection_options.provision_missing_backends && !has_images,
+        ..selection_options
+    };
+    if has_images && let Err(error) = manifest.require_image_setup() {
+        return Some(compact_reason(&error.to_string()));
+    }
     if has_images
         && matches!(backend, BackendChoice::LlamaServer(_))
         && let Err(error) = LlamaServerBackend::validate_image_model(store, manifest)
@@ -10889,6 +11133,16 @@ fn backend_unavailability_reason_for_request(
                 "vLLM does not support image input for architecture '{}'",
                 manifest.architecture.as_deref().unwrap_or("unknown")
             ))
+        }
+        BackendChoice::Vllm | BackendChoice::VllmRocm => {
+            VllmBackend::validate_image_assets(store, manifest)
+                .err()
+                .map(|error| compact_reason(&error.to_string()))
+        }
+        BackendChoice::MlxVlm => {
+            crate::backend::vision_setup::validate_processor_assets(store, manifest)
+                .err()
+                .map(|error| compact_reason(&error.to_string()))
         }
         _ => None,
     }
@@ -10938,7 +11192,7 @@ fn generation_backend_task_readiness(
         Ok(selected) => TaskReadiness {
             status: TaskReadinessStatus::Available,
             detail: format!(
-                "image understanding is routable through {} without loading model weights during capability discovery",
+                "local image prerequisites checked for {}; actual image inference has not been tested by this read-only probe",
                 verbose_backend_label(selected)
             ),
             adapter: Some(backend_label(selected).to_string()),
@@ -11005,6 +11259,9 @@ fn routed_backend_for_request_with_tools(
     tool_calling: bool,
     selection_options: SelectionOptions,
 ) -> Result<RoutedBackend> {
+    if has_images {
+        manifest.require_image_setup()?;
+    }
     if let Some((provider, model)) = crate::model_support::remote(manifest) {
         anyhow::ensure!(
             matches!(backend, BackendChoice::Auto | BackendChoice::Provider),
@@ -12372,6 +12629,17 @@ mod tests {
         for target in &cli_targets {
             assert!(Cli::try_parse_from(["werk", "backend", "install", target]).is_ok());
             assert!(
+                Cli::try_parse_from([
+                    "werk",
+                    "backend",
+                    "install",
+                    target,
+                    "--vision",
+                    "--text-only"
+                ])
+                .is_err()
+            );
+            assert!(
                 validated_backend_install_command(&format!("werk backend install {target}"))
                     .is_some()
             );
@@ -12396,13 +12664,79 @@ mod tests {
     }
 
     #[test]
+    fn optional_vision_cli_scope_and_offline_are_explicit() {
+        for args in [
+            vec![
+                "werk",
+                "pull",
+                "org/model",
+                "--vision",
+                "--projector",
+                "mmproj-F16.gguf",
+            ],
+            vec![
+                "werk",
+                "import",
+                "/model",
+                "--name",
+                "test",
+                "--text-only",
+                "--offline",
+            ],
+            vec![
+                "werk",
+                "artifacts",
+                "vision",
+                "test",
+                "--vision",
+                "--download",
+            ],
+            vec![
+                "werk",
+                "artifacts",
+                "vision",
+                "test",
+                "--vision",
+                "--projector",
+                "/model/mmproj.gguf",
+                "--offline",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec![
+                "werk",
+                "pull",
+                "org/model",
+                "--projector",
+                "mmproj-F16.gguf",
+            ],
+            vec!["werk", "artifacts", "vision", "test", "--download"],
+            vec![
+                "werk",
+                "artifacts",
+                "vision",
+                "test",
+                "--vision",
+                "--download",
+                "--projector",
+                "mmproj.gguf",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn omlx_install_cli_and_platform_hints() {
         let cli = Cli::try_parse_from(["werk", "backend", "install", "omlx"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Commands::Backend {
                 command: BackendCommands::Install {
-                    target: BackendInstallArg::Omlx
+                    target: BackendInstallArg::Omlx,
+                    ..
                 }
             })
         ));
@@ -12451,6 +12785,7 @@ mod tests {
                 name,
                 all,
                 link,
+                ..
             } => {
                 assert_eq!(path, PathBuf::from("/mnt/raid/large-model"));
                 assert_eq!(name.as_deref(), Some("large-model"));
@@ -12483,6 +12818,7 @@ mod tests {
                     name,
                     all,
                     link: parsed_link,
+                    ..
                 } => {
                     assert_eq!(path, PathBuf::from("/mnt/f/Werk1112/models"));
                     assert!(name.is_none());
@@ -12579,7 +12915,8 @@ mod tests {
             cli.command,
             Some(Commands::Backend {
                 command: BackendCommands::Install {
-                    target: BackendInstallArg::LlamaCudaNvfp4
+                    target: BackendInstallArg::LlamaCudaNvfp4,
+                    ..
                 }
             })
         ));
@@ -12606,6 +12943,18 @@ mod tests {
 
     #[test]
     fn parses_cli_commands() {
+        // This aggregate debug-build test keeps many large command enums in
+        // one frame. Give it its own stack instead of requiring callers to set
+        // RUST_MIN_STACK for the entire test suite.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(parses_cli_commands_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn parses_cli_commands_inner() {
         let cli = Cli::try_parse_from([
             "werk",
             "--device",
@@ -12766,6 +13115,7 @@ mod tests {
                 name,
                 all,
                 link,
+                ..
             } => {
                 assert_eq!(path, PathBuf::from("/tmp/model"));
                 assert_eq!(name.as_deref(), Some("local"));
@@ -12786,7 +13136,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command.unwrap() {
-            Commands::Pull { repo, name, file } => {
+            Commands::Pull {
+                repo, name, file, ..
+            } => {
                 assert_eq!(repo, "org/repo");
                 assert_eq!(name.as_deref(), Some("repo"));
                 assert_eq!(file.as_deref(), Some("model.Q4_K_M.gguf"));
@@ -12885,7 +13237,7 @@ mod tests {
         let cli = Cli::try_parse_from(["werk", "backend", "install", "llama-cuda"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
-                command: BackendCommands::Install { target },
+                command: BackendCommands::Install { target, .. },
             } => assert_eq!(target, BackendInstallArg::LlamaCuda),
             command => panic!("unexpected command: {command:?}"),
         }
@@ -12893,7 +13245,7 @@ mod tests {
         let cli = Cli::try_parse_from(["werk", "backend", "install", "llama-rocm"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
-                command: BackendCommands::Install { target },
+                command: BackendCommands::Install { target, .. },
             } => assert_eq!(target, BackendInstallArg::LlamaRocm),
             command => panic!("unexpected command: {command:?}"),
         }
@@ -12901,7 +13253,7 @@ mod tests {
         let cli = Cli::try_parse_from(["werk", "backend", "install", "vllm"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
-                command: BackendCommands::Install { target },
+                command: BackendCommands::Install { target, .. },
             } => assert_eq!(target, BackendInstallArg::Vllm),
             command => panic!("unexpected command: {command:?}"),
         }
@@ -12909,7 +13261,7 @@ mod tests {
         let cli = Cli::try_parse_from(["werk", "backend", "install", "qwen-tts"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
-                command: BackendCommands::Install { target },
+                command: BackendCommands::Install { target, .. },
             } => assert_eq!(target, BackendInstallArg::QwenTts),
             command => panic!("unexpected command: {command:?}"),
         }
@@ -12917,7 +13269,7 @@ mod tests {
         let cli = Cli::try_parse_from(["werk", "backend", "install", "onnx-rocm"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
-                command: BackendCommands::Install { target },
+                command: BackendCommands::Install { target, .. },
             } => assert_eq!(target, BackendInstallArg::OnnxRocm),
             command => panic!("unexpected command: {command:?}"),
         }
@@ -15226,6 +15578,7 @@ mod tests {
         let store = test_store("omlx-node-explicit-backend");
         let model = test_manifest(ModelFormat::Mlx, Some("deepseek_v4"));
         let controls = crate::openai::ChatRuntimeOptions {
+            reasoning: None,
             documents: None,
             omlx: Some(crate::openai::OmlxChatOptions {
                 reasoning_effort: None,
@@ -15269,6 +15622,7 @@ mod tests {
             SelectionOptions::default(),
         );
         let controls = crate::openai::ChatRuntimeOptions {
+            reasoning: None,
             documents: None,
             omlx: Some(crate::openai::OmlxChatOptions {
                 reasoning_effort: None,

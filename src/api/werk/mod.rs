@@ -30,11 +30,17 @@ pub(super) fn routes() -> Router<ApiState> {
     let reads = Router::new()
         .route("/werk/v1/info", get(info_handler))
         .route("/werk/v1/capabilities", get(capabilities_handler))
+        .route("/werk/v1/chat/reasoning", get(reasoning_handler))
+        .route("/werk/v1/chat/limits", get(generation_limits_handler))
         .route("/werk/v1/memory", get(memory_handler))
         .route("/werk/v1/states", get(list_states_handler))
         .route("/werk/v1/experts", get(list_experts_handler));
 
     let writes = Router::new()
+        .route(
+            "/werk/v1/chat/count_tokens",
+            post(chat_count_tokens_handler),
+        )
         .route("/werk/v1/states/prune", post(prune_states_handler))
         .route("/werk/v1/states/{id}/actions", post(state_action_handler))
         .route("/werk/v1/experts/actions", post(expert_action_handler))
@@ -43,6 +49,291 @@ pub(super) fn routes() -> Router<ApiState> {
         .layer(DefaultBodyLimit::max(MAX_WERK_BODY_BYTES));
 
     reads.merge(writes)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReasoningQuery {
+    model: Option<String>,
+    max_output_tokens: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationLimitsQuery {
+    model: Option<String>,
+}
+
+async fn generation_limits_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    query: Result<Query<GenerationLimitsQuery>, QueryRejection>,
+) -> Response {
+    let (request_id, _) = match request_context(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return protocol_error(
+                request_id,
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+            );
+        }
+    };
+    let model = query
+        .model
+        .or_else(|| state.default_model.clone())
+        .unwrap_or_default();
+    if model.is_empty() || model.len() > 512 {
+        return protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "A valid model is required",
+            ),
+        );
+    }
+    let targets = if let Some(registry) = &state.deployments {
+        match registry.preload_targets(&model) {
+            Ok(targets) => targets,
+            Err(error) => {
+                return protocol_error(
+                    request_id,
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+                );
+            }
+        }
+    } else {
+        vec![(model.clone(), state, model.clone())]
+    };
+    let result = crate::logging::spawn_blocking(
+        move || -> anyhow::Result<crate::generation_limits::ChatGenerationLimits> {
+            let mut profiles = Vec::new();
+            for (_, state, physical_model) in targets {
+                let manifest = state.store.get(&physical_model)?;
+                let mut profile = crate::generation_limits::profile(
+                    &manifest,
+                    super::generation::generation_context_size(&state, &manifest),
+                );
+                profile.max_concurrent_requests = state.backend.inference_capacity(&manifest);
+                profiles.push(profile);
+            }
+            anyhow::ensure!(!profiles.is_empty(), "No matching deployment");
+            // An alias must be safe on every replica. An unknown replica prevents
+            // advertising a verified ceiling; known differing limits use the minimum.
+            let minimum = |values: Vec<Option<usize>>| -> Option<usize> {
+                values
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .min()
+            };
+            Ok(crate::generation_limits::ChatGenerationLimits {
+                schema_version: 1,
+                model,
+                context_tokens: minimum(profiles.iter().map(|p| p.context_tokens).collect()),
+                max_output_tokens: minimum(profiles.iter().map(|p| p.max_output_tokens).collect()),
+                max_concurrent_requests: minimum(
+                    profiles.iter().map(|p| p.max_concurrent_requests).collect(),
+                ),
+            })
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(profile)) => success(request_id, profile),
+        Ok(Err(error)) => protocol_error(
+            request_id,
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+        ),
+        Err(_) => protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "Generation limits lookup failed",
+            ),
+        ),
+    }
+}
+
+async fn reasoning_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    query: Result<Query<ReasoningQuery>, QueryRejection>,
+) -> Response {
+    let (request_id, _) = match request_context(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return protocol_error(
+                request_id,
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+            );
+        }
+    };
+    let model = query
+        .model
+        .or_else(|| state.default_model.clone())
+        .unwrap_or_default();
+    let output = query.max_output_tokens.unwrap_or(256);
+    if model.is_empty() || model.len() > 512 || output == 0 || output > 2_000_000 {
+        return protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "model and max_output_tokens (1..2000000) are required",
+            ),
+        );
+    }
+    // Expand aliases read-only: do not take inference permits or move routing cursors.
+    let targets = if let Some(registry) = &state.deployments {
+        match registry.preload_targets(&model) {
+            Ok(targets) => targets,
+            Err(error) => {
+                return protocol_error(
+                    request_id,
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+                );
+            }
+        }
+    } else {
+        vec![(model.clone(), state, model.clone())]
+    };
+    let result = crate::logging::spawn_blocking(
+        move || -> anyhow::Result<crate::reasoning::ReasoningProfile> {
+            let mut profiles = Vec::new();
+            for (_, state, physical_model) in targets {
+                let manifest = state.store.get(&physical_model)?;
+                let mut profile = crate::reasoning::profile(
+                    &manifest,
+                    state.backend.reasoning_config(&manifest).as_ref(),
+                    super::generation::generation_context_size(&state, &manifest),
+                    output,
+                );
+                profile.model = model.clone();
+                profiles.push(profile);
+            }
+            let first = profiles
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("No matching deployment"))?;
+            anyhow::ensure!(
+                profiles.iter().all(|p| p == first),
+                "Deployment replicas report different reasoning profiles; select a deployment ID"
+            );
+            Ok(profiles.remove(0))
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(profile)) => success(request_id, profile),
+        Ok(Err(error)) => protocol_error(
+            request_id,
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string()),
+        ),
+        Err(_) => protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "Reasoning profile lookup failed",
+            ),
+        ),
+    }
+}
+
+async fn chat_count_tokens_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Result<Json<crate::openai::ChatCompletionRequest>, JsonRejection>,
+) -> Response {
+    let (request_id, _) = match request_context(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Json(mut request) = match body {
+        Ok(body) => body,
+        Err(error) => return json_rejection(request_id, error),
+    };
+    // This route never generates, regardless of an inherited stream setting.
+    request.stream = Some(false);
+    let prepared = match super::generation::prepare(
+        state,
+        request,
+        super::generation::ContextPolicy::Count,
+        "/werk/v1/chat/count_tokens",
+        &headers,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return protocol_error(
+                request_id,
+                ProtocolError::new(
+                    if error.status == StatusCode::TOO_MANY_REQUESTS {
+                        ProtocolErrorCode::ResourceExhausted
+                    } else if error.status.is_server_error() {
+                        ProtocolErrorCode::Unavailable
+                    } else {
+                        ProtocolErrorCode::InvalidRequest
+                    },
+                    error.message,
+                )
+                .retryable(
+                    error.status == StatusCode::TOO_MANY_REQUESTS || error.status.is_server_error(),
+                ),
+            );
+        }
+    };
+    let model = prepared
+        .state
+        .requested_alias
+        .clone()
+        .unwrap_or_else(|| prepared.manifest.id.clone());
+    match crate::logging::spawn_blocking(move || {
+        let _permit = prepared.state.deployment_permit;
+        prepared.state.backend.count_api_tokens(
+            &prepared.manifest,
+            prepared.request,
+            prepared.api_options,
+        )
+    })
+    .await
+    {
+        Ok(Ok(count)) => success(
+            request_id,
+            crate::werk_protocol::ChatTokenCountResponse {
+                model,
+                input_tokens: count as u64,
+            },
+        ),
+        Ok(Err(error)) => {
+            let unsupported = error.is::<crate::backend::UnsupportedTokenCounting>();
+            protocol_error(
+                request_id,
+                ProtocolError::new(
+                    if unsupported {
+                        ProtocolErrorCode::Unsupported
+                    } else {
+                        ProtocolErrorCode::Unavailable
+                    },
+                    format!("Native chat token count unavailable: {error}"),
+                )
+                .retryable(!unsupported),
+            )
+        }
+        Err(_) => protocol_error(
+            request_id,
+            ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "Native chat token count task failed",
+            ),
+        ),
+    }
 }
 
 async fn info_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {

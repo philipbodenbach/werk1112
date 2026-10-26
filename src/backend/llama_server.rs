@@ -28,6 +28,7 @@ mod model_prefetch_policy;
 use super::model_file_cache;
 #[cfg(target_os = "linux")]
 mod expert_memory;
+mod probe;
 mod runtime_state;
 mod telemetry;
 #[cfg(test)]
@@ -65,6 +66,8 @@ const API_OPTIONS: &[&str] = &[
     "top_logprobs",
     "top_k",
     "reasoning_effort",
+    "reasoning_budget_tokens",
+    "__werk_thinking",
 ];
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -99,6 +102,8 @@ struct LlamaServerProcess {
     executable: PathBuf,
     discovery_source: String,
     args: Vec<String>,
+    reasoning_defaults: Option<crate::observability::ReasoningDefaults>,
+    reasoning_budget_supported: bool,
     execution: fp4::Execution,
     model_path: PathBuf,
     projector_path: Option<PathBuf>,
@@ -239,6 +244,7 @@ impl LlamaServerBackend {
         store: &ModelStore,
         manifest: &ModelManifest,
     ) -> Result<PathBuf> {
+        manifest.require_image_setup()?;
         if manifest.format != ModelFormat::Gguf {
             bail!("llama.cpp image input requires a GGUF model");
         }
@@ -282,7 +288,7 @@ impl LlamaServerBackend {
             );
         }
         Ok(format!(
-            "llama.cpp server {} is ready for image input with projector {}",
+            "llama.cpp server {} advertises the image path and a local projector is selected; architecture/projector compatibility and actual image inference remain untested ({})",
             display_name(mode),
             projector.display()
         ))
@@ -379,8 +385,15 @@ impl LlamaServerBackend {
             .as_deref()
             .context("GGUF manifest has no model_path")?;
         let absolute_model_path = self.store.absolute_model_file(manifest, model_path);
-        let projector_path =
-            discover_multimodal_projector(&self.store, manifest, &absolute_model_path)?;
+        let projector_path = if require_projector {
+            manifest.require_image_setup()?;
+            discover_multimodal_projector(&self.store, manifest, &absolute_model_path)?
+        } else {
+            // Ambiguous/absent optional assets must not break a text preload.
+            discover_multimodal_projector(&self.store, manifest, &absolute_model_path)
+                .ok()
+                .flatten()
+        };
         if require_projector && projector_path.is_none() {
             bail!(
                 "llama.cpp image input for model '{}' requires exactly one local multimodal projector: add a .gguf file whose filename contains 'mmproj' or 'projector' to the model manifest",
@@ -472,6 +485,26 @@ impl LlamaServerBackend {
 }
 
 impl GenerationBackend for LlamaServerBackend {
+    fn reasoning_config(
+        &self,
+        manifest: &ModelManifest,
+    ) -> Option<crate::reasoning::BackendReasoning> {
+        crate::reasoning::consistent(
+            self.servers
+                .snapshot()
+                .into_iter()
+                .filter(|server| server.model_id == manifest.id && server.is_running())
+                .filter_map(|server| {
+                    let defaults = server.reasoning_defaults.clone()?;
+                    Some(crate::reasoning::BackendReasoning {
+                        backend: "llama.cpp".into(),
+                        defaults,
+                        budget_control: server.reasoning_budget_supported,
+                        native_efforts: vec![],
+                    })
+                }),
+        )
+    }
     fn preload(
         &self,
         manifest: &ModelManifest,
@@ -482,6 +515,24 @@ impl GenerationBackend for LlamaServerBackend {
 
     fn telemetry(&self) -> Vec<crate::observability::BackendSnapshot> {
         telemetry::sample(self)
+    }
+
+    fn inference_capacity(&self, manifest: &ModelManifest) -> Option<usize> {
+        let workers: Vec<_> = self
+            .servers
+            .snapshot()
+            .into_iter()
+            .filter(|server| server.model_id == manifest.id && server.is_running())
+            .collect();
+        if workers.is_empty() {
+            return None;
+        }
+        workers
+            .iter()
+            .map(|server| telemetry::configured_slots(&server.args))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()
     }
 
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
@@ -495,6 +546,15 @@ impl GenerationBackend for LlamaServerBackend {
         options: &std::collections::BTreeMap<String, Value>,
     ) -> Result<()> {
         super::openai_transport::validate_api_options(options, API_OPTIONS)?;
+        if let Some(budget) = options.get("reasoning_budget_tokens") {
+            anyhow::ensure!(
+                budget.as_u64().is_some_and(|n| n <= i32::MAX as u64),
+                "Invalid resolved reasoning budget"
+            );
+        }
+        if let Some(thinking) = options.get("__werk_thinking") {
+            anyhow::ensure!(thinking.is_boolean(), "Invalid resolved thinking control");
+        }
         if let Some(effort) = options.get("reasoning_effort")
             && !effort.is_string()
         {
@@ -540,7 +600,7 @@ impl GenerationBackend for LlamaServerBackend {
     ) -> Result<usize> {
         self.validate_api_options(manifest, &request, &options)?;
         if request_has_images(&request) {
-            bail!("native llama.cpp token counting does not expose image token counts");
+            return Err(super::UnsupportedTokenCounting.into());
         }
         let (server, _, _) = self.cached_server(manifest, false)?;
         let mut body = chat_template_body(&request);
@@ -621,7 +681,7 @@ impl GenerationBackend for LlamaServerBackend {
             Ok(()) => TaskReadiness {
                 status: TaskReadinessStatus::Available,
                 detail: format!(
-                    "{} can execute image understanding without loading model weights during capability discovery",
+                    "{} local image prerequisites checked; actual image inference has not been tested by this read-only probe",
                     display_name(self.mode)
                 ),
                 adapter: Some(format!("llama-server-{}", label(self.mode))),
@@ -933,6 +993,8 @@ impl LlamaServerProcess {
             expert_memory: expert_memory::State::new(model_path, &args, &supported),
             executable,
             discovery_source: discovery.source,
+            reasoning_defaults: telemetry::reasoning_defaults(&args, |name| env::var(name).ok()),
+            reasoning_budget_supported: supported.reasoning_budget,
             args,
             execution,
             model_path: model_path.to_path_buf(),
@@ -1053,6 +1115,7 @@ impl LlamaServerProcess {
         let reported_prompt_tokens = completion.prompt_tokens;
         finalize_completion_stats(&mut completion, request, started.elapsed().as_secs_f64());
         if completion.text.trim().is_empty()
+            && completion.finish_reason != "length"
             && !completion
                 .assistant_message
                 .as_ref()
@@ -1080,12 +1143,18 @@ impl LlamaServerProcess {
             completion.backend_diagnostics.push(format!(
                 "llama.cpp native KV restore duration: {restore_seconds:.6}s"
             ));
-            let save_started = Instant::now();
-            completion.backend_diagnostics.push(cache.save(self));
-            completion.backend_diagnostics.push(format!(
-                "llama.cpp native KV save duration: {:.6}s",
-                save_started.elapsed().as_secs_f64()
-            ));
+            if completion.finish_reason == "length" {
+                completion
+                    .backend_diagnostics
+                    .push("llama.cpp native KV save skipped: output token limit reached".into());
+            } else {
+                let save_started = Instant::now();
+                completion.backend_diagnostics.push(cache.save(self));
+                completion.backend_diagnostics.push(format!(
+                    "llama.cpp native KV save duration: {:.6}s",
+                    save_started.elapsed().as_secs_f64()
+                ));
+            }
         }
         Ok(completion)
     }
@@ -1379,10 +1448,12 @@ fn llama_server_args_with_state(
         args.push("--slot-save-path".to_string());
         args.push(snapshot_dir.display().to_string());
         if supported.cache_ram {
-            // Preserve different API conversations in native RAM even with a
-            // single GPU slot. Disable similarity selection so explicit
-            // id_slot requests used by runtime-state operations bypass native
-            // cache save/load, while unpinned API requests use its LRU path.
+            // The private runtime-state API is supported only with one slot.
+            // There, disable similarity selection so pinned state operations
+            // bypass native RAM cache save/load. With multiple slots, retain
+            // native similarity selection: forcing LRU would move a growing
+            // conversation between slots and save/load its state every turn.
+            let private_slot = runtime_options.parallel.unwrap_or(1) == 1;
             let isolated_cache = supported.slot_prompt_similarity && supported.cache_idle_slots;
             args.push("--cache-ram".to_string());
             args.push(
@@ -1393,7 +1464,7 @@ fn llama_server_args_with_state(
                 }
                 .to_string(),
             );
-            if isolated_cache {
+            if private_slot && isolated_cache {
                 args.extend(["--slot-prompt-similarity".to_string(), "0".to_string()]);
             }
         }
@@ -1485,6 +1556,7 @@ fn complete_request_in_slot(
     let mut sse = SseAccumulator::default();
     let mut finished = false;
     let mut saw_done = false;
+    let mut explicit_finish_reason = None;
     let mut tool_calls = tool_calls::ToolCallAccumulator::default();
 
     stream_body(&mut stream, |bytes| {
@@ -1508,6 +1580,13 @@ fn complete_request_in_slot(
                     .and_then(Value::as_str)
                     .is_some_and(|reason| !reason.is_empty());
             let chunk = if use_chat_endpoint {
+                if let Some(reason) = value
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.is_empty())
+                {
+                    explicit_finish_reason = Some(reason.to_string());
+                }
                 update_chat_completion_from_event(&mut completion, &value);
                 if chat_delta_has_reasoning_content(&value) {
                     completion.saw_reasoning_content = true;
@@ -1543,7 +1622,25 @@ fn complete_request_in_slot(
     if !finished {
         bail!("llama-server stream ended before a completion marker; native snapshot not saved");
     }
-    if let Some(tool_calls) = tool_calls.finish()? {
+    // A token-limited response may end inside a tool argument. Preserve the
+    // upstream finish reason, but never expose these fragments as executable calls.
+    // The default finish_reason is also "length", so require an explicit marker.
+    if explicit_finish_reason.as_deref() == Some("length") {
+        completion.backend_diagnostics.push(format!(
+            "llama.cpp output token limit reached: max_tokens={}, completion_tokens={}; incomplete tool calls discarded",
+            request.max_tokens, completion.completion_tokens
+        ));
+        return Ok(completion);
+    }
+    let calls = tool_calls.finish().map_err(|error| {
+        anyhow!(
+            "{error:#} (finish_reason={}, max_tokens={}, completion_tokens={}); native snapshot not saved",
+            explicit_finish_reason.as_deref().unwrap_or("missing"),
+            request.max_tokens,
+            completion.completion_tokens
+        )
+    })?;
+    if let Some(tool_calls) = calls {
         if completion.finish_reason != "tool_calls" {
             bail!(
                 "llama-server returned tool calls without a tool_calls finish reason; native snapshot not saved"
@@ -1613,11 +1710,16 @@ fn chat_template_body(request: &GenerateRequest) -> Value {
 
 fn apply_chat_api_options(
     body: &mut Value,
-    options: std::collections::BTreeMap<String, Value>,
+    mut options: std::collections::BTreeMap<String, Value>,
 ) -> Result<()> {
-    let thinking = options
-        .get("reasoning_effort")
-        .and_then(super::openai_transport::reasoning_effort_thinking);
+    let tier_thinking = options
+        .remove("__werk_thinking")
+        .and_then(|value| value.as_bool());
+    let thinking = tier_thinking.or_else(|| {
+        options
+            .get("reasoning_effort")
+            .and_then(super::openai_transport::reasoning_effort_thinking)
+    });
     super::openai_transport::apply_api_options(body, options, API_OPTIONS)?;
     if let Some(enabled) = thinking {
         // Standard effort levels override the server's thinking default.
@@ -1817,6 +1919,24 @@ fn discover_multimodal_projector(
     manifest: &ModelManifest,
     model_path: &Path,
 ) -> Result<Option<PathBuf>> {
+    if let Some(setup) = &manifest.metadata.vision_setup {
+        if !setup.enabled {
+            return Ok(None);
+        }
+        if let Some(selected) = &setup.projector {
+            anyhow::ensure!(
+                safe_manifest_relative_path(Path::new(selected))
+                    && manifest.files.iter().any(|f| &f.path == selected),
+                "Selected projector is not a safe manifest-listed file"
+            );
+            let path = store.absolute_model_file(manifest, selected);
+            anyhow::ensure!(
+                path != model_path && path.is_file(),
+                "Selected model-specific projector is missing; run werk artifacts vision MODEL --vision --projector PATH"
+            );
+            return Ok(Some(path));
+        }
+    }
     discover_multimodal_projector_from_files(
         |path| store.absolute_model_file(manifest, path),
         &manifest.files,
@@ -2174,6 +2294,7 @@ struct SupportedArgs {
     no_warmup: bool,
     warmup: bool,
     reasoning: bool,
+    reasoning_budget: bool,
     chat_template_kwargs: bool,
     jinja: bool,
     mmproj: bool,
@@ -2187,17 +2308,9 @@ struct SupportedArgs {
 }
 
 fn supported_args(executable: &PathBuf) -> SupportedArgs {
-    let Ok(output) = Command::new(executable).arg("--help").output() else {
+    let Ok(text) = probe::output(executable, "--help", 2 * 1024 * 1024) else {
         return SupportedArgs::default();
     };
-    if !output.status.success() {
-        return SupportedArgs::default();
-    }
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
     supported_args_from_help(&text)
 }
 
@@ -2213,6 +2326,7 @@ fn supported_args_from_help(text: &str) -> SupportedArgs {
         no_warmup: help_has_exact_option(&text, "--no-warmup"),
         warmup: help_has_exact_option(&text, "--warmup"),
         reasoning: text.contains("--reasoning ") || text.contains("-rea,"),
+        reasoning_budget: help_has_exact_option(text, "--reasoning-budget"),
         chat_template_kwargs: text.contains("--chat-template-kwargs"),
         jinja: help_has_exact_option(text, "--jinja"),
         mmproj: text.split_whitespace().any(|argument| {
@@ -2244,6 +2358,8 @@ pub struct LlamaServerInstallOptions {
     pub cuda_nvfp4: bool,
     /// Automatic model-specific provisioning must not change the default runtime.
     pub preserve_active: bool,
+    /// Reuse a verified image entry point, or stage a replacement separately.
+    pub vision: bool,
 }
 
 pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<PathBuf> {
@@ -2292,8 +2408,37 @@ pub fn install_managed_llama_server_with_options(
     } else {
         base_root
     };
+    if options.vision {
+        let mut candidates = server_candidates_under(&root);
+        if !options.cuda_offload && !options.cuda_nvfp4 {
+            candidates.extend(discover_llama_server(store, mode).path);
+        }
+        if let Some(existing) = candidates.into_iter().find(|path| {
+            path.is_file()
+                && validate_llama_server(path, mode).is_ok()
+                && supported_args(path).mmproj
+                && (!options.cuda_nvfp4 || fp4::validate_runtime(path).is_ok())
+                && (!options.cuda_offload || cuda_offload::validate_runtime(path).is_ok())
+        }) {
+            if !options.preserve_active {
+                select_managed_server_path(&managed_path_file(store, mode), &existing)?;
+            }
+            return Ok(existing);
+        }
+    }
     let source_dir = root.join("llama.cpp");
-    let build_dir = root.join("build");
+    // Keep the old executable and its shared libraries intact until the new
+    // image-capable generation has passed validation and is selected atomically.
+    fs::create_dir_all(&root)?;
+    let build_root = if options.vision {
+        tempfile::Builder::new()
+            .prefix("generation-")
+            .tempdir_in(&root)?
+            .keep()
+    } else {
+        root.clone()
+    };
+    let build_dir = build_root.join("build");
     fs::create_dir_all(&root)
         .with_context(|| format!("failed to create backend cache {}", root.display()))?;
 
@@ -2499,9 +2644,11 @@ pub fn install_managed_llama_server_with_options(
             options.verbose,
         )?;
     }
-    let executable = server_candidates_under(&root)
+    let executable = server_candidates_under(&build_root)
         .into_iter()
-        .find(|path| path.is_file())
+        // A previous published generation can be discovered under this root;
+        // installation must validate the executable from this build directory.
+        .find(|path| path.starts_with(&build_dir) && path.is_file())
         .ok_or_else(|| {
             anyhow!(
                 "llama-server build finished, but no executable was found under {}",
@@ -2509,6 +2656,12 @@ pub fn install_managed_llama_server_with_options(
             )
         })?;
     validate_llama_server(&executable, mode)?;
+    if options.vision {
+        anyhow::ensure!(
+            supported_args(&executable).mmproj,
+            "The built runtime has no --mmproj image entry point; previous installation remains selected"
+        );
+    }
     if options.cuda_nvfp4 {
         fp4::register_runtime(&executable)?;
         fp4::validate_runtime(&executable)?;
@@ -2516,11 +2669,13 @@ pub fn install_managed_llama_server_with_options(
     if options.cuda_offload {
         cuda_offload::validate_runtime(&executable)?;
     }
+    if options.vision && (options.cuda_nvfp4 || options.cuda_offload) {
+        // Model-specific profile discovery must find the validated generation,
+        // not an old fixed build directory or an unvalidated staging directory.
+        select_managed_server_path(&root.join("llama-server.path"), &executable)?;
+    }
     if !options.preserve_active {
-        fs::write(
-            managed_path_file(store, mode),
-            executable.display().to_string(),
-        )?;
+        select_managed_server_path(&managed_path_file(store, mode), &executable)?;
     }
     Ok(executable)
 }
@@ -2567,31 +2722,12 @@ pub fn managed_backend_dir(store: &ModelStore, mode: LlamaCppMode) -> PathBuf {
 }
 
 pub fn llama_server_help_ok(path: &Path) -> bool {
-    Command::new(path)
-        .arg("--help")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    probe::output(path, "--help", 2 * 1024 * 1024).is_ok()
 }
 
 fn validate_llama_server(path: &Path, mode: LlamaCppMode) -> Result<()> {
-    let output = Command::new(path)
-        .arg("--help")
-        .output()
+    let text = probe::output(path, "--help", 2 * 1024 * 1024)
         .with_context(|| format!("failed to run {} --help", path.display()))?;
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() {
-        bail!(
-            "llama-server --help failed for {} with {}:\n{}",
-            path.display(),
-            output.status,
-            tail_lines(&text, 30)
-        );
-    }
     if mode == LlamaCppMode::Cuda && cuda_init_failed(&text) {
         bail!(
             "CUDA llama-server was built, but CUDA runtime validation failed:\n{}\n\nFix the NVIDIA driver/CUDA runtime mismatch, then rerun `werk backend install llama-cuda`.",
@@ -2881,7 +3017,13 @@ fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
     let source = root.join("llama.cpp");
     let build = root.join("build");
     let exe = default_executable_name();
-    vec![
+    let mut candidates = fs::read_to_string(root.join("llama-server.path"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| PathBuf::from(s.trim()))
+        .into_iter()
+        .collect::<Vec<_>>();
+    candidates.extend([
         root.join(exe),
         root.join("bin").join(exe),
         build.join("bin").join(exe),
@@ -2890,7 +3032,19 @@ fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
         source.join("build").join("bin").join(exe),
         source.join("build").join("bin").join("Release").join(exe),
         source.join("build").join("tools").join("server").join(exe),
-    ]
+    ]);
+    candidates
+}
+
+fn select_managed_server_path(path: &Path, executable: &Path) -> Result<()> {
+    let parent = path.parent().context("runtime path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    use std::io::Write;
+    write!(staged, "{}", executable.display())?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 fn managed_path_file(store: &ModelStore, mode: LlamaCppMode) -> PathBuf {
@@ -3770,6 +3924,59 @@ mod tests {
     use super::*;
     use crate::openai::{ChatMessage, ContentPart, ImageUrlPart, ImageUrlSpec, MessageContent};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reasoning_tier_native_payload_preserves_other_template_options() {
+        let mut body = json!({"chat_template_kwargs":{"custom":true}});
+        apply_chat_api_options(
+            &mut body,
+            std::collections::BTreeMap::from([
+                ("reasoning_budget_tokens".into(), json!(1024)),
+                ("__werk_thinking".into(), json!(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(body["reasoning_budget_tokens"], 1024);
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"custom":true,"enable_thinking":true})
+        );
+        assert!(body.get("__werk_thinking").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vision_install_reuses_valid_server_and_selects_only_published_generations() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::resolve(Some(tmp.path().join("store"))).unwrap();
+        let root = managed_backend_dir(&store, LlamaCppMode::Cpu);
+        let server = root.join("build/bin/llama-server");
+        fs::create_dir_all(server.parent().unwrap()).unwrap();
+        fs::write(&server, "#!/bin/sh\nprintf '%s\\n' '--mmproj FILE'\n").unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = install_managed_llama_server_with_options(
+            &store,
+            LlamaCppMode::Cpu,
+            LlamaServerInstallOptions {
+                vision: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(installed, server);
+        assert_eq!(find_managed_server(&store, LlamaCppMode::Cpu), Some(server));
+        assert!(
+            !root.join("llama.cpp").exists(),
+            "reusing a valid runtime must not clone/build"
+        );
+        let staged = root.join("generation-test/build/bin/llama-server");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, "unvalidated").unwrap();
+        assert!(!server_candidates_under(&root).contains(&staged));
+        select_managed_server_path(&root.join("llama-server.path"), &staged).unwrap();
+        assert_eq!(server_candidates_under(&root)[0], staged);
+    }
 
     #[test]
     fn parallel_slots_preserve_context_per_sequence_and_disable_single_slot_state() {
@@ -4657,6 +4864,48 @@ Agent 3
                 assert!(args.iter().any(|v| v == "--no-cache-idle-slots"));
                 assert!(llama_state_args_are_effective(
                     &args, snapshots, model, 12345
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_prompt_cache_keeps_similarity_routing_for_growing_tool_conversations() {
+        let supported = supported_args_from_help(
+            "--mmproj --slots --slot-save-path --parallel --cache-ram --cache-idle-slots --slot-prompt-similarity",
+        );
+        for slots in [2, 4] {
+            for projector in [None, Some(Path::new("/mmproj.gguf"))] {
+                let args = llama_server_args_with_state(
+                    LlamaCppMode::Cuda,
+                    Path::new("/model.gguf"),
+                    projector,
+                    12345,
+                    &LlamaRuntimeOptions {
+                        parallel: Some(slots),
+                        ctx_size: Some(32768),
+                        ..Default::default()
+                    },
+                    &supported,
+                    false,
+                    Some(Path::new("/private")),
+                );
+                assert!(!args.iter().any(|arg| arg == "--slot-prompt-similarity"));
+                assert_eq!(
+                    args.iter().any(|arg| arg == "--mmproj"),
+                    projector.is_some()
+                );
+                assert!(args.windows(2).any(|pair| pair == ["--cache-ram", "8192"]));
+                assert!(args.iter().any(|arg| arg == "--no-cache-idle-slots"));
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair[0] == "-c" && pair[1] == (32768 * slots).to_string())
+                );
+                assert!(!llama_state_args_are_effective(
+                    &args,
+                    Path::new("/private"),
+                    Path::new("/model.gguf"),
+                    12345
                 ));
             }
         }

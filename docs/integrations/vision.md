@@ -15,9 +15,9 @@ required when a compatible llama.cpp GGUF plus projector is available.
 
 | Route | Model/layout requirements | Notes |
 | --- | --- | --- |
-| llama.cpp server | Compatible VLM GGUF plus exactly one manifest-listed multimodal projector GGUF whose filename contains `mmproj` or `projector` | Primary non-vLLM route. Werk starts the persistent server with `--mmproj`. The installed `llama-server` must advertise that option and support the concrete VLM. |
-| vLLM | Transformers safetensors model with exact architecture metadata `qwen2_vl`, `qwen2_5_vl`, `qwen3_vl`, `qwen3_vl_moe`, `glm4v` or `glm4v_moe` | Optional local or configured remote route. Compatibility still depends on the installed vLLM release, model implementation and accelerator. |
-| MLX-VLM | MLX or Hugging Face-style safetensors repository classified as `gemma4_unified` | Existing Apple-Silicon route through `mlx-vlm`. It accepts images but does not preserve the API `detail` hint or arbitrary text/image interleaving. |
+| llama.cpp server | Compatible VLM GGUF plus one explicitly selected (or uniquely discovered) manifest-listed multimodal projector GGUF whose filename contains `mmproj` or `projector` | Primary non-vLLM route. Werk starts the persistent server with `--mmproj`. The installed `llama-server` must advertise that option and support the concrete VLM. |
+| vLLM | Transformers safetensors model with exact architecture metadata `qwen2_vl`, `qwen2_5_vl`, `qwen3_vl`, `qwen3_vl_moe`, `qwen3_5`, `qwen3_5_moe`, `glm4v` or `glm4v_moe` | Optional local or configured remote route. Compatibility still depends on the installed vLLM release, model implementation and accelerator. |
+| MLX-VLM | MLX or Hugging Face-style safetensors repository classified as `gemma4_unified` | Existing Apple-Silicon route through `mlx-vlm`. It accepts a final image-containing turn with text before images and absent/auto `detail`. Explicit detail hints, interleaving and historical image placement are rejected. |
 
 The in-process Candle adapter remains text-only. Importing a Qwen3-VL or
 GLM-4V repository, or finding a similarly named architecture in a dependency,
@@ -35,11 +35,61 @@ werk doctor --model VISUAL_QA_MODEL --task image-understanding --debug
 werk backend doctor --debug
 ~~~
 
-For a multi-file GGUF repository, selecting the main model during `werk pull`
-also retains the preferred recognized projector. Inspect the resulting
-manifest before inference. An absent projector, more than one ambiguous
-projector or an old `llama-server` without `--mmproj` produces an explicit
-error instead of silently running text-only.
+## Optional setup and later activation
+
+New interactive backend installs and supported model pulls/imports ask whether
+to set up images; **Skip is the default**. Without a terminal there is no prompt
+and no consent to optional downloads. Use `--vision` or `--text-only` explicitly
+in automation. Previously recorded choices are preserved unless overridden.
+These flags select components; they do not bypass tool, filesystem, network or
+provider permissions. Backend approval never authorizes downloading a projector
+for a future model.
+
+~~~bash
+# Runtime scope only; no model/projector download.
+werk backend install llama-cuda --vision
+# Main model plus the selected matching projector, from one recorded revision.
+werk pull unsloth/Qwen3.8-27B-GGUF --name qwen27b \
+  --file Qwen3.8-27B-UD-Q4_K_XL.gguf --vision --projector mmproj-BF16.gguf
+# Explicitly skip optional projectors (changed from earlier automatic inclusion).
+werk pull org/model --name text-first --file model.gguf --text-only
+# Enable an existing local matching asset, without network access.
+werk artifacts vision qwen27b --vision --projector /models/mmproj-BF16.gguf --offline
+# For models pulled by this version: download only the projector at the saved revision.
+werk artifacts vision text-first --vision --download
+werk artifacts vision qwen27b --text-only --offline
+werk import /models/complete-vlm --name local-vlm --link --vision --offline
+~~~
+
+Model setup records its own enabled/disabled state and selected projector in
+`vision_setup` in the manifest. Backend choices are stored per install target.
+Readiness and ordinary image requests perform no optional runtime installation
+or model downloads, even when general automatic backend provisioning is enabled.
+Missing components produce a setup instruction; text-only requests remain usable.
+
+A projector's generic filename is not compatibility evidence. Automatic precision
+selection is limited to one filename family. Different model families require
+`--projector`; explicit selection also rejects contradictory GGUF model identity
+metadata. Imports with no identity metadata still need a deliberate, verified
+source association: setup does not claim tensor-level or revision compatibility.
+Main model and projector from a pull share an exact recorded Git revision. Late
+`--download` uses that revision and only the selected LFS file. Older imports
+without revision evidence require an explicitly supplied matching local file.
+No current-repository guess and no main-weight redownload occur. Main-model
+revision provenance does not certify an independently supplied local projector.
+
+`--offline` allows existing-asset configuration/import, rejects repository pulls
+and backend installation, and cannot be combined with an effective download.
+A bare `--yes` is not vision approval. For safetensors, encoder weights can be
+part of the main checkpoint: `--text-only` skips activation, but cannot split
+such an inseparable checkpoint into smaller text-only weights.
+
+Legacy manifests without `vision_setup` retain their previous behavior. A
+manifest/projector selection change changes runtime cache identity; active
+requests may finish on their existing handle while subsequent requests select
+the new state. A runtime `--help` probe proves CLI availability, not concrete
+model inference. Readiness reports prerequisites checked / inference untested.
+See the [complete backend audit and verification matrix](vision-audit.md).
 
 ## CLI visual inspection
 

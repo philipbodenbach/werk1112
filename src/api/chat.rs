@@ -10,7 +10,10 @@ use axum::{
 use serde_json::json;
 use std::{
     convert::Infallible,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio_stream::{StreamExt, once};
 
@@ -260,7 +263,16 @@ async fn stream_chat_response(
     .await;
     let final_usage = Arc::new(Mutex::new(None));
     let body_usage = final_usage.clone();
-    let body = body_stream.map(move |event| {
+    let failed = Arc::new(AtomicBool::new(false));
+    let body_failed = failed.clone();
+    let mut terminal_error = false;
+    let body = body_stream.take_while(move |event| {
+        if terminal_error {
+            return false;
+        }
+        terminal_error = event.is_err();
+        true
+    }).map(move |event| {
             let data = match event {
                 Ok(GenerateStreamEvent::TextChunk(text)) => json!({
                     "id": body_id,
@@ -331,11 +343,13 @@ async fn stream_chat_response(
                     })
                 }
                 Err(message) => {
+                    body_failed.store(true, Ordering::Relaxed);
+                    *body_usage.lock().expect("stream usage mutex poisoned") = None;
                     crate::ui_eprintln!("[werk serve] stream model={} -> error: {message}", body_model_for_log);
                     json!({
                         "error": {
                             "message": message,
-                            "type": "invalid_request_error",
+                            "type": "server_error",
                             "param": null,
                             "code": null
                         }
@@ -345,7 +359,10 @@ async fn stream_chat_response(
             Ok::<Event, Infallible>(Event::default().data(data.to_string()))
         });
 
-    let done = once(Ok::<Event, Infallible>(Event::default().data("[DONE]")));
+    let done = once(()).filter_map(move |_| {
+        (!failed.load(Ordering::Relaxed))
+            .then(|| Ok::<Event, Infallible>(Event::default().data("[DONE]")))
+    });
     let usage = once(()).filter_map(move |_| {
         final_usage
             .lock()

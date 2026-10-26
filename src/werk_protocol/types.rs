@@ -138,6 +138,14 @@ pub struct CapabilitiesResponse {
     pub capabilities: Vec<Capability>,
 }
 
+/// Native count of the exact chat template, including tools and tool history.
+/// No generation is performed and no reusable runtime state is promised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatTokenCountResponse {
+    pub model: String,
+    pub input_tokens: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateTier {

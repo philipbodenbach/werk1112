@@ -49,9 +49,17 @@ pub struct ChatStreamOptions {
 #[serde(deny_unknown_fields)]
 pub struct ChatRuntimeOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documents: Option<crate::documents::DocumentOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omlx: Option<OmlxChatOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningOptions {
+    pub tier: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -105,6 +113,23 @@ impl ChatRuntimeOptions {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(reasoning) = &self.reasoning {
+            anyhow::ensure!(
+                !reasoning.tier.is_empty()
+                    && reasoning.tier.len() <= 64
+                    && reasoning
+                        .tier
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'),
+                "werk.reasoning.tier must be a tier ID reported by WerkProtocol or default"
+            );
+            anyhow::ensure!(
+                self.omlx
+                    .as_ref()
+                    .is_none_or(|o| o.thinking.is_none() && o.reasoning_effort.is_none()),
+                "werk.reasoning cannot be combined with native thinking/reasoning overrides"
+            );
+        }
         if let Some(options) = &self.omlx {
             anyhow::ensure!(
                 options.expert_cache_mb.is_none_or(|mb| mb <= 1_048_576),

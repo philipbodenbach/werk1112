@@ -67,10 +67,13 @@ with one GPU slot. It is a process-local RAM cache, independent of `serve
 cross-restart persistence. Actual hits still depend on matching prompt tokens,
 available cache space and the native model's checkpoint support.
 
-Werk disables automatic idle-slot caching and sets slot similarity selection to
-zero. Ordinary API calls let llama.cpp choose the slot and load the best RAM
-entry; named runtime-state and persistent terminal-chat calls pin their slot so
-automatic cache lookup cannot substitute for an explicitly restored snapshot.
+Werk disables automatic idle-slot caching. With one slot, it sets slot similarity
+selection to zero: ordinary API calls load the best RAM entry, while named
+runtime-state and persistent terminal-chat calls pin their slot so automatic
+cache lookup cannot substitute for an explicitly restored snapshot.
+With multiple slots, Werk retains native similarity selection so a growing
+conversation can reuse its existing slot rather than move through the RAM cache
+on every turn. Named runtime-state operations remain unavailable in this mode.
 Older runtimes without these controls retain the previous isolated-slot policy.
 
 Use `WERK_LLAMA_ARGS='--cache-ram 2048'` to lower the RAM cache limit or
@@ -689,6 +692,17 @@ The primary non-vLLM path is llama.cpp plus the model's matching multimodal
 projector. Model weights remain resident in persistent llama.cpp/vLLM server
 processes, although cache details and image-embedding reuse remain
 backend-specific.
+
+CLI capability inspection (`llama-server --help` and `--version`) is shared
+within each Werk process. Even these commands can initialize the GPU driver.
+Routing, installation validation and server startup reuse their results for
+the same executable version and inherited environment. The bounded cache
+holds up to 32 results, including failures. Each caller waits at most five
+seconds; stdout and stderr are size limited. Probes run one at a time, and a
+timeout does not admit another probe until the previous process and its pipes
+have finished cleanup. A changed executable or environment, cache eviction,
+or a Werk restart permits a fresh inspection. Startup still hashes the
+current executable independently for runtime-state compatibility.
 
 Werk preserves ordered text/image parts and the image `detail` hint for the
 llama.cpp and vLLM chat transports. The MLX-VLM subprocess currently receives

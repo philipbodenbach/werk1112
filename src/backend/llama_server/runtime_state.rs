@@ -36,7 +36,6 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::{IpAddr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex, MutexGuard, TryLockError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -2164,9 +2163,9 @@ fn random_private_id(prefix: &str, random_bytes: usize) -> Result<String> {
     Ok(value)
 }
 
-// Per-start inspection only: never reuse identities across executable changes.
+// Detect executable changes for CLI caching and per-start identity verification.
 #[derive(Clone, PartialEq, Eq)]
-struct FileStamp {
+pub(super) struct FileStamp {
     len: u64,
     modified: SystemTime,
     #[cfg(unix)]
@@ -2174,7 +2173,7 @@ struct FileStamp {
 }
 
 impl FileStamp {
-    fn read(path: &Path) -> Result<Self> {
+    pub(super) fn read(path: &Path) -> Result<Self> {
         let metadata = fs::metadata(path)?;
         anyhow::ensure!(metadata.is_file(), "runtime file is not regular");
         #[cfg(unix)]
@@ -2231,20 +2230,12 @@ fn probe_llama_executable_identity(executable: &Path) -> Result<LlamaExecutableI
 
 pub(super) fn inspect_llama_executable(executable: &Path) -> Result<LlamaExecutableInspection> {
     let stamp = FileStamp::read(executable)?;
-    // Three bounded independent jobs; the hash runs on this thread. Join all
-    // children before returning even when an individual inspection fails.
-    let (binary_sha256, help, version) = std::thread::scope(|scope| {
-        let help = scope.spawn(|| bounded_command_output(executable, "--help", 2 * 1024 * 1024));
-        let version = scope.spawn(|| bounded_command_output(executable, "--version", 64 * 1024));
-        let hash = sha256_regular_file(executable, 4 * 1024 * 1024 * 1024);
-        let help = help
-            .join()
-            .map_err(|_| anyhow!("llama-server help inspection panicked"));
-        let version = version
-            .join()
-            .map_err(|_| anyhow!("llama-server version inspection panicked"));
-        Ok::<_, anyhow::Error>((hash?, help??, version??))
-    })?;
+    // CLI probes share the capability cache and run serially, since even
+    // --help/--version initialize GPU backends. Hash the current file anew;
+    // cached CLI output never replaces startup's identity verification.
+    let binary_sha256 = sha256_regular_file(executable, 4 * 1024 * 1024 * 1024)?;
+    let help = super::probe::output(executable, "--help", 2 * 1024 * 1024)?.to_string();
+    let version = super::probe::output(executable, "--version", 64 * 1024)?.to_string();
     anyhow::ensure!(
         FileStamp::read(executable)? == stamp,
         "llama-server changed during inspection"
@@ -2267,29 +2258,6 @@ pub(super) fn inspect_llama_executable(executable: &Path) -> Result<LlamaExecuta
         help,
         stamp,
     })
-}
-
-fn bounded_command_output(executable: &Path, argument: &str, max_bytes: usize) -> Result<String> {
-    let output = Command::new(executable)
-        .arg(argument)
-        .output()
-        .with_context(|| format!("failed to execute llama-server {argument}"))?;
-    if !output.status.success() {
-        bail!("llama-server {argument} failed");
-    }
-    if output.stdout.len().saturating_add(output.stderr.len()) > max_bytes {
-        bail!("llama-server {argument} output exceeds its size limit");
-    }
-    let mut text = String::from_utf8(output.stdout)
-        .map_err(|_| anyhow!("llama-server {argument} output is not UTF-8"))?;
-    if !output.stderr.is_empty() {
-        text.push('\n');
-        text.push_str(
-            std::str::from_utf8(&output.stderr)
-                .map_err(|_| anyhow!("llama-server {argument} output is not UTF-8"))?,
-        );
-    }
-    Ok(text)
 }
 
 fn sha256_regular_file(path: &Path, max_bytes: u64) -> Result<String> {
@@ -2390,7 +2358,7 @@ mod tests {
         collections::VecDeque,
         io::Cursor,
         net::TcpListener,
-        process::Stdio,
+        process::{Command, Stdio},
         sync::mpsc,
         thread,
         time::{Duration, Instant},
@@ -2808,8 +2776,16 @@ mod tests {
             calls.display()
         )).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        // Ordinary capability routing and startup must share one CLI result.
+        for _ in 0..8 {
+            assert!(super::super::supported_args(&executable).slots);
+            assert!(super::super::llama_server_help_ok(&executable));
+            super::super::validate_llama_server(&executable, LlamaCppMode::Cpu).unwrap();
+        }
         let inspection = inspect_llama_executable(&executable).unwrap();
         assert!(super::super::supported_args_from_help(&inspection.help).slots);
+        assert!(super::super::supported_args(&executable).slots);
+        inspect_llama_executable(&executable).unwrap();
         inspection.verify_unchanged(&executable).unwrap();
         let calls = fs::read_to_string(&calls).unwrap();
         assert_eq!(calls.lines().filter(|line| *line == "--help").count(), 1);
@@ -3809,6 +3785,8 @@ mod tests {
         )
         .unwrap();
         LlamaServerProcess {
+            reasoning_defaults: None,
+            reasoning_budget_supported: false,
             _reservation: Mutex::new(None),
             #[cfg(target_os = "linux")]
             _model_file_cache: None,

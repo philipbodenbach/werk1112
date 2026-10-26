@@ -23,6 +23,16 @@ pub(super) fn sample(backend: &OmlxBackend) -> Vec<BackendSnapshot> {
             if !server.is_running() {
                 return sample;
             }
+            if server.thinking.is_some() || server.reasoning_effort.is_some() {
+                sample.reasoning_defaults = Some(crate::observability::ReasoningDefaults {
+                    source: "worker_launch_configuration".into(),
+                    thinking: server.thinking,
+                    effort: server
+                        .reasoning_effort
+                        .map(|value| serde_json::json!(value)),
+                    budget_tokens: None,
+                });
+            }
             let Ok(status) =
                 server.json_request("GET", "/api/status", None, Duration::from_secs(2))
             else {

@@ -26,6 +26,19 @@ pub struct BackendSnapshot {
     pub available: bool,
     pub counters: BTreeMap<String, u64>,
     pub gauges: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_defaults: Option<ReasoningDefaults>,
+}
+
+/// Configured defaults of this running worker, never inferred from model names
+/// or current-request values. Missing members are unknown/template controlled.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningDefaults {
+    pub source: String,
+    pub effort: Option<serde_json::Value>,
+    pub thinking: Option<bool>,
+    /// -1 means unrestricted; zero ends thinking immediately.
+    pub budget_tokens: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

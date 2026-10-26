@@ -276,7 +276,7 @@ mod imp {
             request: GenerateRequest,
             tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
         ) -> Result<GenerateResponse> {
-            if !request.image_urls.is_empty() {
+            if request.has_images() {
                 bail!(
                     "llama.cpp legacy FFI backend is text-only for now; use a VLM-capable backend/model for image inputs"
                 );
@@ -566,7 +566,7 @@ mod imp {
             request: GenerateRequest,
             tx: Option<mpsc::Sender<Result<GenerateStreamEvent, String>>>,
         ) -> Result<GenerateResponse> {
-            if !request.image_urls.is_empty() {
+            if request.has_images() {
                 bail!(
                     "llama.cpp legacy FFI backend is text-only for now; use a VLM-capable backend/model for image inputs"
                 );

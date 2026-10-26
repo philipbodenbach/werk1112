@@ -10,8 +10,8 @@ Generated from **werk 1.9.1**. See [CLI semantics](cli.md),
 [media input and override rules](cli-media.md), and the
 [canonical parameter schema](parameters-schema.md).
 
-Coverage of this profile: **27 top-level commands**, **93 help nodes**
-(including the root), and **446 distinct long option names**
+Coverage of this profile: **27 top-level commands**, **94 help nodes**
+(including the root), and **451 distinct long option names**
 (excluding `--help` and `--version`). Compatibility aliases are listed
 in [CLI conventions](cli.md#syntax-aliases-and-input-contracts).
 
@@ -74,6 +74,7 @@ is inserted; runtime resolution may still supply one. The built-in
 - [`werk backend install`](cli-options.md#werk-backend-install)
 - [`werk backend list`](cli-options.md#werk-backend-list)
 - [`werk backend doctor`](cli-options.md#werk-backend-doctor)
+- [`werk artifacts vision`](cli-options.md#werk-artifacts-vision)
 - [`werk artifacts build`](cli-options.md#werk-artifacts-build)
 - [`werk artifacts list`](cli-options.md#werk-artifacts-list)
 - [`werk artifacts rebuild`](cli-options.md#werk-artifacts-rebuild)
@@ -430,7 +431,7 @@ Manage optimized runtime artifacts for installed models
 werk artifacts [OPTIONS] <COMMAND>
 ```
 
-Subcommands: [`werk artifacts build`](cli-options.md#werk-artifacts-build), [`werk artifacts list`](cli-options.md#werk-artifacts-list), [`werk artifacts rebuild`](cli-options.md#werk-artifacts-rebuild).
+Subcommands: [`werk artifacts vision`](cli-options.md#werk-artifacts-vision), [`werk artifacts build`](cli-options.md#werk-artifacts-build), [`werk artifacts list`](cli-options.md#werk-artifacts-list), [`werk artifacts rebuild`](cli-options.md#werk-artifacts-rebuild).
 
 Also accepts the [global options](#global-options).
 
@@ -508,6 +509,9 @@ Arguments:
 | `--name <NAME>` | Installed model id; required unless --all is used |
 | `--all` | Import each model directly inside a collection directory, preserving existing Werk model ids |
 | `--link` | Register the existing model in place without copying its files |
+| `--vision` | Set up image input for this backend/model; does not prove image inference |
+| `--text-only` | Skip optional image components and keep this setup text-only |
+| `--offline` | Do not contact repositories or install packages (existing-asset setup only) |
 
 Also accepts the [global options](#global-options).
 
@@ -553,6 +557,10 @@ Arguments:
 | --- | --- |
 | `--name <NAME>` | Installed model id; defaults to the repo id |
 | `--file <FILE>` | Download a repository file, for example model.Q4_K_M.gguf; matching GGUF shards are included automatically |
+| `--vision` | Set up image input for this backend/model; does not prove image inference |
+| `--text-only` | Skip optional image components and keep this setup text-only |
+| `--offline` | Do not contact repositories or install packages (existing-asset setup only) |
+| `--projector <PROJECTOR>` | Select an exact model-specific projector file from this repository |
 
 Also accepts the [global options](#global-options).
 
@@ -793,6 +801,12 @@ Arguments:
           - text-analysis
 ```
 
+| Option | Meaning / parser default |
+| --- | --- |
+| `--vision` | Set up image input for this backend/model; does not prove image inference |
+| `--text-only` | Skip optional image components and keep this setup text-only |
+| `--offline` | Do not contact repositories or install packages (existing-asset setup only) |
+
 Also accepts the [global options](#global-options).
 
 ## werk backend list
@@ -816,6 +830,31 @@ werk backend doctor [OPTIONS]
 | Option | Meaning / parser default |
 | --- | --- |
 | `--debug` | Print detailed backend discovery paths and rejection reasons |
+
+Also accepts the [global options](#global-options).
+
+## werk artifacts vision
+
+Opt in to image input using existing model assets; never downloads the main model
+
+```text
+werk artifacts vision [OPTIONS] <MODEL>
+```
+
+Arguments:
+
+```text
+<MODEL>
+```
+
+| Option | Meaning / parser default |
+| --- | --- |
+| `--vision` | Set up image input for this backend/model; does not prove image inference |
+| `--text-only` | Skip optional image components and keep this setup text-only |
+| `--offline` | Do not contact repositories or install packages (existing-asset setup only) |
+| `--projector <PROJECTOR>` | Explicitly associate a matching local GGUF projector with this model |
+| `--download` | Download only a projector from this model's recorded source revision |
+| `--file <FILE>` | Exact projector filename at the recorded repository revision |
 
 Also accepts the [global options](#global-options).
 

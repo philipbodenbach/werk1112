@@ -918,15 +918,28 @@ where
     F: FnMut(&[u8]) -> Result<()>,
 {
     if header_contains(&response.headers, "transfer-encoding", "chunked") {
+        let mut received = 0usize;
         loop {
             let size_line = read_http_line(&mut response.reader, response.deadline)?;
+            // read_line returns an empty string on EOF. That is an interrupted
+            // response, not an invalid hexadecimal chunk size. Never accept it
+            // as the terminal chunk: callers may hold incomplete tool JSON.
+            if size_line.is_empty() {
+                bail!(
+                    "OpenAI backend connection closed before the terminating HTTP chunk \
+                     ({received} body bytes received); response incomplete"
+                );
+            }
+            if !size_line.ends_with("\r\n") {
+                bail!("OpenAI backend returned an incomplete HTTP chunk-size line");
+            }
             let size_text = size_line
                 .trim()
                 .split_once(';')
                 .map(|(size, _)| size)
                 .unwrap_or_else(|| size_line.trim());
             let size = usize::from_str_radix(size_text, 16)
-                .with_context(|| format!("invalid chunk size from OpenAI backend: {size_text}"))?;
+                .context("OpenAI backend returned an invalid HTTP chunk-size line")?;
             if size == 0 {
                 break;
             }
@@ -934,12 +947,15 @@ where
             let mut chunk = [0u8; 8192];
             while remaining > 0 {
                 let count = remaining.min(chunk.len());
-                read_http_exact(&mut response.reader, &mut chunk[..count], response.deadline)?;
+                read_http_exact(&mut response.reader, &mut chunk[..count], response.deadline)
+                    .context("OpenAI backend HTTP chunk body interrupted; response incomplete")?;
                 on_bytes(&chunk[..count])?;
+                received = received.saturating_add(count);
                 remaining -= count;
             }
             let mut crlf = [0u8; 2];
-            read_http_exact(&mut response.reader, &mut crlf, response.deadline)?;
+            read_http_exact(&mut response.reader, &mut crlf, response.deadline)
+                .context("OpenAI backend HTTP chunk delimiter interrupted; response incomplete")?;
             if crlf != *b"\r\n" {
                 bail!("invalid OpenAI HTTP chunk delimiter");
             }
@@ -1080,6 +1096,66 @@ pub(super) fn send_tool_call_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chunked_response(bytes: &[u8], deadline: Option<HttpDeadline>) -> HttpResponse {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.write_all(bytes).unwrap();
+        server.shutdown(std::net::Shutdown::Write).unwrap();
+        HttpResponse {
+            status: 200,
+            headers: vec![("transfer-encoding".into(), "chunked".into())],
+            reader: BufReader::new(client),
+            deadline,
+            _cancellation: None,
+        }
+    }
+
+    #[test]
+    fn chunked_disconnects_and_malformed_framing_never_complete_response() {
+        // Exercise both generation (no deadline) and probe readers. EOF between
+        // chunks used to be reported as "invalid chunk size ...: " with no cause.
+        for timed in [false, true] {
+            for (body, expected) in [
+                (&b""[..], "before the terminating HTTP chunk (0 body bytes"),
+                (
+                    &b"3\r\nabc\r\n"[..],
+                    "before the terminating HTTP chunk (3 body bytes",
+                ),
+                (&b"a"[..], "incomplete HTTP chunk-size line"),
+                (&b"\r\n"[..], "invalid HTTP chunk-size line"),
+                (&b"not-hex\r\n"[..], "invalid HTTP chunk-size line"),
+                (&b"5\r\nabc"[..], "HTTP chunk body interrupted"),
+                (&b"3\r\nabc\r"[..], "HTTP chunk delimiter interrupted"),
+                (&b"3\r\nabcXX"[..], "invalid OpenAI HTTP chunk delimiter"),
+            ] {
+                let deadline = timed.then(|| HttpDeadline::new(Duration::from_secs(5)));
+                let error =
+                    stream_body(&mut chunked_response(body, deadline), |_| Ok(())).unwrap_err();
+                assert!(error.to_string().contains(expected), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn valid_chunked_response_with_extensions_keeps_all_body_bytes() {
+        for timed in [false, true] {
+            let deadline = timed.then(|| HttpDeadline::new(Duration::from_secs(5)));
+            let mut response =
+                chunked_response(b"3;ext=yes\r\nabc\r\n2\r\nde\r\n0\r\n\r\n", deadline);
+            let mut body = Vec::new();
+            stream_body(&mut response, |bytes| {
+                body.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(body, b"abcde");
+        }
+    }
 
     #[test]
     fn matched_stops_require_native_metadata_and_distinguish_template_terminators() {
