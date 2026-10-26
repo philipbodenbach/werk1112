@@ -693,6 +693,17 @@ projector. Model weights remain resident in persistent llama.cpp/vLLM server
 processes, although cache details and image-embedding reuse remain
 backend-specific.
 
+CLI capability inspection (`llama-server --help` and `--version`) is shared
+within each Werk process. Even these commands can initialize the GPU driver.
+Routing, installation validation and server startup reuse their results for
+the same executable version and inherited environment. The bounded cache
+holds up to 32 results, including failures. Each caller waits at most five
+seconds; stdout and stderr are size limited. Probes run one at a time, and a
+timeout does not admit another probe until the previous process and its pipes
+have finished cleanup. A changed executable or environment, cache eviction,
+or a Werk restart permits a fresh inspection. Startup still hashes the
+current executable independently for runtime-state compatibility.
+
 Werk preserves ordered text/image parts and the image `detail` hint for the
 llama.cpp and vLLM chat transports. The MLX-VLM subprocess currently receives
 the prompt and image list but not arbitrary interleaving or `detail` semantics.

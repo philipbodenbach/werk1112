@@ -28,6 +28,7 @@ mod model_prefetch_policy;
 use super::model_file_cache;
 #[cfg(target_os = "linux")]
 mod expert_memory;
+mod probe;
 mod runtime_state;
 mod telemetry;
 #[cfg(test)]
@@ -2307,17 +2308,9 @@ struct SupportedArgs {
 }
 
 fn supported_args(executable: &PathBuf) -> SupportedArgs {
-    let Ok(output) = Command::new(executable).arg("--help").output() else {
+    let Ok(text) = probe::output(executable, "--help", 2 * 1024 * 1024) else {
         return SupportedArgs::default();
     };
-    if !output.status.success() {
-        return SupportedArgs::default();
-    }
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
     supported_args_from_help(&text)
 }
 
@@ -2729,31 +2722,12 @@ pub fn managed_backend_dir(store: &ModelStore, mode: LlamaCppMode) -> PathBuf {
 }
 
 pub fn llama_server_help_ok(path: &Path) -> bool {
-    Command::new(path)
-        .arg("--help")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    probe::output(path, "--help", 2 * 1024 * 1024).is_ok()
 }
 
 fn validate_llama_server(path: &Path, mode: LlamaCppMode) -> Result<()> {
-    let output = Command::new(path)
-        .arg("--help")
-        .output()
+    let text = probe::output(path, "--help", 2 * 1024 * 1024)
         .with_context(|| format!("failed to run {} --help", path.display()))?;
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() {
-        bail!(
-            "llama-server --help failed for {} with {}:\n{}",
-            path.display(),
-            output.status,
-            tail_lines(&text, 30)
-        );
-    }
     if mode == LlamaCppMode::Cuda && cuda_init_failed(&text) {
         bail!(
             "CUDA llama-server was built, but CUDA runtime validation failed:\n{}\n\nFix the NVIDIA driver/CUDA runtime mismatch, then rerun `werk backend install llama-cuda`.",
