@@ -276,6 +276,22 @@ impl LlamaServerBackend {
         policy: Option<super::Fp4Kernel>,
     ) -> Result<String> {
         let projector = Self::validate_image_model(store, manifest)?;
+        Self::probe_image_runtime(store, manifest, mode, policy)?;
+        Ok(format!(
+            "llama.cpp server {} advertises the image path and a local projector is selected; architecture/projector compatibility and actual image inference remain untested ({})",
+            display_name(mode),
+            projector.display()
+        ))
+    }
+
+    /// Check the runtime independently so setup can offer a missing projector
+    /// and a multimodal runtime upgrade in the same confirmation.
+    pub(crate) fn probe_image_runtime(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        mode: LlamaCppMode,
+        policy: Option<super::Fp4Kernel>,
+    ) -> Result<()> {
         let discovery = require_llama_server_for_model(store, mode, manifest, policy)?;
         let executable = discovery
             .path
@@ -287,11 +303,7 @@ impl LlamaServerBackend {
                 display_name(mode)
             );
         }
-        Ok(format!(
-            "llama.cpp server {} advertises the image path and a local projector is selected; architecture/projector compatibility and actual image inference remain untested ({})",
-            display_name(mode),
-            projector.display()
-        ))
+        Ok(())
     }
 
     pub(crate) fn can_auto_install_nvfp4() -> bool {

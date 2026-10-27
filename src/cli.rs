@@ -2,6 +2,7 @@ mod chat_persistence;
 mod diagnostics;
 mod media_diagnostics;
 mod model_list;
+mod model_setup;
 mod run_inference;
 mod terminal_activity;
 mod top;
@@ -158,7 +159,7 @@ pub struct Cli {
         global = true,
         action = ArgAction::SetTrue,
         conflicts_with = "no_auto_install_backends",
-        help = "Allow Werk to provision missing managed runtime backends during selection"
+        help = "Approve installation of missing model backends and feature components (including vision projectors)"
     )]
     pub auto_install_backends: bool,
 
@@ -1167,6 +1168,15 @@ pub enum Commands {
     },
 
     #[command(
+        about = "Check all model features and offer to install missing backends and components"
+    )]
+    Setup {
+        model: String,
+        #[command(flatten)]
+        vision: crate::backend::vision_setup::VisionOptions,
+    },
+
+    #[command(
         about = "Remove an installed model from the managed model store",
         alias = "rm",
         alias = "delete"
@@ -1852,6 +1862,28 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .with_omlx_server_prefix_cache(server_omlx_prefix_cache_enabled(
                     &server_persistence,
                 ));
+            let mut setup_models: Vec<_> = model
+                .iter()
+                .chain(preload.iter())
+                .chain(image_model.iter())
+                .cloned()
+                .collect();
+            setup_models.sort();
+            setup_models.dedup();
+            for id in setup_models {
+                let setup_store = store.clone();
+                crate::logging::spawn_blocking(move || {
+                    model_setup::ensure(
+                        &setup_store,
+                        &id,
+                        backend_choice,
+                        selection_options,
+                        false,
+                        true,
+                    )
+                })
+                .await??;
+            }
             let backend = build_generation_backend(
                 store.clone(),
                 backend_choice,
@@ -2006,7 +2038,19 @@ pub async fn run(cli: Cli) -> Result<()> {
             let images = normalize_cli_image_sources(&images)?;
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
-            let manifest = store.get(&model)?;
+            let setup_store = store.clone();
+            let setup_id = model.clone();
+            let manifest = crate::logging::spawn_blocking(move || {
+                model_setup::ensure(
+                    &setup_store,
+                    &setup_id,
+                    backend_choice,
+                    selection_options,
+                    false,
+                    true,
+                )
+            })
+            .await??;
             if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
                 bail!(
                     "Model '{}' performs {}, not chat generation. Start werk serve --model '{}' and send a request to {}. Use werk doctor --model '{}' to inspect runtime readiness.",
@@ -2640,14 +2684,44 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name.as_deref(),
                 file.as_deref(),
                 projector.as_deref(),
-                vision.vision,
-                |description| vision.decide(description, None),
+                false,
+                |_| Ok(false),
                 |event| {
                     update_pull_progress(&progress, event);
                 },
             )?;
             progress.finish_and_clear();
             print_manifest_summary("Pulled", &manifest);
+            let choice = resolve_backend(backend_override, device_override)?;
+            let id = manifest.id.clone();
+            crate::logging::spawn_blocking(move || {
+                model_setup::ensure(
+                    &store,
+                    &id,
+                    choice,
+                    selection_options,
+                    false,
+                    !vision.text_only,
+                )
+            })
+            .await??;
+            Ok(())
+        }
+        Commands::Setup { model, vision } => {
+            let store = ModelStore::resolve(model_home)?;
+            let choice = resolve_backend(backend_override, device_override)?;
+            let manifest = crate::logging::spawn_blocking(move || {
+                model_setup::ensure(
+                    &store,
+                    &model,
+                    choice,
+                    selection_options,
+                    vision.offline,
+                    !vision.text_only,
+                )
+            })
+            .await??;
+            print_manifest_summary("Checked", &manifest);
             Ok(())
         }
         Commands::Remove { id } => {
@@ -5104,6 +5178,7 @@ fn should_print_startup_banner_for(
         | Commands::Import { .. }
         | Commands::Convert { .. }
         | Commands::Pull { .. }
+        | Commands::Setup { .. }
         | Commands::Remove { .. }
         | Commands::Estimate { .. }
         | Commands::Bench { .. }
@@ -5136,6 +5211,7 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         Commands::Import { .. }
         | Commands::Convert { .. }
         | Commands::Pull { .. }
+        | Commands::Setup { .. }
         | Commands::Remove { .. }
         | Commands::Estimate { .. }
         | Commands::Doctor { .. }
@@ -9388,14 +9464,21 @@ struct SelectionOptions {
     verbose_backend_installs: bool,
     vllm_automatic_prefix_caching: Option<bool>,
     omlx_server_prefix_cache: bool,
+    setup_policy: model_setup::SetupPolicy,
 }
 
 impl SelectionOptions {
-    fn from_cli(backend: BackendArg, auto_install: bool, no_auto_install: bool) -> Self {
-        let default_provision = matches!(backend, BackendArg::Auto);
+    fn from_cli(_backend: BackendArg, auto_install: bool, no_auto_install: bool) -> Self {
         Self {
             fp4_kernel: None,
-            provision_missing_backends: !no_auto_install && (auto_install || default_provision),
+            provision_missing_backends: false,
+            setup_policy: if no_auto_install {
+                model_setup::SetupPolicy::Never
+            } else if auto_install {
+                model_setup::SetupPolicy::Approve
+            } else {
+                model_setup::SetupPolicy::Ask
+            },
             verbose_backend_installs: false,
             vllm_automatic_prefix_caching: None,
             omlx_server_prefix_cache: false,
@@ -10140,6 +10223,11 @@ impl MlxPreferredBackend {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
+        self.backend_for_request(manifest, has_images)
+            .is_ok_and(|backend| backend.supports_tool_calling(manifest, has_images))
+    }
+
     fn reasoning_config(
         &self,
         manifest: &ModelManifest,
@@ -15096,30 +15184,29 @@ mod tests {
     }
 
     #[test]
-    fn auto_install_policy_defaults_to_auto_only() {
-        assert!(
-            SelectionOptions::from_cli(BackendArg::Auto, false, false).provision_missing_backends
-        );
-        assert!(
-            !SelectionOptions::from_cli(BackendArg::Auto, false, false).verbose_backend_installs
-        );
-        assert!(
-            SelectionOptions::from_cli(BackendArg::Auto, false, false)
-                .with_backend_install_output(true)
-                .verbose_backend_installs
-        );
-        assert!(
-            !SelectionOptions::from_cli(BackendArg::Onnx, false, false).provision_missing_backends
-        );
-        assert!(
-            !SelectionOptions::from_cli(BackendArg::Cuda, false, false).provision_missing_backends
-        );
-        assert!(
-            SelectionOptions::from_cli(BackendArg::Cuda, true, false).provision_missing_backends
-        );
-        assert!(
-            !SelectionOptions::from_cli(BackendArg::Auto, false, true).provision_missing_backends
-        );
+    fn setup_policy_requires_confirmation_unless_explicitly_approved() {
+        use model_setup::SetupPolicy;
+        for backend in [BackendArg::Auto, BackendArg::Cuda, BackendArg::Onnx] {
+            let options = SelectionOptions::from_cli(backend, false, false);
+            assert_eq!(options.setup_policy, SetupPolicy::Ask);
+            assert!(!options.provision_missing_backends);
+            assert!(!options.verbose_backend_installs);
+            assert!(
+                options
+                    .with_backend_install_output(true)
+                    .verbose_backend_installs
+            );
+            let approved = SelectionOptions::from_cli(backend, true, false);
+            assert_eq!(approved.setup_policy, SetupPolicy::Approve);
+            assert!(
+                !approved.provision_missing_backends,
+                "request probes must never install"
+            );
+            assert_eq!(
+                SelectionOptions::from_cli(backend, false, true).setup_policy,
+                SetupPolicy::Never
+            );
+        }
     }
 
     #[test]

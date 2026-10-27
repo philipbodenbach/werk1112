@@ -241,6 +241,17 @@ Validate without model downloads:
 python3 scripts/smoke-logging.py target/debug/werk
 ```
 
+## Model setup
+
+`werk setup MODEL` checks the advertised model features and offers one dialog
+for missing backends and components, including vision projectors. `pull` runs
+this check after saving the main model; local `run`, `chat`, and configured
+`serve` models run it before execution. Choose Set up all to install the listed
+components, or Later to retain the current setup. Without a terminal, use
+`--auto-install-backends` for explicit approval. `--offline` permits only
+existing-asset setup, and `--text-only` excludes vision from this review.
+See [complete model setup](../integrations/vision.md#complete-model-setup).
+
 ## Global options
 
 Global options can appear before or after a subcommand; examples put them first:
@@ -258,8 +269,8 @@ The most important global controls are:
 | `--model-home PATH` | Select the complete Werk store; overrides `WERK_HOME`. |
 | `--backend BACKEND` | Select `auto` or constrain routing to a named runtime/backend family. |
 | `--device DEVICE` | Legacy Candle-only device override. Prefer `--backend` or typed media accelerator controls. |
-| `--auto-install-backends` | Permit managed provisioning during runtime selection. Installation is otherwise explicit. |
-| `--no-auto-install-backends` | Prohibit automatic managed provisioning. |
+| `--auto-install-backends` | Approve the complete model setup plan, including missing backends and model-specific feature components. |
+| `--no-auto-install-backends` | Skip model setup review and prohibit managed provisioning. |
 | `--ctx-size`, `--batch-size`, `--ubatch-size` | Advanced llama.cpp context and batching controls. |
 | `--gpu-layers`, `--main-gpu` | Advanced llama.cpp accelerator placement controls. |
 | `--kv-cache-type`, `--flash-attn`, `--kv-offload` | Advanced llama.cpp cache and attention controls. |

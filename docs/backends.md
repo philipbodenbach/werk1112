@@ -245,9 +245,9 @@ serve and backend doctor. An empty or invalid explicit override fails discovery;
 unset it to use the managed installation. Existing external installations remain
 selectable through `WERK_OMLX_BIN` and are not modified by the installer.
 
-**oMLX is never installed automatically**, including with
-`--auto-install-backends`. `serve`, `run`, `chat`, routing and doctor only discover
-and probe installed runtimes. Werk does not manage an oMLX system service or attach
+The model setup dialog can offer oMLX when it is the eligible missing runtime.
+Installation requires confirmation or `--auto-install-backends`. HTTP routing
+and doctor only discover and probe installed runtimes. Werk does not manage an oMLX system service or attach
 to an external oMLX server. It owns only the workers launched for its requests.
 
 Werk captures the executable and its Python environment together. Recognized

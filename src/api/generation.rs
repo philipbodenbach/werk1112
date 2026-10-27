@@ -368,33 +368,6 @@ pub(super) async fn prepare(
         }
     }
     let requires_tool_calling = request.requires_tool_calling();
-    let tool_transport_supported = if requires_tool_calling {
-        let backend = state.backend.clone();
-        let selected_model = manifest.clone();
-        let has_images = !image_urls.is_empty();
-        crate::logging::spawn_blocking(move || {
-            backend.supports_tool_calling(&selected_model, has_images)
-        })
-        .await
-        .map_err(|error| {
-            GenerationError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("tool routing task failed: {error}"),
-                None,
-            )
-        })?
-    } else {
-        true
-    };
-    if !tool_transport_supported {
-        return Err(GenerationError::with_code(
-            StatusCode::BAD_REQUEST,
-            "the configured adapter does not provide chat tool transport for this request"
-                .to_string(),
-            Some(tool_calling_parameter(&request).to_string()),
-            Some("unsupported_tool_calling".to_string()),
-        ));
-    }
     let stream = request.stream.unwrap_or(false);
     let include_usage = request
         .stream_options
@@ -454,6 +427,35 @@ pub(super) async fn prepare(
             ));
         }
     };
+    // Resolve model/runtime prerequisites first. A missing projector or runtime
+    // must not be hidden by the boolean tool-transport capability probe.
+    let tool_transport_supported = if requires_tool_calling {
+        let backend = state.backend.clone();
+        let selected_model = manifest.clone();
+        let has_images = !image_urls.is_empty();
+        crate::logging::spawn_blocking(move || {
+            backend.supports_tool_calling(&selected_model, has_images)
+        })
+        .await
+        .map_err(|error| {
+            GenerationError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("tool routing task failed: {error}"),
+                None,
+            )
+        })?
+    } else {
+        true
+    };
+    if !tool_transport_supported {
+        return Err(GenerationError::with_code(
+            StatusCode::BAD_REQUEST,
+            "the configured adapter does not provide chat tool transport for this request"
+                .to_string(),
+            Some(tool_calling_parameter(&request).to_string()),
+            Some("unsupported_tool_calling".to_string()),
+        ));
+    }
     let prompt =
         messages_to_prompt_for_model_with_template(&manifest, &request.messages, prompt_options);
     let generation_messages = if requires_tool_calling {

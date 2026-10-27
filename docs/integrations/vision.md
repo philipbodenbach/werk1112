@@ -35,61 +35,82 @@ werk doctor --model VISUAL_QA_MODEL --task image-understanding --debug
 werk backend doctor --debug
 ~~~
 
-## Optional setup and later activation
+## Complete model setup
 
-New interactive backend installs and supported model pulls/imports ask whether
-to set up images; **Skip is the default**. Without a terminal there is no prompt
-and no consent to optional downloads. Use `--vision` or `--text-only` explicitly
-in automation. Previously recorded choices are preserved unless overridden.
-These flags select components; they do not bypass tool, filesystem, network or
-provider permissions. Backend approval never authorizes downloading a projector
-for a future model.
+A successful `werk pull` saves the main model first, then checks the advertised
+features and offers one setup dialog for missing backends, backend upgrades and
+model components such as vision projectors. Local `run`, `chat`, and `serve`
+(with `--model`, `--preload`, or `--image-model`) perform the same check before
+execution. `werk setup MODEL` performs it without running inference.
+
+The plan includes text, streaming and tool transport for chat models, image input
+when advertised, and readiness checks for the model's other declared tasks.
+Choosing **Set up all** installs the listed components and checks readiness
+again. **Later** leaves the saved model unchanged. Cancellation or a failed
+component installation retains the main model. Unsupported tasks, unavailable
+hardware, ambiguous projectors and missing processor assets are reported
+explicitly; they are not reported as fully configured features.
+
+Without a terminal, Werk prints the plan and setup instruction but does not read
+piped input as approval. Use `--auto-install-backends` to approve the complete
+plan in automation, including its model-specific projector download.
+`--no-auto-install-backends` disables this setup review. `--text-only` excludes
+vision from the current pull/setup; later full setup can offer it again.
+`--vision` selects image setup, but does not alone approve backend installation
+in the combined dialog. Standalone `backend install`, `import`, and
+`artifacts vision` retain their explicit `--vision` / `--text-only` controls.
 
 ~~~bash
+# Download the main model, then review all missing components.
+werk pull vumpt/Qwen3.8-Flash-Next-GGUF --name flash
+# Repair an existing model, with one confirmation for the full plan.
+werk --backend cuda setup flash
+# Explicit approval for unattended complete setup.
+werk --auto-install-backends --backend cuda setup flash
+# Review/configure existing assets without network or package installation.
+werk --backend cpu setup local-vlm --offline
+# Select a specific repository projector in the post-pull plan.
+werk pull unsloth/Qwen3.8-27B-GGUF --name qwen27b \
+  --file Qwen3.8-27B-UD-Q4_K_XL.gguf --projector mmproj-BF16.gguf
+# Explicitly exclude vision from this setup.
+werk pull org/model --name text-first --file model.gguf --text-only
+# Import a deliberately selected matching local projector.
+werk artifacts vision qwen27b --vision --projector /models/mmproj-BF16.gguf --offline
 # Runtime scope only; no model/projector download.
 werk backend install llama-cuda --vision
-# Main model plus the selected matching projector, from one recorded revision.
-werk pull unsloth/Qwen3.8-27B-GGUF --name qwen27b \
-  --file Qwen3.8-27B-UD-Q4_K_XL.gguf --vision --projector mmproj-BF16.gguf
-# Explicitly skip optional projectors (changed from earlier automatic inclusion).
-werk pull org/model --name text-first --file model.gguf --text-only
-# Enable an existing local matching asset, without network access.
-werk artifacts vision qwen27b --vision --projector /models/mmproj-BF16.gguf --offline
-# For models pulled by this version: download only the projector at the saved revision.
-werk artifacts vision text-first --vision --download
-werk artifacts vision qwen27b --text-only --offline
-werk import /models/complete-vlm --name local-vlm --link --vision --offline
 ~~~
 
-Model setup records its own enabled/disabled state and selected projector in
-`vision_setup` in the manifest. Backend choices are stored per install target.
-Readiness and ordinary image requests perform no optional runtime installation
-or model downloads, even when general automatic backend provisioning is enabled.
-Missing components produce a setup instruction; text-only requests remain usable.
+Existing complete setups are reused without another dialog. New pulls record the
+source Git revision. Projector discovery first checks that source, then, for
+image-capable GGUF models with no projector there, checks the corresponding
+`ggml-org/<base-model>-GGUF` package. A companion package must declare the same
+unambiguous base-model ID. The displayed download is pinned to its revision,
+filename, byte size and SHA-256. Size and checksum are verified before activation;
+GGUF model identity and projection/embedding dimensions must agree when present.
+Source provenance is stored in `source-revision.json`, and installed projector
+provenance in `vision-source.json`. Legacy pulls without a saved source revision
+use current repository metadata for discovery, with the same download and local
+compatibility checks. They do not gain retroactive main-weight provenance.
 
-A projector's generic filename is not compatibility evidence. Automatic precision
-selection is limited to one filename family. Different model families require
-`--projector`; explicit selection also rejects contradictory GGUF model identity
-metadata. Imports with no identity metadata still need a deliberate, verified
-source association: setup does not claim tensor-level or revision compatibility.
-Main model and projector from a pull share an exact recorded Git revision. Late
-`--download` uses that revision and only the selected LFS file. Older imports
-without revision evidence require an explicitly supplied matching local file.
-No current-repository guess and no main-weight redownload occur. Main-model
-revision provenance does not certify an independently supplied local projector.
+A generic projector filename alone is not compatibility evidence. Automatic
+precision selection is limited to one filename family; ambiguous families need
+an explicit selection. An unknown or incompatible setup is reported, without
+redownloading main weights. Safetensors vision weights can be inseparable from
+the main checkpoint: `--text-only` cannot split that checkpoint.
 
-`--offline` allows existing-asset configuration/import, rejects repository pulls
-and backend installation, and cannot be combined with an effective download.
-A bare `--yes` is not vision approval. For safetensors, encoder weights can be
-part of the main checkpoint: `--text-only` skips activation, but cannot split
-such an inseparable checkpoint into smaller text-only weights.
+HTTP requests and diagnostic probes never ask questions, install packages or
+fetch projectors. For models selected dynamically through the API, run
+`werk setup MODEL` in a terminal first. An image-plus-tools request reports a
+missing model/runtime prerequisite before checking tool transport, preserving
+the useful error instead of incorrectly blaming tool support. Setup enables the
+adapter's tool transport; it does not grant tools additional filesystem, network
+or provider permissions.
 
-Legacy manifests without `vision_setup` retain their previous behavior. A
-manifest/projector selection change changes runtime cache identity; active
-requests may finish on their existing handle while subsequent requests select
-the new state. A runtime `--help` probe proves CLI availability, not concrete
-model inference. Readiness reports prerequisites checked / inference untested.
-See the [complete backend audit and verification matrix](vision-audit.md).
+Model setup records enabled state and projector selection in `vision_setup`.
+Changing that selection changes runtime cache identity. A readiness check proves
+prerequisites and runtime CLI support, not successful model inference or output
+quality. Real architecture support still depends on the installed runtime build
+and hardware. See the [backend verification matrix](vision-audit.md).
 
 ## CLI visual inspection
 
