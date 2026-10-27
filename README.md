@@ -1,7 +1,7 @@
 # Werk1112
 
 <p align="center">
-  <img src="docs/assets/banner_werk.png" alt="Werk1112 startup banner: WERK1112 - Inference Router." />
+  <img src="docs/assets/banner_werk.png" width="576" height="155" alt="Werk1112 · Inference Router" />
 </p>
 
 Werk1112 is a local-first, multimodal inference runtime and router written in
