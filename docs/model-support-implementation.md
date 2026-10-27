@@ -51,9 +51,9 @@ models was performed; no new path is `VERIFIED_LOCAL` or `VERIFIED_REMOTE`.
 
 ## Latest startup preload behavior
 
-`src/api/preload.rs` keeps the existing ordered, deduplicated, best-effort startup
-sequence, including continuation after a failed target. Successful handles remain
-owned by the server until shutdown.
+`src/api/preload.rs` runs an ordered, deduplicated startup sequence and stops at
+the first failed target. The CLI exits on failure instead of starting a partially
+prepared service. Successful handles remain owned by the server until shutdown.
 
 Kolibri uses the existing vLLM runtime-cache transaction and a real short warmup
 with `reasoning_effort:none` / `enable_thinking:false`, so hidden reasoning does

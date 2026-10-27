@@ -1346,10 +1346,22 @@ warm image, video or audio generation.
 Successful local instances are retained until server shutdown. Pinned runtime
 entries sit outside ordinary cache capacity/eviction limits and cannot be
 evicted by later requests. Earlier targets claim resources first. Missing
-models, incompatible paths, resource shortages and warmup failures are logged
-and skipped; later targets are still attempted. The server can start with no
-successful preloads. Skipped models remain requestable under normal routing and
-resource rules.
+models, incompatible paths, resource shortages and warmup failures stop startup
+at the first failed target with a nonzero exit status. Later targets are not
+attempted. The CLI does not report “Server ready” or restart itself after a
+setup/preload failure. Installed components remain available; resolve the reported
+cause, then rerun the complete `werk serve` command with all original parameters.
+
+Setup checks, backend installation, projector validation and model loading show
+a spinner with the current phase and elapsed time in an interactive terminal.
+Projector downloads also show bytes, transfer speed and ETA when the size is
+known. Status events are emitted every five seconds during long operations,
+including when the backend produces no output. Redirected output and explicit
+text/JSON logging use status events without terminal animation. The event names
+are `operation.started`, `operation.phase`, `operation.progress` and
+`operation.finished`; fields include phase, elapsed seconds and download bytes
+when available. A spinner indicates activity, not a measured percentage of model
+loading. Native llama.cpp startup also shows its PID and readiness timeout.
 
 In deployment mode, an alias expands to all replicas in instance-ID order;
 individual IDs also work. Deduplication uses the expanded target instance IDs.

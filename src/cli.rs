@@ -719,7 +719,7 @@ pub enum Commands {
         model: Option<String>,
 
         #[arg(long, value_name = "MODEL", num_args = 1.., action = ArgAction::Append,
-            help = "Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, failures are logged and skipped")]
+            help = "Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, startup exits on failure")]
         preload: Vec<String>,
 
         #[arg(
@@ -1882,7 +1882,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                         true,
                     )
                 })
-                .await??;
+                .await?
+                .context("Model setup failed; werk serve stopped. Resolve the reported cause, then rerun your complete serve command with all parameters")?;
             }
             let backend = build_generation_backend(
                 store.clone(),
@@ -1913,37 +1914,35 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .filter(|_| cli.deployments.is_none() && preload.is_empty())
             {
                 let manifest = store.get(model)?;
-                with_terminal_spinner(
-                    terminal_spinner_enabled(false),
-                    format!("Loading default model '{model}'..."),
-                    || {
-                        if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
-                            let options = text_policy.apply(Default::default())?;
-                            let diagnostics =
-                                crate::backend::text_analysis::TextAnalysisBackend::new(
-                                    store.clone(),
-                                )
+                let activity =
+                    crate::terminal::Activity::start(format!("Preparing default model {model}"));
+                let preparation = (|| {
+                    if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
+                        let options = text_policy.apply(Default::default())?;
+                        let diagnostics =
+                            crate::backend::text_analysis::TextAnalysisBackend::new(store.clone())
                                 .diagnostics(&manifest, &options)?;
-                            if diagnostics["ready"].as_bool() != Some(true) {
-                                return Err(diagnostics::RuntimeSetupRequired {
-                                    detail: diagnostics["detail"]
-                                        .as_str()
-                                        .unwrap_or("Text-analysis runtime unavailable")
-                                        .to_string(),
-                                    backend: options.backend.clone(),
-                                }
-                                .into());
+                        if diagnostics["ready"].as_bool() != Some(true) {
+                            return Err(diagnostics::RuntimeSetupRequired {
+                                detail: diagnostics["detail"]
+                                    .as_str()
+                                    .unwrap_or("Text-analysis runtime unavailable")
+                                    .to_string(),
+                                backend: options.backend.clone(),
                             }
-                            crate::ui_println!(
-                                "Text-analysis model: use {}; weights load on the first request",
-                                crate::backend::text_analysis::endpoint(task)
-                            );
-                            Ok(())
-                        } else {
-                            backend.prepare(&manifest)
+                            .into());
                         }
-                    },
-                )?;
+                        crate::ui_println!(
+                            "Text-analysis model: use {}; weights load on the first request",
+                            crate::backend::text_analysis::endpoint(task)
+                        );
+                        Ok(())
+                    } else {
+                        backend.prepare(&manifest)
+                    }
+                })();
+                preparation.context("Default model preparation failed; werk serve stopped. Resolve the reported cause, then rerun your complete serve command with all parameters")?;
+                activity.finish();
                 crate::ui_println!("Default model available: {model}");
             }
             if let Some(image_model) = image_model.as_deref() {
@@ -1981,7 +1980,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 crate::ui_println!("{summary}");
             }
             if !preload.is_empty() {
-                api_state.preload_models(&preload).await;
+                let report = api_state.preload_models(&preload).await;
+                anyhow::ensure!(
+                    report.ready == report.attempted,
+                    "Model preload failed ({} of {} ready); werk serve stopped. Resolve the reported cause, then rerun your complete serve command with all parameters. No automatic restart was attempted",
+                    report.ready,
+                    report.attempted
+                );
             }
             serve_with_listener(listener, api_state).await
         }
@@ -2273,6 +2278,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                         target_name.get_name(),
                         &vision,
                     )?;
+                    let activity = crate::terminal::Activity::start(format!(
+                        "Installing backend {}",
+                        target_name.get_name()
+                    ));
+                    activity.phase("Installing and checking runtime components");
                     if let Some(mode) = target.mode() {
                         let executable = install_managed_llama_server_with_options(
                             &store,
@@ -2342,6 +2352,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             target_name.get_name()
                         );
                     }
+                    activity.finish();
                     Ok(())
                 }
                 BackendCommands::List => {

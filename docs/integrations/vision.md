@@ -51,6 +51,14 @@ component installation retains the main model. Unsupported tasks, unavailable
 hardware, ambiguous projectors and missing processor assets are reported
 explicitly; they are not reported as fully configured features.
 
+Downloads display byte progress, speed and ETA. Setup, installation and validation
+display a spinner with their phase and elapsed time; periodic status events also
+work in pipes and JSON logs. After setup, `serve` continues with its original
+parameters. If installation or model preparation fails, it exits with an error;
+fix the reported cause and rerun the full command. It does not restart itself
+with default parameters. Installing prerequisites does not prove that a model
+fits in memory or that inference succeeds; startup preload checks inference.
+
 Without a terminal, Werk prints the plan and setup instruction but does not read
 piped input as approval. Use `--auto-install-backends` to approve the complete
 plan in automation, including its model-specific projector download.

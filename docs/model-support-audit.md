@@ -62,8 +62,8 @@ sharding configuration, weight license or local support is invented for it.
 - Kolibri uses the vendor parsers and native template; reasoning effort is
   forwarded to template kwargs. Its synthetic 32-token preload disables thinking
   so hidden reasoning alone cannot exhaust the short warmup.
-- Existing startup preload ordering, deduplication, failure continuation and
-  retention remain in place. DROID workers use the same pinned runtime-cache
+- Startup preload preserves ordering, deduplication and retention; a failed
+  target now stops server startup. DROID workers use the same pinned runtime-cache
   transaction; cloud preloads only prepare the HTTPS client and validate local
   credential syntax. They do not promise provider readiness or warmed weights.
 - POST network/5xx failures are not automatically replayed: a generation may

@@ -834,6 +834,8 @@ impl LlamaServerProcess {
         runtime_options: &LlamaRuntimeOptions,
         deployment: Option<&crate::deployments::Execution>,
     ) -> Result<Self> {
+        let activity = crate::terminal::Activity::start(format!("Loading model {}", manifest.id));
+        activity.phase("Checking llama.cpp runtime and launch parameters");
         let reservation = deployment
             .map(crate::deployments::Execution::reserve)
             .transpose()?;
@@ -945,6 +947,7 @@ impl LlamaServerProcess {
             .flatten();
 
         crate::ui_eprintln!("Using llama.cpp server {} backend", display_name(mode));
+        activity.phase("Preparing model files and memory policy");
         #[cfg(target_os = "linux")]
         let model_file_cache =
             model_file_cache::CacheReleaseGuard::prepare(model_path, projector_path, &args);
@@ -970,6 +973,7 @@ impl LlamaServerProcess {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
         let spawn_started = Instant::now();
+        activity.phase("Starting llama-server");
         let child = match super::llama_process_lifecycle::ManagedChild::spawn(&mut command) {
             Ok(child) => child,
             Err(error) => {
@@ -1039,7 +1043,7 @@ impl LlamaServerProcess {
         }
         // Do not compete with native model loading for disk/cache bandwidth.
         // Session library hashing and snapshot reads begin only after startup.
-        let ready = process.wait_until_ready();
+        let ready = process.wait_until_ready(&activity);
         let ready_seconds = spawn_started.elapsed().as_secs_f64();
         if let Err(error) = ready {
             if let Some(snapshot_dir) = process.state_runtime.snapshot_dir.as_deref() {
@@ -1048,6 +1052,7 @@ impl LlamaServerProcess {
             return Err(error);
         }
         let final_started = Instant::now();
+        activity.phase("Checking ready runtime identity");
         let unchanged = inspection
             .as_ref()
             .is_some_and(|value| value.verify_unchanged(&process.executable).is_ok());
@@ -1061,6 +1066,7 @@ impl LlamaServerProcess {
             format!("llama.cpp final identity validation duration: {final_seconds:.6}s"),
             "llama.cpp cache file preparation: deferred until native startup completes".into(),
         ]);
+        activity.finish();
         Ok(process)
     }
 
@@ -1171,9 +1177,51 @@ impl LlamaServerProcess {
         Ok(completion)
     }
 
-    fn wait_until_ready(&self) -> Result<()> {
+    fn wait_until_ready(&self, activity: &crate::terminal::Activity) -> Result<()> {
         let started = Instant::now();
+        let mut fit_warning_reported = false;
+        let mut phase = "Loading weights and projector";
+        activity.phase(format!(
+            "{phase}; PID {}; timeout {}s",
+            self.pid,
+            HEALTH_TIMEOUT.as_secs()
+        ));
         loop {
+            // Keep the native output tail for errors, but expose useful startup
+            // phases even without verbose logging. A warning is not an exit.
+            let lines = self
+                .log_tail
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if !fit_warning_reported
+                && lines
+                    .iter()
+                    .any(|line| line.contains("failed to fit params"))
+            {
+                fit_warning_reported = true;
+                let message = "llama.cpp could not automatically fit the model to available memory. Explicit GPU-layer settings can prevent fitting; review --gpu-layers and memory/offload settings if startup fails. Launch parameters are unchanged.";
+                if crate::logging::enabled() {
+                    crate::logging::emit(
+                        crate::logging::Level::Warn,
+                        "backend.startup.memory_warning",
+                        message,
+                        json!({"model": self.model_id, "backend_pid": self.pid}),
+                    );
+                } else {
+                    crate::ui_eprintln!("Warning: {message}");
+                }
+            }
+            if let Some(next) = lines.iter().rev().find_map(|line| startup_phase(line)) {
+                if next != phase {
+                    phase = next;
+                    activity.phase(format!(
+                        "{phase}; PID {}; timeout {}s",
+                        self.pid,
+                        HEALTH_TIMEOUT.as_secs()
+                    ));
+                }
+            }
             if let Some(status) = self.try_wait_status()? {
                 self.drain_exit_logs();
                 bail!(
@@ -1188,7 +1236,8 @@ impl LlamaServerProcess {
             }
             if started.elapsed() > HEALTH_TIMEOUT {
                 bail!(
-                    "timed out waiting for llama-server {} at {}{}",
+                    "timed out after {}s waiting for llama-server {} at {}{}",
+                    HEALTH_TIMEOUT.as_secs(),
                     self.pid,
                     self.url,
                     self.formatted_log_tail()
@@ -3888,6 +3937,22 @@ fn find_sse_boundary(bytes: &[u8]) -> Option<usize> {
 
 fn estimate_tokens(text: &str) -> usize {
     text.split_whitespace().count().max(1)
+}
+
+fn startup_phase(line: &str) -> Option<&'static str> {
+    if line.contains("warming up") {
+        Some("Running native warmup")
+    } else if line.contains("clip_model_load") || line.contains("projector") {
+        Some("Loading vision projector")
+    } else if line.contains("llama_context") || line.contains("KV buffer") {
+        Some("Allocating inference context")
+    } else if line.contains("load_tensors") || line.contains("load_all_data") {
+        Some("Loading model tensors")
+    } else if line.contains("loading model") {
+        Some("Loading model weights")
+    } else {
+        None
+    }
 }
 
 fn gpu_layers(mode: LlamaCppMode) -> i32 {

@@ -256,6 +256,9 @@ impl ModelStore {
     pub fn install_projector(&self, id: &str, plan: &ProjectorDownload) -> Result<ModelManifest> {
         // Revalidate serialized plans before using their URL or length.
         let checked = plan.checked()?;
+        let activity =
+            crate::terminal::Activity::start(format!("Vision projector {}", checked.file));
+        activity.phase("Connecting to download source");
         self.ensure()?;
         let staging = tempfile::tempdir_in(self.tmp_dir())?;
         let path = staging.path().join("mmproj.gguf");
@@ -276,6 +279,7 @@ impl ModelStore {
                 .context("Projector size overflow")?,
         );
         let mut file = fs::File::create(&path)?;
+        activity.download(checked.size);
         let mut hash = Sha256::new();
         let mut length = 0u64;
         let mut buffer = vec![0u8; 1024 * 1024];
@@ -291,18 +295,22 @@ impl ModelStore {
             );
             hash.update(&buffer[..n]);
             file.write_all(&buffer[..n])?;
+            activity.position(length);
         }
+        activity.phase("Verifying download size and SHA-256");
         anyhow::ensure!(
             length == checked.size
                 && format!("{:x}", hash.finalize()) == checked.sha256.to_ascii_lowercase(),
             "Projector download failed its size/checksum verification; model unchanged"
         );
         file.sync_all()?;
+        activity.phase("Validating and activating vision projector");
         let manifest = self.configure_vision(id, true, Some(&path))?;
         crate::backend::vision_setup::atomic_json(
             &self.model_dir(id).join("vision-source.json"),
             &checked,
         )?;
+        activity.finish();
         Ok(manifest)
     }
 }

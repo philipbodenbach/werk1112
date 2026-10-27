@@ -133,9 +133,10 @@ curl -fsS http://127.0.0.1:11434/v1/models \
 ~~~
 
 For several installed text models, `werk serve --preload model-a model-b`
-performs ordered, best-effort loading and warmup. Successful instances remain
-resident until shutdown; unsupported paths or resource failures are logged and
-skipped. This does not generally warm image, video or audio generation.
+performs ordered loading and warmup with live status. Successful instances remain
+resident until shutdown; a setup or preload failure stops startup with a nonzero
+exit status. Rerun the complete command after resolving the cause; Werk does not
+restart with default parameters. This does not generally warm image, video or audio generation.
 See [preload semantics and limits](docs/reference/cli.md#startup-preload).
 
 ## Core capabilities

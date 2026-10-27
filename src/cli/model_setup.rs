@@ -308,7 +308,10 @@ pub(super) fn ensure(
     if options.setup_policy == SetupPolicy::Never {
         return Ok(manifest);
     }
+    let checking = crate::terminal::Activity::start(format!("Checking model setup {id}"));
+    checking.phase("Checking backend, tools and model components");
     let setup = plan(store, &manifest, backend, options, offline, include_vision)?;
+    checking.finish();
     if !setup.issues.is_empty() {
         crate::ui_eprintln!("{}", setup.describe());
         bail!("Full model setup is blocked by the listed prerequisites; model files are retained");
@@ -335,6 +338,16 @@ pub(super) fn ensure(
             .arg("--model-home")
             .arg(store.home())
             .args(["backend", "install", target]);
+        if crate::logging::raw_console() {
+            command.env(
+                "WERK_LOG_FORMAT",
+                if crate::logging::json_console() {
+                    "json"
+                } else {
+                    "text"
+                },
+            );
+        }
         if crate::backend::vision_setup::installer_components(target).is_some() {
             command.arg("--vision");
         }
@@ -343,6 +356,7 @@ pub(super) fn ensure(
             "Backend installation failed; model files are retained. Retry with werk setup {id}"
         );
     }
+    let verifying = crate::terminal::Activity::start(format!("Verifying model setup {id}"));
     let updated = store.get(id)?;
     let verify = plan(store, &updated, backend, options, true, include_vision)?;
     anyhow::ensure!(
@@ -350,6 +364,7 @@ pub(super) fn ensure(
         "Model setup is incomplete:\n{}",
         verify.describe()
     );
+    verifying.finish();
     crate::ui_eprintln!(
         "Model setup complete: prerequisites for the advertised features are installed. Actual model inference remains untested."
     );

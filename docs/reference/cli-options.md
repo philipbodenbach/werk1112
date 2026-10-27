@@ -238,7 +238,7 @@ werk serve [OPTIONS]
 | `--host <HOST>` | Address to bind [default: 127.0.0.1] |
 | `--port <PORT>` | Port to bind [default: 11434] |
 | `--model <MODEL>` | Default model for chat or text-analysis API requests that omit model |
-| `--preload <MODEL>...` | Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, failures are logged and skipped |
+| `--preload <MODEL>...` | Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, startup exits on failure |
 | `--image-model <IMAGE_MODEL>` | Default image model for compatible clients that omit model or use an OpenAI image alias |
 | `--api-key <API_KEY>` | Require OpenAI-style Authorization: Bearer <key> for /v1 requests [env: WERK_API_KEY] |
 | `--api-keys <PATH>` | Load OpenAI-style bearer keys from an API keys TOML file [env: WERK_API_KEYS] |

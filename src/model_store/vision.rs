@@ -192,6 +192,8 @@ impl ModelStore {
         enabled: bool,
         projector: Option<&Path>,
     ) -> Result<ModelManifest> {
+        let activity = crate::terminal::Activity::start(format!("Configuring vision for {id}"));
+        activity.phase("Validating and saving model components");
         let mut manifest = self.get(id)?;
         let previous = manifest.metadata.vision_setup.clone();
         let backend = if projector.is_some() && manifest.format == ModelFormat::Gguf {
@@ -311,6 +313,7 @@ impl ModelStore {
             }
         }
         atomic_json(&self.model_dir(id).join(MANIFEST_FILE), &manifest)?;
+        activity.finish();
         Ok(manifest)
     }
 
@@ -358,6 +361,9 @@ impl ModelStore {
         let root = staging.path();
         let token = self.huggingface_token()?;
         let url = format!("https://huggingface.co/{repo}");
+        let checking =
+            crate::terminal::Activity::start(format!("Checking projector source for {id}"));
+        checking.phase("Fetching recorded repository revision");
         for args in [
             vec!["init"],
             vec!["remote", "add", "origin", &url],
@@ -382,6 +388,7 @@ impl ModelStore {
         let selected = select_projector(root, file)?
             .context("No model-specific projector at the recorded revision")?;
         let bytes = lfs_pointer_total_for_files(root, std::slice::from_ref(&selected))?;
+        checking.finish();
         let approved = consent(&format!(
             "Image setup for model {id}; source {repo}@{revision}; file {selected}; additional download {}; destination {}. Main model weights are reused.",
             bytes
@@ -391,6 +398,13 @@ impl ModelStore {
         ))?;
         if !approved {
             return Ok(manifest);
+        }
+        let activity =
+            crate::terminal::Activity::start(format!("Downloading vision projector {selected}"));
+        if let Some(total) = bytes {
+            activity.download(total);
+        } else {
+            activity.phase("Downloading projector (size unknown)");
         }
         for args in [
             vec!["lfs", "install", "--local"],
@@ -413,11 +427,18 @@ impl ModelStore {
                 "Cannot download selected projector; previous model setup is unchanged",
                 Some(root),
                 bytes,
-                |_| {},
+                |event| {
+                    if let GitCommandProgress::Stats { bytes, .. } = event {
+                        activity.position(bytes);
+                    }
+                },
             )?;
         }
+        activity.phase("Verifying and activating downloaded projector");
         ensure_lfs_file_downloaded(root, &selected)?;
-        self.configure_vision(id, true, Some(&root.join(selected)))
+        let manifest = self.configure_vision(id, true, Some(&root.join(selected)))?;
+        activity.finish();
+        Ok(manifest)
     }
 }
 
