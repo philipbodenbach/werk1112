@@ -55,9 +55,10 @@ p code, li code { font-size: .9em; overflow-wrap: anywhere; }
 .header-row { display: flex; justify-content: space-between; align-items: center; gap: 1.5rem; padding-block: 2.5rem 2rem; }
 .brand { display: flex; align-items: center; gap: .8rem; color: var(--text); font-size: 1.35rem; font-weight: 600; text-decoration: none; }
 .brand-mark { font: 700 .85rem ui-monospace, monospace; color: var(--accent); border: 1px solid var(--line); padding: .5rem; border-radius: .35rem; }
-.control { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border: 1px solid var(--line); border-radius: .375rem; background: transparent; color: var(--text); cursor: pointer; font-size: .875rem; }
+.preferences { display: flex; align-items: center; flex-shrink: 0; gap: .5rem; }
+.control { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border: 1px solid var(--line); border-radius: .375rem; background: transparent; color: var(--text); cursor: pointer; font-size: .875rem; text-decoration: none; }
 .control[hidden] { display: none; }
-.control:hover { border-color: var(--accent); }
+.control:hover { border-color: var(--accent); text-decoration: none; }
 .moon, .dark .sun { display: none; }
 .dark .moon { display: inline; }
 .nav { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; padding-bottom: 2rem; font-size: .9rem; }
