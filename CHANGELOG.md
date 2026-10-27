@@ -5,6 +5,14 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-10-27
+
+### Changes
+
+- fix(): github page fixes (`46982a63dd15`)
+- fix(): github page fixes (`cea194890324`)
+- fix(): github page fixes (`5c4f8a0b54ba`)
+
 ## [1.10.0] - 2026-10-26
 
 ### Changes
@@ -498,7 +506,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.10.0...HEAD
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.10.1...HEAD
+[1.10.1]: https://github.com/philipbodenbach/werk1112/compare/v1.10.0...v1.10.1
 [1.10.0]: https://github.com/philipbodenbach/werk1112/compare/v1.9.1...v1.10.0
 [1.9.1]: https://github.com/philipbodenbach/werk1112/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/philipbodenbach/werk1112/compare/v1.8.0...v1.9.0

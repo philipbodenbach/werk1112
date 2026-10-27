@@ -6,7 +6,7 @@ Build scope: **canonical Linux, `--no-default-features`, no optional backend fea
 Coverage is limited to this parser/schema profile, not every platform or feature build.
 See [conditional build options](cli.md#conditional-build-options) for extensions.
 
-Generated from **werk 1.10.0** for all **40 canonical tasks**.
+Generated from **werk 1.10.1** for all **40 canonical tasks**.
 
 These are task-level schema defaults, before model/family/runtime/profile
 resolution. `null` means no concrete schema default. A listed flag is a
