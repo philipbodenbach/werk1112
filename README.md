@@ -236,18 +236,16 @@ are unavailable upstream. Use `werk support list` and the
 [implementation report](docs/model-support-implementation.md) for exact identities,
 requirements and blockers. FLUX.1 Schnell retains its existing Diffusers path.
 
-## What’s new in v1.10.0
+## What’s new in v1.10.1
 
-Werk Core, Media Companion, ComfyUI and n8n share release version **1.10.0**.
+Werk Core, Media Companion, ComfyUI and n8n share release version **1.10.1**.
 ComfyUI and n8n remain Beta integrations.
 
-- fix(): readme and reference (`ac4886242147`)
-- fix(): readme and reference (`0afca26dc2d1`)
-- fix(): readme and reference (`28142a3f9b85`)
-- fix(): readme and reference (`9b195c9b1f60`)
-- fix(): banner fix (`26b6fcd03f15`)
+- fix(): github page fixes (`46982a63dd15`)
+- fix(): github page fixes (`cea194890324`)
+- fix(): github page fixes (`5c4f8a0b54ba`)
 
-See the [v1.10.0 changelog](CHANGELOG.md#1100---2026-10-26) for all changes and compatibility notes.
+See the [v1.10.1 changelog](CHANGELOG.md#1101---2026-10-27) for all changes and compatibility notes.
 
 ## Documentation
 
