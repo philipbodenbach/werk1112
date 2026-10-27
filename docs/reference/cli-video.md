@@ -6,7 +6,7 @@ Build scope: **canonical Linux, `--no-default-features`, no optional backend fea
 Coverage is limited to this parser/schema profile, not every platform or feature build.
 See [conditional build options](cli.md#conditional-build-options) for extensions.
 
-Generated from **werk 1.10.1**. See [CLI semantics](cli.md),
+Generated from **werk 1.10.2**. See [CLI semantics](cli.md),
 [media input and override rules](cli-media.md), and the
 [canonical parameter schema](parameters-schema.md).
 
