@@ -131,6 +131,7 @@ The matching `werk serve` options override the resource-tuning variables.
 | --- | --- |
 | `WERK_LLAMA_SERVER_CUDA`, `WERK_LLAMA_SERVER_ROCM`, `WERK_LLAMA_SERVER_VULKAN`, `WERK_LLAMA_SERVER_METAL`, `WERK_LLAMA_SERVER_CPU` | Mode-specific `llama-server` executable. |
 | `WERK_LLAMA_SERVER` | Generic executable fallback after the mode-specific variable and before managed/PATH discovery. |
+| `WERK_LLAMA_HEALTH_TIMEOUT_SECONDS` | Positive integer readiness timeout for a new native llama-server, default `900` seconds (15 minutes) to allow large-model cold starts. Invalid values fail before launching the worker. Individual startup health probes have a one-second budget. This does not change inference timeouts, memory placement, context or parallel slots. Worker cleanup may take additional time. |
 | `WERK_LLAMA_PARALLEL` | Native llama-server slots (`--parallel`), default `1`; not an agent count. Each slot receives the configured per-sequence context; more slots increase memory. |
 | `WERK_LLAMA_CTX` | Context size per sequence; `0` asks the model/runtime default where supported. |
 | `WERK_LLAMA_BATCH`, `WERK_LLAMA_UBATCH` | Logical batch size and physical micro-batch size. |

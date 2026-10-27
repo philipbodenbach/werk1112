@@ -1363,6 +1363,15 @@ are `operation.started`, `operation.phase`, `operation.progress` and
 when available. A spinner indicates activity, not a measured percentage of model
 loading. Native llama.cpp startup also shows its PID and readiness timeout.
 
+Native llama.cpp readiness allows 900 seconds by default for large-model cold
+starts. Set `WERK_LLAMA_HEALTH_TIMEOUT_SECONDS` to a positive integer to change
+this limit, for example `1200` for 20 minutes. An individual health probe cannot
+wait longer than one second or the remaining startup budget. This limit covers
+native model/projector loading and native warmup, not later inference. Runtime
+termination and memory release can take additional time and have their own
+visible phase. Increasing the timeout does not change GPU placement or make an
+oversized configuration fit; explicit `--gpu-layers` settings remain unchanged.
+
 In deployment mode, an alias expands to all replicas in instance-ID order;
 individual IDs also work. Deduplication uses the expanded target instance IDs.
 Existing placement/admission rules still apply. This adds no multi-node cluster

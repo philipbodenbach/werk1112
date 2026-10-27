@@ -30,6 +30,7 @@ use super::model_file_cache;
 mod expert_memory;
 mod probe;
 mod runtime_state;
+mod startup;
 mod telemetry;
 #[cfg(test)]
 mod tool_call_tests;
@@ -69,7 +70,6 @@ const API_OPTIONS: &[&str] = &[
     "reasoning_budget_tokens",
     "__werk_thinking",
 ];
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 static STRIX_HALO: OnceLock<bool> = OnceLock::new();
@@ -834,6 +834,7 @@ impl LlamaServerProcess {
         runtime_options: &LlamaRuntimeOptions,
         deployment: Option<&crate::deployments::Execution>,
     ) -> Result<Self> {
+        let health_timeout = startup::timeout()?;
         let activity = crate::terminal::Activity::start(format!("Loading model {}", manifest.id));
         activity.phase("Checking llama.cpp runtime and launch parameters");
         let reservation = deployment
@@ -1043,9 +1044,10 @@ impl LlamaServerProcess {
         }
         // Do not compete with native model loading for disk/cache bandwidth.
         // Session library hashing and snapshot reads begin only after startup.
-        let ready = process.wait_until_ready(&activity);
+        let ready = process.wait_until_ready(&activity, health_timeout);
         let ready_seconds = spawn_started.elapsed().as_secs_f64();
         if let Err(error) = ready {
+            activity.phase("Stopping failed runtime and releasing model memory");
             if let Some(snapshot_dir) = process.state_runtime.snapshot_dir.as_deref() {
                 cleanup_llama_snapshot_dir(snapshot_dir);
             }
@@ -1177,14 +1179,18 @@ impl LlamaServerProcess {
         Ok(completion)
     }
 
-    fn wait_until_ready(&self, activity: &crate::terminal::Activity) -> Result<()> {
+    fn wait_until_ready(
+        &self,
+        activity: &crate::terminal::Activity,
+        timeout: Duration,
+    ) -> Result<()> {
         let started = Instant::now();
         let mut fit_warning_reported = false;
         let mut phase = "Loading weights and projector";
         activity.phase(format!(
             "{phase}; PID {}; timeout {}s",
             self.pid,
-            HEALTH_TIMEOUT.as_secs()
+            timeout.as_secs()
         ));
         loop {
             // Keep the native output tail for errors, but expose useful startup
@@ -1218,7 +1224,7 @@ impl LlamaServerProcess {
                     activity.phase(format!(
                         "{phase}; PID {}; timeout {}s",
                         self.pid,
-                        HEALTH_TIMEOUT.as_secs()
+                        timeout.as_secs()
                     ));
                 }
             }
@@ -1229,21 +1235,20 @@ impl LlamaServerProcess {
                     self.formatted_log_tail()
                 );
             }
-            if let Ok(response) = get(&self.url, "/health")
-                && response.status == 200
-            {
-                return Ok(());
-            }
-            if started.elapsed() > HEALTH_TIMEOUT {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
                 bail!(
-                    "timed out after {}s waiting for llama-server {} at {}{}",
-                    HEALTH_TIMEOUT.as_secs(),
+                    "timed out after {}s waiting for llama-server {} at {}. For a slow cold start, increase WERK_LLAMA_HEALTH_TIMEOUT_SECONDS and rerun the complete command; also check the reported memory/launch settings{}",
+                    timeout.as_secs(),
                     self.pid,
                     self.url,
                     self.formatted_log_tail()
                 );
             }
-            std::thread::sleep(HEALTH_POLL_INTERVAL);
+            if startup::healthy(&self.url, remaining.min(Duration::from_secs(1))).unwrap_or(false) {
+                return Ok(());
+            }
+            std::thread::sleep(HEALTH_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
         }
     }
 
@@ -1338,7 +1343,6 @@ impl Drop for LlamaServerProcess {
 }
 
 struct HttpResponse {
-    status: u16,
     headers: Vec<(String, String)>,
     reader: BufReader<TcpStream>,
 }
@@ -2229,10 +2233,6 @@ fn number_field(value: &Value, path: &[&str]) -> Option<f64> {
         .or_else(|| current.as_u64().map(|v| v as f64))
 }
 
-fn get(base_url: &str, path: &str) -> Result<HttpResponse> {
-    request(base_url, path, "GET", None)
-}
-
 fn post_json(base_url: &str, path: &str, body: &Value) -> Result<HttpResponse> {
     request(base_url, path, "POST", Some(body))
 }
@@ -2282,11 +2282,7 @@ fn request(base_url: &str, path: &str, method: &str, body: Option<&Value>) -> Re
         let _ = reader.read_to_string(&mut text);
         bail!("llama-server HTTP {status}: {}", text.trim());
     }
-    Ok(HttpResponse {
-        status,
-        headers,
-        reader,
-    })
+    Ok(HttpResponse { headers, reader })
 }
 
 fn stream_body<F>(response: &mut HttpResponse, mut on_bytes: F) -> Result<()>

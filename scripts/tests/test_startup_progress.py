@@ -39,6 +39,7 @@ if os.environ.get("FIXTURE_FAIL") == "1":
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
     def do_GET(self):
+        time.sleep(float(os.environ.get("FIXTURE_HEALTH_DELAY", "0")))
         body = b'{"status":"ok"}'
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -157,7 +158,7 @@ class StartupProgress(unittest.TestCase):
         self.assertGreater(sum(output.count(c) for c in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"), 3, output)
         plain = " ".join(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output).replace("│", " ").split())
         self.assertIn("could not automatically fit", plain)
-        self.assertIn("timeout 180s", output)
+        self.assertIn("timeout 900s", output)
         args = self.launches()[0]["args"]
         for flag, value in [("-ngl", "3"), ("-c", "8192"), ("-np", "2"),
                             ("-b", "256"), ("-ub", "128"), ("--reasoning-budget", "2048")]:
@@ -186,6 +187,43 @@ class StartupProgress(unittest.TestCase):
         self.env["FIXTURE_FAIL"] = "1"
         code, output = self.capture(self.serve(preload=False))
         self.assert_failed_without_restart(code, output)
+
+    def test_cold_start_timeout_is_configurable_and_stops_worker(self):
+        self.env.update(WERK_LLAMA_HEALTH_TIMEOUT_SECONDS="1", FIXTURE_LOAD_DELAY="5")
+        started = time.monotonic()
+        code, output = self.capture(self.serve())
+        self.assert_failed_without_restart(code, output)
+        self.assertIn("timed out after 1s", output)
+        self.assertIn("Stopping failed runtime and releasing model memory", output)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_silent_health_endpoint_does_not_bypass_timeout(self):
+        self.env.update(WERK_LLAMA_HEALTH_TIMEOUT_SECONDS="1", FIXTURE_HEALTH_DELAY="10")
+        started = time.monotonic()
+        code, output = self.capture(self.serve())
+        self.assert_failed_without_restart(code, output)
+        self.assertIn("timed out after 1s", output)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_longer_budget_allows_slow_success_without_parameter_changes(self):
+        self.env.update(WERK_LLAMA_HEALTH_TIMEOUT_SECONDS="3", FIXTURE_LOAD_DELAY="1.5")
+        command = self.serve()
+        index = command.index("--gpu-layers")
+        command[index:index + 2] = ["--gpu-layers=-1"]
+        code, output = self.capture(command, ready=True)
+        self.assertIn("serve.preload.ready", output)
+        self.assertIn("timeout 3s", output)
+        args = self.launches()[0]["args"]
+        self.assertEqual(args[args.index("-np") + 1], "2")
+        self.assertEqual(args[args.index("-ngl") + 1], "-1")
+
+    def test_invalid_timeout_fails_before_starting_native_worker(self):
+        self.env["WERK_LLAMA_HEALTH_TIMEOUT_SECONDS"] = "0"
+        code, output = self.capture(self.serve())
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("WERK_LLAMA_HEALTH_TIMEOUT_SECONDS must be greater than zero", output)
+        self.assertNotIn("server.started", output)
+        self.assertFalse(self.trace.exists(), output)
 
     def test_failed_preload_does_not_start_later_models(self):
         imported = subprocess.run(self.command + ["--no-auto-install-backends", "import",
