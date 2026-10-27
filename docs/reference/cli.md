@@ -1355,8 +1355,11 @@ cause, then rerun the complete `werk serve` command with all original parameters
 Setup checks, backend installation, projector validation and model loading show
 a spinner with the current phase and elapsed time in an interactive terminal.
 Projector downloads also show bytes, transfer speed and ETA when the size is
-known. Status events are emitted every five seconds during long operations,
-including when the backend produces no output. Redirected output and explicit
+known. At the normal log level, running phases update the spinner in place;
+completion messages, warnings and errors remain visible. `--verbose` also prints
+the running status events. Log files retain those events in either mode. Status
+events are emitted every five seconds during long operations, including when
+the backend produces no output. Redirected output and explicit
 text/JSON logging use status events without terminal animation. The event names
 are `operation.started`, `operation.phase`, `operation.progress` and
 `operation.finished`; fields include phase, elapsed seconds and download bytes
@@ -1371,6 +1374,14 @@ native model/projector loading and native warmup, not later inference. Runtime
 termination and memory release can take additional time and have their own
 visible phase. Increasing the timeout does not change GPU placement or make an
 oversized configuration fit; explicit `--gpu-layers` settings remain unchanged.
+If native `common_fit_params` reports a failed memory fit or an error during
+fitting, Werk stops the worker promptly instead of allowing the subsequent load
+to continue until timeout. The native reason is retained even if later log lines
+overwrite the output tail. This also applies with `WERK_LLAMA_LOG` enabled.
+Correct placement/context/parallel settings and rerun the complete command;
+Werk does not silently reduce settings or restart. This check relies on native
+fitting diagnostics, and is not a general RAM/VRAM limit or proof that a model
+fits when a backend skips fitting or does not report a failure.
 
 In deployment mode, an alias expands to all replicas in instance-ID order;
 individual IDs also work. Deduplication uses the expanded target instance IDs.

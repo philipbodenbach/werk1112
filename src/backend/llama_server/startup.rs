@@ -11,6 +11,19 @@ use std::{
 const TIMEOUT_ENV: &str = "WERK_LLAMA_HEALTH_TIMEOUT_SECONDS";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 900;
 
+pub(super) fn memory_fitting_failed(line: &str) -> bool {
+    // These native diagnostics mean the memory plan could not be validated.
+    // Do not treat unrelated warnings, including deprecations, as load failures.
+    line.split_once("common_fit_params:")
+        .is_some_and(|(_, detail)| {
+            let detail = detail.trim_start();
+            detail.starts_with("failed to fit params to free device memory:")
+                || detail.starts_with(
+                    "encountered an error while trying to fit params to free device memory:",
+                )
+        })
+}
+
 pub(super) fn timeout() -> Result<Duration> {
     let value = match env::var(TIMEOUT_ENV) {
         Ok(value) => Some(value),
@@ -89,6 +102,37 @@ pub(super) fn healthy(url: &str, budget: Duration) -> Result<bool> {
 mod tests {
     use super::*;
     use std::{net::TcpListener, sync::mpsc, thread};
+
+    #[test]
+    fn memory_rejection_is_specific_and_survives_log_tail_rotation() {
+        let failure = "0.01 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 999, abort";
+        assert!(memory_fitting_failed(failure));
+        assert!(memory_fitting_failed(
+            "E common_fit_params: encountered an error while trying to fit params to free device memory: invalid plan"
+        ));
+        for ordinary in [
+            "W Setting 'enable_thinking' is deprecated",
+            "I common_fit_params: successfully fit params to free device memory",
+            "W unrelated: failed to fit params to free device memory: ignored",
+        ] {
+            assert!(!memory_fitting_failed(ordinary));
+        }
+        let tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let failure_latch = std::sync::Arc::new(std::sync::OnceLock::new());
+        let bytes = format!("{failure}\n{}", "I loading other tensors\n".repeat(200)).into_bytes();
+        super::super::spawn_log_tail_reader(
+            "stderr",
+            std::io::Cursor::new(bytes),
+            tail.clone(),
+            failure_latch.clone(),
+        )
+        .join()
+        .unwrap();
+        assert_eq!(failure_latch.get().map(String::as_str), Some(failure));
+        let tail = tail.lock().unwrap();
+        assert_eq!(tail.len(), 80);
+        assert!(!tail.iter().any(|line| memory_fitting_failed(line)));
+    }
 
     #[test]
     fn startup_budget_allows_large_models_and_validates_overrides() {

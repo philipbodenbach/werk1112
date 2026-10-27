@@ -30,8 +30,13 @@ if "--version" in sys.argv:
 with open(os.environ["FIXTURE_TRACE"], "a") as trace:
     trace.write(json.dumps({"pid": os.getpid(), "args": sys.argv[1:]}) + "\n")
 print("srv load_model: loading model", file=sys.stderr, flush=True)
-if os.environ.get("FIXTURE_FAIL") == "1":
-    print("W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user", file=sys.stderr, flush=True)
+if os.environ.get("FIXTURE_FIT_FAILURE") == "1":
+    print("W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 999, abort", file=sys.stderr, flush=True)
+    for _ in range(200):
+        print("I loading other tensors", file=sys.stderr)
+    sys.stderr.flush()
+if os.environ.get("FIXTURE_WARNING") == "1":
+    print("W Setting 'enable_thinking' is deprecated", file=sys.stderr, flush=True)
 time.sleep(float(os.environ.get("FIXTURE_LOAD_DELAY", "0")))
 if os.environ.get("FIXTURE_FAIL") == "1":
     print("fixture native load failure", file=sys.stderr, flush=True)
@@ -156,8 +161,7 @@ class StartupProgress(unittest.TestCase):
         code, output = self.capture(self.serve(), tty=True)
         self.assert_failed_without_restart(code, output)
         self.assertGreater(sum(output.count(c) for c in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"), 3, output)
-        plain = " ".join(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output).replace("│", " ").split())
-        self.assertIn("could not automatically fit", plain)
+        self.assertIn("fixture native load failure", output)
         self.assertIn("timeout 900s", output)
         args = self.launches()[0]["args"]
         for flag, value in [("-ngl", "3"), ("-c", "8192"), ("-np", "2"),
@@ -173,6 +177,48 @@ class StartupProgress(unittest.TestCase):
         progress = [e for e in events if e["event"] == "operation.progress"]
         self.assertTrue(progress, output)
         self.assertTrue(any(e["fields"].get("duration_seconds", 0) >= 5 for e in progress), output)
+
+    def test_memory_fitting_failure_aborts_before_load_delay_even_with_verbose_native_logs(self):
+        self.env.update(FIXTURE_FIT_FAILURE="1", FIXTURE_LOAD_DELAY="10",
+                        WERK_LLAMA_ARGS="--reasoning-budget 2048")
+        for native_logs in (False, True):
+            with self.subTest(native_logs=native_logs):
+                self.trace.unlink(missing_ok=True)
+                self.env["WERK_LLAMA_LOG"] = "1" if native_logs else "0"
+                command = self.serve()
+                command[command.index("--gpu-layers") + 1] = "999"
+                started = time.monotonic()
+                code, output = self.capture(command + (["--verbose"] if native_logs else []))
+                self.assert_failed_without_restart(code, output)
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertIn("backend.startup.memory_rejected", output)
+                self.assertIn("n_gpu_layers already set by user to 999", output)
+                args = self.launches()[0]["args"]
+                for flag, value in [("-ngl", "999"), ("-np", "2"),
+                                    ("-c", "8192"), ("--reasoning-budget", "2048")]:
+                    self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_normal_terminal_keeps_spinner_without_repeated_logs_but_file_keeps_events(self):
+        self.env.update(FIXTURE_FAIL="1", FIXTURE_LOAD_DELAY="5.5")
+        log = Path(self.temp.name) / "events.jsonl"
+        code, output = self.capture(["--log-file", str(log)] + self.serve(), tty=True)
+        self.assert_failed_without_restart(code, output)
+        self.assertGreater(sum(output.count(c) for c in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"), 3, output)
+        events = [json.loads(line) for line in log.read_text().splitlines()]
+        for name in ("operation.started", "operation.phase", "operation.progress"):
+            self.assertNotIn(name, output)
+            self.assertTrue(any(e["event"] == name for e in events), name)
+        self.assertIn("serve.preload.failed", output)
+
+    def test_verbose_and_explicit_text_terminal_keep_status_events(self):
+        self.env.update(FIXTURE_FAIL="1", FIXTURE_LOAD_DELAY="5.5")
+        for logging in (["--verbose"], ["--log-format", "text"]):
+            with self.subTest(logging=logging):
+                self.trace.unlink(missing_ok=True)
+                code, output = self.capture(self.serve() + logging, tty=True)
+                self.assert_failed_without_restart(code, output)
+                for name in ("operation.started", "operation.phase", "operation.progress"):
+                    self.assertIn(name, output)
 
     def test_failure_after_vision_setup_exits_and_retains_installed_assets(self):
         self.env["FIXTURE_FAIL"] = "1"
@@ -253,6 +299,7 @@ class StartupProgress(unittest.TestCase):
         self.assertFalse(self.trace.exists(), output)
 
     def test_successful_preload_starts_request_service(self):
+        self.env["FIXTURE_WARNING"] = "1"
         limits = []
         def inspect_capacity(url):
             with urlopen(url + "/werk/v1/chat/limits?model=tiny", timeout=3) as response:

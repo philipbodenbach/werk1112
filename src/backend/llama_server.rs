@@ -113,6 +113,7 @@ struct LlamaServerProcess {
     pid: u32,
     mode: LlamaCppMode,
     log_tail: Arc<Mutex<VecDeque<String>>>,
+    startup_memory_failure: Arc<OnceLock<String>>,
     log_readers: Mutex<Vec<thread::JoinHandle<()>>>,
     state_gate: std::sync::RwLock<()>,
     state_runtime: LlamaProcessStateRuntime,
@@ -965,14 +966,10 @@ impl LlamaServerProcess {
         command.args(&args);
         execution.apply(&mut command);
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
-        if env_true("WERK_LLAMA_LOG")
-            && !crate::logging::enabled()
-            && !crate::terminal::interactive(crate::terminal::Stream::Err)
-        {
-            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        } else {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        }
+        let startup_memory_failure = Arc::new(OnceLock::new());
+        // Always inspect native diagnostics, including raw library logging.
+        // Otherwise WERK_LLAMA_LOG could bypass the startup memory check.
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let spawn_started = Instant::now();
         activity.phase("Starting llama-server");
         let child = match super::llama_process_lifecycle::ManagedChild::spawn(&mut command) {
@@ -988,16 +985,21 @@ impl LlamaServerProcess {
         };
         let mut child_process = child.lock().unwrap_or_else(|e| e.into_inner());
         let mut log_readers = Vec::new();
-        if !env_true("WERK_LLAMA_LOG")
-            || crate::logging::enabled()
-            || crate::terminal::interactive(crate::terminal::Stream::Err)
-        {
-            if let Some(stdout) = child_process.stdout.take() {
-                log_readers.push(spawn_log_tail_reader("stdout", stdout, log_tail.clone()));
-            }
-            if let Some(stderr) = child_process.stderr.take() {
-                log_readers.push(spawn_log_tail_reader("stderr", stderr, log_tail.clone()));
-            }
+        if let Some(stdout) = child_process.stdout.take() {
+            log_readers.push(spawn_log_tail_reader(
+                "stdout",
+                stdout,
+                log_tail.clone(),
+                startup_memory_failure.clone(),
+            ));
+        }
+        if let Some(stderr) = child_process.stderr.take() {
+            log_readers.push(spawn_log_tail_reader(
+                "stderr",
+                stderr,
+                log_tail.clone(),
+                startup_memory_failure.clone(),
+            ));
         }
         let pid = child_process.id();
         drop(child_process);
@@ -1022,6 +1024,7 @@ impl LlamaServerProcess {
             pid,
             mode,
             log_tail,
+            startup_memory_failure,
             log_readers: Mutex::new(log_readers),
             state_gate: std::sync::RwLock::new(()),
             state_runtime: LlamaProcessStateRuntime {
@@ -1185,7 +1188,6 @@ impl LlamaServerProcess {
         timeout: Duration,
     ) -> Result<()> {
         let started = Instant::now();
-        let mut fit_warning_reported = false;
         let mut phase = "Loading weights and projector";
         activity.phase(format!(
             "{phase}; PID {}; timeout {}s",
@@ -1193,31 +1195,14 @@ impl LlamaServerProcess {
             timeout.as_secs()
         ));
         loop {
-            // Keep the native output tail for errors, but expose useful startup
-            // phases even without verbose logging. A warning is not an exit.
+            // Native fitting failure is logged as a warning, but continuing can
+            // cause host/GPU memory thrashing. Stop before waiting for readiness.
+            self.check_startup_memory()?;
             let lines = self
                 .log_tail
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            if !fit_warning_reported
-                && lines
-                    .iter()
-                    .any(|line| line.contains("failed to fit params"))
-            {
-                fit_warning_reported = true;
-                let message = "llama.cpp could not automatically fit the model to available memory. Explicit GPU-layer settings can prevent fitting; review --gpu-layers and memory/offload settings if startup fails. Launch parameters are unchanged.";
-                if crate::logging::enabled() {
-                    crate::logging::emit(
-                        crate::logging::Level::Warn,
-                        "backend.startup.memory_warning",
-                        message,
-                        json!({"model": self.model_id, "backend_pid": self.pid}),
-                    );
-                } else {
-                    crate::ui_eprintln!("Warning: {message}");
-                }
-            }
             if let Some(next) = lines.iter().rev().find_map(|line| startup_phase(line)) {
                 if next != phase {
                     phase = next;
@@ -1230,6 +1215,7 @@ impl LlamaServerProcess {
             }
             if let Some(status) = self.try_wait_status()? {
                 self.drain_exit_logs();
+                self.check_startup_memory()?;
                 bail!(
                     "llama-server exited before becoming healthy ({status}){}",
                     self.formatted_log_tail()
@@ -1245,11 +1231,37 @@ impl LlamaServerProcess {
                     self.formatted_log_tail()
                 );
             }
-            if startup::healthy(&self.url, remaining.min(Duration::from_secs(1))).unwrap_or(false) {
+            let healthy =
+                startup::healthy(&self.url, remaining.min(Duration::from_secs(1))).unwrap_or(false);
+            self.check_startup_memory()?;
+            if healthy {
                 return Ok(());
             }
             std::thread::sleep(HEALTH_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
         }
+    }
+
+    fn check_startup_memory(&self) -> Result<()> {
+        if let Some(reason) = self.startup_memory_failure.get() {
+            // Stop allocations before rendering diagnostics (a terminal or log
+            // pipe may block). Normal process destruction then reaps the worker.
+            let _ = self.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            let message = format!(
+                "llama.cpp memory fitting failed; stopping the runtime to avoid continuing with an unverified memory allocation. Native reason: {reason}. Review GPU/CPU placement, context and parallel slots; use automatic fitting only if supported by this backend. Launch parameters are unchanged. Rerun the complete command after correcting the configuration."
+            );
+            if crate::logging::enabled() {
+                crate::logging::emit(
+                    crate::logging::Level::Error,
+                    "backend.startup.memory_rejected",
+                    &message,
+                    json!({"model": self.model_id, "backend_pid": self.pid}),
+                );
+            } else {
+                crate::ui_eprintln!("Error: {message}");
+            }
+            bail!("{message}{}", self.formatted_log_tail());
+        }
+        Ok(())
     }
 
     fn is_running(&self) -> bool {
@@ -3718,32 +3730,47 @@ fn spawn_log_tail_reader<R>(
     label: &'static str,
     reader: R,
     tail: Arc<Mutex<VecDeque<String>>>,
+    startup_memory_failure: Arc<OnceLock<String>>,
 ) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
+    let context = crate::logging::capture();
     thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines().map_while(Result::ok) {
-            if env_true("WERK_LLAMA_LOG") && crate::logging::enabled() {
-                crate::logging::emit(
-                    crate::logging::Level::Debug,
-                    "backend.output",
-                    &line,
-                    serde_json::json!({"runtime":"llama.cpp", "stream":label}),
-                );
-            } else if env_true("WERK_LLAMA_LOG")
-                && crate::terminal::interactive(crate::terminal::Stream::Err)
-            {
-                crate::ui_eprintln!("[llama.cpp] {line}");
-            }
-            if let Ok(mut tail) = tail.lock() {
-                if tail.len() >= 80 {
-                    tail.pop_front();
+        crate::logging::with_context(context, || {
+            let reader = BufReader::new(reader);
+            for line in reader.lines().map_while(Result::ok) {
+                // Latch before any potentially blocked console writes. The rolling
+                // tail can evict this line during a burst of native diagnostics.
+                if startup::memory_fitting_failed(&line) {
+                    let _ = startup_memory_failure.set(line.clone());
                 }
-                tail.push_back(format!("{label}: {line}"));
+                if let Ok(mut tail) = tail.lock() {
+                    if tail.len() >= 80 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(format!("{label}: {line}"));
+                }
+                if env_true("WERK_LLAMA_LOG") && crate::logging::enabled() {
+                    crate::logging::emit(
+                        crate::logging::Level::Debug,
+                        "backend.output",
+                        &line,
+                        serde_json::json!({"runtime":"llama.cpp", "stream":label}),
+                    );
+                } else if env_true("WERK_LLAMA_LOG")
+                    && crate::terminal::interactive(crate::terminal::Stream::Err)
+                {
+                    crate::ui_eprintln!("[llama.cpp] {line}");
+                } else if env_true("WERK_LLAMA_LOG") && !crate::logging::enabled() {
+                    if label == "stdout" {
+                        let _ = writeln!(std::io::stdout().lock(), "{line}");
+                    } else {
+                        let _ = writeln!(std::io::stderr().lock(), "{line}");
+                    }
+                }
             }
-        }
+        })
     })
 }
 
