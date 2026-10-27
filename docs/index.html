@@ -12,6 +12,9 @@
     content="Rust, AI, multimodal AI, image generation, video generation, audio generation, local AI, inference router, OpenAI-compatible API, llama.cpp, Diffusers, Transformers, ONNX Runtime, Candle, MLX">
   <meta name="robots" content="index, follow">
   <link rel="canonical" href="https://philipbodenbach.github.io/werk1112/">
+  <link rel="alternate" hreflang="en" href="https://philipbodenbach.github.io/werk1112/">
+  <link rel="alternate" hreflang="de" href="https://philipbodenbach.github.io/werk1112/de/">
+  <link rel="alternate" hreflang="x-default" href="https://philipbodenbach.github.io/werk1112/">
 
   <meta property="og:type" content="website">
   <meta property="og:title" content="Werk1112 &ndash; Local-first, multimodal inference runtime and router in Rust">
@@ -19,6 +22,8 @@
     content="Werk1112 is a local-first, multimodal inference runtime and router for text, image, video and audio models.">
   <meta property="og:url" content="https://philipbodenbach.github.io/werk1112/">
   <meta property="og:site_name" content="Werk1112">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:locale:alternate" content="de_DE">
   <meta property="og:image" content="https://philipbodenbach.github.io/werk1112/assets/banner_werk.png">
   <meta property="og:image:width" content="1152">
   <meta property="og:image:height" content="310">
@@ -101,10 +106,14 @@
     <div class="container">
       <div class="header-row">
         <a class="brand" href="./"><span class="brand-mark" aria-hidden="true">W</span>Werk1112</a>
-        <button class="control" type="button" data-theme-toggle aria-label="Activate dark mode"
-          aria-pressed="false" hidden>
-          <span class="sun" aria-hidden="true">☀</span><span class="moon" aria-hidden="true">☾</span>
-        </button>
+        <div class="preferences">
+          <button class="control" type="button" data-theme-toggle
+            data-light-label="Activate light mode" data-dark-label="Activate dark mode"
+            aria-label="Activate dark mode" aria-pressed="false" hidden>
+            <span class="sun" aria-hidden="true">☀</span><span class="moon" aria-hidden="true">☾</span>
+          </button>
+          <a class="control" href="./de/" hreflang="de" lang="de" aria-label="Deutsch">DE</a>
+        </div>
       </div>
       <nav class="nav" aria-label="Primary navigation">
         <a href="#features">Runtime</a>

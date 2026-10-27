@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="de">
+
+<head>
+  <meta name="google-site-verification" content="KH3HzwYFpDDkhWauf32eo_XYD8zmsKfOokF9yRPJQmU" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Werk1112 – Lokale, multimodale Inferenz und Routing in Rust</title>
+  <meta name="description"
+    content="Werk1112 verbindet lokale Inferenz und Routing für Text-, Bild-, Video- und Audiomodelle mit einer gemeinsamen CLI und HTTP-API. Geschrieben in Rust.">
+  <meta name="keywords"
+    content="Rust, KI, multimodale KI, Bildgenerierung, Videogenerierung, Audiogenerierung, lokale KI, Inferenz-Router, OpenAI-kompatible API, llama.cpp, Diffusers, Transformers, ONNX Runtime, Candle, MLX">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://philipbodenbach.github.io/werk1112/de/">
+  <link rel="alternate" hreflang="en" href="https://philipbodenbach.github.io/werk1112/">
+  <link rel="alternate" hreflang="de" href="https://philipbodenbach.github.io/werk1112/de/">
+  <link rel="alternate" hreflang="x-default" href="https://philipbodenbach.github.io/werk1112/">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Werk1112 – Lokale, multimodale Inferenz und Routing in Rust">
+  <meta property="og:description"
+    content="Text-, Bild-, Video- und Audiomodelle auf eigener Infrastruktur betreiben. Werk1112 verbindet lokale Inferenz, Modellverwaltung und verschiedene Runtimes.">
+  <meta property="og:url" content="https://philipbodenbach.github.io/werk1112/de/">
+  <meta property="og:site_name" content="Werk1112">
+  <meta property="og:locale" content="de_DE">
+  <meta property="og:locale:alternate" content="en_US">
+  <meta property="og:image" content="https://philipbodenbach.github.io/werk1112/assets/banner_werk.png">
+  <meta property="og:image:width" content="1152">
+  <meta property="og:image:height" content="310">
+  <meta property="og:image:alt" content="Werk1112 · Inference Router – Projektbanner">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Werk1112 – Lokale, multimodale Inferenz und Routing in Rust">
+  <meta name="twitter:description"
+    content="Text-, Bild-, Video- und Audiomodelle auf eigener Infrastruktur betreiben. Werk1112 verbindet lokale Inferenz, Modellverwaltung und verschiedene Runtimes.">
+  <meta name="twitter:image" content="https://philipbodenbach.github.io/werk1112/assets/banner_werk.png">
+  <meta name="twitter:image:alt" content="Werk1112 · Inference Router – Projektbanner">
+
+  <meta name="theme-color" content="#fafafa">
+  <script src="../assets/site.js"></script>
+  <link rel="stylesheet" href="../assets/site.css">
+
+  <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareSourceCode",
+        "name": "Werk1112",
+        "headline": "Werk1112 – Lokale, multimodale Inferenz und Routing in Rust",
+        "description": "Werk1112 verbindet lokale Inferenz und Routing für Text-, Bild-, Video- und Audiomodelle mit einer gemeinsamen CLI und HTTP-API. Geschrieben in Rust.",
+        "url": "https://philipbodenbach.github.io/werk1112/de/",
+        "codeRepository": "https://github.com/philipbodenbach/werk1112",
+        "license": "https://www.elastic.co/licensing/elastic-license",
+        "programmingLanguage": {
+          "@type": "ComputerLanguage",
+          "name": "Rust"
+        },
+        "runtimePlatform": [
+          "Linux",
+          "macOS",
+          "Windows"
+        ],
+        "operatingSystem": [
+          "Linux",
+          "macOS",
+          "Windows"
+        ],
+        "applicationCategory": "DeveloperApplication",
+        "isAccessibleForFree": true,
+        "author": {
+          "@type": "Person",
+          "name": "Philip Bodenbach",
+          "url": "https://github.com/philipbodenbach"
+        },
+        "sameAs": [
+          "https://github.com/philipbodenbach/werk1112",
+          "https://github.com/philipbodenbach"
+        ],
+        "keywords": [
+          "Rust",
+          "KI",
+          "LLM",
+          "lokale KI",
+          "multimodale KI",
+          "Bildgenerierung",
+          "Videogenerierung",
+          "Audiogenerierung",
+          "Inferenz-Router",
+          "OpenAI-kompatible API",
+          "llama.cpp",
+          "Diffusers",
+          "Transformers",
+          "vLLM",
+          "ONNX Runtime",
+          "Candle",
+          "MLX",
+          "lokale KI-Runtime"
+        ]
+      }
+    </script>
+</head>
+
+<body>
+  <a class="skip-link" href="#main">Zum Inhalt</a>
+  <header class="site-header">
+    <div class="container">
+      <div class="header-row">
+        <a class="brand" href="./"><span class="brand-mark" aria-hidden="true">W</span>Werk1112</a>
+        <div class="preferences">
+          <button class="control" type="button" data-theme-toggle
+            data-light-label="Hellmodus aktivieren" data-dark-label="Dunkelmodus aktivieren"
+            aria-label="Dunkelmodus aktivieren" aria-pressed="false" hidden>
+            <span class="sun" aria-hidden="true">☀</span><span class="moon" aria-hidden="true">☾</span>
+          </button>
+          <a class="control" href="../" hreflang="en" lang="en" aria-label="English">EN</a>
+        </div>
+      </div>
+      <nav class="nav" aria-label="Hauptnavigation">
+        <a href="#features">Runtime</a>
+        <a href="#quick-start">Schnellstart</a>
+        <a href="#platforms">Plattformen</a>
+        <a href="#apis">APIs</a>
+        <a href="#documentation">Dokumentation</a>
+        <a href="https://philipbodenbach.de/">philipbodenbach.de ↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section class="hero container" aria-labelledby="hero-title">
+      <div>
+        <p class="eyebrow">Lokale Inferenz · Multimodal · Rust</p>
+        <h1 id="hero-title">Modelle nach deinen Regeln.</h1>
+        <p class="lead">
+          Werk1112 bringt Text-, Bild-, Video- und Audiomodelle in eine gemeinsame CLI und einen
+          HTTP-Dienst. Modelle entdecken, ein passendes Backend wählen und Inferenz auf eigener
+          Infrastruktur betreiben.
+        </p>
+        <div class="actions" aria-label="Projektlinks">
+          <a class="button primary" href="../getting-started.html" hreflang="en">Werk installieren <span aria-hidden="true">→</span></a>
+          <a class="button" href="https://github.com/philipbodenbach/werk1112">Quellcode auf GitHub</a>
+        </div>
+        <p class="note">Installationsanleitung und technische Dokumentation auf Englisch.</p>
+      </div>
+
+      <aside class="terminal" aria-label="Werk1112-Terminalvorschau">
+        <img src="../assets/banner_werk.png" width="576" height="155" alt="Werk1112 · Inference Router">
+        <pre><code><span class="terminal-prompt">$</span> werk inspect local-model
+<span class="terminal-prompt">$</span> werk doctor --model local-model
+<span class="terminal-prompt">$</span> werk chat local-model --max-tokens 128</code></pre>
+        <p class="terminal-label">Nach dem Import eines kompatiblen Modells · prüfen und starten</p>
+      </aside>
+    </section>
+
+    <section class="section panel" id="features" aria-labelledby="features-title">
+      <div class="container">
+        <p class="eyebrow">Runtime</p>
+        <h2 id="features-title">Ein Dienst für kompatible Runtimes</h2>
+        <p class="section-copy">
+          Typisierte Anfragen werden passend zu Modell, Aufgabe, installierter Runtime und den
+          Fähigkeiten des Rechners weitergeleitet. Optionale Adapter binden externe Anbieter ein;
+          deren Zugangsvoraussetzungen und Kosten gelten weiterhin.
+        </p>
+
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>Den lokalen Stack selbst wählen</h3>
+            <p>Kompatible Modelle, Hardware und Runtimes selbst wählen, digitale Souveränität stärken und
+              die Abhängigkeit von bezahlter, extern betriebener Inferenz verringern. Geeignete lokale
+              Abläufe funktionieren offline, sobald Modelle, Runtimes und Abhängigkeiten eingerichtet
+              sind. Downloads und externe APIs benötigen eine Netzwerkverbindung.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Modelle gemeinsam verwalten</h3>
+            <p>Vorhandene Dateien importieren, externe Modellgewichte verknüpfen oder kompatible
+              Hugging-Face-Repositories in einen gemeinsamen
+              <a href="../concepts/models-manifests-and-store.html" hreflang="en">Modellspeicher</a> laden.
+              Typisierte Befehle für Chat, Vision, Bild, Video und Audio nutzen die jeweils benötigten Runtimes.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Runtime-Auswahl nachvollziehen</h3>
+            <p>Backends automatisch oder gezielt auswählen und mit <code>werk inspect</code> und
+              <code>werk doctor</code> Voraussetzungen und Routing-Hindernisse prüfen.
+              Planungsschätzungen garantieren nicht, dass ein Modell in den Speicher passt oder ausführbar ist.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Modelle bereitstellen und beobachten</h3>
+            <p>Unterstützte Worker durch <a href="../reference/cli.html#startup-preload" hreflang="en">Vorabladen beim Start</a>
+              im Speicher halten, Aktivitäten mit <code>werk top</code> prüfen und
+              <a href="https://github.com/philipbodenbach/werk1112/tree/main/utils/observability">Prometheus und Grafana</a>
+              anbinden. Kapazität und Parallelität hängen vom Backend und den verfügbaren Ressourcen ab.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Mit begrenztem Speicher arbeiten</h3>
+            <p>Backend-spezifisches CPU/GPU-Offloading sowie Platzierungs- und Cache-Einstellungen nutzen,
+              soweit implementiert.
+              <a href="../concepts/runtime-persistence-and-memory.html" hreflang="en">Residente Modellgewichte, Prefix-/KV-Wiederverwendung und SSD-Expert-Caches</a>
+              erfüllen unterschiedliche Aufgaben. KV-Zustände sind nicht zwischen beliebigen Runtimes übertragbar.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Texte analysieren</h3>
+            <p><a href="../api.html#text-analysis-endpoints" hreflang="en">Embedding-, Reranking- und Klassifikations-Endpunkte</a>
+              mit kompatiblen Modellen und installierten Pooling-Runtimes nutzen. Die Embedding-API
+              akzeptiert Text und liefert Float-Ausgaben; Reranking und Klassifikation folgen ihren
+              dokumentierten Schnittstellenverträgen.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="quick-start" aria-labelledby="quick-start-title">
+      <div class="container">
+        <div class="split setup-step">
+          <div>
+            <p class="eyebrow">Schnellstart</p>
+            <h2 id="quick-start-title">Mit einem lokalen Modell starten.</h2>
+            <p class="section-copy">
+              <a href="../getting-started.html" hreflang="en">Werk für Linux, macOS oder Windows installieren</a>
+              und passende Treiber, Runtime und Modell separat einrichten. Für ein lokales GGUF-Chatmodell
+              einen llama.cpp-Build wählen, der dessen Architektur unterstützt. Details stehen im
+              <a href="../backends.html" hreflang="en">Backend-Leitfaden</a>.
+            </p>
+          </div>
+          <div>
+            <pre class="code" tabindex="0" aria-label="Befehle zum Einrichten eines lokalen Modells"><code>werk backend list
+werk import /absolute/path/to/model.gguf --name local-model
+werk doctor --model local-model
+werk chat local-model --max-tokens 128</code></pre>
+            <p class="note">Den Pfad durch die eigene Modelldatei ersetzen. Modell, Runtime und Hardware müssen zusammenpassen.</p>
+          </div>
+        </div>
+        <div class="split setup-step">
+          <div>
+            <h3>Mit Authentifizierung bereitstellen</h3>
+            <p class="section-copy">
+              Einen Schlüssel erzeugen und vor dem Start des Dienstes den Platzhalter damit ersetzen
+              (Beispiel für eine POSIX-Shell). Kompatible OpenAI-Clients mit
+              <code>http://127.0.0.1:11434/v1</code> und demselben Schlüssel konfigurieren.
+            </p>
+          </div>
+          <div>
+            <pre class="code" tabindex="0" aria-label="Befehle zum Starten eines authentifizierten Servers"><code>werk auth api-key generate
+export WERK_API_KEY="replace-with-generated-key"
+werk serve --model local-model</code></pre>
+            <p class="note">
+              Für mehrere installierte Textmodelle lädt <code>werk serve --preload model-a model-b</code>
+              die Modelle der Reihe nach und führt nach Möglichkeit ein Warmup durch. Erfolgreich geladene
+              Worker bleiben bis zum Beenden im Speicher; nicht unterstützte Pfade und Ressourcenfehler
+              werden protokolliert und übersprungen. Bild-, Video- und Audiogenerierung werden dadurch
+              nicht generell vorgewärmt.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section panel" id="platforms" aria-labelledby="platforms-title">
+      <div class="container">
+        <p class="eyebrow">Hardware &amp; Backends</p>
+        <h2 id="platforms-title">Die passende Runtime zur Hardware</h2>
+        <p class="section-copy">
+          Dies sind dokumentierte Integrationspfade. Die Ausführung hängt weiterhin von Architektur,
+          Checkpoint, Plattform und installierter Runtime ab. Die Modellerkennung deckt mehr Modelle
+          ab als die ausführbaren Adapter.
+        </p>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>CPU und NVIDIA CUDA</h3>
+            <p>Kompatible CPU-Pfade über llama.cpp, Candle oder ONNX sowie llama.cpp CUDA und geeignete
+              vLLM/Python-Runtimes nutzen. Linux ist der primäre CUDA-Pfad; Windows benötigt eine passende
+              Toolchain, WSL2 wird nach Möglichkeit unterstützt und lokales vLLM setzt natives Linux voraus.
+              Details in der <a href="../backends.html#platform-support-matrix" hreflang="en">Plattformmatrix</a>.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Apple Silicon</h3>
+            <p>Kompatible Adapter für llama.cpp Metal, MLX/MLX-VLM oder oMLX unter macOS wählen.
+              Verwaltetes oMLX benötigt macOS 15 oder neuer. Unified Memory ist gemeinsam genutzter
+              physischer Speicher; Budgets und Offload-Einstellungen garantieren nicht, dass ein Modell hineinpasst.
+              Siehe <a href="../backends.html#platform-aware-explicit-installation" hreflang="en">Runtime-Anforderungen</a>.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Strix Halo und DGX Spark</h3>
+            <p><a href="../integrations/strix-halo.html" hreflang="en">AMD Strix Halo</a> bietet native Linux-Pfade
+              über ROCm/HIP und Vulkan, jedoch keinen NPU-Adapter.
+              <a href="../integrations/dgx-spark.html" hreflang="en">DGX Spark / GB10</a> verwendet ein
+              Spark-spezifisches Linux-aarch64-Profil ohne native TensorRT-LLM- oder NIM-Adapter.
+              Für beide Integrationen stehen die grundlegenden Tests auf echter Hardware noch aus.</p>
+          </article>
+        </div>
+        <p class="section-copy">
+          <a href="../concepts/single-host-deployments.html" hreflang="en">Deployment-Profile für einzelne Rechner</a>
+          konfigurieren unterstützte lokale CUDA-GPU-Gruppen, Aliasse und Replikate. Läufe auf Multi-GPU-Hardware
+          sind weiterhin unbestätigt. Diese Profile bieten weder Cluster über mehrere Rechner noch
+          gemischtes NVIDIA/AMD-Sharding.
+        </p>
+      </div>
+    </section>
+
+    <section class="section" id="apis" aria-labelledby="apis-title">
+      <div class="container">
+        <p class="eyebrow">Schnittstellen</p>
+        <h2 id="apis-title">APIs und Integrationen</h2>
+        <p class="section-copy">
+          Für Vorhaben zur digitalen Souveränität ermöglichen die dokumentierten API-Teilmengen,
+          vorhandene kompatible Clients an einen selbst betriebenen Werk-Dienst anzubinden.
+          Agentenschleifen und Workflow-Ausführung liegen bei den Client-Anwendungen;
+          Werk bleibt eine Inferenz-Runtime und ein Router.
+        </p>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>OpenAI- und Anthropic-Clients</h3>
+            <p>Chat Completions unter <code>/v1/chat/completions</code> und Messages unter
+              <code>/v1/messages</code> für die dokumentierten Text-, Vision-, Streaming- und
+              clientseitigen Tool-Abläufe nutzen. Es handelt sich um
+              <a href="../api.html#compatibility-classes" hreflang="en">kompatible Teilmengen</a>;
+              die OpenAI Responses API ist nicht implementiert.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Medien und Runtime-Steuerung</h3>
+            <p>OpenAI-inspirierte und Werk-eigene Routen für Medien, Jobs und Dateien nutzen, ergänzt um
+              kleine Kompatibilitätsbereiche für ComfyUI/AUTOMATIC1111. Separate Routen des
+              <a href="../reference/werk-protocol-v1.html" hreflang="en">Werk Protocol 1.0</a> bieten
+              Zugriff auf Fähigkeiten, Zustände und Speichersteuerung. Vor optionalen Operationen die Unterstützung prüfen.</p>
+          </article>
+          <article class="feature-card">
+            <h3>ComfyUI und n8n</h3>
+            <p>Optionale <a href="../integrations/comfyui.html" hreflang="en">ComfyUI-Nodes (Beta)</a> oder
+              manuell installierte <a href="https://github.com/philipbodenbach/werk1112/tree/main/utils/n8n">n8n-Nodes (Beta)</a>
+              für native Medien- und Runtime-Steuerung anbinden.
+              Bei <a href="../integrations/documents.html" hreflang="en">Dokument- und Dateieingaben</a>
+              gelten weiterhin die jeweiligen Format- und Runtime-Grenzen.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section panel" id="release" aria-labelledby="release-title">
+      <div class="container split">
+        <div>
+          <p class="eyebrow">Versionshinweise</p>
+          <h2 id="release-title">Neu in v1.9.1</h2>
+          <p class="section-copy">
+            Werk Core, Media Companion, ComfyUI und n8n haben die gemeinsame Version 1.9.1.
+            ComfyUI und n8n bleiben Beta-Integrationen.
+          </p>
+        </div>
+        <div>
+          <ul class="release-notes">
+            <li>Vorabladen beim Start hält unterstützte Text-Worker im Speicher, löst Deployment-Aliasse
+              auf und liefert Diagnosen je Modell.</li>
+            <li>Die auf Belegen basierende Modellerkennung ergänzt optionale Adapter für gehostetes
+              Mistral Large 4, FLUX 3 Image und Eleven v4, Kolibri-Routing über vLLM-Plugins sowie
+              typisierte FLUX 3 Action DROID-Vorhersagen.</li>
+            <li>Preload ergänzt DROID-Warmup mit anschließendem Verbleib im Speicher. Die Vorbereitung
+              von Clients für gehostete Anbieter führt weder Netzwerkanfragen noch Inferenz aus;
+              für diesen Vorbereitungsschritt fallen keine Kosten an.</li>
+          </ul>
+          <p class="section-copy">
+            Die tatsächliche Inferenz mit diesen neuen Anbieter-, Kolibri- und DROID-Integrationen
+            hat weiterhin den Status <code>IMPLEMENTED_UNTESTED</code>. Einige lokale oder entfernte
+            Betriebsarten sind auf Anbieterseite nicht verfügbar. Genaue Voraussetzungen und Hindernisse
+            stehen in <code>werk support list</code> und der
+            <a href="../model-support-matrix.html" hreflang="en">Modellunterstützungsmatrix</a>.
+            FLUX.1 Schnell behält seinen bestehenden Diffusers-Pfad.
+          </p>
+          <div class="actions">
+            <a href="https://github.com/philipbodenbach/werk1112/blob/main/CHANGELOG.md#191---2026-10-14">Änderungen in v1.9.1 lesen ↗</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="documentation" aria-labelledby="documentation-title">
+      <div class="container">
+        <p class="eyebrow">Dokumentation</p>
+        <h2 id="documentation-title">Versionierte Dokumentation</h2>
+        <p class="section-copy">
+          Die Projekt-README ist bewusst kurz. Die englischsprachige, versionierte Dokumentation beschreibt
+          API-Verträge, Backend- und Betriebssystemunterstützung, Fallback-Verhalten, Medienaufgaben
+          und bekannte Einschränkungen im Detail.
+        </p>
+
+        <div class="feature-grid docs-grid">
+          <article class="feature-card">
+            <h3><a href="../api.html" hreflang="en">HTTP-API <span aria-hidden="true">→</span></a></h3>
+            <p>Alle Routen, Felder, Antworten, unterstützten Aufgaben, Authentifizierung, Jobs, Aufbewahrung und Kompatibilitätslücken.</p>
+          </article>
+          <article class="feature-card">
+            <h3><a href="../concepts/runtime-persistence-and-memory.html" hreflang="en">Runtime-Persistenz und Speicher <span aria-hidden="true">→</span></a></h3>
+            <p>Versionierte Runtime-Steuerung, tatsächliche Backend-Fähigkeiten, opake Zustände, Speicherdruck und Grenzen zwischen Prefill und Decode.</p>
+          </article>
+          <article class="feature-card">
+            <h3><a href="../backends.html" hreflang="en">Backends <span aria-hidden="true">→</span></a></h3>
+            <p>Routing, Fallback-Regeln, verwaltete Installation, Plattformunterstützung, Qwen-TTS und Bereinigung.</p>
+          </article>
+          <article class="feature-card">
+            <h3><a href="../media-inference.html" hreflang="en">Medieninferenz <span aria-hidden="true">→</span></a></h3>
+            <p>Kanonische Bild-, Video- und Audioaufgaben, Modellstrukturen, Parameter, Planung und Beispiele.</p>
+          </article>
+          <article class="feature-card">
+            <h3><a href="../getting-started.html" hreflang="en">Erste Schritte <span aria-hidden="true">→</span></a></h3>
+            <p>Werk1112 installieren, ein Modell hinzufügen, lokale Inferenz ausführen und den authentifizierten HTTP-Dienst starten.</p>
+          </article>
+          <article class="feature-card">
+            <h3><a href="../reference/cli.html" hreflang="en">CLI-Referenz <span aria-hidden="true">→</span></a></h3>
+            <p>Globale Optionen, Befehle, Modellverwaltung, Wartung, Diagnosen, Inferenz und Serverbetrieb.</p>
+          </article>
+          <article class="feature-card">
+            <h3><a href="../concepts/models-manifests-and-store.html" hreflang="en">Modelle und Speicherung <span aria-hidden="true">→</span></a></h3>
+            <p>Importe, Verknüpfungen externer Modellgewichte, Downloads, Manifeste, Modellauswahl, verwalteter Speicher und optimierte Artefakte.</p>
+          </article>
+          <article class="feature-card">
+            <h3><a href="../concepts/single-host-deployments.html" hreflang="en">Deployment-Profile <span aria-hidden="true">→</span></a></h3>
+            <p>Lokale CUDA-GPU-Gruppen, Aliasse, Replikate, Zulassungs- und Parallelitätsgrenzen sowie Stand der Hardwarevalidierung.</p>
+          </article>
+          <article class="feature-card">
+            <h3><a href="../model-support-matrix.html" hreflang="en">Modellunterstützung <span aria-hidden="true">→</span></a></h3>
+            <p>Genaue Modellidentitäten, lokale und gehostete Pfade, Abhängigkeiten, Zugangsvoraussetzungen und Inferenzprüfung.</p>
+          </article>
+        </div>
+
+        <div class="actions documentation-actions">
+          <a class="button primary" href="../documentation.html" hreflang="en">Zur gesamten Dokumentation</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section panel" id="topics" aria-labelledby="topics-title">
+      <div class="container">
+        <p class="eyebrow">Ökosystem</p>
+        <h2 id="topics-title">Projektthemen</h2>
+        <p class="section-copy">
+          Werk1112 konzentriert sich auf lokale KI-Infrastruktur und Backend-Routing, ohne selbst eine Workflow-Engine zu werden.
+        </p>
+        <ul class="topics" aria-label="Werk1112-Schlagwörter und Themen">
+          <li>Rust</li>
+          <li>KI</li>
+          <li>LLM</li>
+          <li>multimodale KI</li>
+          <li>Bildgenerierung</li>
+          <li>Videogenerierung</li>
+          <li>Audiogenerierung</li>
+          <li>lokale KI</li>
+          <li>Inferenz-Router</li>
+          <li>OpenAI-kompatible API</li>
+          <li>llama.cpp</li>
+          <li>Diffusers</li>
+          <li>Transformers</li>
+          <li>vLLM</li>
+          <li>ONNX Runtime</li>
+          <li>Candle</li>
+          <li>MLX</li>
+          <li>lokale KI-Runtime</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="source-title">
+      <div class="container">
+        <div class="repo-panel">
+          <div>
+            <h2 id="source-title">Quellcode</h2>
+            <p class="section-copy">
+              Werk1112 wird von <a href="https://philipbodenbach.de/">Philip Bodenbach</a> im
+              <a href="https://github.com/philipbodenbach/werk1112">GitHub-Repository philipbodenbach/werk1112</a> entwickelt.
+            </p>
+          </div>
+          <a class="button primary" href="https://github.com/philipbodenbach/werk1112">Repository öffnen</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <nav class="footer-links" aria-label="Fußnavigation">
+        <a href="https://philipbodenbach.de/">Philip Bodenbach</a>
+        <a href="https://github.com/philipbodenbach/werk1112">GitHub</a>
+        <a href="https://philipbodenbach.github.io/werkWorker/de/">WerkWorker</a>
+        <a href="../documentation.html" hreflang="en">Dokumentation</a>
+        <a href="https://philipbodenbach.de/lab/">Lab</a>
+        <a href="https://philipbodenbach.de/impressum/">Impressum</a>
+        <a href="https://philipbodenbach.de/datenschutz/">Datenschutz</a>
+      </nav>
+      <p>© 2026 Philip Bodenbach.
+        <a href="https://github.com/philipbodenbach/werk1112/blob/main/LICENSE">Quellcode verfügbar unter der Elastic License 2.0.</a>
+      </p>
+    </div>
+  </footer>
+</body>
+
+</html>

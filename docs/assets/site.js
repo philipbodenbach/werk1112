@@ -11,7 +11,7 @@
     document.querySelector('meta[name="theme-color"]').content = dark ? '#0a0a0a' : '#fafafa';
     const button = document.querySelector('[data-theme-toggle]');
     if (!button) return;
-    const label = dark ? 'Activate light mode' : 'Activate dark mode';
+    const label = dark ? button.dataset.lightLabel : button.dataset.darkLabel;
     button.setAttribute('aria-pressed', String(dark));
     button.setAttribute('aria-label', label);
     button.title = label;
