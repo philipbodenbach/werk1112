@@ -88,6 +88,17 @@ pub fn require_qwen_tts_python(store: &crate::model_store::ModelStore) -> Result
 /// media companion. FlashAttention remains an optional, separately managed
 /// optimization and is intentionally not installed here.
 pub fn install_managed_qwen_tts(store: &crate::model_store::ModelStore) -> Result<PathBuf> {
+    provision_managed_qwen_tts(store, false)
+}
+
+pub fn update_managed_qwen_tts(store: &crate::model_store::ModelStore) -> Result<PathBuf> {
+    provision_managed_qwen_tts(store, true)
+}
+
+fn provision_managed_qwen_tts(
+    store: &crate::model_store::ModelStore,
+    update: bool,
+) -> Result<PathBuf> {
     super::python_install::ensure_install_platform("qwen-tts")?;
     let root = managed_qwen_tts_dir(store);
     let venv = root.join("venv");
@@ -100,7 +111,7 @@ pub fn install_managed_qwen_tts(store: &crate::model_store::ModelStore) -> Resul
         )
     })?;
 
-    if venv_python.is_file() && qwen_tts_python_status(&venv_python).usable {
+    if !update && venv_python.is_file() && qwen_tts_python_status(&venv_python).usable {
         return Ok(venv_python);
     }
 
@@ -144,11 +155,16 @@ pub fn install_managed_qwen_tts(store: &crate::model_store::ModelStore) -> Resul
             .arg("pip")
             .arg("install")
             .arg("--upgrade")
+            .args(["--upgrade-strategy", "eager"])
             .arg(QWEN_TTS_PACKAGE),
         "failed to install qwen-tts==0.1.1; check network access, free disk space, \
          and PyTorch/torchaudio wheel availability for this platform",
     )?;
 
+    run_command(
+        Command::new(&venv_python).args(["-m", "pip", "check"]),
+        "Qwen-TTS dependency validation failed",
+    )?;
     validate_qwen_tts_python(&venv_python).with_context(|| {
         format!(
             "managed Qwen-TTS installation at {} is unusable; rerun `werk backend install \

@@ -6,6 +6,7 @@ mod import_collection;
 pub use import_collection::ModelImportCandidate;
 pub mod feature_setup;
 mod gguf_conversion;
+mod updates;
 mod vision;
 pub use gguf_conversion::GgufConversionOptions;
 mod quantization;
@@ -1158,8 +1159,17 @@ impl ModelStore {
 
     pub fn list(&self) -> Result<Vec<ModelManifest>> {
         self.ensure()?;
+        self.list_existing()
+    }
+
+    pub(crate) fn list_existing(&self) -> Result<Vec<ModelManifest>> {
         let mut manifests = Vec::new();
-        for entry in fs::read_dir(self.models_dir())? {
+        let entries = match fs::read_dir(self.models_dir()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(manifests),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             let manifest_path = entry.path().join(MANIFEST_FILE);
             if manifest_path.is_file() {

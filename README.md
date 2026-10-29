@@ -101,11 +101,18 @@ Replace `/absolute/path/to/model.gguf` with your compatible local model file;
 ~~~bash
 werk backend list
 werk backend doctor --debug
+werk components
 werk import /absolute/path/to/model.gguf --name local-model
 werk inspect local-model
 werk doctor --model local-model
 werk chat local-model --max-tokens 128
 ~~~
+
+`werk components` opens the component manager: scroll through installed runtimes,
+available updates and missing model dependencies, select individual operations or
+all updates, and follow their progress. `werk updates --json` provides a read-only
+scan; `werk update --all --dry-run` previews a complete update plan. See
+[component installation and updates](docs/backends.md#component-installation-and-updates).
 
 Already imported? Use its ID from `werk list`. To download instead, follow
 [Hugging Face pull setup](docs/getting-started.md#add-a-model), including Git LFS

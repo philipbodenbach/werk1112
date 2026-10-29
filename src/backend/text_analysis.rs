@@ -48,7 +48,15 @@ pub fn install(store: &ModelStore) -> Result<PathBuf> {
     )?;
     let status = crate::terminal::command_status(
         Command::new(&python)
-            .args(["-m", "pip", "install", "--upgrade", "-r"])
+            .args([
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--upgrade-strategy",
+                "eager",
+                "-r",
+            ])
             .arg(&requirements),
     )?;
     ensure!(
@@ -69,6 +77,11 @@ pub fn install(store: &ModelStore) -> Result<PathBuf> {
             );
         }
     }
+    ensure!(
+        crate::terminal::command_status(Command::new(&python).args(["-m", "pip", "check"]))?
+            .success(),
+        "Text-analysis dependency validation failed"
+    );
     Ok(python)
 }
 

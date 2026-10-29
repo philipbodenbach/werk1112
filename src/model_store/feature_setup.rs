@@ -46,7 +46,7 @@ fn image_capable(info: &Value) -> bool {
         || info["config"]["vision_config"].is_object()
 }
 
-fn projector_from_info(
+pub(crate) fn projector_from_info(
     repo: &str,
     info: &Value,
     selected: Option<&str>,

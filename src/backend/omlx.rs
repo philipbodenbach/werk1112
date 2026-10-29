@@ -356,6 +356,14 @@ struct OmlxChatSession {
 }
 
 impl OmlxBackend {
+    pub(crate) fn discovered_python(store: &ModelStore) -> Result<PathBuf> {
+        if env::var_os("WERK_OMLX_BIN").is_none() {
+            if let Some(launcher) = find_program("omlx") {
+                return Ok(OmlxInvocation::from_launcher(launcher, DEFAULT_HEALTH_TIMEOUT)?.python);
+            }
+        }
+        Ok(OmlxInvocation::discover(store)?.python)
+    }
     pub fn new(store: ModelStore) -> Self {
         let invocation = OmlxInvocation::discover(&store).map_err(|error| format!("{error:#}"));
         Self {

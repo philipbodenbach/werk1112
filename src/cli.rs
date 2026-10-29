@@ -1,4 +1,5 @@
 mod chat_persistence;
+mod components;
 mod diagnostics;
 mod media_diagnostics;
 mod model_list;
@@ -1037,6 +1038,25 @@ pub enum Commands {
         command: BackendCommands,
     },
 
+    #[command(
+        about = "Scan installed backends, models and vision projectors for updates without changing them",
+        visible_alias = "update-scan"
+    )]
+    Updates {
+        #[command(flatten)]
+        options: crate::backend::updates::ScanOptions,
+        #[arg(long, value_enum, default_value = "all", help = "Components to scan")]
+        scope: crate::backend::updates::ScanScope,
+    },
+
+    #[command(about = "Browse, install and update host-compatible components in a terminal UI")]
+    Components(components::ComponentsArgs),
+
+    #[command(
+        about = "Update a managed component or all installed compatible components, including dependencies"
+    )]
+    Update(components::UpdateArgs),
+
     #[command(about = "Manage optimized runtime artifacts for installed models")]
     Artifacts {
         #[command(subcommand)]
@@ -1264,6 +1284,22 @@ pub enum DoctorCommands {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackendCommands {
+    #[command(about = "Update a managed backend and its compatible dependencies")]
+    Update {
+        #[arg(value_enum)]
+        target: BackendInstallArg,
+        #[command(flatten)]
+        vision: crate::backend::vision_setup::VisionOptions,
+    },
+    #[command(
+        about = "Scan installed managed backends for updates without installing them",
+        visible_alias = "update-scan"
+    )]
+    Updates {
+        #[command(flatten)]
+        options: crate::backend::updates::ScanOptions,
+    },
+
     #[command(about = "Install a managed runtime backend")]
     Install {
         #[arg(
@@ -1667,7 +1703,7 @@ pub async fn run_from_env() -> Result<()> {
         verbose,
         pure,
         title == "serve",
-        title != "top" || !machine,
+        !matches!(title.as_str(), "top" | "components") || !machine,
     )?;
     crate::logging::emit(
         crate::logging::Level::Debug,
@@ -1686,7 +1722,7 @@ pub async fn run_from_env() -> Result<()> {
             json!({"command":title}),
         );
     }
-    if result.is_ok() && title != "top" {
+    if result.is_ok() && !matches!(title.as_str(), "top" | "components") {
         crate::terminal::finish();
     }
     crate::logging::flush();
@@ -1726,6 +1762,7 @@ fn console_command(matches: &clap::ArgMatches) -> (String, bool) {
             Some("gpus" | "deployment-plan" | "inspect" | "runtime")
         )
         || path == ["temp", "path"]
+        || path.first() == Some(&"components")
         || path.first() == Some(&"top")
             && !node
                 .try_get_one::<bool>("once")
@@ -2258,15 +2295,45 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ),
             }
         }
+        Commands::Components(args) => {
+            let store = ModelStore::resolve(model_home)?;
+            crate::logging::spawn_blocking(move || components::run(store, args)).await?
+        }
+        Commands::Update(args) => {
+            let store = ModelStore::resolve(model_home)?;
+            crate::logging::spawn_blocking(move || components::update(store, args)).await?
+        }
+        Commands::Updates { options, scope } => {
+            let store = ModelStore::resolve(model_home)?;
+            crate::logging::spawn_blocking(move || {
+                crate::backend::updates::run(&store, scope, &options)
+            })
+            .await?
+        }
         Commands::Backend { command } => {
             let store = ModelStore::resolve(model_home)?;
+            let updating = matches!(&command, BackendCommands::Update { .. });
             match command {
-                BackendCommands::Install { target, vision } => {
+                BackendCommands::Updates { options } => {
+                    crate::logging::spawn_blocking(move || {
+                        crate::backend::updates::run(
+                            &store,
+                            crate::backend::updates::ScanScope::Backends,
+                            &options,
+                        )
+                    })
+                    .await?
+                }
+                BackendCommands::Install { target, vision }
+                | BackendCommands::Update { target, vision } => {
                     anyhow::ensure!(
                         !vision.offline,
                         "Offline mode does not install runtimes; inspect existing components with werk backend doctor"
                     );
                     let target_name = target.to_possible_value().expect("install target");
+                    if updating {
+                        components::ensure_compatible(&store, target_name.get_name())?;
+                    }
                     crate::backend::python_install::ensure_install_platform(
                         target
                             .to_possible_value()
@@ -2292,6 +2359,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 cuda_offload: target == BackendInstallArg::LlamaCudaOffload,
                                 cuda_nvfp4: target == BackendInstallArg::LlamaCudaNvfp4,
                                 vision: vision_choice == Some(true),
+                                update: updating,
                                 ..Default::default()
                             },
                         )?;
@@ -2301,14 +2369,25 @@ pub async fn run(cli: Cli) -> Result<()> {
                             executable.display()
                         );
                     } else if let Some(mode) = target.onnx_mode() {
-                        let executable = install_managed_onnx_runtime(&store, mode)?;
+                        let executable = if updating
+                            && mode == OnnxRuntimeMode::Cpu
+                            && crate::backend::python_install::PythonBackend::OnnxCpu
+                                .managed_python(&store)
+                                .is_some()
+                        {
+                            crate::backend::python_install::PythonBackend::OnnxCpu
+                                .install(&store)?
+                        } else {
+                            install_managed_onnx_runtime(&store, mode)?
+                        };
                         crate::ui_println!(
                             "Installed {} runtime: {}",
                             mode.display(),
                             executable.display()
                         );
                     } else if let Some(backend) = target.python_backend() {
-                        let python = if vision_choice == Some(true)
+                        let python = if !updating
+                            && vision_choice == Some(true)
                             && MlxVlmBackend::probe_for_store(&store).is_ok()
                         {
                             crate::ui_eprintln!(
@@ -2324,7 +2403,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                             python.display()
                         );
                     } else if target == BackendInstallArg::Vllm {
-                        let python = install_managed_vllm(&store)?;
+                        let python = if updating {
+                            crate::backend::update_managed_vllm(&store)?
+                        } else {
+                            install_managed_vllm(&store)?
+                        };
                         crate::ui_println!("Installed vLLM backend: {}", python.display());
                     } else if target == BackendInstallArg::Omlx {
                         let launcher = crate::backend::install_managed_omlx(&store)?;
@@ -2335,7 +2418,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                             );
                         }
                     } else if target == BackendInstallArg::QwenTts {
-                        let python = install_managed_qwen_tts(&store)?;
+                        let python = if updating {
+                            crate::backend::update_managed_qwen_tts(&store)?
+                        } else {
+                            install_managed_qwen_tts(&store)?
+                        };
                         crate::ui_println!("Installed Qwen-TTS backend: {}", python.display());
                     } else if target == BackendInstallArg::TextAnalysis {
                         let python = crate::backend::text_analysis::install(&store)?;
@@ -5195,6 +5282,9 @@ fn should_print_startup_banner_for(
         | Commands::Bench { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
+        | Commands::Updates { .. }
+        | Commands::Components(..)
+        | Commands::Update(..)
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
@@ -5227,6 +5317,9 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         | Commands::Estimate { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
+        | Commands::Updates { .. }
+        | Commands::Components(..)
+        | Commands::Update(..)
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }

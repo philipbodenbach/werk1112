@@ -2429,6 +2429,8 @@ pub struct LlamaServerInstallOptions {
     pub preserve_active: bool,
     /// Reuse a verified image entry point, or stage a replacement separately.
     pub vision: bool,
+    /// Build a fresh generation from upstream; keep the active binary intact.
+    pub update: bool,
 }
 
 pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<PathBuf> {
@@ -2477,7 +2479,7 @@ pub fn install_managed_llama_server_with_options(
     } else {
         base_root
     };
-    if options.vision {
+    if options.vision && !options.update {
         let mut candidates = server_candidates_under(&root);
         if !options.cuda_offload && !options.cuda_nvfp4 {
             candidates.extend(discover_llama_server(store, mode).path);
@@ -2495,6 +2497,16 @@ pub fn install_managed_llama_server_with_options(
             return Ok(existing);
         }
     }
+    fs::create_dir_all(&root)?;
+    let profile_root = root.clone();
+    let root = if options.update {
+        tempfile::Builder::new()
+            .prefix("generation-update-")
+            .tempdir_in(&root)?
+            .keep()
+    } else {
+        root
+    };
     let source_dir = root.join("llama.cpp");
     // Keep the old executable and its shared libraries intact until the new
     // image-capable generation has passed validation and is selected atomically.
@@ -2738,10 +2750,10 @@ pub fn install_managed_llama_server_with_options(
     if options.cuda_offload {
         cuda_offload::validate_runtime(&executable)?;
     }
-    if options.vision && (options.cuda_nvfp4 || options.cuda_offload) {
+    if (options.vision || options.update) && (options.cuda_nvfp4 || options.cuda_offload) {
         // Model-specific profile discovery must find the validated generation,
         // not an old fixed build directory or an unvalidated staging directory.
-        select_managed_server_path(&root.join("llama-server.path"), &executable)?;
+        select_managed_server_path(&profile_root.join("llama-server.path"), &executable)?;
     }
     if !options.preserve_active {
         select_managed_server_path(&managed_path_file(store, mode), &executable)?;
@@ -3082,7 +3094,7 @@ fn managed_server_candidates(store: &ModelStore, mode: LlamaCppMode) -> Vec<Path
     server_candidates_under(&root)
 }
 
-fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
+pub(super) fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
     let source = root.join("llama.cpp");
     let build = root.join("build");
     let exe = default_executable_name();

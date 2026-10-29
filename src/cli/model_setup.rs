@@ -12,21 +12,21 @@ pub(super) enum SetupPolicy {
 }
 
 #[derive(Debug)]
-struct SetupPlan {
+pub(super) struct SetupPlan {
     model: String,
     runtime: Option<RuntimeId>,
-    installs: Vec<&'static str>,
-    configure_vision: bool,
-    projector: Option<ProjectorDownload>,
-    issues: Vec<String>,
+    pub(super) installs: Vec<&'static str>,
+    pub(super) configure_vision: bool,
+    pub(super) projector: Option<ProjectorDownload>,
+    pub(super) issues: Vec<String>,
 }
 
 impl SetupPlan {
-    fn has_actions(&self) -> bool {
+    pub(super) fn has_actions(&self) -> bool {
         !self.installs.is_empty() || self.configure_vision || self.projector.is_some()
     }
 
-    fn describe(&self) -> String {
+    pub(super) fn describe(&self) -> String {
         let mut lines = vec![format!("Model setup: {}", self.model)];
         if let Some(runtime) = self.runtime {
             lines.push(format!(
@@ -61,7 +61,7 @@ impl SetupPlan {
     }
 }
 
-fn plan(
+pub(super) fn plan(
     store: &ModelStore,
     manifest: &ModelManifest,
     backend: BackendChoice,

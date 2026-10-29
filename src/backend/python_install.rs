@@ -34,7 +34,7 @@ impl PythonBackend {
         }
     }
 
-    fn packages(self) -> &'static [&'static str] {
+    pub(crate) fn packages(self) -> &'static [&'static str] {
         match self {
             Self::OnnxCpu => &["onnxruntime-genai"],
             Self::Mlx => &["mlx-lm"],
@@ -62,7 +62,7 @@ impl PythonBackend {
         }
     }
 
-    fn validation(self) -> &'static str {
+    pub(crate) fn validation(self) -> &'static str {
         match self {
             Self::OnnxCpu => {
                 "from onnxruntime_genai import Model, Tokenizer, Generator, GeneratorParams; print('ONNX GenAI ready (CPU); models require genai_config.json')"
@@ -238,7 +238,15 @@ impl PythonBackend {
         }
         run(Command::new(&python).args(["-I", "-m", "pip", "install", "--upgrade", "pip"]))?;
         run(Command::new(&python)
-            .args(["-I", "-m", "pip", "install", "--upgrade"])
+            .args([
+                "-I",
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--upgrade-strategy",
+                "eager",
+            ])
             .args(self.packages()))?;
         run(Command::new(&python).args(["-I", "-m", "pip", "check"]))?;
         run(Command::new(&python).args(["-I", "-c", self.validation()]))?;
