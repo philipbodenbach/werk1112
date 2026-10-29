@@ -473,6 +473,26 @@ struct Package {
     detail: String,
 }
 
+/// Use the installer's own requirements when interpreting upstream releases.
+fn python_install_requirements(name: &str) -> Vec<&'static str> {
+    use super::python_install::PythonBackend;
+    match name {
+        "mlx" => PythonBackend::Mlx.packages().to_vec(),
+        "mlx-vlm" => PythonBackend::MlxVlm.packages().to_vec(),
+        "transformers" => PythonBackend::Transformers.packages().to_vec(),
+        "media" => PythonBackend::Media.packages().to_vec(),
+        "onnx-cpu" => PythonBackend::OnnxCpu.packages().to_vec(),
+        "qwen-tts" => vec![super::qwen_tts::QWEN_TTS_PACKAGE],
+        "text-analysis" => include_str!("../../runtime/requirements-text-analysis.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .chain(std::iter::once(super::text_analysis::TILELANG_PACKAGE))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn scan_python(name: &str, python: &Path, offline: bool, external: bool, entries: &mut Vec<Entry>) {
     let primary: &[&str] = match name {
         "mlx" => &["mlx-lm"],
@@ -542,7 +562,8 @@ fn scan_python(name: &str, python: &Path, offline: bool, external: bool, entries
             String::new()
         };
         let config = json!({"packages": packages, "required": required,
-            "pinned": pinned, "offline": offline, "constraints": constraints});
+            "pinned": pinned, "offline": offline, "constraints": constraints,
+            "requirements": python_install_requirements(name)});
         let mut command = Command::new(python);
         if !external {
             command.arg("-I");
@@ -1209,6 +1230,40 @@ mod tests {
             assert!(repository_url(bad).is_err());
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn python_scan_passes_installer_bounds_and_local_constraints_together() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        for (target, expected) in [
+            ("text-analysis", "laya>=0.3.29,<0.4"),
+            ("transformers", "transformers>=5.19,<6"),
+        ] {
+            let root = temp.path().join(target);
+            let python = root.join("venv/bin/python");
+            let config = root.join("config.json");
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::write(root.join("constraints.txt"), "torch==2.11.0+cu128\n").unwrap();
+            fs::write(&python, format!(
+                "#!/bin/sh\nfor argument do config=$argument; done\nprintf '%s' \"$config\" > '{}'\nprintf '%s' '[{{\"name\":\"fixture\",\"installed\":\"1\",\"available\":null,\"status\":\"unknown\",\"detail\":\"fixture\"}}]'\n",
+                config.display()
+            )).unwrap();
+            fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut entries = Vec::new();
+            scan_python(target, &python, false, false, &mut entries);
+            assert_eq!(entries.len(), 1);
+            assert_ne!(entries[0].status, Status::Error);
+            let config: Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
+            assert!(
+                config["requirements"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(expected))
+            );
+            assert_eq!(config["constraints"], "torch==2.11.0+cu128\n");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn broken_external_environment_is_rejected_before_install_or_resolution() {

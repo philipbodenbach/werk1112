@@ -16,6 +16,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+pub(crate) const TILELANG_PACKAGE: &str = "tilelang>=0.1.14,<0.2";
+
 pub fn install(store: &ModelStore) -> Result<PathBuf> {
     super::python_install::ensure_install_platform("text-analysis")?;
     use std::process::Command;
@@ -66,7 +68,7 @@ pub fn install(store: &ModelStore) -> Result<PathBuf> {
     );
     if cfg!(target_os = "linux") {
         let status = crate::terminal::command_status(super::python_install::with_constraints(
-            Command::new(&python).args(["-m", "pip", "install", "tilelang>=0.1.14,<0.2"]),
+            Command::new(&python).args(["-m", "pip", "install", TILELANG_PACKAGE]),
             &root,
         ))?;
         if !status.success() {

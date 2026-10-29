@@ -870,8 +870,12 @@ after validation; ordinary `backend install` continues to reuse its source check
 The managed `media`, `transformers`, `text-analysis`, `qwen-tts`, `mlx`, `mlx-vlm`
 and `onnx-cpu` installers also honor an optional
 `MODEL_HOME/backends/TARGET/constraints.txt` containing package version constraints.
-The inventory marks newer versions outside those constraints as pinned, so a
-validated accelerator-specific wheel is retained during later component updates.
+The inventory uses both the installer's built-in version ranges and these local
+constraints. It offers the newest non-yanked stable release within those ranges
+that supports the current Python version. If only excluded versions are newer,
+it reports `pinned` and explains the version limit instead of repeatedly offering
+an update that the installer cannot apply. A validated accelerator-specific wheel
+is retained during later component updates.
 
 Existing external Python installations are discovered through Werk's interpreter
 overrides, normal runtime discovery and oMLX console launchers. Their exact Python

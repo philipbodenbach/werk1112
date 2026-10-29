@@ -35,7 +35,40 @@ def fetch(package):
     return json.loads(payload)
 
 
-def check(package, offline, pinned, metadata=importlib.metadata, get=fetch, constraints=""):
+def package_bounds(package, constraints, requirements):
+    try:
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+    except ImportError:
+        from pip._vendor.packaging.requirements import Requirement
+        from pip._vendor.packaging.utils import canonicalize_name
+    bounds = []
+    for origin, lines in (("installer requirements", requirements),
+                          ("local constraints.txt", constraints.splitlines())):
+        for line in lines:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            requirement = Requirement(line)
+            if (canonicalize_name(requirement.name) == canonicalize_name(package)
+                    and (requirement.marker is None or requirement.marker.evaluate())):
+                bounds.append((requirement, origin))
+    return bounds
+
+
+def release_supports_python(files):
+    try:
+        from packaging.specifiers import SpecifierSet
+    except ImportError:
+        from pip._vendor.packaging.specifiers import SpecifierSet
+    python_version = ".".join(str(part) for part in sys.version_info[:3])
+    return any(not file.get("yanked", False)
+               and SpecifierSet(file.get("requires_python") or "").contains(python_version)
+               for file in files)
+
+
+def check(package, offline, pinned, metadata=importlib.metadata, get=fetch,
+          constraints="", requirements=()):
     try:
         distribution = metadata.distribution(package)
     except importlib.metadata.PackageNotFoundError:
@@ -60,31 +93,38 @@ def check(package, offline, pinned, metadata=importlib.metadata, get=fetch, cons
         elif not info.get("urls") or all(file.get("yanked", False) for file in info["urls"]):
             item["detail"] = "Latest release has no non-yanked distributions"
         elif latest_version > current_version:
-            constrained = False
-            if constraints:
+            if package in pinned:
+                item["status"] = "pinned"
+                item["detail"] = "New upstream release; this runtime is pinned by Werk"
+                return item
+            bounds = package_bounds(package, constraints, requirements)
+            releases = dict(info.get("releases") or {})
+            releases.setdefault(latest, info["urls"])
+            candidates = []
+            for number, files in releases.items():
                 try:
-                    from packaging.requirements import Requirement
-                    from packaging.utils import canonicalize_name
-                except ImportError:
-                    from pip._vendor.packaging.requirements import Requirement
-                    from pip._vendor.packaging.utils import canonicalize_name
-                for line in constraints.splitlines():
-                    line = line.split("#", 1)[0].strip()
-                    if not line:
-                        continue
-                    requirement = Requirement(line)
-                    if (canonicalize_name(requirement.name) == canonicalize_name(package)
-                            and (requirement.marker is None or requirement.marker.evaluate())
-                            and not requirement.specifier.contains(latest_version)):
-                        constrained = True
-            item["status"] = "pinned" if package in pinned or constrained else "update_available"
-            item["detail"] = (
-                "New upstream release is outside this runtime's local constraints.txt"
-                if constrained else
-                "New upstream release; this runtime is pinned by Werk"
-                if package in pinned else
-                "New upstream release; Python, accelerator and dependency compatibility must be checked before upgrading"
-            )
+                    candidate = Version(number)
+                except ValueError:
+                    continue
+                if (candidate > current_version and not candidate.is_prerelease
+                        and not candidate.is_devrelease
+                        and all(req.specifier.contains(candidate) for req, _ in bounds)
+                        and release_supports_python(files)):
+                    candidates.append((candidate, number))
+            excluded = [f"{origin}: {req}" for req, origin in bounds
+                        if not req.specifier.contains(latest_version)]
+            if candidates:
+                item["status"] = "update_available"
+                item["available"] = max(candidates)[1]
+                item["detail"] = "New release within the installer's version limits; dependency compatibility must still be checked before upgrading"
+                if excluded:
+                    item["detail"] += f". Upstream {latest} is excluded by " + "; ".join(excluded)
+            elif excluded:
+                item["status"] = "pinned"
+                item["detail"] = f"No newer supported release; upstream {latest} is excluded by " + "; ".join(excluded)
+            else:
+                item["status"] = "up_to_date"
+                item["detail"] = "No newer non-yanked stable release supports this Python version"
         else:
             item["status"] = "up_to_date"
             item["detail"] = "Installed version is at least the latest stable PyPI release"
@@ -113,7 +153,8 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         results = pool.map(
             lambda package: check(package, options["offline"], options["pinned"],
-                                  constraints=options.get("constraints", "")),
+                                  constraints=options.get("constraints", ""),
+                                  requirements=options.get("requirements", [])),
             options["packages"],
         )
         print(json.dumps([item for item in results if item is not None]))

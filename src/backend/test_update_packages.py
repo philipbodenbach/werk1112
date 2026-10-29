@@ -14,9 +14,12 @@ class PackageUpdates(unittest.TestCase):
         distribution.read_text.return_value = options.get("source")
         metadata = Mock()
         metadata.distribution.return_value = distribution
-        get = Mock(return_value={"info": {"version": latest}, "urls": [{"yanked": options.get("yanked", False)}]})
-        result = scan.check("fixture", options.get("offline", False), options.get("pinned", []), metadata, get,
-                            constraints=options.get("constraints", ""))
+        get = Mock(return_value={"info": {"version": latest}, "urls": [{"yanked": options.get("yanked", False)}],
+                                 "releases": options.get("releases", {})})
+        result = scan.check(options.get("package", "fixture"), options.get("offline", False),
+                            options.get("pinned", []), metadata, get,
+                            constraints=options.get("constraints", ""),
+                            requirements=options.get("requirements", []))
         return result, get
 
     def test_versions_are_compared_with_pep440(self):
@@ -52,6 +55,49 @@ class PackageUpdates(unittest.TestCase):
         self.assertEqual(result["status"], "pinned")
         self.assertIn("constraints.txt", result["detail"])
         self.assertEqual(self.check("2.11", "2.15", constraints="fixture<3")[0]["status"], "update_available")
+
+    def test_laya_update_is_complete_within_the_installers_supported_range(self):
+        result, _ = self.check("0.3.29", "0.4.17", package="laya",
+                               requirements=["laya>=0.3.29,<0.4"],
+                               releases={"0.3.29": [{}], "0.4.0": [{}], "0.4.17": [{}]})
+        self.assertEqual(result["status"], "pinned")
+        self.assertIn("installer requirements", result["detail"])
+        self.assertIn("<0.4", result["detail"])
+
+    def test_newer_supported_release_is_offered_even_if_latest_major_is_excluded(self):
+        result, _ = self.check("0.3.29", "0.4.17", package="laya",
+                               requirements=["laya>=0.3.29,<0.4"],
+                               releases={"0.3.29": [{}], "0.3.30": [{}], "0.4.17": [{}]})
+        self.assertEqual(result["status"], "update_available")
+        self.assertEqual(result["available"], "0.3.30")
+        self.assertIn("0.4.17 is excluded", result["detail"])
+
+    def test_builtin_and_local_constraints_both_limit_the_candidate(self):
+        result, _ = self.check("0.3.29", "0.4.17", package="laya",
+                               requirements=["laya>=0.3.29,<0.4"],
+                               constraints="laya==0.3.29",
+                               releases={"0.3.29": [{}], "0.3.30": [{}], "0.4.17": [{}]})
+        self.assertEqual(result["status"], "pinned")
+        self.assertIn("constraints.txt", result["detail"])
+
+    def test_excluded_yanked_prerelease_and_unsupported_python_are_not_updates(self):
+        result, _ = self.check("0.3.29", "0.4.17", package="laya",
+                               requirements=["laya>=0.3.29,<0.4"], releases={
+                                   "0.3.30": [{"yanked": True}],
+                                   "0.3.31rc1": [{}],
+                                   "0.3.32": [{"requires_python": ">=99"}],
+                                   "invalid": [{}],
+                                   "0.4.17": [{}],
+                               })
+        self.assertEqual(result["status"], "pinned")
+
+    def test_requirement_extras_normalized_names_and_markers(self):
+        result, _ = self.check("6.1", "7.1", package="sentence_transformers",
+                               requirements=["sentence-transformers[image]>=6.1,<7"],
+                               releases={"6.2": [{}], "7.1": [{}]})
+        self.assertEqual((result["status"], result["available"]), ("update_available", "6.2"))
+        result, _ = self.check("1", "2", requirements=['fixture<2; sys_platform == "not-a-platform"'])
+        self.assertEqual(result["status"], "update_available")
 
 
 if __name__ == "__main__":
