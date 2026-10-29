@@ -46,7 +46,7 @@ pub fn install(store: &ModelStore) -> Result<PathBuf> {
         &requirements,
         include_str!("../../runtime/requirements-text-analysis.txt"),
     )?;
-    let status = crate::terminal::command_status(
+    let status = crate::terminal::command_status(super::python_install::with_constraints(
         Command::new(&python)
             .args([
                 "-m",
@@ -58,18 +58,17 @@ pub fn install(store: &ModelStore) -> Result<PathBuf> {
                 "-r",
             ])
             .arg(&requirements),
-    )?;
+        &root,
+    ))?;
     ensure!(
         status.success(),
         "Text-analysis dependency installation failed. Check the pip error above, then retry werk backend install text-analysis; alternatively set WERK_TEXT_PYTHON to a compatible environment"
     );
     if cfg!(target_os = "linux") {
-        let status = crate::terminal::command_status(Command::new(&python).args([
-            "-m",
-            "pip",
-            "install",
-            "tilelang>=0.1.14,<0.2",
-        ]))?;
+        let status = crate::terminal::command_status(super::python_install::with_constraints(
+            Command::new(&python).args(["-m", "pip", "install", "tilelang>=0.1.14,<0.2"]),
+            &root,
+        ))?;
         if !status.success() {
             crate::ui_eprintln!(
                 "Optional Laya TileLang acceleration could not be installed; the PyTorch CUDA/CPU fallback remains available. Install laya[fast] in {} to retry.",

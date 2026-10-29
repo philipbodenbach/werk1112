@@ -69,6 +69,26 @@ pub(super) fn plan(
     offline: bool,
     include_vision: bool,
 ) -> Result<SetupPlan> {
+    plan_with_service(
+        &InferenceService::new(store.clone()),
+        manifest,
+        backend,
+        options,
+        offline,
+        include_vision,
+    )
+}
+
+/// Share runtime health probes across all models in one component inventory.
+pub(super) fn plan_with_service(
+    service: &InferenceService,
+    manifest: &ModelManifest,
+    backend: BackendChoice,
+    options: SelectionOptions,
+    offline: bool,
+    include_vision: bool,
+) -> Result<SetupPlan> {
+    let store = service.store();
     let mut plan = SetupPlan {
         model: manifest.id.clone(),
         runtime: None,
@@ -85,7 +105,7 @@ pub(super) fn plan(
         ) {
             continue;
         }
-        let probe = InferenceService::new(store.clone()).parameter_probe(manifest, *task)?;
+        let probe = service.parameter_probe(manifest, *task)?;
         if !probe.available {
             let target = probe
                 .readiness

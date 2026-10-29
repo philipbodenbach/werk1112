@@ -15,7 +15,8 @@ class PackageUpdates(unittest.TestCase):
         metadata = Mock()
         metadata.distribution.return_value = distribution
         get = Mock(return_value={"info": {"version": latest}, "urls": [{"yanked": options.get("yanked", False)}]})
-        result = scan.check("fixture", options.get("offline", False), options.get("pinned", []), metadata, get)
+        result = scan.check("fixture", options.get("offline", False), options.get("pinned", []), metadata, get,
+                            constraints=options.get("constraints", ""))
         return result, get
 
     def test_versions_are_compared_with_pep440(self):
@@ -45,6 +46,12 @@ class PackageUpdates(unittest.TestCase):
         metadata = Mock()
         metadata.distribution.side_effect = importlib.metadata.PackageNotFoundError
         self.assertIsNone(scan.check("missing", False, [], metadata, Mock()))
+
+    def test_local_cuda_compatibility_pin_is_not_offered_as_update(self):
+        result, _ = self.check("2.11.0+cu128", "2.15.0", constraints="# GPU-compatible wheel\nfixture==2.11.0+cu128\n")
+        self.assertEqual(result["status"], "pinned")
+        self.assertIn("constraints.txt", result["detail"])
+        self.assertEqual(self.check("2.11", "2.15", constraints="fixture<3")[0]["status"], "update_available")
 
 
 if __name__ == "__main__":

@@ -847,13 +847,19 @@ remain visible and are never reported as current. `--offline` performs no regist
 requests and disables installation/update actions.
 
 Use arrows or Page Up/Page Down to scroll, Space to select, `a` to select all
-installed component updates, `m` to select missing model requirements, and Enter
+available installed component updates, `m` to select missing model requirements, and Enter
 to review the plan. `y` starts the reviewed queue; `n` returns to the inventory.
-`f` cycles filters, `v` switches to the scrollable queue/results, `r` rescans,
-and `x` clears selection. During execution, the
+`f` cycles filters, `v` switches to the scrollable queue/results, `r` rescans and
+returns to the component list, and `x` clears selection. Esc returns from a review
+or results view without exiting or cancelling installation; `q` quits (after the
+active installer finishes). During execution, the
 manager shows completed operations, the active operation, elapsed time and live
 installer output. `c` cancels pending operations after the current installer
 finishes. Failed operations are reported individually; completed operations remain.
+Installer output and exit statuses are retained in `MODEL_HOME/logs/components/`;
+the exact run log path is shown in the output. Rescanning does not erase these logs.
+Both `a` and `werk update --all` skip current, pinned and unchecked components;
+an explicit component update remains available for a deliberate retry.
 
 Python updates include dependencies using the installer's version constraints.
 Pinned CUDA profiles, oMLX and Qwen-TTS retain their supported pins. A newer PyPI
@@ -861,14 +867,24 @@ release is an upstream availability signal, not proof that the host, Python vers
 or other packages support it. Running inference services need a restart after
 runtime updates. llama.cpp updates build a fresh generation and select it only
 after validation; ordinary `backend install` continues to reuse its source checkout.
+The managed `media`, `transformers`, `text-analysis`, `qwen-tts`, `mlx`, `mlx-vlm`
+and `onnx-cpu` installers also honor an optional
+`MODEL_HOME/backends/TARGET/constraints.txt` containing package version constraints.
+The inventory marks newer versions outside those constraints as pinned, so a
+validated accelerator-specific wheel is retained during later component updates.
 
 Existing external Python installations are discovered through Werk's interpreter
 overrides, normal runtime discovery and oMLX console launchers. Their exact Python
 path appears in the details and execution plan. Updates run in that environment,
 including shared dependencies, without creating a second managed installation.
 They require pip with `--dry-run --report` support and normal write access. Downgrades,
-editable packages and replacement of a different VCS origin are rejected before
-installation. An environment owned by another package manager may require that
+editable packages and replacement of a different source are rejected before
+installation. Werk first checks the existing environment, then checks the proposed
+versions against the requirements of every installed package, including unrelated
+applications. Conflicts stop the update before packages are changed. Use
+`werk backend install media` or `werk backend install transformers` to provision
+an isolated Werk runtime when a shared application's pins are incompatible.
+An environment owned by another package manager may require that
 manager's update workflow; Werk never invokes `--break-system-packages` or sudo.
 
 Projectors already present in registered or linked model directories are scanned

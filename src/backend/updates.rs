@@ -515,9 +515,34 @@ fn scan_python(name: &str, python: &Path, offline: bool, external: bool, entries
     } else {
         primary
     };
-    let config =
-        json!({"packages": packages, "required": required, "pinned": pinned, "offline": offline});
     let result = (|| -> Result<Vec<Package>> {
+        let constraints = if external
+            || !matches!(
+                name,
+                "mlx"
+                    | "mlx-vlm"
+                    | "media"
+                    | "transformers"
+                    | "onnx-cpu"
+                    | "text-analysis"
+                    | "qwen-tts"
+            ) {
+            String::new()
+        } else if let Some(path) = python
+            .ancestors()
+            .nth(3)
+            .map(|root| root.join("constraints.txt"))
+        {
+            match fs::read_to_string(path) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            String::new()
+        };
+        let config = json!({"packages": packages, "required": required,
+            "pinned": pinned, "offline": offline, "constraints": constraints});
         let mut command = Command::new(python);
         if !external {
             command.arg("-I");
@@ -656,6 +681,15 @@ pub(crate) fn update_external_python(target: &str, python: &Path) -> Result<()> 
     let report = tempfile::NamedTempFile::new()?;
     let constraints = tempfile::NamedTempFile::new()?;
     let scratch = tempfile::tempdir()?;
+    ensure!(
+        crate::terminal::command_status(
+            Command::new(python)
+                .current_dir(scratch.path())
+                .args(["-B", "-m", "pip", "check"])
+        )?
+        .success(),
+        "External environment already has dependency conflicts; no packages changed. Repair it with its own package manager, or use `werk backend install {target}` for an isolated managed environment"
+    );
     let mut preview = Command::new(python);
     preview.current_dir(scratch.path());
     preview
@@ -676,36 +710,14 @@ pub(crate) fn update_external_python(target: &str, python: &Path) -> Result<()> 
         crate::terminal::command_status(&mut preview)?.success(),
         "Cannot resolve an update for this external environment; its package manager may own it"
     );
-    let check = r#"import sys
-sys.path = [path for path in sys.path if path]
-import importlib.metadata as m,json,re
-try:
- from packaging.version import Version
-except ImportError:
- from pip._vendor.packaging.version import Version
-items=json.load(open(sys.argv[1]))['install']
-for item in items:
- name=item['metadata']['name']
- try: old=m.distribution(name)
- except m.PackageNotFoundError: continue
- direct=json.loads(old.read_text('direct_url.json') or '{}')
- assert not direct.get('dir_info',{}).get('editable'), 'Editable package requires its own source workflow: '+name
- assert Version(item['metadata']['version']) >= Version(old.version), 'Refusing downgrade in external environment: '+name
- if direct.get('vcs_info'):
-  assert direct.get('url') == item.get('download_info',{}).get('url'), 'Refusing to replace an external VCS source: '+name
-with open(sys.argv[2], 'w') as constraints:
- for item in items:
-  name=item['metadata']['name']; version=item['metadata']['version']
-  assert re.fullmatch(r'[A-Za-z0-9_.-]+',name) and re.fullmatch(r'[A-Za-z0-9_.+!-]+',version), 'Invalid resolved package identity'
-  constraints.write(name+'=='+version+'\n')
-"#;
     ensure!(
         crate::terminal::command_status(
             Command::new(python)
                 .current_dir(scratch.path())
-                .args(["-B", "-c", check])
+                .args(["-B", "-c", include_str!("update_external_check.py")])
                 .arg(report.path())
                 .arg(constraints.path())
+                .arg(serde_json::to_string(&packages)?)
         )?
         .success(),
         "External update would alter an incompatible/custom installation; environment retained"
@@ -757,6 +769,7 @@ pub(crate) fn command_output_with_cancel(
     timeout: Duration,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    use std::io::{Seek, SeekFrom};
     struct Probe(std::process::Child, bool);
     impl Drop for Probe {
         fn drop(&mut self) {
@@ -791,10 +804,17 @@ pub(crate) fn command_output_with_cancel(
     loop {
         match child.0.try_wait() {
             Ok(Some(status)) => {
-                ensure!(
-                    status.success(),
-                    "Installed runtime metadata probe exited with {status}"
-                );
+                if !status.success() {
+                    let mut errors = errors.try_clone()?;
+                    let length = errors.metadata()?.len();
+                    errors.seek(SeekFrom::Start(length.saturating_sub(8192)))?;
+                    let mut detail = Vec::new();
+                    errors.take(8192).read_to_end(&mut detail)?;
+                    anyhow::bail!(
+                        "Installed runtime metadata probe exited with {status}: {}",
+                        crate::terminal::clean(&String::from_utf8_lossy(&detail)).trim()
+                    );
+                }
                 break;
             }
             Ok(None)
@@ -812,7 +832,6 @@ pub(crate) fn command_output_with_cancel(
             }
         }
     }
-    use std::io::{Seek, SeekFrom};
     let read = |mut file: fs::File| -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         file.seek(SeekFrom::Start(0))?;
@@ -1192,6 +1211,23 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn broken_external_environment_is_rejected_before_install_or_resolution() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let python = temp.path().join("python");
+        let calls = temp.path().join("calls");
+        fs::write(&python, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'torchvision requires torch==2.6.0\\n' >&2\nexit 1\n",
+            calls.display()
+        )).unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = update_external_python("media", &python).unwrap_err();
+        assert!(error.to_string().contains("no packages changed"));
+        assert_eq!(fs::read_to_string(calls).unwrap(), "-B -m pip check\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn probes_keep_stderr_out_of_json_and_stop_on_timeout() {
         let (out, err) = command_output(
             Command::new("sh").args(["-c", "printf '[]'; printf warning >&2"]),
@@ -1200,6 +1236,12 @@ mod tests {
         .unwrap();
         assert_eq!(out, b"[]");
         assert_eq!(err, b"warning");
+        let failure = command_output(
+            Command::new("sh").args(["-c", "printf 'dependency conflict' >&2; exit 3"]),
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(failure.to_string().contains("dependency conflict"));
         let start = Instant::now();
         assert!(
             command_output(

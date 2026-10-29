@@ -150,13 +150,16 @@ fn provision_managed_qwen_tts(
         "failed to upgrade pip in the managed Qwen-TTS virtualenv",
     )?;
     run_command(
-        Command::new(&venv_python)
-            .arg("-m")
-            .arg("pip")
-            .arg("install")
-            .arg("--upgrade")
-            .args(["--upgrade-strategy", "eager"])
-            .arg(QWEN_TTS_PACKAGE),
+        super::python_install::with_constraints(
+            Command::new(&venv_python)
+                .arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg("--upgrade")
+                .args(["--upgrade-strategy", "eager"])
+                .arg(QWEN_TTS_PACKAGE),
+            &root,
+        ),
         "failed to install qwen-tts==0.1.1; check network access, free disk space, \
          and PyTorch/torchaudio wheel availability for this platform",
     )?;

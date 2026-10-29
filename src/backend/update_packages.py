@@ -35,7 +35,7 @@ def fetch(package):
     return json.loads(payload)
 
 
-def check(package, offline, pinned, metadata=importlib.metadata, get=fetch):
+def check(package, offline, pinned, metadata=importlib.metadata, get=fetch, constraints=""):
     try:
         distribution = metadata.distribution(package)
     except importlib.metadata.PackageNotFoundError:
@@ -60,8 +60,27 @@ def check(package, offline, pinned, metadata=importlib.metadata, get=fetch):
         elif not info.get("urls") or all(file.get("yanked", False) for file in info["urls"]):
             item["detail"] = "Latest release has no non-yanked distributions"
         elif latest_version > current_version:
-            item["status"] = "pinned" if package in pinned else "update_available"
+            constrained = False
+            if constraints:
+                try:
+                    from packaging.requirements import Requirement
+                    from packaging.utils import canonicalize_name
+                except ImportError:
+                    from pip._vendor.packaging.requirements import Requirement
+                    from pip._vendor.packaging.utils import canonicalize_name
+                for line in constraints.splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    requirement = Requirement(line)
+                    if (canonicalize_name(requirement.name) == canonicalize_name(package)
+                            and (requirement.marker is None or requirement.marker.evaluate())
+                            and not requirement.specifier.contains(latest_version)):
+                        constrained = True
+            item["status"] = "pinned" if package in pinned or constrained else "update_available"
             item["detail"] = (
+                "New upstream release is outside this runtime's local constraints.txt"
+                if constrained else
                 "New upstream release; this runtime is pinned by Werk"
                 if package in pinned else
                 "New upstream release; Python, accelerator and dependency compatibility must be checked before upgrading"
@@ -93,7 +112,8 @@ def main():
         return
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         results = pool.map(
-            lambda package: check(package, options["offline"], options["pinned"]),
+            lambda package: check(package, options["offline"], options["pinned"],
+                                  constraints=options.get("constraints", "")),
             options["packages"],
         )
         print(json.dumps([item for item in results if item is not None]))

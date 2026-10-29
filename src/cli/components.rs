@@ -1,4 +1,5 @@
 //! Shared component inventory and execution plans for CLI and terminal UI.
+mod install_output;
 mod self_update;
 mod ui;
 use super::*;
@@ -96,6 +97,22 @@ struct Component {
     detail: String,
     required_by: Vec<String>,
     action: Option<Action>,
+}
+
+impl Component {
+    fn has_update(&self) -> bool {
+        self.status == "update available"
+            && matches!(
+                self.action,
+                Some(
+                    Action::UpdateBackend(_)
+                        | Action::UpdateModel(_)
+                        | Action::UpdateExternalBackend { .. }
+                        | Action::UpdateWerk(_)
+                        | Action::UpdateProjector { .. }
+                )
+            )
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -286,6 +303,7 @@ fn inventory(store: &ModelStore, offline: bool) -> Result<Inventory> {
         });
     }
     let models = store.list_existing()?;
+    let service = InferenceService::new(store.clone());
     let mut compatible_models = HashSet::new();
     for model in &models {
         let scanned_model = scanned
@@ -297,8 +315,8 @@ fn inventory(store: &ModelStore, offline: bool) -> Result<Inventory> {
             .unwrap_or("unknown")
             .to_string();
         let mut action = None;
-        let plan = model_setup::plan(
-            store,
+        let plan = model_setup::plan_with_service(
+            &service,
             &model,
             BackendChoice::Auto,
             SelectionOptions::default(),
@@ -458,16 +476,10 @@ fn selected_actions(inventory: &Inventory, args: &UpdateArgs) -> Result<Vec<Acti
         .iter()
         .filter(|c| {
             c.action.as_ref().is_some_and(|a| {
-                matches!(
-                    a,
-                    Action::UpdateBackend(_)
-                        | Action::UpdateModel(_)
-                        | Action::UpdateExternalBackend { .. }
-                        | Action::UpdateWerk(_)
-                        | Action::UpdateProjector { .. }
-                ) || args.include_missing
-                    && (matches!(a, Action::SetupModel(_))
-                        || matches!(a, Action::InstallBackend(_)) && !c.required_by.is_empty())
+                c.has_update()
+                    || args.include_missing
+                        && (matches!(a, Action::SetupModel(_))
+                            || matches!(a, Action::InstallBackend(_)) && !c.required_by.is_empty())
             })
         })
         .filter_map(|c| c.action.as_ref())
@@ -506,6 +518,8 @@ pub(super) fn update(store: ModelStore, args: UpdateArgs) -> Result<()> {
         }
     }
     let mut failed = Vec::new();
+    let mut log = install_output::RunLog::create(&store)?;
+    crate::ui_println!("Installation log: {}", log.path.display());
     for (i, action) in actions.iter().enumerate() {
         let activity = crate::terminal::Activity::start(format!(
             "[{}/{}] {}",
@@ -513,9 +527,14 @@ pub(super) fn update(store: ModelStore, args: UpdateArgs) -> Result<()> {
             actions.len(),
             action.label()
         ));
-        let status = action_command(&store, action)?.status();
+        let status = execute_logged(&store, action, &mut log, |line| {
+            crate::ui_println!("{line}");
+        });
         activity.finish();
-        if !status.is_ok_and(|s| s.success()) {
+        if !status.unwrap_or_else(|error| {
+            crate::ui_eprintln!("{error:#}");
+            false
+        }) {
             failed.push(action.label());
         }
     }
@@ -664,50 +683,28 @@ fn execute_queue(
     tx: mpsc::Sender<Event>,
 ) {
     thread::spawn(move || {
+        let mut log = match install_output::RunLog::create(&store) {
+            Ok(log) => log,
+            Err(error) => {
+                let _ = tx.send(Event::Log(format!(
+                    "Cannot create installation log: {error:#}"
+                )));
+                let _ = tx.send(Event::Finished);
+                return;
+            }
+        };
+        let _ = tx.send(Event::Log(format!(
+            "Installation log: {}",
+            log.path.display()
+        )));
         for (i, action) in actions.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let _ = tx.send(Event::Started(i, action.label()));
-            let result = (|| -> Result<bool> {
-                let mut child = action_command(&store, action)?
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()?;
-                let out = child.stdout.take().context("Missing installer stdout")?;
-                let err = child.stderr.take().context("Missing installer stderr")?;
-                let stream = |reader: Box<dyn Read + Send>, tx: mpsc::Sender<Event>| {
-                    thread::spawn(move || {
-                        let mut line = Vec::new();
-                        for byte in io::BufReader::new(reader)
-                            .bytes()
-                            .map_while(std::result::Result::ok)
-                        {
-                            if byte == b'\n' || byte == b'\r' || line.len() >= 8192 {
-                                if !line.is_empty() {
-                                    let _ = tx.send(Event::Log(crate::terminal::clean(
-                                        &String::from_utf8_lossy(&line),
-                                    )));
-                                    line.clear();
-                                }
-                            } else {
-                                line.push(byte);
-                            }
-                        }
-                        if !line.is_empty() {
-                            let _ = tx.send(Event::Log(crate::terminal::clean(
-                                &String::from_utf8_lossy(&line),
-                            )));
-                        }
-                    })
-                };
-                let a = stream(Box::new(out), tx.clone());
-                let b = stream(Box::new(err), tx.clone());
-                let status = child.wait()?;
-                let _ = a.join();
-                let _ = b.join();
-                Ok(status.success())
-            })();
+            let result = execute_logged(&store, action, &mut log, |line| {
+                let _ = tx.send(Event::Log(line));
+            });
             let success = match result {
                 Ok(ok) => ok,
                 Err(e) => {
@@ -717,8 +714,36 @@ fn execute_queue(
             };
             let _ = tx.send(Event::Done(i, success));
         }
+        let _ = tx.send(Event::Log(format!(
+            "Installation log saved: {}",
+            log.path.display()
+        )));
         let _ = tx.send(Event::Finished);
     });
+}
+
+fn execute_logged(
+    store: &ModelStore,
+    action: &Action,
+    log: &mut install_output::RunLog,
+    mut emit: impl FnMut(String),
+) -> Result<bool> {
+    let mut output = |line: String| {
+        if let Err(error) = log.record(&line) {
+            emit(format!("Installation log error: {error:#}"));
+        }
+        emit(line);
+    };
+    output(format!("Starting: {}", action.label()));
+    let result = action_command(store, action)
+        .and_then(|mut command| install_output::run(&mut command, &mut output));
+    let outcome = match &result {
+        Ok(true) => "completed".into(),
+        Ok(false) => "FAILED".into(),
+        Err(error) => format!("FAILED: {error:#}"),
+    };
+    output(format!("{}: {outcome}", action.label()));
+    result
 }
 
 #[cfg(test)]
@@ -763,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn update_plan_includes_installed_and_external_but_not_optional_installs() {
+    fn update_plan_includes_available_updates_and_external_but_not_optional_installs() {
         let actions = vec![
             Action::UpdateBackend("llama-cpu".into()),
             Action::InstallBackend("media".into()),
@@ -774,7 +799,7 @@ mod tests {
             },
             Action::UpdateWerk("2.0.0".into()),
         ];
-        let inventory = Inventory {
+        let mut inventory = Inventory {
             host: "fixture".into(),
             offline: false,
             components: actions
@@ -784,7 +809,7 @@ mod tests {
                     id: i.to_string(),
                     name: i.to_string(),
                     kind: "fixture".into(),
-                    status: "".into(),
+                    status: "update available".into(),
                     installed: None,
                     available: None,
                     detail: "".into(),
@@ -793,6 +818,24 @@ mod tests {
                 })
                 .collect(),
         };
+        for status in [
+            "up to date",
+            "pinned",
+            "installed / unchecked",
+            "scan error",
+        ] {
+            inventory.components.push(Component {
+                id: status.into(),
+                name: status.into(),
+                kind: "backend".into(),
+                status: status.into(),
+                installed: Some("1".into()),
+                available: None,
+                detail: String::new(),
+                required_by: vec![],
+                action: Some(Action::UpdateBackend("llama-cpu".into())),
+            });
+        }
         let mut args = UpdateArgs {
             component: None,
             all: true,
@@ -805,6 +848,8 @@ mod tests {
         assert_eq!(selected_actions(&inventory, &args).unwrap().len(), 4);
         args.component = Some("1".into());
         assert!(selected_actions(&inventory, &args).is_err());
+        args.component = Some("up to date".into());
+        assert_eq!(selected_actions(&inventory, &args).unwrap().len(), 1);
     }
 
     #[test]

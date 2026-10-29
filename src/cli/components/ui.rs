@@ -127,22 +127,36 @@ impl App {
                     matches!(row.action, Some(Action::SetupModel(_)))
                         || row.status == "missing / required"
                 } else {
-                    matches!(
-                        row.action,
-                        Some(
-                            Action::UpdateBackend(_)
-                                | Action::UpdateModel(_)
-                                | Action::UpdateExternalBackend { .. }
-                                | Action::UpdateWerk(_)
-                                | Action::UpdateProjector { .. }
-                        )
-                    )
+                    row.has_update()
                 };
                 if eligible && row.action.is_some() {
                     self.selected.insert(row.id.clone());
                 }
             }
         }
+    }
+
+    fn back(&mut self) {
+        if self.confirm.take().is_none() {
+            self.queue_view = false;
+            self.filter = 0;
+            self.table.select(Some(0));
+        }
+    }
+
+    fn request_rescan(&mut self) -> bool {
+        if self.running {
+            self.log("Wait for the active installation before rescanning.".into());
+            return false;
+        }
+        self.back();
+        if self.scanning {
+            self.log("Component scan is already running; results will appear here.".into());
+            return false;
+        }
+        self.scanning = true;
+        self.selected.clear();
+        true
     }
 }
 
@@ -281,7 +295,8 @@ pub(super) fn run(store: ModelStore, offline: bool) -> Result<()> {
                         app.filter = (app.filter + 1) % 4;
                         app.table.select(Some(0));
                     }
-                    KeyCode::Char('q') | KeyCode::Esc if !app.running => {
+                    KeyCode::Esc => app.back(),
+                    KeyCode::Char('q') if !app.running => {
                         if !app.scanning {
                             break;
                         }
@@ -305,8 +320,7 @@ pub(super) fn run(store: ModelStore, offline: bool) -> Result<()> {
                     KeyCode::Char('a') if !app.running && !app.scanning => app.mark(false),
                     KeyCode::Char('m') if !app.running && !app.scanning => app.mark(true),
                     KeyCode::Char('x') if !app.running => app.selected.clear(),
-                    KeyCode::Char('r') if !app.running && !app.scanning => {
-                        app.scanning = true;
+                    KeyCode::Char('r') if app.request_rescan() => {
                         scan_cancel.store(false, Ordering::Relaxed);
                         refresh(store.clone(), offline, tx.clone(), scan_cancel.clone());
                     }
@@ -548,7 +562,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             .block(panel(" Live installer output / Results ")),
         areas[4],
     );
-    frame.render_widget(Paragraph::new("↑↓/PgUp/PgDn scroll · Space select · a all updates · m missing · Enter review\nf filter · v queue · r rescan · x clear · c cancel pending · q quit").style(Style::default().fg(CYAN)), areas[5]);
+    frame.render_widget(Paragraph::new("↑↓/PgUp/PgDn scroll · Space select · a all updates · m missing · Enter review\nf filter · v queue · r rescan · Esc back · x clear · c cancel pending · q quit").style(Style::default().fg(CYAN)), areas[5]);
     if let Some(actions) = &app.confirm {
         let width = frame.area().width.saturating_sub(6).min(100);
         let height = (actions.len() as u16 + 7).min(frame.area().height.saturating_sub(2));
@@ -586,6 +600,65 @@ fn draw(frame: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescan_after_install_returns_to_inventory_and_keeps_results() {
+        let mut app = App {
+            queue_view: true,
+            queue: vec![("Update media".into(), "FAILED".into())],
+            done: 1,
+            failed: 1,
+            ..Default::default()
+        };
+        app.selected.insert("stale".into());
+        assert!(app.request_rescan());
+        assert!(app.scanning);
+        assert!(!app.queue_view);
+        assert!(app.selected.is_empty());
+        assert_eq!(app.queue[0].1, "FAILED");
+        assert_eq!(app.failed, 1);
+        assert!(!app.request_rescan(), "must not start duplicate scans");
+        app.scanning = false;
+        assert!(app.request_rescan(), "another scan works after completion");
+    }
+
+    #[test]
+    fn escape_returns_from_results_without_exiting_or_cancelling_work() {
+        for running in [false, true] {
+            let mut app = App {
+                running,
+                scanning: !running,
+                queue_view: true,
+                ..Default::default()
+            };
+            app.back();
+            assert!(!app.queue_view);
+            assert!(!app.exiting);
+            assert_eq!(app.running, running);
+            assert_eq!(app.scanning, !running);
+            app.back();
+            assert!(!app.exiting, "Esc in inventory also stays in the app");
+        }
+        let mut app = App::default();
+        app.confirm = Some(vec![Action::UpdateBackend("media".into())]);
+        app.back();
+        assert!(app.confirm.is_none());
+        assert!(!app.exiting);
+    }
+
+    #[test]
+    fn rescan_during_install_reports_busy_without_starting_a_scan() {
+        let mut app = App {
+            running: true,
+            queue_view: true,
+            ..Default::default()
+        };
+        assert!(!app.request_rescan());
+        assert!(app.running);
+        assert!(!app.scanning);
+        assert!(app.logs.back().unwrap().contains("active installation"));
+    }
+
     #[test]
     fn terminal_renders_small_and_large_inventory_without_mutations() {
         for (width, height) in [(50, 12), (80, 25), (140, 45)] {
