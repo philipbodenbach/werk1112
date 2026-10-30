@@ -41,12 +41,28 @@ pub(super) fn validate_projector_identity(main: &Path, projector: &Path) -> Resu
             "Projector model identity differs from the main GGUF; select artifacts from the same model and revision"
         );
     }
+    if let Some(architecture) = detect_gguf_architecture(main)? {
+        let input = super::gguf_conversion::gguf_unsigned_metadata(
+            main,
+            &format!("{architecture}.embedding_length"),
+        )?;
+        let output = super::gguf_conversion::gguf_unsigned_metadata(
+            projector,
+            "clip.vision.projection_dim",
+        )?;
+        if let (Some(input), Some(output)) = (input, output) {
+            ensure!(
+                input == output,
+                "Projector output dimension {output} differs from model embedding dimension {input}"
+            );
+        }
+    }
     Ok(())
 }
 
 /// A choice of precision is allowed only within one projector family. Two
 /// different model families must never be resolved by filename sorting.
-fn projector_family(path: &str) -> String {
+pub(super) fn projector_family(path: &str) -> String {
     let mut name = path.to_ascii_lowercase();
     for part in ["bf16", "f16", "f32", "q8_0"] {
         name = name.replace(part, "<precision>");
@@ -156,6 +172,18 @@ pub(super) fn pull_vision_description(
 }
 
 impl ModelStore {
+    pub(crate) fn validate_vision_projector(
+        &self,
+        manifest: &ModelManifest,
+        projector: &Path,
+    ) -> Result<()> {
+        let main = manifest
+            .model_path
+            .as_deref()
+            .context("Missing main model file")?;
+        validate_projector_identity(&self.absolute_model_file(manifest, main), projector)
+    }
+
     /// Select existing assets or explicitly import one local projector, without
     /// downloading/replacing the main model or installing a runtime.
     pub fn configure_vision(
@@ -164,6 +192,8 @@ impl ModelStore {
         enabled: bool,
         projector: Option<&Path>,
     ) -> Result<ModelManifest> {
+        let activity = crate::terminal::Activity::start(format!("Configuring vision for {id}"));
+        activity.phase("Validating and saving model components");
         let mut manifest = self.get(id)?;
         let previous = manifest.metadata.vision_setup.clone();
         let backend = if projector.is_some() && manifest.format == ModelFormat::Gguf {
@@ -283,6 +313,7 @@ impl ModelStore {
             }
         }
         atomic_json(&self.model_dir(id).join(MANIFEST_FILE), &manifest)?;
+        activity.finish();
         Ok(manifest)
     }
 
@@ -330,6 +361,9 @@ impl ModelStore {
         let root = staging.path();
         let token = self.huggingface_token()?;
         let url = format!("https://huggingface.co/{repo}");
+        let checking =
+            crate::terminal::Activity::start(format!("Checking projector source for {id}"));
+        checking.phase("Fetching recorded repository revision");
         for args in [
             vec!["init"],
             vec!["remote", "add", "origin", &url],
@@ -354,6 +388,7 @@ impl ModelStore {
         let selected = select_projector(root, file)?
             .context("No model-specific projector at the recorded revision")?;
         let bytes = lfs_pointer_total_for_files(root, std::slice::from_ref(&selected))?;
+        checking.finish();
         let approved = consent(&format!(
             "Image setup for model {id}; source {repo}@{revision}; file {selected}; additional download {}; destination {}. Main model weights are reused.",
             bytes
@@ -363,6 +398,13 @@ impl ModelStore {
         ))?;
         if !approved {
             return Ok(manifest);
+        }
+        let activity =
+            crate::terminal::Activity::start(format!("Downloading vision projector {selected}"));
+        if let Some(total) = bytes {
+            activity.download(total);
+        } else {
+            activity.phase("Downloading projector (size unknown)");
         }
         for args in [
             vec!["lfs", "install", "--local"],
@@ -385,11 +427,18 @@ impl ModelStore {
                 "Cannot download selected projector; previous model setup is unchanged",
                 Some(root),
                 bytes,
-                |_| {},
+                |event| {
+                    if let GitCommandProgress::Stats { bytes, .. } = event {
+                        activity.position(bytes);
+                    }
+                },
             )?;
         }
+        activity.phase("Verifying and activating downloaded projector");
         ensure_lfs_file_downloaded(root, &selected)?;
-        self.configure_vision(id, true, Some(&root.join(selected)))
+        let manifest = self.configure_vision(id, true, Some(&root.join(selected)))?;
+        activity.finish();
+        Ok(manifest)
     }
 }
 
@@ -412,6 +461,33 @@ mod tests {
             bytes.extend(value.as_bytes());
         }
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn matching_projector_name_cannot_hide_incompatible_dimensions() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("model.gguf");
+        let projector = temp.path().join("mmproj.gguf");
+        for (path, architecture, key, dimension) in [
+            (&main, "qwen35", "qwen35.embedding_length", 2560u32),
+            (&projector, "clip", "clip.vision.projection_dim", 5120u32),
+        ] {
+            gguf(path, architecture, "same model name");
+            let mut bytes = fs::read(path).unwrap();
+            bytes[16..24].copy_from_slice(&3u64.to_le_bytes());
+            bytes.extend((key.len() as u64).to_le_bytes());
+            bytes.extend(key.as_bytes());
+            bytes.extend(4u32.to_le_bytes());
+            bytes.extend(dimension.to_le_bytes());
+            fs::write(path, bytes).unwrap();
+        }
+        let error = validate_projector_identity(&main, &projector).unwrap_err();
+        assert!(error.to_string().contains("dimension"));
+        let mut bytes = fs::read(&projector).unwrap();
+        let end = bytes.len();
+        bytes[end - 4..].copy_from_slice(&2560u32.to_le_bytes());
+        fs::write(&projector, bytes).unwrap();
+        validate_projector_identity(&main, &projector).unwrap();
     }
 
     #[test]

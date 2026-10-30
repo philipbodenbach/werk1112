@@ -2,7 +2,19 @@
 //! completed installations and never invokes pip or downloads model weights.
 use crate::model_store::ModelStore;
 use anyhow::{Context, Result, ensure};
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+pub(crate) fn with_constraints<'a>(command: &'a mut Command, root: &Path) -> &'a mut Command {
+    let constraints = root.join("constraints.txt");
+    if constraints.is_file() {
+        command.arg("--constraint").arg(constraints);
+    }
+    command
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PythonBackend {
@@ -34,7 +46,7 @@ impl PythonBackend {
         }
     }
 
-    fn packages(self) -> &'static [&'static str] {
+    pub(crate) fn packages(self) -> &'static [&'static str] {
         match self {
             Self::OnnxCpu => &["onnxruntime-genai"],
             Self::Mlx => &["mlx-lm"],
@@ -62,7 +74,7 @@ impl PythonBackend {
         }
     }
 
-    fn validation(self) -> &'static str {
+    pub(crate) fn validation(self) -> &'static str {
         match self {
             Self::OnnxCpu => {
                 "from onnxruntime_genai import Model, Tokenizer, Generator, GeneratorParams; print('ONNX GenAI ready (CPU); models require genai_config.json')"
@@ -185,7 +197,7 @@ impl PythonBackend {
             .with_context(|| format!("Install Python 3.11–3.13 with venv on PATH, then retry werk backend install {}. MLX additionally requires native arm64 Python and macOS 14+.", self.target()))?;
         let python = self.install_with(store, bootstrap, bootstrap_args, |cmd| {
             let status = crate::terminal::command_status(cmd)?;
-            ensure!(status.success(), "installer command failed");
+            ensure!(status.success(), "installer command failed: {status}");
             Ok(())
         }).with_context(|| format!("{} installation failed. Check the command output and platform wheel availability, then retry `werk backend install {}`; alternatively configure {}", self.target(), self.target(), self.override_env()))?;
         if env::var_os(self.override_env()).is_some() {
@@ -237,9 +249,19 @@ impl PythonBackend {
                 .arg(root.join("venv")))?;
         }
         run(Command::new(&python).args(["-I", "-m", "pip", "install", "--upgrade", "pip"]))?;
-        run(Command::new(&python)
-            .args(["-I", "-m", "pip", "install", "--upgrade"])
-            .args(self.packages()))?;
+        let mut install = Command::new(&python);
+        install
+            .args([
+                "-I",
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--upgrade-strategy",
+                "eager",
+            ])
+            .args(self.packages());
+        run(with_constraints(&mut install, &root))?;
         run(Command::new(&python).args(["-I", "-m", "pip", "check"]))?;
         run(Command::new(&python).args(["-I", "-c", self.validation()]))?;
         ensure!(
@@ -381,5 +403,35 @@ mod tests {
             );
             assert!(backend.managed_python(&store).is_none());
         }
+    }
+
+    #[test]
+    fn backend_install_retains_local_compatibility_constraints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::resolve(Some(dir.path().join("home"))).unwrap();
+        let backend = PythonBackend::Media;
+        let python = backend.python(&store);
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, "fixture").unwrap();
+        let constraints = backend.root(&store).join("constraints.txt");
+        fs::write(&constraints, "torch==2.11.0+cu128\n").unwrap();
+        let mut constrained = false;
+        backend
+            .install_with(&store, "bootstrap", &[], |command| {
+                let args: Vec<_> = command.get_args().collect();
+                if args.contains(&std::ffi::OsStr::new("diffusers[torch]")) {
+                    assert!(args.windows(2).any(
+                        |pair| pair[0] == "--constraint" && pair[1] == constraints.as_os_str()
+                    ));
+                    constrained = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(constrained);
+        assert_eq!(
+            fs::read_to_string(constraints).unwrap(),
+            "torch==2.11.0+cu128\n"
+        );
     }
 }

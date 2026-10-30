@@ -4,7 +4,9 @@ use crate::capabilities::{
 };
 mod import_collection;
 pub use import_collection::ModelImportCandidate;
+pub mod feature_setup;
 mod gguf_conversion;
+mod updates;
 mod vision;
 pub use gguf_conversion::GgufConversionOptions;
 mod quantization;
@@ -289,7 +291,7 @@ impl ModelManifest {
             .is_some_and(|s| !s.enabled)
         {
             bail!(
-                "Image input was skipped for this model. Set up its existing/matching assets with werk artifacts vision MODEL --vision; text requests remain available"
+                "Image input is not set up for this model. Run werk setup MODEL to install the backend and matching projector, or werk artifacts vision MODEL --vision for existing local assets; text requests remain available"
             );
         }
         Ok(())
@@ -983,31 +985,30 @@ impl ModelStore {
             projector.is_none() || vision_backend == Some("llama-server"),
             "--projector applies only to a supported GGUF/llama-server repository"
         );
-        let enabled = match vision_backend {
-            Some(backend) => choose_vision(&vision::pull_vision_description(
+        let selected_projector = if projector.is_some() {
+            vision::select_projector(&tmp, projector)?
+        } else {
+            None
+        };
+        let vision_description = match vision_backend {
+            Some(backend) => Some(vision::pull_vision_description(
                 &tmp,
                 repo,
                 &revision,
                 &self.model_dir(id),
                 backend,
-            )?)?,
+            )?),
             None => {
                 anyhow::ensure!(
                     projector.is_none() && !require_vision,
                     "This repository has no supported image setup"
                 );
-                false
+                None
             }
         };
-        let selected_projector = if enabled && vision_backend == Some("llama-server") {
-            Some(vision::select_projector(&tmp, projector)?.context("No matching projector in the selected repository; text-only pull remains available")?)
-        } else {
-            None
-        };
-        let mut include_files = selected_lfs_include_files(&tmp, include_file.as_deref())?;
-        if let Some(projector) = &selected_projector {
-            include_files.push(projector.clone());
-        }
+        // Complete and register the main model before asking about optional
+        // feature components. Declining/cancelling setup never loses this pull.
+        let include_files = selected_lfs_include_files(&tmp, include_file.as_deref())?;
 
         if tmp.join(".gitattributes").is_file() {
             let mut lfs_install_command = Command::new("git");
@@ -1081,9 +1082,6 @@ impl ModelStore {
         for include_file in &include_files {
             ensure_lfs_file_downloaded(&tmp, include_file)?;
         }
-        if let (Some(main), Some(projector)) = (&include_file, &selected_projector) {
-            vision::validate_projector_identity(&tmp.join(main), &tmp.join(projector))?;
-        }
         let import_tmp = tmp.with_file_name(format!(
             "{}-import",
             tmp.file_name()
@@ -1122,10 +1120,12 @@ impl ModelStore {
                 InputModality::Image,
             );
             manifest.metadata.vision_setup = Some(crate::backend::vision_setup::ModelVisionSetup {
-                enabled,
+                enabled: false,
                 backend: backend.into(),
-                projector: selected_projector.map(|path| format!("files/{path}")),
-                source_revision: Some(revision),
+                projector: selected_projector
+                    .as_ref()
+                    .map(|path| format!("files/{path}")),
+                source_revision: Some(revision.clone()),
             });
             crate::backend::vision_setup::atomic_json(
                 &self.model_dir(id).join(MANIFEST_FILE),
@@ -1137,17 +1137,39 @@ impl ModelStore {
                 let _ = fs::remove_dir_all(self.model_dir(id));
             })?;
         }
+        crate::backend::vision_setup::atomic_json(
+            &self.model_dir(id).join("source-revision.json"),
+            &serde_json::json!({"repo": repo, "revision": revision}),
+        )?;
         progress(PullProgress::Finished {
             files: manifest.files.len(),
             bytes: manifest.files.iter().map(|file| file.size).sum(),
         });
+        if let Some(description) = vision_description
+            && choose_vision(&description)?
+        {
+            manifest = if vision_backend == Some("llama-server") {
+                self.download_vision_projector(id, projector, |_| Ok(true))?
+            } else {
+                self.configure_vision(id, true, None)?
+            };
+        }
         Ok(manifest)
     }
 
     pub fn list(&self) -> Result<Vec<ModelManifest>> {
         self.ensure()?;
+        self.list_existing()
+    }
+
+    pub(crate) fn list_existing(&self) -> Result<Vec<ModelManifest>> {
         let mut manifests = Vec::new();
-        for entry in fs::read_dir(self.models_dir())? {
+        let entries = match fs::read_dir(self.models_dir()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(manifests),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             let manifest_path = entry.path().join(MANIFEST_FILE);
             if manifest_path.is_file() {

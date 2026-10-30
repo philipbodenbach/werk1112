@@ -101,11 +101,18 @@ Replace `/absolute/path/to/model.gguf` with your compatible local model file;
 ~~~bash
 werk backend list
 werk backend doctor --debug
+werk components
 werk import /absolute/path/to/model.gguf --name local-model
 werk inspect local-model
 werk doctor --model local-model
 werk chat local-model --max-tokens 128
 ~~~
+
+`werk components` opens the component manager: scroll through installed runtimes,
+available updates and missing model dependencies, select individual operations or
+all updates, and follow their progress. `werk updates --json` provides a read-only
+scan; `werk update --all --dry-run` previews a complete update plan. See
+[component installation and updates](docs/backends.md#component-installation-and-updates).
 
 Already imported? Use its ID from `werk list`. To download instead, follow
 [Hugging Face pull setup](docs/getting-started.md#add-a-model), including Git LFS
@@ -133,9 +140,10 @@ curl -fsS http://127.0.0.1:11434/v1/models \
 ~~~
 
 For several installed text models, `werk serve --preload model-a model-b`
-performs ordered, best-effort loading and warmup. Successful instances remain
-resident until shutdown; unsupported paths or resource failures are logged and
-skipped. This does not generally warm image, video or audio generation.
+performs ordered loading and warmup with live status. Successful instances remain
+resident until shutdown; a setup or preload failure stops startup with a nonzero
+exit status. Rerun the complete command after resolving the cause; Werk does not
+restart with default parameters. This does not generally warm image, video or audio generation.
 See [preload semantics and limits](docs/reference/cli.md#startup-preload).
 
 ## Core capabilities

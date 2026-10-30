@@ -3805,6 +3805,7 @@ mod tests {
             pid: std::process::id(),
             mode: LlamaCppMode::Cpu,
             log_tail: Arc::new(Mutex::new(VecDeque::new())),
+            startup_memory_failure: Default::default(),
             log_readers: Mutex::new(Vec::new()),
             state_gate: std::sync::RwLock::new(()),
             startup_diagnostics: Vec::new(),

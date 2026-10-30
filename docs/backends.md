@@ -245,9 +245,9 @@ serve and backend doctor. An empty or invalid explicit override fails discovery;
 unset it to use the managed installation. Existing external installations remain
 selectable through `WERK_OMLX_BIN` and are not modified by the installer.
 
-**oMLX is never installed automatically**, including with
-`--auto-install-backends`. `serve`, `run`, `chat`, routing and doctor only discover
-and probe installed runtimes. Werk does not manage an oMLX system service or attach
+The model setup dialog can offer oMLX when it is the eligible missing runtime.
+Installation requires confirmation or `--auto-install-backends`. HTTP routing
+and doctor only discover and probe installed runtimes. Werk does not manage an oMLX system service or attach
 to an external oMLX server. It owns only the workers launched for its requests.
 
 Werk captures the executable and its Python environment together. Recognized
@@ -792,6 +792,8 @@ The current command surface is:
 
 ~~~text
 werk backend install TARGET
+werk backend update TARGET
+werk backend updates [--offline] [--json]
 werk backend list
 werk backend doctor [--debug]
 ~~~
@@ -821,6 +823,96 @@ text-analysis
 
 There is currently no <code>werk backend uninstall</code> command. See
 [Uninstall and cleanup](#uninstall-and-cleanup).
+
+### Component installation and updates
+
+~~~bash
+werk components                            # interactive component manager
+werk components --list --json              # inventory for scripts
+werk components --list --offline           # local inventory only
+werk updates --scope all --json             # read-only upstream scan
+werk updates --scope artifacts             # model revisions and projectors
+werk update llama-cpu --dry-run             # review one runtime update
+werk update external:omlx                   # update the discovered external oMLX environment
+werk update model:my-model                  # stage a managed model revision
+werk update werk                            # update this Werk executable
+werk update --all --include-missing --yes   # execute all supported updates and model setup
+~~~
+
+The manager filters install targets by OS, architecture and detected accelerators.
+It uses the existing model setup planner to identify required runtimes and vision
+assets. A compatible target can still need Python, build tools, a runner bundle or
+network access, which its installer checks. Unknown versions and registry errors
+remain visible and are never reported as current. `--offline` performs no registry
+requests and disables installation/update actions.
+
+Use arrows or Page Up/Page Down to scroll, Space to select, `a` to select all
+available installed component updates, `m` to select missing model requirements, and Enter
+to review the plan. `y` starts the reviewed queue; `n` returns to the inventory.
+`f` cycles filters, `v` switches to the scrollable queue/results, `r` rescans and
+returns to the component list, and `x` clears selection. Esc returns from a review
+or results view without exiting or cancelling installation; `q` quits (after the
+active installer finishes). During execution, the
+manager shows completed operations, the active operation, elapsed time and live
+installer output. `c` cancels pending operations after the current installer
+finishes. Failed operations are reported individually; completed operations remain.
+Installer output and exit statuses are retained in `MODEL_HOME/logs/components/`;
+the exact run log path is shown in the output. Rescanning does not erase these logs.
+Both `a` and `werk update --all` skip current, pinned and unchecked components;
+an explicit component update remains available for a deliberate retry.
+
+Python updates include dependencies using the installer's version constraints.
+Pinned CUDA profiles, oMLX and Qwen-TTS retain their supported pins. A newer PyPI
+release is an upstream availability signal, not proof that the host, Python version
+or other packages support it. Running inference services need a restart after
+runtime updates. llama.cpp updates build a fresh generation and select it only
+after validation; ordinary `backend install` continues to reuse its source checkout.
+The managed `media`, `transformers`, `text-analysis`, `qwen-tts`, `mlx`, `mlx-vlm`
+and `onnx-cpu` installers also honor an optional
+`MODEL_HOME/backends/TARGET/constraints.txt` containing package version constraints.
+The inventory uses both the installer's built-in version ranges and these local
+constraints. It offers the newest non-yanked stable release within those ranges
+that supports the current Python version. If only excluded versions are newer,
+it reports `pinned` and explains the version limit instead of repeatedly offering
+an update that the installer cannot apply. A validated accelerator-specific wheel
+is retained during later component updates.
+
+Existing external Python installations are discovered through Werk's interpreter
+overrides, normal runtime discovery and oMLX console launchers. Their exact Python
+path appears in the details and execution plan. Updates run in that environment,
+including shared dependencies, without creating a second managed installation.
+They require pip with `--dry-run --report` support and normal write access. Downgrades,
+editable packages and replacement of a different source are rejected before
+installation. Werk first checks the existing environment, then checks the proposed
+versions against the requirements of every installed package, including unrelated
+applications. Conflicts stop the update before packages are changed. Use
+`werk backend install media` or `werk backend install transformers` to provision
+an isolated Werk runtime when a shared application's pins are incompatible.
+An environment owned by another package manager may require that
+manager's update workflow; Werk never invokes `--break-system-packages` or sudo.
+
+Projectors already present in registered or linked model directories are scanned
+too. Werk uses saved source receipts, Hugging Face clone origins and snapshot
+identities; it does not guess a repository for an arbitrary local file. Model
+revision changes and projector content changes are reported separately. Updating
+a managed model stages the selected weights and matching vision assets before
+activation and retains the old model under `WERK_HOME/backups/model-updates/`.
+Linked external projectors can be updated individually when the upstream main
+weights still match the local model. Their previous file is retained alongside
+the source directory. Content-addressed Hugging Face snapshots remain immutable:
+link the newer complete snapshot instead. Files must first be registered with
+`werk import --link` or associated with the model's vision setup to be inventoried.
+
+Werk self-update uses the official checksum-verified release installer in a staging
+directory, checks the downloaded executable and retains the old binary. In-place
+self-update is available for the supported Linux and Apple Silicon release
+profiles; other platforms require the official installer or a source rebuild.
+`--all` includes the Werk update last, when a newer stable release is available.
+**Operating system packages and GPU drivers are outside this manager's scope.**
+
+`werk updates` exits nonzero for scan errors after printing its complete report.
+Unknown/offline entries are counted separately. JSON reports have `schema_version`,
+`offline`, per-component `entries`, and status counts in `summary`.
 
 ### Platform-aware explicit installation
 

@@ -1,7 +1,9 @@
 mod chat_persistence;
+mod components;
 mod diagnostics;
 mod media_diagnostics;
 mod model_list;
+mod model_setup;
 mod run_inference;
 mod terminal_activity;
 mod top;
@@ -158,7 +160,7 @@ pub struct Cli {
         global = true,
         action = ArgAction::SetTrue,
         conflicts_with = "no_auto_install_backends",
-        help = "Allow Werk to provision missing managed runtime backends during selection"
+        help = "Approve installation of missing model backends and feature components (including vision projectors)"
     )]
     pub auto_install_backends: bool,
 
@@ -718,7 +720,7 @@ pub enum Commands {
         model: Option<String>,
 
         #[arg(long, value_name = "MODEL", num_args = 1.., action = ArgAction::Append,
-            help = "Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, failures are logged and skipped")]
+            help = "Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, startup exits on failure")]
         preload: Vec<String>,
 
         #[arg(
@@ -1036,6 +1038,25 @@ pub enum Commands {
         command: BackendCommands,
     },
 
+    #[command(
+        about = "Scan installed backends, models and vision projectors for updates without changing them",
+        visible_alias = "update-scan"
+    )]
+    Updates {
+        #[command(flatten)]
+        options: crate::backend::updates::ScanOptions,
+        #[arg(long, value_enum, default_value = "all", help = "Components to scan")]
+        scope: crate::backend::updates::ScanScope,
+    },
+
+    #[command(about = "Browse, install and update host-compatible components in a terminal UI")]
+    Components(components::ComponentsArgs),
+
+    #[command(
+        about = "Update a managed component or all installed compatible components, including dependencies"
+    )]
+    Update(components::UpdateArgs),
+
     #[command(about = "Manage optimized runtime artifacts for installed models")]
     Artifacts {
         #[command(subcommand)]
@@ -1167,6 +1188,15 @@ pub enum Commands {
     },
 
     #[command(
+        about = "Check all model features and offer to install missing backends and components"
+    )]
+    Setup {
+        model: String,
+        #[command(flatten)]
+        vision: crate::backend::vision_setup::VisionOptions,
+    },
+
+    #[command(
         about = "Remove an installed model from the managed model store",
         alias = "rm",
         alias = "delete"
@@ -1254,6 +1284,22 @@ pub enum DoctorCommands {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackendCommands {
+    #[command(about = "Update a managed backend and its compatible dependencies")]
+    Update {
+        #[arg(value_enum)]
+        target: BackendInstallArg,
+        #[command(flatten)]
+        vision: crate::backend::vision_setup::VisionOptions,
+    },
+    #[command(
+        about = "Scan installed managed backends for updates without installing them",
+        visible_alias = "update-scan"
+    )]
+    Updates {
+        #[command(flatten)]
+        options: crate::backend::updates::ScanOptions,
+    },
+
     #[command(about = "Install a managed runtime backend")]
     Install {
         #[arg(
@@ -1657,7 +1703,7 @@ pub async fn run_from_env() -> Result<()> {
         verbose,
         pure,
         title == "serve",
-        title != "top" || !machine,
+        !matches!(title.as_str(), "top" | "components") || !machine,
     )?;
     crate::logging::emit(
         crate::logging::Level::Debug,
@@ -1676,7 +1722,7 @@ pub async fn run_from_env() -> Result<()> {
             json!({"command":title}),
         );
     }
-    if result.is_ok() && title != "top" {
+    if result.is_ok() && !matches!(title.as_str(), "top" | "components") {
         crate::terminal::finish();
     }
     crate::logging::flush();
@@ -1716,6 +1762,7 @@ fn console_command(matches: &clap::ArgMatches) -> (String, bool) {
             Some("gpus" | "deployment-plan" | "inspect" | "runtime")
         )
         || path == ["temp", "path"]
+        || path.first() == Some(&"components")
         || path.first() == Some(&"top")
             && !node
                 .try_get_one::<bool>("once")
@@ -1852,6 +1899,29 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .with_omlx_server_prefix_cache(server_omlx_prefix_cache_enabled(
                     &server_persistence,
                 ));
+            let mut setup_models: Vec<_> = model
+                .iter()
+                .chain(preload.iter())
+                .chain(image_model.iter())
+                .cloned()
+                .collect();
+            setup_models.sort();
+            setup_models.dedup();
+            for id in setup_models {
+                let setup_store = store.clone();
+                crate::logging::spawn_blocking(move || {
+                    model_setup::ensure(
+                        &setup_store,
+                        &id,
+                        backend_choice,
+                        selection_options,
+                        false,
+                        true,
+                    )
+                })
+                .await?
+                .context("Model setup failed; werk serve stopped. Resolve the reported cause, then rerun your complete serve command with all parameters")?;
+            }
             let backend = build_generation_backend(
                 store.clone(),
                 backend_choice,
@@ -1881,37 +1951,35 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .filter(|_| cli.deployments.is_none() && preload.is_empty())
             {
                 let manifest = store.get(model)?;
-                with_terminal_spinner(
-                    terminal_spinner_enabled(false),
-                    format!("Loading default model '{model}'..."),
-                    || {
-                        if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
-                            let options = text_policy.apply(Default::default())?;
-                            let diagnostics =
-                                crate::backend::text_analysis::TextAnalysisBackend::new(
-                                    store.clone(),
-                                )
+                let activity =
+                    crate::terminal::Activity::start(format!("Preparing default model {model}"));
+                let preparation = (|| {
+                    if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
+                        let options = text_policy.apply(Default::default())?;
+                        let diagnostics =
+                            crate::backend::text_analysis::TextAnalysisBackend::new(store.clone())
                                 .diagnostics(&manifest, &options)?;
-                            if diagnostics["ready"].as_bool() != Some(true) {
-                                return Err(diagnostics::RuntimeSetupRequired {
-                                    detail: diagnostics["detail"]
-                                        .as_str()
-                                        .unwrap_or("Text-analysis runtime unavailable")
-                                        .to_string(),
-                                    backend: options.backend.clone(),
-                                }
-                                .into());
+                        if diagnostics["ready"].as_bool() != Some(true) {
+                            return Err(diagnostics::RuntimeSetupRequired {
+                                detail: diagnostics["detail"]
+                                    .as_str()
+                                    .unwrap_or("Text-analysis runtime unavailable")
+                                    .to_string(),
+                                backend: options.backend.clone(),
                             }
-                            crate::ui_println!(
-                                "Text-analysis model: use {}; weights load on the first request",
-                                crate::backend::text_analysis::endpoint(task)
-                            );
-                            Ok(())
-                        } else {
-                            backend.prepare(&manifest)
+                            .into());
                         }
-                    },
-                )?;
+                        crate::ui_println!(
+                            "Text-analysis model: use {}; weights load on the first request",
+                            crate::backend::text_analysis::endpoint(task)
+                        );
+                        Ok(())
+                    } else {
+                        backend.prepare(&manifest)
+                    }
+                })();
+                preparation.context("Default model preparation failed; werk serve stopped. Resolve the reported cause, then rerun your complete serve command with all parameters")?;
+                activity.finish();
                 crate::ui_println!("Default model available: {model}");
             }
             if let Some(image_model) = image_model.as_deref() {
@@ -1949,7 +2017,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 crate::ui_println!("{summary}");
             }
             if !preload.is_empty() {
-                api_state.preload_models(&preload).await;
+                let report = api_state.preload_models(&preload).await;
+                anyhow::ensure!(
+                    report.ready == report.attempted,
+                    "Model preload failed ({} of {} ready); werk serve stopped. Resolve the reported cause, then rerun your complete serve command with all parameters. No automatic restart was attempted",
+                    report.ready,
+                    report.attempted
+                );
             }
             serve_with_listener(listener, api_state).await
         }
@@ -2006,7 +2080,19 @@ pub async fn run(cli: Cli) -> Result<()> {
             let images = normalize_cli_image_sources(&images)?;
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
-            let manifest = store.get(&model)?;
+            let setup_store = store.clone();
+            let setup_id = model.clone();
+            let manifest = crate::logging::spawn_blocking(move || {
+                model_setup::ensure(
+                    &setup_store,
+                    &setup_id,
+                    backend_choice,
+                    selection_options,
+                    false,
+                    true,
+                )
+            })
+            .await??;
             if let Some(task) = crate::backend::text_analysis::task_for(&manifest) {
                 bail!(
                     "Model '{}' performs {}, not chat generation. Start werk serve --model '{}' and send a request to {}. Use werk doctor --model '{}' to inspect runtime readiness.",
@@ -2209,15 +2295,45 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ),
             }
         }
+        Commands::Components(args) => {
+            let store = ModelStore::resolve(model_home)?;
+            crate::logging::spawn_blocking(move || components::run(store, args)).await?
+        }
+        Commands::Update(args) => {
+            let store = ModelStore::resolve(model_home)?;
+            crate::logging::spawn_blocking(move || components::update(store, args)).await?
+        }
+        Commands::Updates { options, scope } => {
+            let store = ModelStore::resolve(model_home)?;
+            crate::logging::spawn_blocking(move || {
+                crate::backend::updates::run(&store, scope, &options)
+            })
+            .await?
+        }
         Commands::Backend { command } => {
             let store = ModelStore::resolve(model_home)?;
+            let updating = matches!(&command, BackendCommands::Update { .. });
             match command {
-                BackendCommands::Install { target, vision } => {
+                BackendCommands::Updates { options } => {
+                    crate::logging::spawn_blocking(move || {
+                        crate::backend::updates::run(
+                            &store,
+                            crate::backend::updates::ScanScope::Backends,
+                            &options,
+                        )
+                    })
+                    .await?
+                }
+                BackendCommands::Install { target, vision }
+                | BackendCommands::Update { target, vision } => {
                     anyhow::ensure!(
                         !vision.offline,
                         "Offline mode does not install runtimes; inspect existing components with werk backend doctor"
                     );
                     let target_name = target.to_possible_value().expect("install target");
+                    if updating {
+                        components::ensure_compatible(&store, target_name.get_name())?;
+                    }
                     crate::backend::python_install::ensure_install_platform(
                         target
                             .to_possible_value()
@@ -2229,6 +2345,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                         target_name.get_name(),
                         &vision,
                     )?;
+                    let activity = crate::terminal::Activity::start(format!(
+                        "Installing backend {}",
+                        target_name.get_name()
+                    ));
+                    activity.phase("Installing and checking runtime components");
                     if let Some(mode) = target.mode() {
                         let executable = install_managed_llama_server_with_options(
                             &store,
@@ -2238,6 +2359,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 cuda_offload: target == BackendInstallArg::LlamaCudaOffload,
                                 cuda_nvfp4: target == BackendInstallArg::LlamaCudaNvfp4,
                                 vision: vision_choice == Some(true),
+                                update: updating,
                                 ..Default::default()
                             },
                         )?;
@@ -2247,14 +2369,25 @@ pub async fn run(cli: Cli) -> Result<()> {
                             executable.display()
                         );
                     } else if let Some(mode) = target.onnx_mode() {
-                        let executable = install_managed_onnx_runtime(&store, mode)?;
+                        let executable = if updating
+                            && mode == OnnxRuntimeMode::Cpu
+                            && crate::backend::python_install::PythonBackend::OnnxCpu
+                                .managed_python(&store)
+                                .is_some()
+                        {
+                            crate::backend::python_install::PythonBackend::OnnxCpu
+                                .install(&store)?
+                        } else {
+                            install_managed_onnx_runtime(&store, mode)?
+                        };
                         crate::ui_println!(
                             "Installed {} runtime: {}",
                             mode.display(),
                             executable.display()
                         );
                     } else if let Some(backend) = target.python_backend() {
-                        let python = if vision_choice == Some(true)
+                        let python = if !updating
+                            && vision_choice == Some(true)
                             && MlxVlmBackend::probe_for_store(&store).is_ok()
                         {
                             crate::ui_eprintln!(
@@ -2270,7 +2403,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                             python.display()
                         );
                     } else if target == BackendInstallArg::Vllm {
-                        let python = install_managed_vllm(&store)?;
+                        let python = if updating {
+                            crate::backend::update_managed_vllm(&store)?
+                        } else {
+                            install_managed_vllm(&store)?
+                        };
                         crate::ui_println!("Installed vLLM backend: {}", python.display());
                     } else if target == BackendInstallArg::Omlx {
                         let launcher = crate::backend::install_managed_omlx(&store)?;
@@ -2281,7 +2418,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                             );
                         }
                     } else if target == BackendInstallArg::QwenTts {
-                        let python = install_managed_qwen_tts(&store)?;
+                        let python = if updating {
+                            crate::backend::update_managed_qwen_tts(&store)?
+                        } else {
+                            install_managed_qwen_tts(&store)?
+                        };
                         crate::ui_println!("Installed Qwen-TTS backend: {}", python.display());
                     } else if target == BackendInstallArg::TextAnalysis {
                         let python = crate::backend::text_analysis::install(&store)?;
@@ -2298,6 +2439,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             target_name.get_name()
                         );
                     }
+                    activity.finish();
                     Ok(())
                 }
                 BackendCommands::List => {
@@ -2640,14 +2782,44 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name.as_deref(),
                 file.as_deref(),
                 projector.as_deref(),
-                vision.vision,
-                |description| vision.decide(description, None),
+                false,
+                |_| Ok(false),
                 |event| {
                     update_pull_progress(&progress, event);
                 },
             )?;
             progress.finish_and_clear();
             print_manifest_summary("Pulled", &manifest);
+            let choice = resolve_backend(backend_override, device_override)?;
+            let id = manifest.id.clone();
+            crate::logging::spawn_blocking(move || {
+                model_setup::ensure(
+                    &store,
+                    &id,
+                    choice,
+                    selection_options,
+                    false,
+                    !vision.text_only,
+                )
+            })
+            .await??;
+            Ok(())
+        }
+        Commands::Setup { model, vision } => {
+            let store = ModelStore::resolve(model_home)?;
+            let choice = resolve_backend(backend_override, device_override)?;
+            let manifest = crate::logging::spawn_blocking(move || {
+                model_setup::ensure(
+                    &store,
+                    &model,
+                    choice,
+                    selection_options,
+                    vision.offline,
+                    !vision.text_only,
+                )
+            })
+            .await??;
+            print_manifest_summary("Checked", &manifest);
             Ok(())
         }
         Commands::Remove { id } => {
@@ -5104,11 +5276,15 @@ fn should_print_startup_banner_for(
         | Commands::Import { .. }
         | Commands::Convert { .. }
         | Commands::Pull { .. }
+        | Commands::Setup { .. }
         | Commands::Remove { .. }
         | Commands::Estimate { .. }
         | Commands::Bench { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
+        | Commands::Updates { .. }
+        | Commands::Components(..)
+        | Commands::Update(..)
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
@@ -5136,10 +5312,14 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         Commands::Import { .. }
         | Commands::Convert { .. }
         | Commands::Pull { .. }
+        | Commands::Setup { .. }
         | Commands::Remove { .. }
         | Commands::Estimate { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
+        | Commands::Updates { .. }
+        | Commands::Components(..)
+        | Commands::Update(..)
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
         | Commands::Temp { .. }
@@ -9388,14 +9568,21 @@ struct SelectionOptions {
     verbose_backend_installs: bool,
     vllm_automatic_prefix_caching: Option<bool>,
     omlx_server_prefix_cache: bool,
+    setup_policy: model_setup::SetupPolicy,
 }
 
 impl SelectionOptions {
-    fn from_cli(backend: BackendArg, auto_install: bool, no_auto_install: bool) -> Self {
-        let default_provision = matches!(backend, BackendArg::Auto);
+    fn from_cli(_backend: BackendArg, auto_install: bool, no_auto_install: bool) -> Self {
         Self {
             fp4_kernel: None,
-            provision_missing_backends: !no_auto_install && (auto_install || default_provision),
+            provision_missing_backends: false,
+            setup_policy: if no_auto_install {
+                model_setup::SetupPolicy::Never
+            } else if auto_install {
+                model_setup::SetupPolicy::Approve
+            } else {
+                model_setup::SetupPolicy::Ask
+            },
             verbose_backend_installs: false,
             vllm_automatic_prefix_caching: None,
             omlx_server_prefix_cache: false,
@@ -10140,6 +10327,11 @@ impl MlxPreferredBackend {
 }
 
 impl GenerationBackend for MlxPreferredBackend {
+    fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
+        self.backend_for_request(manifest, has_images)
+            .is_ok_and(|backend| backend.supports_tool_calling(manifest, has_images))
+    }
+
     fn reasoning_config(
         &self,
         manifest: &ModelManifest,
@@ -15096,30 +15288,29 @@ mod tests {
     }
 
     #[test]
-    fn auto_install_policy_defaults_to_auto_only() {
-        assert!(
-            SelectionOptions::from_cli(BackendArg::Auto, false, false).provision_missing_backends
-        );
-        assert!(
-            !SelectionOptions::from_cli(BackendArg::Auto, false, false).verbose_backend_installs
-        );
-        assert!(
-            SelectionOptions::from_cli(BackendArg::Auto, false, false)
-                .with_backend_install_output(true)
-                .verbose_backend_installs
-        );
-        assert!(
-            !SelectionOptions::from_cli(BackendArg::Onnx, false, false).provision_missing_backends
-        );
-        assert!(
-            !SelectionOptions::from_cli(BackendArg::Cuda, false, false).provision_missing_backends
-        );
-        assert!(
-            SelectionOptions::from_cli(BackendArg::Cuda, true, false).provision_missing_backends
-        );
-        assert!(
-            !SelectionOptions::from_cli(BackendArg::Auto, false, true).provision_missing_backends
-        );
+    fn setup_policy_requires_confirmation_unless_explicitly_approved() {
+        use model_setup::SetupPolicy;
+        for backend in [BackendArg::Auto, BackendArg::Cuda, BackendArg::Onnx] {
+            let options = SelectionOptions::from_cli(backend, false, false);
+            assert_eq!(options.setup_policy, SetupPolicy::Ask);
+            assert!(!options.provision_missing_backends);
+            assert!(!options.verbose_backend_installs);
+            assert!(
+                options
+                    .with_backend_install_output(true)
+                    .verbose_backend_installs
+            );
+            let approved = SelectionOptions::from_cli(backend, true, false);
+            assert_eq!(approved.setup_policy, SetupPolicy::Approve);
+            assert!(
+                !approved.provision_missing_backends,
+                "request probes must never install"
+            );
+            assert_eq!(
+                SelectionOptions::from_cli(backend, false, true).setup_policy,
+                SetupPolicy::Never
+            );
+        }
     }
 
     #[test]

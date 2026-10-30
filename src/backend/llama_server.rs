@@ -30,6 +30,7 @@ use super::model_file_cache;
 mod expert_memory;
 mod probe;
 mod runtime_state;
+mod startup;
 mod telemetry;
 #[cfg(test)]
 mod tool_call_tests;
@@ -69,7 +70,6 @@ const API_OPTIONS: &[&str] = &[
     "reasoning_budget_tokens",
     "__werk_thinking",
 ];
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 static STRIX_HALO: OnceLock<bool> = OnceLock::new();
@@ -113,6 +113,7 @@ struct LlamaServerProcess {
     pid: u32,
     mode: LlamaCppMode,
     log_tail: Arc<Mutex<VecDeque<String>>>,
+    startup_memory_failure: Arc<OnceLock<String>>,
     log_readers: Mutex<Vec<thread::JoinHandle<()>>>,
     state_gate: std::sync::RwLock<()>,
     state_runtime: LlamaProcessStateRuntime,
@@ -276,6 +277,22 @@ impl LlamaServerBackend {
         policy: Option<super::Fp4Kernel>,
     ) -> Result<String> {
         let projector = Self::validate_image_model(store, manifest)?;
+        Self::probe_image_runtime(store, manifest, mode, policy)?;
+        Ok(format!(
+            "llama.cpp server {} advertises the image path and a local projector is selected; architecture/projector compatibility and actual image inference remain untested ({})",
+            display_name(mode),
+            projector.display()
+        ))
+    }
+
+    /// Check the runtime independently so setup can offer a missing projector
+    /// and a multimodal runtime upgrade in the same confirmation.
+    pub(crate) fn probe_image_runtime(
+        store: &ModelStore,
+        manifest: &ModelManifest,
+        mode: LlamaCppMode,
+        policy: Option<super::Fp4Kernel>,
+    ) -> Result<()> {
         let discovery = require_llama_server_for_model(store, mode, manifest, policy)?;
         let executable = discovery
             .path
@@ -287,11 +304,7 @@ impl LlamaServerBackend {
                 display_name(mode)
             );
         }
-        Ok(format!(
-            "llama.cpp server {} advertises the image path and a local projector is selected; architecture/projector compatibility and actual image inference remain untested ({})",
-            display_name(mode),
-            projector.display()
-        ))
+        Ok(())
     }
 
     pub(crate) fn can_auto_install_nvfp4() -> bool {
@@ -822,6 +835,9 @@ impl LlamaServerProcess {
         runtime_options: &LlamaRuntimeOptions,
         deployment: Option<&crate::deployments::Execution>,
     ) -> Result<Self> {
+        let health_timeout = startup::timeout()?;
+        let activity = crate::terminal::Activity::start(format!("Loading model {}", manifest.id));
+        activity.phase("Checking llama.cpp runtime and launch parameters");
         let reservation = deployment
             .map(crate::deployments::Execution::reserve)
             .transpose()?;
@@ -933,6 +949,7 @@ impl LlamaServerProcess {
             .flatten();
 
         crate::ui_eprintln!("Using llama.cpp server {} backend", display_name(mode));
+        activity.phase("Preparing model files and memory policy");
         #[cfg(target_os = "linux")]
         let model_file_cache =
             model_file_cache::CacheReleaseGuard::prepare(model_path, projector_path, &args);
@@ -949,15 +966,12 @@ impl LlamaServerProcess {
         command.args(&args);
         execution.apply(&mut command);
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
-        if env_true("WERK_LLAMA_LOG")
-            && !crate::logging::enabled()
-            && !crate::terminal::interactive(crate::terminal::Stream::Err)
-        {
-            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        } else {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        }
+        let startup_memory_failure = Arc::new(OnceLock::new());
+        // Always inspect native diagnostics, including raw library logging.
+        // Otherwise WERK_LLAMA_LOG could bypass the startup memory check.
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let spawn_started = Instant::now();
+        activity.phase("Starting llama-server");
         let child = match super::llama_process_lifecycle::ManagedChild::spawn(&mut command) {
             Ok(child) => child,
             Err(error) => {
@@ -971,16 +985,21 @@ impl LlamaServerProcess {
         };
         let mut child_process = child.lock().unwrap_or_else(|e| e.into_inner());
         let mut log_readers = Vec::new();
-        if !env_true("WERK_LLAMA_LOG")
-            || crate::logging::enabled()
-            || crate::terminal::interactive(crate::terminal::Stream::Err)
-        {
-            if let Some(stdout) = child_process.stdout.take() {
-                log_readers.push(spawn_log_tail_reader("stdout", stdout, log_tail.clone()));
-            }
-            if let Some(stderr) = child_process.stderr.take() {
-                log_readers.push(spawn_log_tail_reader("stderr", stderr, log_tail.clone()));
-            }
+        if let Some(stdout) = child_process.stdout.take() {
+            log_readers.push(spawn_log_tail_reader(
+                "stdout",
+                stdout,
+                log_tail.clone(),
+                startup_memory_failure.clone(),
+            ));
+        }
+        if let Some(stderr) = child_process.stderr.take() {
+            log_readers.push(spawn_log_tail_reader(
+                "stderr",
+                stderr,
+                log_tail.clone(),
+                startup_memory_failure.clone(),
+            ));
         }
         let pid = child_process.id();
         drop(child_process);
@@ -1005,6 +1024,7 @@ impl LlamaServerProcess {
             pid,
             mode,
             log_tail,
+            startup_memory_failure,
             log_readers: Mutex::new(log_readers),
             state_gate: std::sync::RwLock::new(()),
             state_runtime: LlamaProcessStateRuntime {
@@ -1027,15 +1047,17 @@ impl LlamaServerProcess {
         }
         // Do not compete with native model loading for disk/cache bandwidth.
         // Session library hashing and snapshot reads begin only after startup.
-        let ready = process.wait_until_ready();
+        let ready = process.wait_until_ready(&activity, health_timeout);
         let ready_seconds = spawn_started.elapsed().as_secs_f64();
         if let Err(error) = ready {
+            activity.phase("Stopping failed runtime and releasing model memory");
             if let Some(snapshot_dir) = process.state_runtime.snapshot_dir.as_deref() {
                 cleanup_llama_snapshot_dir(snapshot_dir);
             }
             return Err(error);
         }
         let final_started = Instant::now();
+        activity.phase("Checking ready runtime identity");
         let unchanged = inspection
             .as_ref()
             .is_some_and(|value| value.verify_unchanged(&process.executable).is_ok());
@@ -1049,6 +1071,7 @@ impl LlamaServerProcess {
             format!("llama.cpp final identity validation duration: {final_seconds:.6}s"),
             "llama.cpp cache file preparation: deferred until native startup completes".into(),
         ]);
+        activity.finish();
         Ok(process)
     }
 
@@ -1159,31 +1182,86 @@ impl LlamaServerProcess {
         Ok(completion)
     }
 
-    fn wait_until_ready(&self) -> Result<()> {
+    fn wait_until_ready(
+        &self,
+        activity: &crate::terminal::Activity,
+        timeout: Duration,
+    ) -> Result<()> {
         let started = Instant::now();
+        let mut phase = "Loading weights and projector";
+        activity.phase(format!(
+            "{phase}; PID {}; timeout {}s",
+            self.pid,
+            timeout.as_secs()
+        ));
         loop {
+            // Native fitting failure is logged as a warning, but continuing can
+            // cause host/GPU memory thrashing. Stop before waiting for readiness.
+            self.check_startup_memory()?;
+            let lines = self
+                .log_tail
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(next) = lines.iter().rev().find_map(|line| startup_phase(line)) {
+                if next != phase {
+                    phase = next;
+                    activity.phase(format!(
+                        "{phase}; PID {}; timeout {}s",
+                        self.pid,
+                        timeout.as_secs()
+                    ));
+                }
+            }
             if let Some(status) = self.try_wait_status()? {
                 self.drain_exit_logs();
+                self.check_startup_memory()?;
                 bail!(
                     "llama-server exited before becoming healthy ({status}){}",
                     self.formatted_log_tail()
                 );
             }
-            if let Ok(response) = get(&self.url, "/health")
-                && response.status == 200
-            {
-                return Ok(());
-            }
-            if started.elapsed() > HEALTH_TIMEOUT {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
                 bail!(
-                    "timed out waiting for llama-server {} at {}{}",
+                    "timed out after {}s waiting for llama-server {} at {}. For a slow cold start, increase WERK_LLAMA_HEALTH_TIMEOUT_SECONDS and rerun the complete command; also check the reported memory/launch settings{}",
+                    timeout.as_secs(),
                     self.pid,
                     self.url,
                     self.formatted_log_tail()
                 );
             }
-            std::thread::sleep(HEALTH_POLL_INTERVAL);
+            let healthy =
+                startup::healthy(&self.url, remaining.min(Duration::from_secs(1))).unwrap_or(false);
+            self.check_startup_memory()?;
+            if healthy {
+                return Ok(());
+            }
+            std::thread::sleep(HEALTH_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
         }
+    }
+
+    fn check_startup_memory(&self) -> Result<()> {
+        if let Some(reason) = self.startup_memory_failure.get() {
+            // Stop allocations before rendering diagnostics (a terminal or log
+            // pipe may block). Normal process destruction then reaps the worker.
+            let _ = self.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            let message = format!(
+                "llama.cpp memory fitting failed; stopping the runtime to avoid continuing with an unverified memory allocation. Native reason: {reason}. Review GPU/CPU placement, context and parallel slots; use automatic fitting only if supported by this backend. Launch parameters are unchanged. Rerun the complete command after correcting the configuration."
+            );
+            if crate::logging::enabled() {
+                crate::logging::emit(
+                    crate::logging::Level::Error,
+                    "backend.startup.memory_rejected",
+                    &message,
+                    json!({"model": self.model_id, "backend_pid": self.pid}),
+                );
+            } else {
+                crate::ui_eprintln!("Error: {message}");
+            }
+            bail!("{message}{}", self.formatted_log_tail());
+        }
+        Ok(())
     }
 
     fn is_running(&self) -> bool {
@@ -1277,7 +1355,6 @@ impl Drop for LlamaServerProcess {
 }
 
 struct HttpResponse {
-    status: u16,
     headers: Vec<(String, String)>,
     reader: BufReader<TcpStream>,
 }
@@ -2168,10 +2245,6 @@ fn number_field(value: &Value, path: &[&str]) -> Option<f64> {
         .or_else(|| current.as_u64().map(|v| v as f64))
 }
 
-fn get(base_url: &str, path: &str) -> Result<HttpResponse> {
-    request(base_url, path, "GET", None)
-}
-
 fn post_json(base_url: &str, path: &str, body: &Value) -> Result<HttpResponse> {
     request(base_url, path, "POST", Some(body))
 }
@@ -2221,11 +2294,7 @@ fn request(base_url: &str, path: &str, method: &str, body: Option<&Value>) -> Re
         let _ = reader.read_to_string(&mut text);
         bail!("llama-server HTTP {status}: {}", text.trim());
     }
-    Ok(HttpResponse {
-        status,
-        headers,
-        reader,
-    })
+    Ok(HttpResponse { headers, reader })
 }
 
 fn stream_body<F>(response: &mut HttpResponse, mut on_bytes: F) -> Result<()>
@@ -2360,6 +2429,8 @@ pub struct LlamaServerInstallOptions {
     pub preserve_active: bool,
     /// Reuse a verified image entry point, or stage a replacement separately.
     pub vision: bool,
+    /// Build a fresh generation from upstream; keep the active binary intact.
+    pub update: bool,
 }
 
 pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<PathBuf> {
@@ -2408,7 +2479,7 @@ pub fn install_managed_llama_server_with_options(
     } else {
         base_root
     };
-    if options.vision {
+    if options.vision && !options.update {
         let mut candidates = server_candidates_under(&root);
         if !options.cuda_offload && !options.cuda_nvfp4 {
             candidates.extend(discover_llama_server(store, mode).path);
@@ -2426,6 +2497,16 @@ pub fn install_managed_llama_server_with_options(
             return Ok(existing);
         }
     }
+    fs::create_dir_all(&root)?;
+    let profile_root = root.clone();
+    let root = if options.update {
+        tempfile::Builder::new()
+            .prefix("generation-update-")
+            .tempdir_in(&root)?
+            .keep()
+    } else {
+        root
+    };
     let source_dir = root.join("llama.cpp");
     // Keep the old executable and its shared libraries intact until the new
     // image-capable generation has passed validation and is selected atomically.
@@ -2669,10 +2750,10 @@ pub fn install_managed_llama_server_with_options(
     if options.cuda_offload {
         cuda_offload::validate_runtime(&executable)?;
     }
-    if options.vision && (options.cuda_nvfp4 || options.cuda_offload) {
+    if (options.vision || options.update) && (options.cuda_nvfp4 || options.cuda_offload) {
         // Model-specific profile discovery must find the validated generation,
         // not an old fixed build directory or an unvalidated staging directory.
-        select_managed_server_path(&root.join("llama-server.path"), &executable)?;
+        select_managed_server_path(&profile_root.join("llama-server.path"), &executable)?;
     }
     if !options.preserve_active {
         select_managed_server_path(&managed_path_file(store, mode), &executable)?;
@@ -3013,7 +3094,7 @@ fn managed_server_candidates(store: &ModelStore, mode: LlamaCppMode) -> Vec<Path
     server_candidates_under(&root)
 }
 
-fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
+pub(super) fn server_candidates_under(root: &Path) -> Vec<PathBuf> {
     let source = root.join("llama.cpp");
     let build = root.join("build");
     let exe = default_executable_name();
@@ -3661,32 +3742,47 @@ fn spawn_log_tail_reader<R>(
     label: &'static str,
     reader: R,
     tail: Arc<Mutex<VecDeque<String>>>,
+    startup_memory_failure: Arc<OnceLock<String>>,
 ) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
+    let context = crate::logging::capture();
     thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines().map_while(Result::ok) {
-            if env_true("WERK_LLAMA_LOG") && crate::logging::enabled() {
-                crate::logging::emit(
-                    crate::logging::Level::Debug,
-                    "backend.output",
-                    &line,
-                    serde_json::json!({"runtime":"llama.cpp", "stream":label}),
-                );
-            } else if env_true("WERK_LLAMA_LOG")
-                && crate::terminal::interactive(crate::terminal::Stream::Err)
-            {
-                crate::ui_eprintln!("[llama.cpp] {line}");
-            }
-            if let Ok(mut tail) = tail.lock() {
-                if tail.len() >= 80 {
-                    tail.pop_front();
+        crate::logging::with_context(context, || {
+            let reader = BufReader::new(reader);
+            for line in reader.lines().map_while(Result::ok) {
+                // Latch before any potentially blocked console writes. The rolling
+                // tail can evict this line during a burst of native diagnostics.
+                if startup::memory_fitting_failed(&line) {
+                    let _ = startup_memory_failure.set(line.clone());
                 }
-                tail.push_back(format!("{label}: {line}"));
+                if let Ok(mut tail) = tail.lock() {
+                    if tail.len() >= 80 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(format!("{label}: {line}"));
+                }
+                if env_true("WERK_LLAMA_LOG") && crate::logging::enabled() {
+                    crate::logging::emit(
+                        crate::logging::Level::Debug,
+                        "backend.output",
+                        &line,
+                        serde_json::json!({"runtime":"llama.cpp", "stream":label}),
+                    );
+                } else if env_true("WERK_LLAMA_LOG")
+                    && crate::terminal::interactive(crate::terminal::Stream::Err)
+                {
+                    crate::ui_eprintln!("[llama.cpp] {line}");
+                } else if env_true("WERK_LLAMA_LOG") && !crate::logging::enabled() {
+                    if label == "stdout" {
+                        let _ = writeln!(std::io::stdout().lock(), "{line}");
+                    } else {
+                        let _ = writeln!(std::io::stderr().lock(), "{line}");
+                    }
+                }
             }
-        }
+        })
     })
 }
 
@@ -3876,6 +3972,22 @@ fn find_sse_boundary(bytes: &[u8]) -> Option<usize> {
 
 fn estimate_tokens(text: &str) -> usize {
     text.split_whitespace().count().max(1)
+}
+
+fn startup_phase(line: &str) -> Option<&'static str> {
+    if line.contains("warming up") {
+        Some("Running native warmup")
+    } else if line.contains("clip_model_load") || line.contains("projector") {
+        Some("Loading vision projector")
+    } else if line.contains("llama_context") || line.contains("KV buffer") {
+        Some("Allocating inference context")
+    } else if line.contains("load_tensors") || line.contains("load_all_data") {
+        Some("Loading model tensors")
+    } else if line.contains("loading model") {
+        Some("Loading model weights")
+    } else {
+        None
+    }
 }
 
 fn gpu_layers(mode: LlamaCppMode) -> i32 {

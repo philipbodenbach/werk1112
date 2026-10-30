@@ -16,6 +16,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+pub(crate) const TILELANG_PACKAGE: &str = "tilelang>=0.1.14,<0.2";
+
 pub fn install(store: &ModelStore) -> Result<PathBuf> {
     super::python_install::ensure_install_platform("text-analysis")?;
     use std::process::Command;
@@ -46,22 +48,29 @@ pub fn install(store: &ModelStore) -> Result<PathBuf> {
         &requirements,
         include_str!("../../runtime/requirements-text-analysis.txt"),
     )?;
-    let status = crate::terminal::command_status(
+    let status = crate::terminal::command_status(super::python_install::with_constraints(
         Command::new(&python)
-            .args(["-m", "pip", "install", "--upgrade", "-r"])
+            .args([
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--upgrade-strategy",
+                "eager",
+                "-r",
+            ])
             .arg(&requirements),
-    )?;
+        &root,
+    ))?;
     ensure!(
         status.success(),
         "Text-analysis dependency installation failed. Check the pip error above, then retry werk backend install text-analysis; alternatively set WERK_TEXT_PYTHON to a compatible environment"
     );
     if cfg!(target_os = "linux") {
-        let status = crate::terminal::command_status(Command::new(&python).args([
-            "-m",
-            "pip",
-            "install",
-            "tilelang>=0.1.14,<0.2",
-        ]))?;
+        let status = crate::terminal::command_status(super::python_install::with_constraints(
+            Command::new(&python).args(["-m", "pip", "install", TILELANG_PACKAGE]),
+            &root,
+        ))?;
         if !status.success() {
             crate::ui_eprintln!(
                 "Optional Laya TileLang acceleration could not be installed; the PyTorch CUDA/CPU fallback remains available. Install laya[fast] in {} to retry.",
@@ -69,6 +78,11 @@ pub fn install(store: &ModelStore) -> Result<PathBuf> {
             );
         }
     }
+    ensure!(
+        crate::terminal::command_status(Command::new(&python).args(["-m", "pip", "check"]))?
+            .success(),
+        "Text-analysis dependency validation failed"
+    );
     Ok(python)
 }
 

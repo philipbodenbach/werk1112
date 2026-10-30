@@ -114,8 +114,21 @@ fn install_with(
     )?;
     // Upstream's versioned source declares the compatible MLX dependency pins.
     run(
-        Command::new(&python).args(["-I", "-m", "pip", "install", PACKAGE]),
+        Command::new(&python).args([
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--upgrade-strategy",
+            "eager",
+            PACKAGE,
+        ]),
         "Could not install oMLX",
+    )?;
+    run(
+        Command::new(&python).args(["-I", "-m", "pip", "check"]),
+        "oMLX dependency validation failed",
     )?;
     run(
         Command::new(&python).args(["-I", "-c", VALIDATE]),

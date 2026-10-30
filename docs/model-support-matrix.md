@@ -31,7 +31,7 @@ werk serve --preload mistral-large-4 flux-3-image eleven_v4
 
 Keys belong in `MISTRAL_API_KEY`, `BFL_API_KEY`, `ELEVENLABS_API_KEY`; neither
 registration nor listing requires them. Preload without a needed key logs a
-per-model failure and continues. With a key, cloud preload performs **no network
+per-model failure and stops server startup. With a key, cloud preload performs **no network
 call**, no inference and no billing. `serve.preload.remote_prepared` explicitly
 reports this distinction. Local-only servers do not need any provider keys.
 

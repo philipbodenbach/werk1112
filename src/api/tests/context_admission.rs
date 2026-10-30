@@ -253,3 +253,55 @@ async fn protocol_token_count_reports_unsupported_instead_of_guessing() {
     assert!(value.get("data").is_none());
     assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn protocol_admission_matches_generation_without_generating() {
+    for native in [None, Some(4096 - 32 + 1)] {
+        for images in [false, true] {
+            let backend = Counter::new(native);
+            let app = app(backend.clone());
+            let mut payload = request(true, true);
+            if images {
+                payload["messages"][0]["content"] = json!([
+                    {"type":"text","text":"Inspect this page"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8=","detail":"high"}}
+                ]);
+            }
+            let response = post_json(&app, "/werk/v1/chat/admission", payload.clone(), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let preview: Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let plan = &preview["data"];
+            assert_eq!(plan["model"], "context-test");
+            assert_eq!(plan["context_tokens"], 4096);
+            assert_eq!(plan["max_output_tokens"], 32);
+            assert_eq!(
+                plan["token_count_method"],
+                if native.is_some() {
+                    "native"
+                } else {
+                    "estimate"
+                }
+            );
+            assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
+            let response = post_json(&app, "/v1/chat/completions", payload, None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value: Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["error"]["prompt_tokens"], plan["input_tokens"]);
+            assert_eq!(
+                value["error"]["token_count_method"],
+                plan["token_count_method"]
+            );
+            assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
+        }
+    }
+}

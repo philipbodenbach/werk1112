@@ -89,7 +89,7 @@ async fn chat(app: Router, model: &str, stream: bool) -> Response {
 }
 
 #[tokio::test]
-async fn preload_large_list_survives_failure_and_reuses_workers_through_http() {
+async fn preload_large_list_reuses_workers_through_http_and_stops_on_failure() {
     let dir = tempfile::tempdir().unwrap();
     let store = ModelStore::resolve(Some(dir.path().to_path_buf())).unwrap();
     let backend = Arc::new(ResidentBackend {
@@ -103,16 +103,20 @@ async fn preload_large_list_survives_failure_and_reuses_workers_through_http() {
     }
     let state = ApiState::new_with_default_model(store, backend.clone(), Some(models[0].clone()));
     let mut requested = models.clone();
-    requested.insert(1, "broken".into());
-    requested.insert(2, "missing".into());
     requested.push(models[0].clone());
     let report = state.preload_models(&requested).await;
-    assert_eq!((report.ready, report.attempted), (70, 72));
+    assert_eq!((report.ready, report.attempted), (70, 70));
+    // The CLI exits on this report. No later target is warmed or retried.
+    let report = state
+        .preload_models(&["broken".into(), "model-0".into()])
+        .await;
+    assert_eq!((report.ready, report.attempted), (0, 1));
     assert!(state.telemetry.snapshot().requests.is_empty());
     assert_eq!(state.telemetry.snapshot().totals.output_tokens, 0);
     assert_eq!(backend.warmups.load(Ordering::SeqCst), 71);
     let loaded = backend.loads.lock().unwrap().clone();
-    assert_eq!(&loaded[..3], &["model-0", "broken", "model-1"]);
+    assert_eq!(&loaded[..3], &["model-0", "model-1", "model-2"]);
+    assert_eq!(loaded.last().unwrap(), "broken");
     assert_eq!(backend.cache.snapshot().len(), 70);
     assert!(
         backend
@@ -148,7 +152,7 @@ async fn preload_large_list_survives_failure_and_reuses_workers_through_http() {
 }
 
 #[tokio::test]
-async fn unsupported_preload_keeps_server_usable() {
+async fn unsupported_preload_reports_failure_without_attempting_later_targets() {
     let dir = tempfile::tempdir().unwrap();
     let store = ModelStore::resolve(Some(dir.path().to_path_buf())).unwrap();
     install(&store, "one-shot");
@@ -156,7 +160,7 @@ async fn unsupported_preload_keeps_server_usable() {
     let report = state
         .preload_models(&["one-shot".into(), "missing".into(), "one-shot".into()])
         .await;
-    assert_eq!((report.ready, report.attempted), (0, 2));
+    assert_eq!((report.ready, report.attempted), (0, 1));
     assert_eq!(
         chat(router(state), "one-shot", false).await.status(),
         StatusCode::OK

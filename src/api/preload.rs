@@ -1,4 +1,5 @@
-//! Ordered, best-effort startup preloading. No HTTP request, user telemetry or
+//! Ordered startup preloading. The CLI requires every target to be ready.
+//! No HTTP request, user telemetry or
 //! persistent conversation is created for the synthetic warmup.
 use super::state::ApiState;
 use crate::{
@@ -29,7 +30,7 @@ impl ApiState {
     pub(crate) async fn preload_models(&self, models: &[String]) -> PreloadReport {
         let mut seen = HashSet::new();
         let mut report = PreloadReport::default();
-        for name in models {
+        'targets: for name in models {
             let targets = match &self.deployments {
                 Some(registry) => registry.preload_targets(name),
                 None => Ok(vec![(name.clone(), self.clone(), name.clone())]),
@@ -42,11 +43,11 @@ impl ApiState {
                         event(
                             Level::Warn,
                             "serve.preload.failed",
-                            format!("Preload '{name}' skipped: {error:#}"),
+                            format!("Preload '{name}' failed: {error:#}"),
                             json!({"model":name,"error":format!("{error:#}"),"duration_seconds":0.0}),
                         );
                     }
-                    continue;
+                    break;
                 }
             };
             for (id, state, model) in targets {
@@ -61,6 +62,8 @@ impl ApiState {
                     json!({"model":model,"target":id}),
                 );
                 let started = Instant::now();
+                let activity = crate::terminal::Activity::start(format!("Preload {id}"));
+                activity.phase("Preparing runtime and warming model");
                 let result =
                     crate::logging::spawn_blocking(move || state.preload_one(&model)).await;
                 let result = result
@@ -68,6 +71,7 @@ impl ApiState {
                 let seconds = started.elapsed().as_secs_f64();
                 match result {
                     Ok(handle) => {
+                        activity.finish();
                         self.preloaded
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -86,9 +90,10 @@ impl ApiState {
                         event(
                             Level::Warn,
                             "serve.preload.failed",
-                            format!("Preload '{id}' skipped after {seconds:.2}s: {error:#}"),
+                            format!("Preload '{id}' failed after {seconds:.2}s: {error:#}"),
                             json!({"target":id,"duration_seconds":seconds,"error":format!("{error:#}")}),
                         );
+                        break 'targets;
                     }
                 }
             }
@@ -101,8 +106,14 @@ impl ApiState {
             },
             "serve.preload.finished",
             format!(
-                "Preload complete: {} of {} ready; starting request service",
-                report.ready, report.attempted
+                "Preload complete: {} of {} ready; {}",
+                report.ready,
+                report.attempted,
+                if report.ready == report.attempted {
+                    "starting request service"
+                } else {
+                    "startup failed"
+                }
             ),
             json!({"ready":report.ready,"attempted":report.attempted,"failed":report.attempted-report.ready}),
         );

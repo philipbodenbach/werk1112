@@ -4,12 +4,12 @@
 //! not follow redirects and never includes authentication material in errors.
 
 use super::{
-    CapabilitiesResponse, ChatTokenCountResponse, DecodeRequest, DecodeResponse,
-    ExpertActionRequest, ExpertActionResponse, ExpertListFilter, ExpertListResponse,
-    MemoryStatusResponse, PROTOCOL_VERSION_HEADER, PrefillRequest, PrefillResponse,
-    ProtocolEnvelope, ProtocolErrorBody, ProtocolVersion, PruneStatesRequest, PruneStatesResponse,
-    RuntimeInfo, StateActionRequest, StateActionResponse, StateListFilter, StateListResponse,
-    StateTier,
+    CapabilitiesResponse, ChatAdmissionResponse, ChatTokenCountResponse, DecodeRequest,
+    DecodeResponse, ExpertActionRequest, ExpertActionResponse, ExpertListFilter,
+    ExpertListResponse, MemoryStatusResponse, PROTOCOL_VERSION_HEADER, PrefillRequest,
+    PrefillResponse, ProtocolEnvelope, ProtocolErrorBody, ProtocolVersion, PruneStatesRequest,
+    PruneStatesResponse, RuntimeInfo, StateActionRequest, StateActionResponse, StateListFilter,
+    StateListResponse, StateTier,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -154,6 +154,13 @@ impl WerkProtocolClient {
 
     pub fn capabilities(&self) -> Result<CapabilitiesResponse, ClientError> {
         self.get("/werk/v1/capabilities")
+    }
+
+    pub fn chat_admission(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<ChatAdmissionResponse, ClientError> {
+        self.post("/werk/v1/chat/admission", request)
     }
 
     pub fn count_chat_tokens(

@@ -595,6 +595,43 @@ async fn unsupported_backend_rejects_tool_calling_before_backend_execution() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn missing_vision_components_are_not_reported_as_unsupported_tools() {
+    let store = test_store();
+    install_tool_chat_model(&store);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver: PromptOptionsResolver = Arc::new(|_, _, has_images| {
+        assert!(has_images);
+        anyhow::bail!("Missing vision projector; run werk setup tool-model")
+    });
+    let app = router(ApiState::new_with_default_model_and_prompt_options(
+        store,
+        Arc::new(UnsupportedToolBackend {
+            calls: calls.clone(),
+        }),
+        None,
+        Some(resolver),
+    ));
+    let response = post_json(&app, "/v1/chat/completions", json!({
+        "model": "tool-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Use a tool to inspect this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aA=="}}
+        ]}],
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    }), None).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value = response_json(response).await;
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing vision projector")
+    );
+    assert_ne!(value["error"]["code"], "unsupported_tool_calling");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
 fn install_tool_chat_model(store: &ModelStore) {
     let manifest = ModelManifest {
         storage: Default::default(),

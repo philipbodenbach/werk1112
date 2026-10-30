@@ -200,7 +200,24 @@ pub(super) async fn execute(
         validate_server_worker_options(backend_override, device_override, &llama_options)?;
     }
     let store = ModelStore::resolve(model_home)?;
-    let manifest = store.get(&model)?;
+    let manifest = if options.server.is_none() {
+        let choice = resolve_backend(backend_override, device_override)?;
+        let setup_store = store.clone();
+        let setup_id = model.clone();
+        crate::logging::spawn_blocking(move || {
+            model_setup::ensure(
+                &setup_store,
+                &setup_id,
+                choice,
+                selection_options,
+                false,
+                true,
+            )
+        })
+        .await??
+    } else {
+        store.get(&model)?
+    };
     let mut raw = options.request.as_deref().map(read_request).transpose()?;
     if let Some(raw) = raw.as_mut() {
         bind_request_model(raw, &manifest.id)?;
