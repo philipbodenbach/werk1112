@@ -146,6 +146,17 @@ pub struct ChatTokenCountResponse {
     pub input_tokens: u64,
 }
 
+/// Budget planning using the same native-count/estimate fallback as generation.
+/// `token_count_method` distinguishes a native count from a conservative estimate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatAdmissionResponse {
+    pub model: String,
+    pub input_tokens: u64,
+    pub max_output_tokens: u64,
+    pub context_tokens: Option<u64>,
+    pub token_count_method: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateTier {

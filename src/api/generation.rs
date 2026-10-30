@@ -88,6 +88,8 @@ pub(super) struct Prepared {
     pub explicit_runtime_options: bool,
     pub stream: bool,
     pub include_usage: bool,
+    pub context_tokens: Option<usize>,
+    pub admission_estimate: usize,
 }
 pub(super) async fn prepare(
     mut state: ApiState,
@@ -263,7 +265,7 @@ pub(super) async fn prepare(
         }
     }
     let context_size = generation_context_size(&state, &manifest).or_else(|| {
-        if matches!(context_policy, ContextPolicy::Reject) {
+        if matches!(context_policy, ContextPolicy::Reject | ContextPolicy::Count) {
             manifest
                 .metadata
                 .parameter_constraints
@@ -281,15 +283,13 @@ pub(super) async fn prepare(
             None
         }
     });
+    let admission_estimate = estimate_prompt_tokens(&request).map_err(|message| {
+        GenerationError::new(StatusCode::BAD_REQUEST, message, Some("messages".into()))
+    })?;
     let needs_context_check = matches!(context_policy, ContextPolicy::Reject)
         || (matches!(context_policy, ContextPolicy::Trim) && request.requires_tool_calling());
     let context_check = if needs_context_check {
-        context_size
-            .map(|size| estimate_prompt_tokens(&request).map(|prompt| (size, prompt)))
-            .transpose()
-            .map_err(|message| {
-                GenerationError::new(StatusCode::BAD_REQUEST, message, Some("messages".into()))
-            })?
+        context_size.map(|size| (size, admission_estimate))
     } else {
         None
     };
@@ -521,25 +521,14 @@ pub(super) async fn prepare(
     if let Some((limit, estimate)) = context_check
         && estimate.saturating_add(max_tokens) > limit
     {
-        let backend = state.backend.clone();
-        let selected_model = manifest.clone();
-        let selected_request = generate_request.clone();
-        let options = request.extra.clone();
-        let counted = crate::logging::spawn_blocking(move || {
-            backend.count_api_tokens(&selected_model, selected_request, options)
-        })
-        .await
-        .map_err(|error| {
-            GenerationError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("native context validation task failed: {error}"),
-                None,
-            )
-        })?;
-        let (prompt_tokens, method) = match counted {
-            Ok(tokens) => (tokens, "native"),
-            Err(_) => (estimate, "estimate"),
-        };
+        let (prompt_tokens, method) = count_for_admission(
+            &state,
+            &manifest,
+            &generate_request,
+            &request.extra,
+            estimate,
+        )
+        .await?;
         state.log_verbose(format!(
             "[werk serve] context admission model={} prompt_tokens={} max_tokens={} context_size={} count_method={} estimated_prompt_tokens={}",
             manifest.id, prompt_tokens, max_tokens, limit, method, estimate,
@@ -569,6 +558,8 @@ pub(super) async fn prepare(
     }
 
     Ok(Prepared {
+        context_tokens: context_size,
+        admission_estimate,
         api_options: request.extra,
         state,
         manifest,
@@ -576,6 +567,36 @@ pub(super) async fn prepare(
         explicit_runtime_options,
         stream,
         include_usage,
+    })
+}
+
+/// Shared by planning and generation. An unavailable native counter retains
+/// exactly the server admission estimate, never an estimate labeled as exact.
+pub(super) async fn count_for_admission(
+    state: &ApiState,
+    manifest: &ModelManifest,
+    request: &GenerateRequest,
+    options: &std::collections::BTreeMap<String, serde_json::Value>,
+    estimate: usize,
+) -> Result<(usize, &'static str), GenerationError> {
+    let backend = state.backend.clone();
+    let manifest = manifest.clone();
+    let request = request.clone();
+    let options = options.clone();
+    let counted = crate::logging::spawn_blocking(move || {
+        backend.count_api_tokens(&manifest, request, options)
+    })
+    .await
+    .map_err(|error| {
+        GenerationError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("native context validation task failed: {error}"),
+            None,
+        )
+    })?;
+    Ok(match counted {
+        Ok(count) => (count, "native"),
+        Err(_) => (estimate, "estimate"),
     })
 }
 
