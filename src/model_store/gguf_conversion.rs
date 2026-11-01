@@ -277,6 +277,37 @@ pub(super) struct GgufInspection {
 }
 
 /// Bounded metadata-only identity check, independent of tensor quantization.
+/// Bounded metadata-only lookup; tensor payloads are never read.
+pub(super) fn gguf_unsigned_metadata(path: &Path, wanted: &str) -> Result<Option<u64>> {
+    let file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut r = GgufReader {
+        reader: BufReader::new(file),
+        size,
+        position: 0,
+    };
+    anyhow::ensure!(
+        r.bytes::<4>()? == *b"GGUF" && matches!(r.u32()?, 2 | 3),
+        "Invalid GGUF header"
+    );
+    let _tensors = r.u64()?;
+    let count = r.u64()?;
+    anyhow::ensure!(count <= 1_000_000, "Invalid GGUF metadata count");
+    for _ in 0..count {
+        let key = r.string()?;
+        let kind = r.u32()?;
+        if key == wanted {
+            return match kind {
+                4 => Ok(Some(r.u32()? as u64)),
+                10 => Ok(Some(r.u64()?)),
+                _ => bail!("Invalid unsigned GGUF dimension for {wanted}"),
+            };
+        }
+        r.skip_value(kind, 0)?;
+    }
+    Ok(None)
+}
+
 pub(super) fn gguf_model_identity(path: &Path) -> Result<Option<String>> {
     let file = fs::File::open(path)?;
     let size = file.metadata()?.len();

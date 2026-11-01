@@ -39,6 +39,7 @@ PROFILES = {
     ],
 }
 OPTION_NOTES = {
+    ("components", "--json"): "Print host compatibility, installed versions, status, requirements and planned actions as JSON; requires --list and executes no actions.",
     ("top", "--url"): "Server root URL without /v1, credentials, query or fragment; HTTP(S).",
     ("top", "--api-key"): "Bearer credential; local servers also support discovery from the default key file.",
     ("top", "--interval-ms"): "Refresh interval in milliseconds; range 500–60000.",

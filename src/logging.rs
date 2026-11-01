@@ -303,7 +303,17 @@ impl Logger {
                 }
             }
         }
-        if self.console {
+        // The spinner already shows running phases in an ordinary terminal.
+        // Keep file events complete and retain explicit verbose/raw logging.
+        let spinner_only = self.format == Format::Auto
+            && self.level == Level::Info
+            && level == Level::Info
+            && matches!(
+                name,
+                "operation.started" | "operation.phase" | "operation.progress"
+            )
+            && crate::terminal::interactive(crate::terminal::Stream::Err);
+        if self.console && !spinner_only {
             if self.format == Format::Json {
                 crate::terminal::write(
                     crate::terminal::Stream::Err,

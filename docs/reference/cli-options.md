@@ -10,8 +10,8 @@ Generated from **werk 1.10.2**. See [CLI semantics](cli.md),
 [media input and override rules](cli-media.md), and the
 [canonical parameter schema](parameters-schema.md).
 
-Coverage of this profile: **27 top-level commands**, **94 help nodes**
-(including the root), and **451 distinct long option names**
+Coverage of this profile: **31 top-level commands**, **100 help nodes**
+(including the root), and **455 distinct long option names**
 (excluding `--help` and `--version`). Compatibility aliases are listed
 in [CLI conventions](cli.md#syntax-aliases-and-input-contracts).
 
@@ -37,6 +37,9 @@ is inserted; runtime resolution may still supply one. The built-in
 - [`werk bench`](cli-options.md#werk-bench)
 - [`werk doctor`](cli-options.md#werk-doctor)
 - [`werk backend`](cli-options.md#werk-backend)
+- [`werk updates`](cli-options.md#werk-updates)
+- [`werk components`](cli-options.md#werk-components)
+- [`werk update`](cli-options.md#werk-update)
 - [`werk artifacts`](cli-options.md#werk-artifacts)
 - [`werk auth`](cli-options.md#werk-auth)
 - [`werk temp`](cli-options.md#werk-temp)
@@ -45,6 +48,7 @@ is inserted; runtime resolution may still supply one. The built-in
 - [`werk import`](cli-options.md#werk-import)
 - [`werk convert`](cli-options.md#werk-convert)
 - [`werk pull`](cli-options.md#werk-pull)
+- [`werk setup`](cli-options.md#werk-setup)
 - [`werk remove`](cli-options.md#werk-remove)
 - [`werk list`](cli-options.md#werk-list)
 - [`werk parameters`](cli-options.md#werk-parameters)
@@ -71,6 +75,8 @@ is inserted; runtime resolution may still supply one. The built-in
 - [`werk audio transform`](cli-audio.md#werk-audio-transform)
 - [`werk audio embed`](cli-audio.md#werk-audio-embed)
 - [`werk doctor perf`](cli-options.md#werk-doctor-perf)
+- [`werk backend update`](cli-options.md#werk-backend-update)
+- [`werk backend updates`](cli-options.md#werk-backend-updates)
 - [`werk backend install`](cli-options.md#werk-backend-install)
 - [`werk backend list`](cli-options.md#werk-backend-list)
 - [`werk backend doctor`](cli-options.md#werk-backend-doctor)
@@ -125,7 +131,7 @@ Werk1112 imports local or Hugging Face models, routes inference across installed
 werk [OPTIONS] [COMMAND]
 ```
 
-Subcommands: [`werk support`](cli-options.md#werk-support), [`werk gpus`](cli-options.md#werk-gpus), [`werk deployment-plan`](cli-options.md#werk-deployment-plan), [`werk top`](cli-options.md#werk-top), [`werk serve`](cli-options.md#werk-serve), [`werk run`](cli-options.md#werk-run), [`werk chat`](cli-options.md#werk-chat), [`werk image`](cli-image.md#werk-image), [`werk video`](cli-video.md#werk-video), [`werk audio`](cli-audio.md#werk-audio), [`werk estimate`](cli-options.md#werk-estimate), [`werk bench`](cli-options.md#werk-bench), [`werk doctor`](cli-options.md#werk-doctor), [`werk backend`](cli-options.md#werk-backend), [`werk artifacts`](cli-options.md#werk-artifacts), [`werk auth`](cli-options.md#werk-auth), [`werk temp`](cli-options.md#werk-temp), [`werk cache`](cli-options.md#werk-cache), [`werk runtime`](cli-options.md#werk-runtime), [`werk import`](cli-options.md#werk-import), [`werk convert`](cli-options.md#werk-convert), [`werk pull`](cli-options.md#werk-pull), [`werk remove`](cli-options.md#werk-remove), [`werk list`](cli-options.md#werk-list), [`werk parameters`](cli-options.md#werk-parameters), [`werk inspect`](cli-options.md#werk-inspect), [`werk select-file`](cli-options.md#werk-select-file).
+Subcommands: [`werk support`](cli-options.md#werk-support), [`werk gpus`](cli-options.md#werk-gpus), [`werk deployment-plan`](cli-options.md#werk-deployment-plan), [`werk top`](cli-options.md#werk-top), [`werk serve`](cli-options.md#werk-serve), [`werk run`](cli-options.md#werk-run), [`werk chat`](cli-options.md#werk-chat), [`werk image`](cli-image.md#werk-image), [`werk video`](cli-video.md#werk-video), [`werk audio`](cli-audio.md#werk-audio), [`werk estimate`](cli-options.md#werk-estimate), [`werk bench`](cli-options.md#werk-bench), [`werk doctor`](cli-options.md#werk-doctor), [`werk backend`](cli-options.md#werk-backend), [`werk updates`](cli-options.md#werk-updates), [`werk components`](cli-options.md#werk-components), [`werk update`](cli-options.md#werk-update), [`werk artifacts`](cli-options.md#werk-artifacts), [`werk auth`](cli-options.md#werk-auth), [`werk temp`](cli-options.md#werk-temp), [`werk cache`](cli-options.md#werk-cache), [`werk runtime`](cli-options.md#werk-runtime), [`werk import`](cli-options.md#werk-import), [`werk convert`](cli-options.md#werk-convert), [`werk pull`](cli-options.md#werk-pull), [`werk setup`](cli-options.md#werk-setup), [`werk remove`](cli-options.md#werk-remove), [`werk list`](cli-options.md#werk-list), [`werk parameters`](cli-options.md#werk-parameters), [`werk inspect`](cli-options.md#werk-inspect), [`werk select-file`](cli-options.md#werk-select-file).
 
 ### Global options
 
@@ -140,7 +146,7 @@ Subcommands: [`werk support`](cli-options.md#werk-support), [`werk gpus`](cli-op
 | `--model-home <MODEL_HOME>` | Model store directory; defaults to WERK_HOME, XDG_DATA_HOME/werk1112, or ~/.local/share/werk1112 [env: WERK_HOME] |
 | `--device <DEVICE>` | Candle-only device override for this command: auto, cpu, cuda, or metal [possible values: auto, cpu, cuda, metal] |
 | `--backend <BACKEND>` | Backend for this process: auto, cpu, cuda, rocm, vulkan, metal, mlx, omlx, onnx, transformers, vllm, candle, llama-highlevel, or llama-legacy [default: auto] [possible values: auto, candle, cpu, cuda, llama-highlevel, llama-legacy, metal, mlx, omlx, onnx, rocm, transformers, vllm, vulkan] |
-| `--auto-install-backends` | Allow Werk to provision missing managed runtime backends during selection |
+| `--auto-install-backends` | Approve installation of missing model backends and feature components (including vision projectors) |
 | `--no-auto-install-backends` | Disable automatic managed runtime provisioning |
 | `--parallel <PARALLEL>` | llama-server active sequence slots; default 1; each slot receives --ctx-size tokens [env: WERK_LLAMA_PARALLEL] |
 | `--fp4-kernel <FP4_KERNEL>` | NVFP4 CUDA kernel policy; default auto prefers native Blackwell, then Marlin, then GGML [env: WERK_FP4_KERNEL] [possible values: auto, native, marlin, ggml] |
@@ -237,7 +243,7 @@ werk serve [OPTIONS]
 | `--host <HOST>` | Address to bind [default: 127.0.0.1] |
 | `--port <PORT>` | Port to bind [default: 11434] |
 | `--model <MODEL>` | Default model for chat or text-analysis API requests that omit model |
-| `--preload <MODEL>...` | Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, failures are logged and skipped |
+| `--preload <MODEL>...` | Load, warm and retain local models in order; hosted models prepare clients without paid inference; repeatable, startup exits on failure |
 | `--image-model <IMAGE_MODEL>` | Default image model for compatible clients that omit model or use an OpenAI image alias |
 | `--api-key <API_KEY>` | Require OpenAI-style Authorization: Bearer <key> for /v1 requests [env: WERK_API_KEY] |
 | `--api-keys <PATH>` | Load OpenAI-style bearer keys from an API keys TOML file [env: WERK_API_KEYS] |
@@ -419,7 +425,62 @@ Manage local runtime backends
 werk backend [OPTIONS] <COMMAND>
 ```
 
-Subcommands: [`werk backend install`](cli-options.md#werk-backend-install), [`werk backend list`](cli-options.md#werk-backend-list), [`werk backend doctor`](cli-options.md#werk-backend-doctor).
+Subcommands: [`werk backend update`](cli-options.md#werk-backend-update), [`werk backend updates`](cli-options.md#werk-backend-updates), [`werk backend install`](cli-options.md#werk-backend-install), [`werk backend list`](cli-options.md#werk-backend-list), [`werk backend doctor`](cli-options.md#werk-backend-doctor).
+
+Also accepts the [global options](#global-options).
+
+## werk updates
+
+Scan installed backends, models and vision projectors for updates without changing them
+
+```text
+werk updates [OPTIONS]
+```
+
+| Option | Meaning / parser default |
+| --- | --- |
+| `--json` | Print the complete report as JSON, including per-component errors |
+| `--offline` | Inventory local components without contacting upstream registries |
+| `--scope <SCOPE>` | Components to scan [default: all] [possible values: all, backends, artifacts] |
+
+Also accepts the [global options](#global-options).
+
+## werk components
+
+Browse, install and update host-compatible components in a terminal UI
+
+```text
+werk components [OPTIONS]
+```
+
+| Option | Meaning / parser default |
+| --- | --- |
+| `--list` | Print the component inventory instead of opening the terminal UI |
+| `--json` | Print host compatibility, installed versions, status, requirements and planned actions as JSON; requires --list and executes no actions. |
+| `--offline` | Use local metadata only; installation and update actions stay disabled |
+
+Also accepts the [global options](#global-options).
+
+## werk update
+
+Update a managed component or all installed compatible components, including dependencies
+
+```text
+werk update [OPTIONS] [COMPONENT]
+```
+
+Arguments:
+
+```text
+[COMPONENT]  Backend target or model:MODEL_ID; omit with --all
+```
+
+| Option | Meaning / parser default |
+| --- | --- |
+| `--all` | Update all installed, host-compatible managed backends and changed models |
+| `--include-missing` | Also set up missing dependencies required by installed models |
+| `-y, --yes` | Approve the displayed plan without prompting |
+| `--dry-run` | Display the concrete plan without changing components |
 
 Also accepts the [global options](#global-options).
 
@@ -561,6 +622,28 @@ Arguments:
 | `--text-only` | Skip optional image components and keep this setup text-only |
 | `--offline` | Do not contact repositories or install packages (existing-asset setup only) |
 | `--projector <PROJECTOR>` | Select an exact model-specific projector file from this repository |
+
+Also accepts the [global options](#global-options).
+
+## werk setup
+
+Check all model features and offer to install missing backends and components
+
+```text
+werk setup [OPTIONS] <MODEL>
+```
+
+Arguments:
+
+```text
+<MODEL>
+```
+
+| Option | Meaning / parser default |
+| --- | --- |
+| `--vision` | Set up image input for this backend/model; does not prove image inference |
+| `--text-only` | Skip optional image components and keep this setup text-only |
+| `--offline` | Do not contact repositories or install packages (existing-asset setup only) |
 
 Also accepts the [global options](#global-options).
 
@@ -763,6 +846,62 @@ Arguments:
 ```text
 <MODEL>  Installed model id
 ```
+
+Also accepts the [global options](#global-options).
+
+## werk backend update
+
+Update a managed backend and its compatible dependencies
+
+```text
+werk backend update [OPTIONS] <TARGET>
+```
+
+Arguments:
+
+```text
+<TARGET>
+          Possible values:
+          - llama-cuda
+          - llama-cuda-nvfp4:   Pinned CUDA runtime with native NVFP4 and standalone Marlin kernels
+          - llama-cuda-offload: Experimental pinned CUDA runtime with MoE caching and lazy PLE reads
+          - llama-rocm
+          - llama-vulkan
+          - llama-metal
+          - llama-cpu
+          - onnx-cuda
+          - onnx-rocm
+          - onnx-cpu
+          - vllm
+          - omlx:               Install the managed oMLX CLI on Apple Silicon (explicit installation only)
+          - mlx:                Install official MLX-LM on Apple Silicon
+          - mlx-vlm:            Install MLX-VLM on Apple Silicon
+          - transformers:       Install Hugging Face Transformers and PyTorch
+          - media:              Install Diffusers, Transformers and media codecs
+          - qwen-tts
+          - text-analysis
+```
+
+| Option | Meaning / parser default |
+| --- | --- |
+| `--vision` | Set up image input for this backend/model; does not prove image inference |
+| `--text-only` | Skip optional image components and keep this setup text-only |
+| `--offline` | Do not contact repositories or install packages (existing-asset setup only) |
+
+Also accepts the [global options](#global-options).
+
+## werk backend updates
+
+Scan installed managed backends for updates without installing them
+
+```text
+werk backend updates [OPTIONS]
+```
+
+| Option | Meaning / parser default |
+| --- | --- |
+| `--json` | Print the complete report as JSON, including per-component errors |
+| `--offline` | Inventory local components without contacting upstream registries |
 
 Also accepts the [global options](#global-options).
 

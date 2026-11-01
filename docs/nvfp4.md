@@ -22,8 +22,9 @@ is honored. Native FP4 and Marlin W4A16 use different activation arithmetic;
 WERK does not treat their persisted state as interchangeable.
 
 For an installed NVFP4 GGUF, default `--backend auto` can build the matching
-profile when a CUDA compiler and NVIDIA GPU are detected. It does so in a
-separate versioned directory, without changing the default CUDA runtime for
+profile after approval in the model setup dialog (or with
+`--auto-install-backends`) when a CUDA compiler and NVIDIA GPU are detected.
+It does so in a separate versioned directory, without changing the default CUDA runtime for
 other models. `--no-auto-install-backends` disables provisioning. Explicit
 `WERK_LLAMA_SERVER_CUDA` / `WERK_LLAMA_SERVER` paths retain precedence and must
 point to a compatible, validated build.

@@ -10,6 +10,9 @@ use std::{
     },
 };
 
+mod activity;
+pub(crate) use activity::Activity;
+
 pub const CYAN: (u8, u8, u8) = (0, 220, 255);
 pub const BLUE: (u8, u8, u8) = (59, 130, 246);
 pub const INDIGO: (u8, u8, u8) = (99, 102, 241);

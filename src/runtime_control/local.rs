@@ -405,6 +405,11 @@ fn capabilities_for_descriptor(
             operations: vec!["thinking".into(), "reasoning_effort".into(), "expert_cache_mb".into(), "ngram_cache_mb".into()],
         },
     );
+    capabilities.insert("api.chat.admission".into(),Capability {
+        id:"api.chat.admission".into(),status:CapabilityStatus::Supported,
+        detail:"POST /werk/v1/chat/admission plans input/output against the same native count or explicitly labeled estimate used by generation, including multimodal fallback. No generation or capacity reservation.".into(),
+        operations:vec!["admission".into()],
+    });
     capabilities.insert(
         "api.chat.token_count".into(),
         Capability {

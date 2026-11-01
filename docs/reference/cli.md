@@ -241,6 +241,17 @@ Validate without model downloads:
 python3 scripts/smoke-logging.py target/debug/werk
 ```
 
+## Model setup
+
+`werk setup MODEL` checks the advertised model features and offers one dialog
+for missing backends and components, including vision projectors. `pull` runs
+this check after saving the main model; local `run`, `chat`, and configured
+`serve` models run it before execution. Choose Set up all to install the listed
+components, or Later to retain the current setup. Without a terminal, use
+`--auto-install-backends` for explicit approval. `--offline` permits only
+existing-asset setup, and `--text-only` excludes vision from this review.
+See [complete model setup](../integrations/vision.md#complete-model-setup).
+
 ## Global options
 
 Global options can appear before or after a subcommand; examples put them first:
@@ -258,8 +269,8 @@ The most important global controls are:
 | `--model-home PATH` | Select the complete Werk store; overrides `WERK_HOME`. |
 | `--backend BACKEND` | Select `auto` or constrain routing to a named runtime/backend family. |
 | `--device DEVICE` | Legacy Candle-only device override. Prefer `--backend` or typed media accelerator controls. |
-| `--auto-install-backends` | Permit managed provisioning during runtime selection. Installation is otherwise explicit. |
-| `--no-auto-install-backends` | Prohibit automatic managed provisioning. |
+| `--auto-install-backends` | Approve the complete model setup plan, including missing backends and model-specific feature components. |
+| `--no-auto-install-backends` | Skip model setup review and prohibit managed provisioning. |
 | `--ctx-size`, `--batch-size`, `--ubatch-size` | Advanced llama.cpp context and batching controls. |
 | `--gpu-layers`, `--main-gpu` | Advanced llama.cpp accelerator placement controls. |
 | `--kv-cache-type`, `--flash-attn`, `--kv-offload` | Advanced llama.cpp cache and attention controls. |
@@ -1335,10 +1346,42 @@ warm image, video or audio generation.
 Successful local instances are retained until server shutdown. Pinned runtime
 entries sit outside ordinary cache capacity/eviction limits and cannot be
 evicted by later requests. Earlier targets claim resources first. Missing
-models, incompatible paths, resource shortages and warmup failures are logged
-and skipped; later targets are still attempted. The server can start with no
-successful preloads. Skipped models remain requestable under normal routing and
-resource rules.
+models, incompatible paths, resource shortages and warmup failures stop startup
+at the first failed target with a nonzero exit status. Later targets are not
+attempted. The CLI does not report “Server ready” or restart itself after a
+setup/preload failure. Installed components remain available; resolve the reported
+cause, then rerun the complete `werk serve` command with all original parameters.
+
+Setup checks, backend installation, projector validation and model loading show
+a spinner with the current phase and elapsed time in an interactive terminal.
+Projector downloads also show bytes, transfer speed and ETA when the size is
+known. At the normal log level, running phases update the spinner in place;
+completion messages, warnings and errors remain visible. `--verbose` also prints
+the running status events. Log files retain those events in either mode. Status
+events are emitted every five seconds during long operations, including when
+the backend produces no output. Redirected output and explicit
+text/JSON logging use status events without terminal animation. The event names
+are `operation.started`, `operation.phase`, `operation.progress` and
+`operation.finished`; fields include phase, elapsed seconds and download bytes
+when available. A spinner indicates activity, not a measured percentage of model
+loading. Native llama.cpp startup also shows its PID and readiness timeout.
+
+Native llama.cpp readiness allows 900 seconds by default for large-model cold
+starts. Set `WERK_LLAMA_HEALTH_TIMEOUT_SECONDS` to a positive integer to change
+this limit, for example `1200` for 20 minutes. An individual health probe cannot
+wait longer than one second or the remaining startup budget. This limit covers
+native model/projector loading and native warmup, not later inference. Runtime
+termination and memory release can take additional time and have their own
+visible phase. Increasing the timeout does not change GPU placement or make an
+oversized configuration fit; explicit `--gpu-layers` settings remain unchanged.
+If native `common_fit_params` reports a failed memory fit or an error during
+fitting, Werk stops the worker promptly instead of allowing the subsequent load
+to continue until timeout. The native reason is retained even if later log lines
+overwrite the output tail. This also applies with `WERK_LLAMA_LOG` enabled.
+Correct placement/context/parallel settings and rerun the complete command;
+Werk does not silently reduce settings or restart. This check relies on native
+fitting diagnostics, and is not a general RAM/VRAM limit or proof that a model
+fits when a backend skips fitting or does not report a failure.
 
 In deployment mode, an alias expands to all replicas in instance-ID order;
 individual IDs also work. Deduplication uses the expanded target instance IDs.

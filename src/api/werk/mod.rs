@@ -37,6 +37,7 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/werk/v1/experts", get(list_experts_handler));
 
     let writes = Router::new()
+        .route("/werk/v1/chat/admission", post(chat_admission_handler))
         .route(
             "/werk/v1/chat/count_tokens",
             post(chat_count_tokens_handler),
@@ -241,6 +242,79 @@ async fn reasoning_handler(
                 ProtocolErrorCode::Internal,
                 "Reasoning profile lookup failed",
             ),
+        ),
+    }
+}
+
+async fn chat_admission_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Result<Json<crate::openai::ChatCompletionRequest>, JsonRejection>,
+) -> Response {
+    let (request_id, _) = match request_context(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Json(mut request) = match body {
+        Ok(body) => body,
+        Err(error) => return json_rejection(request_id, error),
+    };
+    request.stream = Some(false);
+    let prepared = match super::generation::prepare(
+        state,
+        request,
+        super::generation::ContextPolicy::Count,
+        "/werk/v1/chat/admission",
+        &headers,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return protocol_error(
+                request_id,
+                ProtocolError::new(
+                    if error.status == StatusCode::TOO_MANY_REQUESTS {
+                        ProtocolErrorCode::ResourceExhausted
+                    } else if error.status.is_server_error() {
+                        ProtocolErrorCode::Unavailable
+                    } else {
+                        ProtocolErrorCode::InvalidRequest
+                    },
+                    error.message,
+                )
+                .retryable(
+                    error.status == StatusCode::TOO_MANY_REQUESTS || error.status.is_server_error(),
+                ),
+            );
+        }
+    };
+    match super::generation::count_for_admission(
+        &prepared.state,
+        &prepared.manifest,
+        &prepared.request,
+        &prepared.api_options,
+        prepared.admission_estimate,
+    )
+    .await
+    {
+        Ok((count, method)) => success(
+            request_id,
+            crate::werk_protocol::ChatAdmissionResponse {
+                model: prepared
+                    .state
+                    .requested_alias
+                    .clone()
+                    .unwrap_or_else(|| prepared.manifest.id.clone()),
+                input_tokens: count as u64,
+                max_output_tokens: prepared.request.max_tokens as u64,
+                context_tokens: prepared.context_tokens.map(|v| v as u64),
+                token_count_method: method.into(),
+            },
+        ),
+        Err(error) => protocol_error(
+            request_id,
+            ProtocolError::new(ProtocolErrorCode::Unavailable, error.message).retryable(true),
         ),
     }
 }

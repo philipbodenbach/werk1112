@@ -238,6 +238,27 @@ an estimate labeled as an exact count. Temporary native failures return
 with a bounded backoff. Authentication, versioning and the 1 MiB request bound
 are the same as other protocol routes.
 
+`api.chat.admission` with operation `admission` advertises
+`POST /werk/v1/chat/admission`. It accepts the same complete chat request and
+returns a planning budget without generation or history trimming:
+
+~~~json
+{"protocol":{"major":1,"minor":0},"request_id":"req_example",
+ "data":{"model":"selected-model-or-alias","input_tokens":14000,
+ "max_output_tokens":4096,"context_tokens":32768,"token_count_method":"estimate"}}
+~~~
+
+The method is `native` when the backend counted the complete request, or
+`estimate` when its native counter is unavailable (including unsupported image
+counting). The fallback is exactly the generation admission estimator, not a
+client's independently calibrated image estimate. `context_tokens` is null if
+the server has no established limit. Clients add the returned output budget and
+their margin to the input budget, compact/reduce before dispatch, and keep
+estimates separate from exact-count caches. The native-only `count_tokens`
+contract is unchanged. Authentication, request bounds, deployment routing and
+template/options validation match the counting route. This planning response
+does not reserve inference capacity; generation validates the final request again.
+
 For existing local llama.cpp workers, `/werk/v1/observability` also reports
 `context_per_request_tokens`: the **minimum** `n_ctx` across all validated native
 slots. `context_capacity_tokens` remains the sum across slots and must not be

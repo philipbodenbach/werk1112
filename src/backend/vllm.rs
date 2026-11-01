@@ -1629,6 +1629,14 @@ fn vllm_server_cache_key(
 }
 
 pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
+    provision_managed_vllm(store, false)
+}
+
+pub fn update_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
+    provision_managed_vllm(store, true)
+}
+
+fn provision_managed_vllm(store: &ModelStore, update: bool) -> Result<PathBuf> {
     let platform = current_vllm_platform();
     if let Some(reason) = managed_vllm_install_rejection_for(platform, env::consts::ARCH) {
         bail!("{reason}");
@@ -1639,7 +1647,7 @@ pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
 
     let root = managed_vllm_dir(store);
     let existing_python = managed_vllm_python(store);
-    if existing_python.is_file() && validate_vllm_python(&existing_python).is_ok() {
+    if !update && existing_python.is_file() && validate_vllm_python(&existing_python).is_ok() {
         crate::ui_eprintln!(
             "Reusing the installed vLLM runtime; concrete image-model compatibility still needs validation."
         );
@@ -1675,8 +1683,12 @@ pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
             .arg("-m")
             .arg("pip")
             .arg("install")
-            .arg("vllm"),
+            .args(["--upgrade", "--upgrade-strategy", "eager", "vllm"]),
         "failed to install vLLM; check network access, Python version, CUDA/PyTorch wheel availability",
+    )?;
+    run_command(
+        Command::new(&venv_python).args(["-m", "pip", "check"]),
+        "vLLM dependency validation failed",
     )?;
     validate_vllm_python(&venv_python)?;
     Ok(venv_python)
