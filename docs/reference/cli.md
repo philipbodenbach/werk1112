@@ -39,6 +39,7 @@ Compatibility spellings remain accepted:
 | Spelling | Canonical form / scope |
 | --- | --- |
 | `werk rm`, `werk delete` | `werk remove` |
+| `werk tmp` | `werk temp` |
 | `werk auth hf` | `werk auth huggingface` |
 | `werk auth api-keys` | `werk auth api-key` |
 | `serve --verbose-lite` | `serve --verbose-pure` |
@@ -479,6 +480,9 @@ The new Kolibri, Mistral Large 4, FLUX 3 Image, Eleven v4 and DROID paths remain
 and JSON fields; these commands do not change that verification status.
 
 ## Temporary files
+
+`tmp` is an alias for `temp`: `werk tmp list`, `werk tmp purge --dry-run`
+and `werk tmp purge` run the same operations below.
 
 Print or list the temporary directory for the active Werk store, preview its
 cleanup or purge it:

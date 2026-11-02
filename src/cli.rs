@@ -1069,7 +1069,10 @@ pub enum Commands {
         command: AuthCommands,
     },
 
-    #[command(about = "Manage temporary files in the model store")]
+    #[command(
+        about = "Manage temporary files in the model store",
+        visible_alias = "tmp"
+    )]
     Temp {
         #[command(subcommand)]
         command: TempCommands,
@@ -14025,6 +14028,13 @@ mod tests {
 
     #[test]
     fn parses_temp_commands_and_global_model_home() {
+        let alias = Cli::try_parse_from(["werk", "tmp", "purge", "--dry-run"]).unwrap();
+        assert!(matches!(
+            alias.command,
+            Some(Commands::Temp {
+                command: TempCommands::Purge { dry_run: true }
+            })
+        ));
         let cli = Cli::try_parse_from([
             "werk",
             "--model-home",
