@@ -481,36 +481,44 @@ and JSON fields; these commands do not change that verification status.
 
 ## Temporary files
 
-`tmp` is an alias for `temp`: `werk tmp list`, `werk tmp purge --dry-run`
-and `werk tmp purge` run the same operations below.
-
-Print or list the temporary directory for the active Werk store, preview its
-cleanup or purge it:
+`tmp` is an alias for `temp`. List now inventories both the active model store's
+`tmp` directory and Werk-owned system temporary entries, including test and
+diagnostic leftovers. It reports paths, file counts, allocated sizes and reasons
+why an entry is protected.
 
 ```bash
-werk temp path
-werk temp list
-werk temp purge --dry-run
-werk temp purge
+werk tmp path
+werk tmp list
+werk tmp list --json
+werk tmp purge --all --dry-run
+werk tmp purge --all
+werk tmp purge --all --older-than-hours 0
 ```
 
-These commands resolve the same active `WERK_HOME` as the rest of the CLI,
-including a global `--model-home PATH` override. `temp list` prints each direct
-child path in sorted order, including hidden entries, without creating or
-changing the temporary directory. It does not recursively expand directories or
-follow child symlinks. Purging removes every child of that store's `tmp`
-directory, including any concurrently active temporary work, but preserves the
-`tmp` directory itself. The `--dry-run` form reports the planned cleanup without
-changing the filesystem.
+`--all` expands cleanup to model-store and system temporary entries. It defaults
+to entries unchanged for at least 24 hours, including their descendants; use
+`--older-than-hours 0` to include recent entries. The system scope is the OS
+temporary directory (`TMPDIR` on Unix), plus `/var/tmp` when the OS directory is
+`/tmp`. Only names starting with `werk1112-`, `werk-` or `werk_` qualify;
+`werk-worker-` and `werk_doctor_` belong to WerkWorker and are excluded.
 
-Models, artifacts, managed outputs, jobs, authentication data, backends, files
-at the store root and output paths outside the store are persistent boundaries
-and are not touched by temporary-file purging.
+Symlink roots, entries owned by other users on Unix, unreadable trees, special
+files and detected active entries are protected. Child symlinks are not followed.
+Linux process detection checks executable paths, working directories and open
+files; it is a best-effort snapshot, not a lock against new activity. Run cleanup
+when affected jobs are idle. `--dry-run` never deletes files. Expanded purge
+also supports `--json` and reports skipped entries.
+
+For compatibility, `werk tmp purge` without `--all` still removes every direct
+child of the model store's temporary directory, including active temporary work.
+`werk tmp path` prints that store directory. Both respect `WERK_HOME` and global
+`--model-home PATH`. Temporary roots themselves remain present. Models, managed
+outputs, jobs, authentication, backends and store-root files are outside cleanup.
 
 ## Local persistence caches
 
-Inspect local persistence storage and remove one listed entry or all eligible
-caches in the active `WERK_HOME` (or global `--model-home PATH`):
+Inspect persistence storage in the active `WERK_HOME` (or global `--model-home
+PATH`), Rust build directories in the current workspace and saved program backups:
 
 ```bash
 werk cache list
@@ -521,6 +529,11 @@ werk cache purge --all --dry-run
 werk cache purge --all
 werk cache purge --all --kind chat-kv
 werk cache purge --all --include-history
+werk cache list --workspace ~/werk1112 --shared
+werk cache purge --all --kind build --workspace ~/werk1112
+werk cache purge --all --kind backup
+werk cache purge --all --shared --dry-run
+werk cache purge --all --shared
 ```
 
 Copy the exact ID from `cache list`; paths and wildcard selectors are not
@@ -529,12 +542,24 @@ immediately unless `--dry-run` is supplied. Both subcommands support `--json`;
 list JSON separates `entries` from `blocked` storage-provider errors so one
 unavailable catalog does not hide the remaining caches.
 
-| Kind | Storage beneath the Werk home | Cleanup scope |
+| Kind | Storage | Cleanup scope |
 | --- | --- | --- |
 | `chat-kv` | `chat-sessions/<session-hash>.cache/` | Rebuildable native KV caches for one persistent conversation, across its runtime namespaces. |
 | `chat-history` | `chat-sessions/<session-hash>.json` | Saved conversation messages; excluded from `--all` unless `--include-history` or `--kind chat-history` is supplied. An exact history ID also explicitly selects its deletion. |
 | `omlx-worker` | `backends/omlx/workers/<worker>/cache/` | Inactive worker cache files only; settings, credentials and logs are retained. |
 | `runtime-state` | `runtime-state/v1/` | Individual disk states from the managed runtime catalog; pinned or in-use states are protected. |
+| `build` | `target` directories in `--workspace` (default current directory), including nested Cargo packages up to four levels. | Rebuildable outputs; Cargo locks protect active builds. Custom target paths outside these locations are excluded. |
+| `backup` | `werk1112/backups` and legacy shared `werk-update-backups` beneath `XDG_STATE_HOME` or `~/.local/state` (`LOCALAPPDATA` on Windows). | Saved program versions; removing them loses those rollback copies. |
+| `shared` | Pip/uv/pipenv/vLLM caches, npm `_cacache`, CUDA/Triton compiled kernels, and Cargo registry cache/source/index. | Only included with `--shared`, `--kind shared`, or an exact shared-cache ID. Used by other projects too; may require downloading/rebuilding. |
+
+`--all` now includes workspace build files and program backups as well as
+persistence caches. Shared caches remain explicit. Shared roots respect
+`XDG_CACHE_HOME` and `CARGO_HOME`; nonstandard per-tool cache overrides are not
+discovered. Hugging Face caches/tokens, installed programs and model weights are
+excluded. Local filesystem entries include `path` and file counts in JSON.
+Allocated sizes count hard links once per entry; the amount actually reclaimed
+can be smaller when files have links elsewhere. Unknown sizes remain unknown.
+
 
 The inventory reports each entry's kind, backend when known, size and protection
 status. Active chats and workers are skipped; runtime-state cleanup is blocked
