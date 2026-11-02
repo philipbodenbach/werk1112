@@ -9960,6 +9960,19 @@ impl GenerationBackend for AutoBackend {
         )?
         .count_api_tokens(manifest, request, options)
     }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_execution(
+            manifest,
+            request.has_images(),
+            request.requires_tool_calling(),
+        )?
+        .count_api_text_tokens(manifest, request, options)
+    }
 
     fn with_chat_options(
         &self,
@@ -10288,6 +10301,19 @@ impl GenerationBackend for GgufPreferredBackend {
         )?
         .count_api_tokens(manifest, request, options)
     }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_execution(
+            manifest,
+            request.has_images(),
+            request.requires_tool_calling(),
+        )?
+        .count_api_text_tokens(manifest, request, options)
+    }
 
     fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
         self.backend_for_capabilities(manifest, has_images, true)
@@ -10507,6 +10533,15 @@ impl GenerationBackend for MlxPreferredBackend {
     ) -> anyhow::Result<usize> {
         self.backend_for_request(manifest, request.has_images())?
             .count_api_tokens(manifest, request, options)
+    }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_request(manifest, request.has_images())?
+            .count_api_text_tokens(manifest, request, options)
     }
 
     fn runtime_control_adapter_for(
@@ -10757,6 +10792,15 @@ impl GenerationBackend for VllmPreferredBackend {
     ) -> anyhow::Result<usize> {
         self.backend_for_request(manifest, request.has_images())?
             .count_api_tokens(manifest, request, options)
+    }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_request(manifest, request.has_images())?
+            .count_api_text_tokens(manifest, request, options)
     }
 
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {

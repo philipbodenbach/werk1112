@@ -1518,6 +1518,18 @@ pub trait GenerationBackend: Send + Sync {
         }
         self.count_tokens(manifest, request)
     }
+    /// Count only the text/tool projection of a visual request with the same
+    /// concrete runtime and template used for its generation. The caller must
+    /// add a visual estimate and must not present the result as an exact count.
+    /// Routers must forward the original request before removing any images.
+    fn count_api_text_tokens(
+        &self,
+        _manifest: &ModelManifest,
+        _request: GenerateRequest,
+        _options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<usize> {
+        Err(UnsupportedTokenCounting.into())
+    }
     /// Applies explicit API runtime controls without changing process-wide
     /// environment or silently routing them to an unrelated backend.
     fn with_chat_options(

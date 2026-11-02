@@ -602,6 +602,15 @@ impl GenerationBackend for RuntimeRoutedGenerationBackend {
     ) -> anyhow::Result<usize> {
         self.backend.count_api_tokens(manifest, request, options)
     }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend
+            .count_api_text_tokens(manifest, request, options)
+    }
 
     fn with_chat_options(
         &self,

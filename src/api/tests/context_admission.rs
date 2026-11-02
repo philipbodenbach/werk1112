@@ -6,7 +6,9 @@ use std::sync::{
 
 struct Counter {
     native: Option<usize>,
+    native_text: Option<usize>,
     counts: AtomicUsize,
+    text_counts: AtomicUsize,
     generations: AtomicUsize,
     counted: Mutex<Option<Value>>,
 }
@@ -14,7 +16,9 @@ impl Counter {
     fn new(native: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
             native,
+            native_text: None,
             counts: AtomicUsize::new(0),
+            text_counts: AtomicUsize::new(0),
             generations: AtomicUsize::new(0),
             counted: Mutex::new(None),
         })
@@ -44,6 +48,25 @@ impl GenerationBackend for Counter {
         self.counts.fetch_add(1, Ordering::SeqCst);
         *self.counted.lock().unwrap() = Some(signature(&request, &options));
         self.native
+            .ok_or_else(|| crate::backend::UnsupportedTokenCounting.into())
+    }
+    fn count_api_text_tokens(
+        &self,
+        _: &ModelManifest,
+        request: GenerateRequest,
+        options: BTreeMap<String, Value>,
+    ) -> anyhow::Result<usize> {
+        self.text_counts.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            request.has_images(),
+            "route using the original visual request"
+        );
+        assert_eq!(
+            *self.counted.lock().unwrap(),
+            Some(signature(&request, &options)),
+            "projection must preserve tool pairs and API options until routed"
+        );
+        self.native_text
             .ok_or_else(|| crate::backend::UnsupportedTokenCounting.into())
     }
     fn generate_api(
@@ -302,6 +325,62 @@ async fn protocol_admission_matches_generation_without_generating() {
                 plan["token_count_method"]
             );
             assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn visual_admission_uses_native_text_and_keeps_exact_count_unsupported() {
+    // Reproduce a browser screenshot added to tool-heavy history. The byte
+    // estimate overflows while native text plus the visual allowance can fit.
+    for text_tokens in [2048, 3000] {
+        for stream in [false, true] {
+            let mut backend = Counter::new(None);
+            Arc::get_mut(&mut backend).unwrap().native_text = Some(text_tokens);
+            let app = app(backend.clone());
+            let mut payload = request(stream, true);
+            payload["messages"][0]["content"] = json!([
+                {"type":"text","text":"Inspect this page"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+            ]);
+            let response =
+                post_json(&app, "/werk/v1/chat/count_tokens", payload.clone(), None).await;
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(backend.text_counts.load(Ordering::SeqCst), 0);
+
+            let response = post_json(&app, "/werk/v1/chat/admission", payload.clone(), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let preview: Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let plan = &preview["data"];
+            assert_eq!(plan["input_tokens"], text_tokens + 1024 + 64);
+            assert_eq!(plan["token_count_method"], "estimate");
+            assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
+
+            let response = post_json(&app, "/v1/chat/completions", payload, None).await;
+            if text_tokens == 2048 {
+                assert_eq!(response.status(), StatusCode::OK);
+                body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(backend.generations.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let error: Value = serde_json::from_slice(
+                    &body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(error["error"]["prompt_tokens"], plan["input_tokens"]);
+                assert_eq!(error["error"]["token_count_method"], "estimate");
+                assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(backend.text_counts.load(Ordering::SeqCst), 2);
         }
     }
 }
