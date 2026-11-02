@@ -129,6 +129,17 @@ already-running workers; unsupported values remain absent, not fabricated zeroes
   90 samples, with panel activity markers controlled by the animation toggle.
   Host occupancy includes reclaimable cache; host availability includes memory
   reclaimable from that cache. Host and GPU pressure are labelled separately.
+  NVIDIA device-memory samples use one persistent, dynamically loaded NVML
+  connection and one worker thread per server process. Dashboard refreshes do
+  not launch `nvidia-smi`. Samples are demand-driven and cached for two seconds;
+  failed queries back off for 30 seconds. A blocked driver call cannot create
+  replacement workers, and callers wait at most two seconds. Missing NVML or
+  failed/expired samples leave GPU memory unavailable instead of reporting
+  stale values as current. This avoids accumulating short-lived GPU clients on
+  affected WSL/Windows drivers. Already accumulated host-driver allocations are
+  outside Werk's control; a Windows restart may still be needed after upgrading.
+  On Unix, the terminal reader handles EOF and `top` exits when its terminal
+  disappears, including when no hangup signal is delivered.
   These new panels and animations apply only to llama.cpp; the oMLX layout and
   its expert-cache/offload-read displays remain unchanged.
 * Native live counters also supplement **oMLX**: active/waiting requests,

@@ -372,6 +372,9 @@ pub fn run(args: TopArgs) -> Result<()> {
         let started = Instant::now();
         let mut demo_sample = Instant::now() - Duration::from_secs(3);
         loop {
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                break;
+            }
             if !app.paused {
                 if args.demo && demo_sample.elapsed() >= Duration::from_millis(args.interval_ms) {
                     app.update(demo(started.elapsed().as_secs_f64()));
