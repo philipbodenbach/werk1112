@@ -8,6 +8,14 @@ availability checks still apply. Context admission includes tool schemas, histor
 and a conservative allowance for protocol formatting; exact token counts remain
 the runtime tokenizer’s responsibility.
 
+For a known context limit, every generation checks the final prepared request
+with the same counter used by `/werk/v1/chat/admission`, including requests whose
+wire-size estimate looks small. Native counts take precedence; unsupported counters
+retain an explicitly labeled estimate. Overflow is rejected before generation or
+SSE headers, preserving complete tool pairs. Admission is a planning operation;
+clients must compact their own history and budget the response before submitting
+generation. Estimates are not an exact-token guarantee for arbitrary runtimes.
+
 | Adapter | Tool transport |
 | --- | --- |
 | llama.cpp server (CUDA, ROCm, Vulkan, Metal, CPU) | Native OpenAI tools, Jinja templates, tool history and streamed deltas |

@@ -264,35 +264,9 @@ pub(super) async fn prepare(
             request.extra.extend(options);
         }
     }
-    let context_size = generation_context_size(&state, &manifest).or_else(|| {
-        if matches!(context_policy, ContextPolicy::Reject | ContextPolicy::Count) {
-            manifest
-                .metadata
-                .parameter_constraints
-                .get("max_position_embeddings")
-                .or_else(|| {
-                    manifest
-                        .metadata
-                        .parameter_constraints
-                        .get("model_max_length")
-                })
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|v| usize::try_from(v).ok())
-                .filter(|v| *v > 0)
-        } else {
-            None
-        }
-    });
-    let admission_estimate = estimate_prompt_tokens(&request).map_err(|message| {
-        GenerationError::new(StatusCode::BAD_REQUEST, message, Some("messages".into()))
-    })?;
-    let needs_context_check = matches!(context_policy, ContextPolicy::Reject)
-        || (matches!(context_policy, ContextPolicy::Trim) && request.requires_tool_calling());
-    let context_check = if needs_context_check {
-        context_size.map(|size| (size, admission_estimate))
-    } else {
-        None
-    };
+    let context_size =
+        crate::generation_limits::profile(&manifest, generation_context_size(&state, &manifest))
+            .context_tokens;
     let removed_messages = if let Some(context_size) = context_size {
         match match context_policy {
             ContextPolicy::Trim if request.requires_tool_calling() => {
@@ -328,6 +302,18 @@ pub(super) async fn prepare(
             max_tokens
         );
     }
+    // Plan and enforce the same final request, including legacy text trimming.
+    // A low byte estimate is not proof that a native template fits. Count every
+    // generation with a known limit before committing JSON/SSE or starting the
+    // backend; use the labeled estimate only when native counting is unsupported.
+    let admission_estimate = estimate_prompt_tokens(&request).map_err(|message| {
+        GenerationError::new(StatusCode::BAD_REQUEST, message, Some("messages".into()))
+    })?;
+    let context_check = if !matches!(context_policy, ContextPolicy::Count) {
+        context_size.map(|size| (size, admission_estimate))
+    } else {
+        None
+    };
 
     let image_urls = image_urls_from_messages(&request.messages);
     let runtime_options = request.werk.as_ref().filter(|options| !options.is_empty());
@@ -518,9 +504,7 @@ pub(super) async fn prepare(
         }
     }
 
-    if let Some((limit, estimate)) = context_check
-        && estimate.saturating_add(max_tokens) > limit
-    {
+    if let Some((limit, estimate)) = context_check {
         let (prompt_tokens, method) = count_for_admission(
             &state,
             &manifest,

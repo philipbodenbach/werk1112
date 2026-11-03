@@ -143,8 +143,8 @@ async fn native_count_admits_overestimated_tool_history_without_trimming() {
     // Exact boundary is valid, despite JSON escaping making the estimate huge.
     let backend = Counter::new(Some(4096 - 32));
     let app = app(backend.clone());
-    for stream in [false, true] {
-        let response = post_json(&app, "/v1/chat/completions", request(stream, true), None).await;
+    for (stream, large) in [(false, true), (true, true), (false, false), (true, false)] {
+        let response = post_json(&app, "/v1/chat/completions", request(stream, large), None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -157,15 +157,15 @@ async fn native_count_admits_overestimated_tool_history_without_trimming() {
             );
         }
     }
-    assert_eq!(backend.counts.load(Ordering::SeqCst), 2);
-    assert_eq!(backend.generations.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.counts.load(Ordering::SeqCst), 4);
+    assert_eq!(backend.generations.load(Ordering::SeqCst), 4);
 }
 #[tokio::test]
 async fn native_overflow_returns_recognizable_error_before_json_or_sse() {
     let backend = Counter::new(Some(4096 - 32 + 1));
     let app = app(backend.clone());
-    for stream in [false, true] {
-        let response = post_json(&app, "/v1/chat/completions", request(stream, true), None).await;
+    for (stream, large) in [(false, true), (true, true), (false, false), (true, false)] {
+        let response = post_json(&app, "/v1/chat/completions", request(stream, large), None).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
         let bytes = body::to_bytes(response.into_body(), usize::MAX)
@@ -189,6 +189,22 @@ async fn native_overflow_returns_recognizable_error_before_json_or_sse() {
     assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]
+async fn plain_text_underestimate_is_rejected_before_json_or_sse() {
+    for stream in [false, true] {
+        let backend = Counter::new(Some(4096 - 32 + 1));
+        let app = app(backend.clone());
+        let response = post_json(&app, "/v1/chat/completions", json!({
+            "model":"context-test", "stream":stream, "max_tokens":32,
+            "messages":[{"role":"user","content":"A small wire request can have a larger native template"}]
+        }), None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(backend.counts.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn unavailable_native_counter_keeps_labeled_estimate_and_compaction_signal() {
     let backend = Counter::new(None);
     let app = app(backend.clone());
@@ -203,7 +219,7 @@ async fn unavailable_native_counter_keeps_labeled_estimate_and_compaction_signal
     assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]
-async fn requests_well_within_budget_do_not_add_tokenizer_round_trips() {
+async fn unsupported_counter_keeps_small_requests_compatible() {
     let backend = Counter::new(None);
     let app = app(backend.clone());
     let response = post_json(&app, "/v1/chat/completions", request(false, false), None).await;
@@ -217,7 +233,7 @@ async fn requests_well_within_budget_do_not_add_tokenizer_round_trips() {
     assert_eq!(value["choices"][0]["message"]["content"], "ok");
     assert!(value.get("protocol").is_none());
     assert!(value.get("data").is_none());
-    assert_eq!(backend.counts.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.counts.load(Ordering::SeqCst), 1);
     assert_eq!(backend.generations.load(Ordering::SeqCst), 1);
 }
 
