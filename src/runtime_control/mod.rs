@@ -7,6 +7,7 @@ mod backend;
 // this separate RAM/VRAM pressure-policy surface.
 #[cfg_attr(not(test), allow(dead_code))]
 mod experts;
+mod gpu_memory;
 mod handoff;
 mod local;
 pub(crate) mod memory;

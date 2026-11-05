@@ -252,6 +252,8 @@ fn worker_lock(root: &Path, id: &str) -> Result<WorkerLock> {
 
 fn blank_entry(id: &str) -> CacheEntry {
     CacheEntry {
+        path: None,
+        files: None,
         id: format!("omlx-worker:{id}"),
         kind: CacheKind::OmlxWorker,
         backend: Some("omlx".into()),

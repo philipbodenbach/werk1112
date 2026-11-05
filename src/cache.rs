@@ -26,6 +26,9 @@ pub enum CacheKind {
     ChatHistory,
     OmlxWorker,
     RuntimeState,
+    Build,
+    Backup,
+    Shared,
 }
 
 impl CacheKind {
@@ -35,6 +38,9 @@ impl CacheKind {
             Self::ChatHistory => "chat-history",
             Self::OmlxWorker => "omlx-worker",
             Self::RuntimeState => "runtime-state",
+            Self::Build => "build",
+            Self::Backup => "backup",
+            Self::Shared => "shared",
         }
     }
 }
@@ -48,6 +54,123 @@ pub struct CacheEntry {
     pub modified_unix_seconds: Option<u64>,
     pub active: bool,
     pub blocked_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<u64>,
+}
+
+fn maintenance_kind(kind: CacheKind) -> Option<crate::maintenance::Kind> {
+    use crate::maintenance::Kind;
+    match kind {
+        CacheKind::Build => Some(Kind::Build),
+        CacheKind::Backup => Some(Kind::Backup),
+        CacheKind::Shared => Some(Kind::Shared),
+        _ => None,
+    }
+}
+
+fn maintenance_entry(entry: crate::maintenance::Entry) -> CacheEntry {
+    use crate::maintenance::Kind;
+    CacheEntry {
+        id: entry.id,
+        kind: match entry.kind {
+            Kind::Build => CacheKind::Build,
+            Kind::Backup => CacheKind::Backup,
+            Kind::Shared => CacheKind::Shared,
+            Kind::Temporary => unreachable!(),
+        },
+        backend: None,
+        bytes: entry.size_complete.then_some(entry.allocated_bytes),
+        modified_unix_seconds: None,
+        active: false,
+        blocked_reason: entry.blocked,
+        path: Some(entry.path),
+        files: entry.size_complete.then_some(entry.files),
+    }
+}
+
+/// CLI-only inventory: persistence APIs keep their original model-store boundary.
+pub fn list_local(
+    home: &Path,
+    locations: &crate::maintenance::Locations,
+    kind: Option<CacheKind>,
+    shared: bool,
+) -> Result<CacheInventory> {
+    let mut report = inventory(home, kind);
+    if kind.is_none() || kind.and_then(maintenance_kind).is_some() {
+        let local = crate::maintenance::run(
+            crate::maintenance::cache_candidates(
+                locations,
+                kind.and_then(maintenance_kind),
+                shared,
+            )?,
+            0,
+            None,
+        )?;
+        report
+            .entries
+            .extend(local.entries.into_iter().map(maintenance_entry));
+    }
+    report.entries.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(report)
+}
+
+pub fn purge_local(
+    home: &Path,
+    locations: &crate::maintenance::Locations,
+    selection: &CacheSelection,
+    shared: bool,
+    dry_run: bool,
+) -> Result<CachePurgeReport> {
+    use crate::maintenance::{self, Kind, Selection};
+    let local_kind = match selection {
+        CacheSelection::Id(id) => match id.split_once(':').map(|(kind, _)| kind) {
+            Some("build") => Some(Kind::Build),
+            Some("backup") => Some(Kind::Backup),
+            Some("shared") => Some(Kind::Shared),
+            _ => None,
+        },
+        CacheSelection::All { kind, .. } => kind.and_then(maintenance_kind),
+    };
+    let mut report = if local_kind.is_some() {
+        CachePurgeReport {
+            entries: vec![],
+            removed: vec![],
+            blocked: vec![],
+            dry_run,
+        }
+    } else {
+        purge(home, selection, dry_run)?
+    };
+    if local_kind.is_some() || matches!(selection, CacheSelection::All { kind: None, .. }) {
+        let local_selection = Selection {
+            id: match selection {
+                CacheSelection::Id(id) => Some(id.clone()),
+                _ => None,
+            },
+            all: matches!(selection, CacheSelection::All { .. }),
+            dry_run,
+        };
+        let local = maintenance::run(
+            maintenance::cache_candidates(locations, local_kind, shared)?,
+            0,
+            Some(&local_selection),
+        )?;
+        for entry in local.entries {
+            if let Some(reason) = &entry.blocked {
+                report.blocked.push(CacheBlocked {
+                    id: entry.id.clone(),
+                    reason: reason.clone(),
+                });
+            }
+            if local.removed.contains(&entry.path) {
+                report.removed.push(entry.id.clone());
+            }
+            report.entries.push(maintenance_entry(entry));
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +203,7 @@ pub struct CachePurgeReport {
     pub dry_run: bool,
 }
 
+#[cfg(test)]
 pub fn list(home: &Path) -> Result<CacheInventory> {
     Ok(inventory(home, None))
 }
@@ -212,6 +336,8 @@ fn valid_chat_hash(hash: &str) -> bool {
 
 fn chat_entry(root: &Path, path: &Path, hash: &str, kind: CacheKind) -> Result<CacheEntry> {
     let mut entry = CacheEntry {
+        path: None,
+        files: None,
         id: format!("{}:{hash}", kind.as_str()),
         kind,
         backend: None,
@@ -286,6 +412,8 @@ fn purge_chat(home: &Path, id: &str, dry_run: bool) -> Result<CacheEntry> {
     };
     let stats = inspect_chat_target(&path, kind)?;
     let entry = CacheEntry {
+        path: None,
+        files: None,
         id: id.into(),
         kind,
         backend: chat_backend(&path, kind)?,

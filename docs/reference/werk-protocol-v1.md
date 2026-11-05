@@ -250,7 +250,11 @@ returns a planning budget without generation or history trimming:
 
 The method is `native` when the backend counted the complete request, or
 `estimate` when its native counter is unavailable (including unsupported image
-counting). The fallback is exactly the generation admission estimator, not a
+counting). When the selected visual runtime can count its text/tool projection,
+the estimate combines that native count with the visual allowance; adding an
+image does not replace native text/tool counts with serialized-byte estimates.
+The projection keeps the same runtime, template, tool pairs and API options.
+The fallback is exactly the generation admission estimator, not a
 client's independently calibrated image estimate. `context_tokens` is null if
 the server has no established limit. Clients add the returned output budget and
 their margin to the input budget, compact/reduce before dispatch, and keep

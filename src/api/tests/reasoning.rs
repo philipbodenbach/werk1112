@@ -384,8 +384,9 @@ async fn reasoning_protocol_profile_and_both_requests_share_resolution() {
         assert_eq!(response.status(), StatusCode::OK);
     }
     let calls = backend.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0], calls[1]);
+    // Explicit count, generation admission and generation share resolution.
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|options| options == &calls[0]));
     assert_eq!(calls[0]["reasoning_budget_tokens"], 1024);
 }
 #[tokio::test]

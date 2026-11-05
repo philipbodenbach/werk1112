@@ -29,6 +29,8 @@ pub(super) fn purge(home: &Path, id: &str, dry_run: bool) -> Result<CacheEntry> 
 
 fn cache_entry(entry: StoredCacheEntry) -> CacheEntry {
     CacheEntry {
+        path: None,
+        files: None,
         id: format!("runtime-state:{}:{}", entry.namespace, entry.id),
         kind: CacheKind::RuntimeState,
         backend: entry.backend,

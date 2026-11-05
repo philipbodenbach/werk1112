@@ -11,7 +11,7 @@ Generated from **werk 1.10.2**. See [CLI semantics](cli.md),
 [canonical parameter schema](parameters-schema.md).
 
 Coverage of this profile: **31 top-level commands**, **100 help nodes**
-(including the root), and **455 distinct long option names**
+(including the root), and **458 distinct long option names**
 (excluding `--help` and `--version`). Compatibility aliases are listed
 in [CLI conventions](cli.md#syntax-aliases-and-input-contracts).
 
@@ -510,7 +510,7 @@ Also accepts the [global options](#global-options).
 
 ## werk temp
 
-Manage temporary files in the model store
+Inspect model-store and system temporary files; purge both with --all
 
 ```text
 werk temp [OPTIONS] <COMMAND>
@@ -522,7 +522,7 @@ Also accepts the [global options](#global-options).
 
 ## werk cache
 
-List and remove local persistence caches
+List and remove persistence caches, build files and program backups
 
 ```text
 werk cache [OPTIONS] <COMMAND>
@@ -1071,11 +1071,16 @@ Also accepts the [global options](#global-options).
 
 ## werk temp list
 
-List temporary entries in the model store
+List model-store and owned Werk system temporary entries
 
 ```text
 werk temp list [OPTIONS]
 ```
+
+| Option | Meaning / parser default |
+| --- | --- |
+| `--json` | Print a machine-readable inventory with paths, counts, allocated sizes and protection reasons. |
+| `--older-than-hours <OLDER_THAN_HOURS>` | Minimum unchanged age for --all cleanup [default: 24] |
 
 Also accepts the [global options](#global-options).
 
@@ -1090,6 +1095,9 @@ werk temp purge [OPTIONS]
 | Option | Meaning / parser default |
 | --- | --- |
 | `--dry-run` | Show what would be removed without deleting anything |
+| `--all` | Include owned Werk system temporary files; skip recent and active entries |
+| `--older-than-hours <OLDER_THAN_HOURS>` | Minimum unchanged age, including descendants; 0 includes recent entries [default: 24] |
+| `--json` | Print the expanded cleanup report as JSON |
 
 Also accepts the [global options](#global-options).
 
@@ -1113,7 +1121,9 @@ werk cache list [OPTIONS]
 
 | Option | Meaning / parser default |
 | --- | --- |
-| `--kind <KIND>` | Show only this storage type [possible values: chat-kv, chat-history, omlx-worker, runtime-state] |
+| `--kind <KIND>` | Show only this storage type [possible values: chat-kv, chat-history, omlx-worker, runtime-state, build, backup, shared] |
+| `--workspace <WORKSPACE>` | Rust workspace to inspect for target directories [default: .] |
+| `--shared` | Include shared package/GPU caches used by other projects |
 | `--json` | Print machine-readable JSON |
 
 Also accepts the [global options](#global-options).
@@ -1132,13 +1142,15 @@ Arguments:
 [CACHE]  Exact cache ID from werk cache list
 ```
 
-Saved chat histories are excluded from --all unless --include-history or --kind chat-history is supplied. Active or protected entries are skipped. Model weights are never removed.
+--all includes persistence caches, workspace build files and program backups. Shared package/GPU caches require --shared or --kind shared. Saved chat histories require --include-history or --kind chat-history. Active or protected entries are skipped. Model weights and credentials are never removed.
 
 | Option | Meaning / parser default |
 | --- | --- |
 | `--all` | Remove all inactive, unprotected caches |
-| `--kind <KIND>` | Limit --all to this storage type [possible values: chat-kv, chat-history, omlx-worker, runtime-state] |
+| `--kind <KIND>` | Limit --all to this storage type [possible values: chat-kv, chat-history, omlx-worker, runtime-state, build, backup, shared] |
 | `--include-history` | Also delete saved chat histories with --all |
+| `--workspace <WORKSPACE>` | Rust workspace whose build files may be removed [default: .] |
+| `--shared` | Include shared package/GPU caches with --all |
 | `--dry-run` | Show what would be removed without deleting anything |
 | `--json` | Print machine-readable JSON |
 

@@ -49,6 +49,7 @@ pub mod generation_limits;
 pub mod inference;
 pub mod inference_service;
 pub mod logging;
+pub(crate) mod maintenance;
 pub mod media_cli;
 pub mod media_companion;
 pub mod model_store;

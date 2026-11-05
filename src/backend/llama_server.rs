@@ -620,6 +620,20 @@ impl GenerationBackend for LlamaServerBackend {
         apply_chat_api_options(&mut body, options)?;
         count_request_tokens(&server.url, &body)
     }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, Value>,
+    ) -> Result<usize> {
+        self.validate_api_options(manifest, &request, &options)?;
+        // Select the visual worker first: stripping images before routing can
+        // select a different backend/template in mixed text/vision setups.
+        let (server, _, _) = self.cached_server(manifest, request.has_images())?;
+        let mut body = chat_text_template_body(&request);
+        apply_chat_api_options(&mut body, options)?;
+        count_request_tokens(&server.url, &body)
+    }
     fn runtime_control_adapter(&self) -> Arc<dyn BackendRuntimeAdapter> {
         Arc::new(LlamaRuntimeStateAdapter::new(self.clone()))
     }
@@ -1783,6 +1797,19 @@ fn chat_template_body(request: &GenerateRequest) -> Value {
             .extend(fields.as_object().unwrap().clone());
     }
     body
+}
+
+fn chat_text_template_body(request: &GenerateRequest) -> Value {
+    let mut text = request.clone();
+    text.image_urls.clear();
+    for message in &mut text.messages {
+        if let Some(content) = &message.content
+            && !content.image_urls().is_empty()
+        {
+            message.content = Some(crate::openai::MessageContent::Text(content.as_text()));
+        }
+    }
+    chat_template_body(&text)
 }
 
 fn apply_chat_api_options(
@@ -4465,6 +4492,10 @@ Agent 3
             "https://example.test/second.png"
         );
         assert_eq!(body["messages"][0]["name"], "visual-check");
+        let text = chat_text_template_body(&request);
+        assert_eq!(text["messages"][0]["content"], "Inspect this layout");
+        assert_eq!(text["messages"][0]["name"], "visual-check");
+        assert_eq!(chat_completion_body(&request), body);
     }
 
     #[test]
@@ -4525,6 +4556,9 @@ Agent 3
             content[1]["image_url"]["url"],
             "https://example.test/layout.png"
         );
+        let text = chat_text_template_body(&request);
+        assert_eq!(text["messages"][0]["content"], "Inspect this image");
+        assert_eq!(llama_chat_messages(&request), messages);
     }
 
     #[test]

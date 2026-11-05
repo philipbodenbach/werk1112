@@ -264,35 +264,9 @@ pub(super) async fn prepare(
             request.extra.extend(options);
         }
     }
-    let context_size = generation_context_size(&state, &manifest).or_else(|| {
-        if matches!(context_policy, ContextPolicy::Reject | ContextPolicy::Count) {
-            manifest
-                .metadata
-                .parameter_constraints
-                .get("max_position_embeddings")
-                .or_else(|| {
-                    manifest
-                        .metadata
-                        .parameter_constraints
-                        .get("model_max_length")
-                })
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|v| usize::try_from(v).ok())
-                .filter(|v| *v > 0)
-        } else {
-            None
-        }
-    });
-    let admission_estimate = estimate_prompt_tokens(&request).map_err(|message| {
-        GenerationError::new(StatusCode::BAD_REQUEST, message, Some("messages".into()))
-    })?;
-    let needs_context_check = matches!(context_policy, ContextPolicy::Reject)
-        || (matches!(context_policy, ContextPolicy::Trim) && request.requires_tool_calling());
-    let context_check = if needs_context_check {
-        context_size.map(|size| (size, admission_estimate))
-    } else {
-        None
-    };
+    let context_size =
+        crate::generation_limits::profile(&manifest, generation_context_size(&state, &manifest))
+            .context_tokens;
     let removed_messages = if let Some(context_size) = context_size {
         match match context_policy {
             ContextPolicy::Trim if request.requires_tool_calling() => {
@@ -328,6 +302,18 @@ pub(super) async fn prepare(
             max_tokens
         );
     }
+    // Plan and enforce the same final request, including legacy text trimming.
+    // A low byte estimate is not proof that a native template fits. Count every
+    // generation with a known limit before committing JSON/SSE or starting the
+    // backend; use the labeled estimate only when native counting is unsupported.
+    let admission_estimate = estimate_prompt_tokens(&request).map_err(|message| {
+        GenerationError::new(StatusCode::BAD_REQUEST, message, Some("messages".into()))
+    })?;
+    let context_check = if !matches!(context_policy, ContextPolicy::Count) {
+        context_size.map(|size| (size, admission_estimate))
+    } else {
+        None
+    };
 
     let image_urls = image_urls_from_messages(&request.messages);
     let runtime_options = request.werk.as_ref().filter(|options| !options.is_empty());
@@ -518,9 +504,7 @@ pub(super) async fn prepare(
         }
     }
 
-    if let Some((limit, estimate)) = context_check
-        && estimate.saturating_add(max_tokens) > limit
-    {
+    if let Some((limit, estimate)) = context_check {
         let (prompt_tokens, method) = count_for_admission(
             &state,
             &manifest,
@@ -570,8 +554,9 @@ pub(super) async fn prepare(
     })
 }
 
-/// Shared by planning and generation. An unavailable native counter retains
-/// exactly the server admission estimate, never an estimate labeled as exact.
+/// Shared by planning and generation. Prefer a full native count, then native
+/// text/tool tokens plus the visual estimate, then the complete estimate.
+/// Only a full native count may be labeled exact.
 pub(super) async fn count_for_admission(
     state: &ApiState,
     manifest: &ModelManifest,
@@ -584,7 +569,20 @@ pub(super) async fn count_for_admission(
     let request = request.clone();
     let options = options.clone();
     let counted = crate::logging::spawn_blocking(move || {
-        backend.count_api_tokens(&manifest, request, options)
+        if let Ok(count) = backend.count_api_tokens(&manifest, request.clone(), options.clone()) {
+            return (count, "native");
+        }
+        if request.has_images() {
+            let images = estimate_visual_tokens(&request.messages);
+            if images > 0
+                && let Ok(text) = backend.count_api_text_tokens(&manifest, request, options)
+            {
+                // Reserve framing around the visual embeddings as well. The
+                // result remains an estimate even though text/tools are native.
+                return (text.saturating_add(images).saturating_add(64), "estimate");
+            }
+        }
+        (estimate, "estimate")
     })
     .await
     .map_err(|error| {
@@ -594,9 +592,21 @@ pub(super) async fn count_for_admission(
             None,
         )
     })?;
-    Ok(match counted {
-        Ok(count) => (count, "native"),
-        Err(_) => (estimate, "estimate"),
+    Ok(counted)
+}
+
+fn estimate_visual_tokens(messages: &[crate::openai::ChatMessage]) -> usize {
+    messages.iter().fold(0usize, |tokens, message| {
+        let Some(crate::openai::MessageContent::Parts(parts)) = &message.content else {
+            return tokens;
+        };
+        parts.iter().fold(tokens, |tokens, part| {
+            if matches!(part.kind.as_str(), "image_url" | "input_image") {
+                tokens.saturating_add(estimate_image_part_tokens(part))
+            } else {
+                tokens
+            }
+        })
     })
 }
 
@@ -827,28 +837,30 @@ fn estimate_message_tokens(messages: &[crate::openai::ChatMessage]) -> usize {
 }
 
 fn estimate_content_tokens(content: &crate::openai::MessageContent) -> usize {
-    use crate::openai::{ImageUrlSpec, MessageContent};
+    use crate::openai::MessageContent;
 
     match content {
         MessageContent::Text(text) => text.len().div_ceil(3),
         MessageContent::Parts(parts) => parts.iter().fold(0usize, |tokens, part| {
             let part_tokens = match part.kind.as_str() {
                 "text" => part.text.as_deref().unwrap_or_default().len().div_ceil(3),
-                "image_url" | "input_image" => {
-                    let detail = part.image_url.as_ref().and_then(|image| match image {
-                        ImageUrlSpec::Object(image) => image.detail.as_deref(),
-                        ImageUrlSpec::Url(_) => None,
-                    });
-                    match detail {
-                        Some("low") => 256,
-                        Some("high") => 2048,
-                        _ => 1024,
-                    }
-                }
+                "image_url" | "input_image" => estimate_image_part_tokens(part),
                 _ => 0,
             };
             tokens.saturating_add(part_tokens)
         }),
+    }
+}
+
+fn estimate_image_part_tokens(part: &crate::openai::ContentPart) -> usize {
+    let detail = part.image_url.as_ref().and_then(|image| match image {
+        crate::openai::ImageUrlSpec::Object(image) => image.detail.as_deref(),
+        crate::openai::ImageUrlSpec::Url(_) => None,
+    });
+    match detail {
+        Some("low") => 256,
+        Some("high") => 2048,
+        _ => 1024,
     }
 }
 

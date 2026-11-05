@@ -39,6 +39,7 @@ PROFILES = {
     ],
 }
 OPTION_NOTES = {
+    ("temp list", "--json"): "Print a machine-readable inventory with paths, counts, allocated sizes and protection reasons.",
     ("components", "--json"): "Print host compatibility, installed versions, status, requirements and planned actions as JSON; requires --list and executes no actions.",
     ("top", "--url"): "Server root URL without /v1, credentials, query or fragment; HTTP(S).",
     ("top", "--api-key"): "Bearer credential; local servers also support discovery from the default key file.",

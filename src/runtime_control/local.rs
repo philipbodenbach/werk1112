@@ -34,13 +34,10 @@ use crate::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    io::Read,
-    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
 
@@ -3301,124 +3298,10 @@ fn host_memory_observation() -> Option<(u64, Option<u64>)> {
 }
 
 fn accelerator_memory_observation(accelerator: Option<&str>) -> Option<(u64, Option<u64>)> {
-    let accelerator = accelerator?.to_ascii_lowercase();
-    if !accelerator.contains("cuda") {
+    if !accelerator?.to_ascii_lowercase().contains("cuda") {
         return None;
     }
-    let stdout = bounded_command_stdout(
-        "nvidia-smi",
-        &[
-            "--query-gpu=memory.total,memory.free",
-            "--format=csv,noheader,nounits",
-        ],
-        Duration::from_secs(2),
-        64 * 1024,
-    )?;
-    let line = String::from_utf8(stdout).ok()?.lines().next()?.to_string();
-    let mut values = line.split(',').map(str::trim);
-    let total_mib = values.next()?.parse::<u64>().ok()?;
-    let free_mib = values.next()?.parse::<u64>().ok()?;
-    let mib = 1024 * 1024;
-    Some((
-        total_mib.saturating_mul(mib),
-        Some(free_mib.saturating_mul(mib)),
-    ))
-}
-
-fn bounded_command_stdout(
-    program: &str,
-    arguments: &[&str],
-    timeout: Duration,
-    max_stdout_bytes: usize,
-) -> Option<Vec<u8>> {
-    // Killing a process stuck in a driver syscall does not bound wait() or a
-    // pipe read. Isolate cleanup from callers and retain the single-flight
-    // guard until it really finishes, rather than accumulate stuck probes.
-    static PROBE: std::sync::OnceLock<CommandProbe> = std::sync::OnceLock::new();
-    let program = program.to_owned();
-    let arguments: Vec<String> = arguments.iter().map(|s| (*s).to_owned()).collect();
-    PROBE
-        .get_or_init(CommandProbe::default)
-        .run(timeout, move || {
-            command_stdout_worker(&program, &arguments, timeout, max_stdout_bytes)
-        })
-}
-
-#[derive(Default)]
-struct CommandProbe {
-    busy: Arc<AtomicBool>,
-}
-
-struct ProbeGuard(Arc<AtomicBool>);
-impl Drop for ProbeGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-impl CommandProbe {
-    fn run<F>(&self, timeout: Duration, operation: F) -> Option<Vec<u8>>
-    where
-        F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
-    {
-        self.busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        let guard = ProbeGuard(self.busy.clone());
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("werk-memory-probe".into())
-            .spawn(move || {
-                let result = operation();
-                drop(guard);
-                let _ = tx.send(result);
-            })
-            .ok()?;
-        rx.recv_timeout(timeout).ok().flatten()
-    }
-}
-
-fn command_stdout_worker(
-    program: &str,
-    arguments: &[String],
-    timeout: Duration,
-    max_stdout_bytes: usize,
-) -> Option<Vec<u8>> {
-    let mut child = Command::new(program)
-        .args(arguments)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    if !status.success() {
-        return None;
-    }
-    let mut stdout = child.stdout.take()?;
-    let mut bytes = Vec::new();
-    stdout
-        .by_ref()
-        .take((max_stdout_bytes + 1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() <= max_stdout_bytes).then_some(bytes)
+    super::gpu_memory::observe().map(|(total, free)| (total, Some(free)))
 }
 
 fn invalid(message: impl Into<String>) -> ProtocolError {
@@ -3456,63 +3339,10 @@ mod tests {
         fs,
         path::PathBuf,
         sync::atomic::{AtomicBool, AtomicU64, AtomicUsize},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
-
-    #[test]
-    fn timed_out_memory_probe_keeps_one_worker_until_cleanup_finishes() {
-        let probe = CommandProbe::default();
-        let (release, blocked) = std::sync::mpsc::channel();
-        let started = Instant::now();
-        assert!(
-            probe
-                .run(Duration::from_millis(30), move || {
-                    let _ = blocked.recv();
-                    Some(vec![1])
-                })
-                .is_none()
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
-        for _ in 0..10 {
-            assert!(
-                probe
-                    .run(Duration::from_millis(30), || {
-                        panic!("must not start another probe while cleanup is blocked")
-                    })
-                    .is_none()
-            );
-        }
-        release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while probe.busy.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(
-            probe.run(Duration::from_secs(1), || Some(vec![2])),
-            Some(vec![2])
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn memory_probe_command_bounds_output_and_reaps_a_timeout() {
-        let run = |command: &str, limit| {
-            command_stdout_worker(
-                "sh",
-                &["-c".into(), command.into()],
-                Duration::from_millis(50),
-                limit,
-            )
-        };
-        assert_eq!(run("printf 1234", 4), Some(b"1234".to_vec()));
-        assert!(run("printf 12345", 4).is_none());
-        assert!(run("exit 1", 4).is_none());
-        let started = Instant::now();
-        assert!(run("exec sleep 5", 4).is_none());
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

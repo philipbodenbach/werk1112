@@ -1069,13 +1069,16 @@ pub enum Commands {
         command: AuthCommands,
     },
 
-    #[command(about = "Manage temporary files in the model store")]
+    #[command(
+        about = "Inspect model-store and system temporary files; purge both with --all",
+        visible_alias = "tmp"
+    )]
     Temp {
         #[command(subcommand)]
         command: TempCommands,
     },
 
-    #[command(about = "List and remove local persistence caches")]
+    #[command(about = "List and remove persistence caches, build files and program backups")]
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
@@ -1375,13 +1378,40 @@ pub enum ArtifactCommands {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum TempCommands {
-    #[command(about = "List temporary entries in the model store")]
-    List,
+    #[command(about = "List model-store and owned Werk system temporary entries")]
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(
+            long,
+            default_value_t = 24,
+            help = "Minimum unchanged age for --all cleanup"
+        )]
+        older_than_hours: u64,
+    },
 
     #[command(about = "Remove temporary files from the model store")]
     Purge {
         #[arg(long, help = "Show what would be removed without deleting anything")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Include owned Werk system temporary files; skip recent and active entries"
+        )]
+        all: bool,
+        #[arg(
+            long,
+            default_value_t = 24,
+            requires = "all",
+            help = "Minimum unchanged age, including descendants; 0 includes recent entries"
+        )]
+        older_than_hours: u64,
+        #[arg(
+            long,
+            requires = "all",
+            help = "Print the expanded cleanup report as JSON"
+        )]
+        json: bool,
     },
 
     #[command(about = "Print the temporary-files directory")]
@@ -1394,6 +1424,9 @@ pub enum CacheKindArg {
     ChatHistory,
     OmlxWorker,
     RuntimeState,
+    Build,
+    Backup,
+    Shared,
 }
 
 impl From<CacheKindArg> for CacheKind {
@@ -1403,6 +1436,9 @@ impl From<CacheKindArg> for CacheKind {
             CacheKindArg::ChatHistory => Self::ChatHistory,
             CacheKindArg::OmlxWorker => Self::OmlxWorker,
             CacheKindArg::RuntimeState => Self::RuntimeState,
+            CacheKindArg::Build => Self::Build,
+            CacheKindArg::Backup => Self::Backup,
+            CacheKindArg::Shared => Self::Shared,
         }
     }
 }
@@ -1414,13 +1450,25 @@ pub enum CacheCommands {
         #[arg(long, value_enum, help = "Show only this storage type")]
         kind: Option<CacheKindArg>,
 
+        #[arg(
+            long,
+            default_value = ".",
+            help = "Rust workspace to inspect for target directories"
+        )]
+        workspace: PathBuf,
+        #[arg(
+            long,
+            help = "Include shared package/GPU caches used by other projects"
+        )]
+        shared: bool,
+
         #[arg(long, help = "Print machine-readable JSON")]
         json: bool,
     },
 
     #[command(
         about = "Remove a listed cache, or all inactive caches with --all",
-        after_help = "Saved chat histories are excluded from --all unless --include-history or --kind chat-history is supplied. Active or protected entries are skipped. Model weights are never removed.",
+        after_help = "--all includes persistence caches, workspace build files and program backups. Shared package/GPU caches require --shared or --kind shared. Saved chat histories require --include-history or --kind chat-history. Active or protected entries are skipped. Model weights and credentials are never removed.",
         group(clap::ArgGroup::new("cache_selection").required(true).args(["id", "all"]))
     )]
     Purge {
@@ -1446,6 +1494,15 @@ pub enum CacheCommands {
             help = "Also delete saved chat histories with --all"
         )]
         include_history: bool,
+
+        #[arg(
+            long,
+            default_value = ".",
+            help = "Rust workspace whose build files may be removed"
+        )]
+        workspace: PathBuf,
+        #[arg(long, help = "Include shared package/GPU caches with --all")]
+        shared: bool,
 
         #[arg(long, help = "Show what would be removed without deleting anything")]
         dry_run: bool,
@@ -2564,13 +2621,70 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Temp { command } => {
             let store = ModelStore::resolve(model_home)?;
             match command {
-                TempCommands::List => {
-                    crate::ui_println!("{}", format_temp_list(&store.list_tmp()?));
+                TempCommands::List {
+                    json,
+                    older_than_hours,
+                } => {
+                    let locations = crate::maintenance::Locations::resolve(Path::new("."))?;
+                    let candidates = crate::maintenance::temporary_candidates(
+                        store.home(),
+                        store.list_tmp()?,
+                        &locations.temporary,
+                    )?;
+                    let report = crate::maintenance::run(candidates, older_than_hours, None)?;
+                    if json {
+                        print_runtime_json(&report)?;
+                    } else {
+                        if report.entries.is_empty() {
+                            crate::ui_println!("{}", format_temp_list(&[]));
+                        }
+                        crate::ui_println!("{}", crate::maintenance::format_report(&report, false));
+                        crate::ui_println!(
+                            "Includes model-store and system temporary entries. Use `werk tmp purge --all --dry-run` to preview cleanup."
+                        );
+                    }
                     Ok(())
                 }
-                TempCommands::Purge { dry_run } => {
-                    let summary = store.purge_tmp(dry_run)?;
-                    crate::ui_println!("{}", format_temp_purge_summary(&summary, dry_run));
+                TempCommands::Purge {
+                    dry_run,
+                    all,
+                    older_than_hours,
+                    json,
+                } => {
+                    if all {
+                        let locations = crate::maintenance::Locations::resolve(Path::new("."))?;
+                        let candidates = crate::maintenance::temporary_candidates(
+                            store.home(),
+                            store.list_tmp()?,
+                            &locations.temporary,
+                        )?;
+                        let report = crate::maintenance::run(
+                            candidates,
+                            older_than_hours,
+                            Some(&crate::maintenance::Selection {
+                                id: None,
+                                all: true,
+                                dry_run,
+                            }),
+                        )?;
+                        if json {
+                            print_runtime_json(&report)?;
+                        } else {
+                            crate::ui_println!(
+                                "{}",
+                                crate::maintenance::format_report(&report, true)
+                            );
+                        }
+                        if !report.errors.is_empty() {
+                            bail!("some temporary entries could not be removed; see the report");
+                        }
+                    } else {
+                        let summary = store.purge_tmp(dry_run)?;
+                        crate::ui_println!("{}", format_temp_purge_summary(&summary, dry_run));
+                        crate::ui_println!(
+                            "System temporary files were retained. Add --all to include them."
+                        );
+                    }
                     Ok(())
                 }
                 TempCommands::Path => {
@@ -2582,11 +2696,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Cache { command } => {
             let store = ModelStore::resolve(model_home)?;
             match command {
-                CacheCommands::List { kind, json } => {
-                    let mut inventory = cache::list(store.home())?;
-                    if let Some(kind) = kind {
-                        inventory.entries.retain(|entry| entry.kind == kind.into());
-                    }
+                CacheCommands::List {
+                    kind,
+                    json,
+                    workspace,
+                    shared,
+                } => {
+                    let locations = crate::maintenance::Locations::resolve(&workspace)?;
+                    let inventory =
+                        cache::list_local(store.home(), &locations, kind.map(Into::into), shared)?;
                     if json {
                         print_runtime_json(&inventory)
                     } else {
@@ -2599,6 +2717,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     all,
                     kind,
                     include_history,
+                    workspace,
+                    shared,
                     dry_run,
                     json,
                 } => {
@@ -2610,7 +2730,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                         },
                         _ => bail!("select a cache ID or --all"),
                     };
-                    let report = cache::purge(store.home(), &selection, dry_run)?;
+                    let locations = crate::maintenance::Locations::resolve(&workspace)?;
+                    let report =
+                        cache::purge_local(store.home(), &locations, &selection, shared, dry_run)?;
                     if json {
                         print_runtime_json(&report)?;
                     } else {
@@ -9838,6 +9960,19 @@ impl GenerationBackend for AutoBackend {
         )?
         .count_api_tokens(manifest, request, options)
     }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_execution(
+            manifest,
+            request.has_images(),
+            request.requires_tool_calling(),
+        )?
+        .count_api_text_tokens(manifest, request, options)
+    }
 
     fn with_chat_options(
         &self,
@@ -10166,6 +10301,19 @@ impl GenerationBackend for GgufPreferredBackend {
         )?
         .count_api_tokens(manifest, request, options)
     }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_execution(
+            manifest,
+            request.has_images(),
+            request.requires_tool_calling(),
+        )?
+        .count_api_text_tokens(manifest, request, options)
+    }
 
     fn supports_tool_calling(&self, manifest: &ModelManifest, has_images: bool) -> bool {
         self.backend_for_capabilities(manifest, has_images, true)
@@ -10385,6 +10533,15 @@ impl GenerationBackend for MlxPreferredBackend {
     ) -> anyhow::Result<usize> {
         self.backend_for_request(manifest, request.has_images())?
             .count_api_tokens(manifest, request, options)
+    }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_request(manifest, request.has_images())?
+            .count_api_text_tokens(manifest, request, options)
     }
 
     fn runtime_control_adapter_for(
@@ -10635,6 +10792,15 @@ impl GenerationBackend for VllmPreferredBackend {
     ) -> anyhow::Result<usize> {
         self.backend_for_request(manifest, request.has_images())?
             .count_api_tokens(manifest, request, options)
+    }
+    fn count_api_text_tokens(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        self.backend_for_request(manifest, request.has_images())?
+            .count_api_text_tokens(manifest, request, options)
     }
 
     fn supports_tool_calling(&self, _manifest: &ModelManifest, _has_images: bool) -> bool {
@@ -12500,18 +12666,13 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn cache_kind_label(kind: CacheKind) -> &'static str {
-    match kind {
-        CacheKind::ChatKv => "chat-kv",
-        CacheKind::ChatHistory => "chat-history",
-        CacheKind::OmlxWorker => "omlx-worker",
-        CacheKind::RuntimeState => "runtime-state",
-    }
+    kind.as_str()
 }
 
 fn format_cache_list(inventory: &cache::CacheInventory) -> String {
     let entries = &inventory.entries;
     if entries.is_empty() && inventory.blocked.is_empty() {
-        return "No local persistence caches or saved chat histories found.".to_string();
+        return "No persistence caches, workspace build files or program backups found. Shared package caches require --shared.".to_string();
     }
     let mut lines = Vec::new();
     for entry in entries {
@@ -12525,6 +12686,9 @@ fn format_cache_list(inventory: &cache::CacheInventory) -> String {
             "available"
         };
         lines.push(entry.id.clone());
+        if let Some(path) = &entry.path {
+            lines.push(format!("  path: {}", path.display()));
+        }
         lines.push(format!(
             "  type: {} | backend: {} | size: {} | status: {status}",
             cache_kind_label(entry.kind),
@@ -12542,7 +12706,7 @@ fn format_cache_list(inventory: &cache::CacheInventory) -> String {
         ));
     }
     lines.push(format!(
-        "{} entries. Purge one ID, or use --all for inactive caches; saved histories require explicit selection.",
+        "{} entries. Purge one ID, or use --all for inactive caches/builds/backups. Shared package caches require --shared; saved histories require explicit selection.",
         entries.len(),
     ));
     lines.join("\n")
@@ -13897,6 +14061,26 @@ mod tests {
 
     #[test]
     fn cache_commands_require_an_explicit_selection_and_support_filters() {
+        for kind in ["build", "backup", "shared"] {
+            assert!(
+                Cli::try_parse_from([
+                    "werk",
+                    "cache",
+                    "purge",
+                    "--all",
+                    "--kind",
+                    kind,
+                    "--workspace",
+                    "/tmp/fixture",
+                    "--dry-run"
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["werk", "cache", "purge", "--all", "--shared", "--dry-run"])
+                .is_ok()
+        );
         let cli = Cli::try_parse_from([
             "werk",
             "cache",
@@ -13917,7 +14101,8 @@ mod tests {
             Some(Commands::Cache {
                 command: CacheCommands::List {
                     kind: Some(CacheKindArg::ChatKv),
-                    json: true
+                    json: true,
+                    ..
                 }
             })
         ));
@@ -13949,6 +14134,7 @@ mod tests {
                     include_history: false,
                     dry_run: true,
                     json: true,
+                    ..
                 }
             })
         ));
@@ -13980,6 +14166,8 @@ mod tests {
     #[test]
     fn cache_output_distinguishes_histories_and_never_counts_blocked_entries_as_removed() {
         let entry = CacheEntry {
+            path: None,
+            files: None,
             id: format!("chat-kv:{}", "a".repeat(64)),
             kind: CacheKind::ChatKv,
             backend: Some("omlx".into()),
@@ -13989,6 +14177,8 @@ mod tests {
             blocked_reason: None,
         };
         let history = CacheEntry {
+            path: None,
+            files: None,
             id: format!("chat-history:{}", "a".repeat(64)),
             kind: CacheKind::ChatHistory,
             backend: None,
@@ -14025,6 +14215,37 @@ mod tests {
 
     #[test]
     fn parses_temp_commands_and_global_model_home() {
+        let expanded = Cli::try_parse_from([
+            "werk",
+            "tmp",
+            "purge",
+            "--all",
+            "--older-than-hours",
+            "0",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            expanded.command,
+            Some(Commands::Temp {
+                command: TempCommands::Purge {
+                    all: true,
+                    older_than_hours: 0,
+                    dry_run: true,
+                    json: true
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["werk", "tmp", "list", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["werk", "tmp", "purge", "--older-than-hours", "0"]).is_err());
+        let alias = Cli::try_parse_from(["werk", "tmp", "purge", "--dry-run"]).unwrap();
+        assert!(matches!(
+            alias.command,
+            Some(Commands::Temp {
+                command: TempCommands::Purge { dry_run: true, .. }
+            })
+        ));
         let cli = Cli::try_parse_from([
             "werk",
             "--model-home",
@@ -14040,7 +14261,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Temp {
-                command: TempCommands::List
+                command: TempCommands::List { .. }
             })
         ));
 
@@ -14059,7 +14280,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Temp {
-                command: TempCommands::Purge { dry_run: false }
+                command: TempCommands::Purge { dry_run: false, .. }
             })
         ));
 
@@ -14067,7 +14288,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Temp {
-                command: TempCommands::Purge { dry_run: true }
+                command: TempCommands::Purge { dry_run: true, .. }
             })
         ));
 
