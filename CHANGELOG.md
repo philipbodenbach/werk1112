@@ -5,6 +5,24 @@ All notable changes to Werk1112 are documented in this file. The project uses
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-11-05
+
+### Changes
+
+- fix(): backend installer (`6a83047f8219`)
+- fix(): backend installer (`3888c5923932`)
+- fix(): backend installer (`bb4238b29651`)
+- fix(): backend installer (`9fda405f74f5`)
+- fix(): backend installer (`7a6b96ebf9d6`)
+- fix(): backend installer (`14eaa09910ea`)
+- fix(): backend installer (`bf229f5eb19c`)
+- fix(): backend installer (`d734fa4224ba`)
+- feat(): expand cli (`777a15b34f84`)
+- feat(): expand cli (`64e398dbbb39`)
+- feat(): expand cli (`0b44be698531`)
+- feat(): expand cli (`4a4fbb7d55df`)
+- feat(): expand cli (`73a018759d1d`)
+
 ## [1.10.2] - 2026-10-27
 
 ### Changes
@@ -512,7 +530,8 @@ All notable changes to Werk1112 are documented in this file. The project uses
 - The ComfyUI package keeps its independent `0.1.0` Registry version; it does
   not follow the Werk binary version.
 
-[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.10.2...HEAD
+[Unreleased]: https://github.com/philipbodenbach/werk1112/compare/v1.11.0...HEAD
+[1.11.0]: https://github.com/philipbodenbach/werk1112/compare/v1.10.2...v1.11.0
 [1.10.2]: https://github.com/philipbodenbach/werk1112/compare/v1.10.1...v1.10.2
 [1.10.1]: https://github.com/philipbodenbach/werk1112/compare/v1.10.0...v1.10.1
 [1.10.0]: https://github.com/philipbodenbach/werk1112/compare/v1.9.1...v1.10.0
