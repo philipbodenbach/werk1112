@@ -10072,12 +10072,21 @@ impl GenerationBackend for AutoBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
+        self.generate_cancellable(manifest, request, &|| false)
+    }
+
+    fn generate_cancellable(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::backend::GenerateResponse> {
         self.backend_for_execution(
             manifest,
             request.has_images(),
             request.requires_tool_calling(),
         )?
-        .generate(manifest, request)
+        .generate_cancellable(manifest, request, cancelled)
     }
 
     fn generate_stream(
@@ -10398,12 +10407,21 @@ impl GenerationBackend for GgufPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
+        self.generate_cancellable(manifest, request, &|| false)
+    }
+
+    fn generate_cancellable(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::backend::GenerateResponse> {
         self.backend_for_execution(
             manifest,
             request.has_images(),
             request.requires_tool_calling(),
         )?
-        .generate(manifest, request)
+        .generate_cancellable(manifest, request, cancelled)
     }
 
     fn generate_stream(
@@ -10610,8 +10628,17 @@ impl GenerationBackend for MlxPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
+        self.generate_cancellable(manifest, request, &|| false)
+    }
+
+    fn generate_cancellable(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::backend::GenerateResponse> {
         self.backend_for_request(manifest, request.has_images())?
-            .generate(manifest, request)
+            .generate_cancellable(manifest, request, cancelled)
     }
 
     fn generate_stream(
@@ -10890,8 +10917,17 @@ impl GenerationBackend for VllmPreferredBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<crate::backend::GenerateResponse> {
+        self.generate_cancellable(manifest, request, &|| false)
+    }
+
+    fn generate_cancellable(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::backend::GenerateResponse> {
         self.backend_for_request(manifest, request.has_images())?
-            .generate(manifest, request)
+            .generate_cancellable(manifest, request, cancelled)
     }
 
     fn generate_stream(

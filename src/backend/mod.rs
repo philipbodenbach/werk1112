@@ -1648,6 +1648,17 @@ pub trait GenerationBackend: Send + Sync {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse>;
+    /// Adapters that can interrupt decoding may poll the client lifetime between
+    /// work units. An in-flight uninterruptible adapter retains its other limits.
+    fn generate_cancellable(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<GenerateResponse> {
+        anyhow::ensure!(!cancelled(), "generation cancelled");
+        self.generate(manifest, request)
+    }
     fn generate_stream(&self, manifest: ModelManifest, request: GenerateRequest) -> GenerateStream;
 }
 

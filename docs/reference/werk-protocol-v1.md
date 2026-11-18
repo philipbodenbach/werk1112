@@ -224,6 +224,37 @@ Chat image parts accept inline image data URLs and HTTP(S) URLs subject to the c
 
 Werk assigns persistent job and output IDs in the authenticated principal's namespace. Job status, cancellation and artifact downloads require the same principal that submitted the job. This also applies to the built-in `get_job` and `cancel_job` functions. A server without configured keys uses its shared `local` principal. Versioned routes accept only Werk-owned IDs. The legacy job and output endpoints reject these IDs and continue to serve older resources with their existing authorization. This access control applies to ID-based lookups. Legacy media interfaces that accept operator-authorized local paths retain their own filesystem access policy. The namespaces share the server's artifact storage and retention limits.
 
+For a synchronous chat request, the client cancels by aborting the pending HTTP
+connection or closing the SSE response. A client that only half-closes its TCP
+write side can still receive a normal response. Once the server observes disconnection, the
+built-in Candle decoder checks for cancellation between model operations. An
+already executing model load or inference kernel can finish. Other adapters
+may finish a blocking upstream call before releasing resources. The server
+records an abandoned request as `cancelled` in inference telemetry. Durable
+jobs use their advertised `cancel` operation and job ID.
+
+Model inventory reports the registered provider through `owned_by`. Operators
+can configure downstream providers or external runtimes on a loopback server.
+Clients deciding whether a prompt or tool result may leave the host must take
+that downstream route into account before submitting chat content. Tool-call
+IDs correlate intents and results. Authorization, host execution receipts,
+handles, credentials and sandbox evidence belong to the calling supervisor.
+
+The interoperability test runs both native binaries with an authenticated
+loopback endpoint and locally generated, deterministic one-layer Llama
+Safetensors weights. It requires Python's standard library and a CPU-enabled
+Werk build.
+
+```powershell
+python scripts/smoke-werk-worker.py --werk target/debug/werk.exe --worker F:/werkWorker/target/debug/ww.exe --evidence target/werk-worker-interop.json
+```
+
+The Windows run records executable and fixture hashes, token usage, error
+codes and cancellation observations. The regression report compares named
+failures and normalized panic chains with the native baselines.
+[CPU interoperability evidence](../development/werk-worker-cpu-interop.json) ·
+[Regression signatures](../development/werk-worker-inference-regression.json)
+
 Errors before a stream starts use the JSON error envelope. Inference routes retain the HTTP status and any `Retry-After` header. Model-specific rejections may carry `error.details.inference_code`. For `context_length_exceeded`, the details can also include `context_length`, `prompt_tokens`, `max_tokens` and `token_count_method`.
 
 Chat and explicit tool calls use the server's configured inference request-body limit. JSON response envelopes are limited to 8 MiB. Built-in tool schemas and result formats are documented in [Tool calling](../tool-calling.md).
