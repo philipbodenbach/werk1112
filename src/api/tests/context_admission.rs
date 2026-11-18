@@ -400,3 +400,27 @@ async fn visual_admission_uses_native_text_and_keeps_exact_count_unsupported() {
         }
     }
 }
+
+#[tokio::test]
+async fn werk_context_overflow_has_typed_budget_evidence_before_sse_headers() {
+    let backend = Counter::new(Some(4065));
+    let app = app(backend.clone());
+    let response = post_json(
+        &app,
+        "/werk/v1/chat/completions",
+        request(true, false),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let value = response_json(response).await;
+    assert_eq!(value["error"]["code"], "invalid_request");
+    let details = &value["error"]["details"];
+    assert_eq!(details["inference_code"], "context_length_exceeded");
+    assert_eq!(details["prompt_tokens"], 4065);
+    assert_eq!(details["max_tokens"], 32);
+    assert_eq!(details["context_length"], 4096);
+    assert_eq!(details["token_count_method"], "native");
+    assert_eq!(backend.generations.load(Ordering::SeqCst), 0);
+}

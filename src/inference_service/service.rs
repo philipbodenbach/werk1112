@@ -10,7 +10,7 @@ use std::{
 use super::{
     backend::{BackendExecution, BackendProbe, MediaInferenceBackend},
     companion::CompanionMediaBackend,
-    helpers::{new_id, validate_safe_name, write_json_atomic},
+    helpers::{InferenceScope, validate_safe_name, write_json_atomic},
     output::{OutputStore, output_metadata, remove_output_dir},
     resources::{detect_host_resources, detected_memory_topology},
     types::{InferenceResult, InferenceTimings, RuntimeAttemptOutcome, RuntimeAttemptTiming},
@@ -107,6 +107,12 @@ impl InferenceService {
 
     pub fn store(&self) -> &ModelStore {
         &self.store
+    }
+
+    pub(super) fn scoped(&self, scope: InferenceScope) -> Self {
+        let mut service = self.clone();
+        service.outputs.scope = scope;
+        service
     }
 
     pub fn output_store(&self) -> &OutputStore {
@@ -278,7 +284,7 @@ impl InferenceService {
 
         let output_setup_started = Instant::now();
         self.outputs.enforce_retention()?;
-        let result_id = new_id("out")?;
+        let result_id = self.outputs.scope.new_id("out")?;
         let output_dir = self.outputs.create_output_dir(&result_id)?;
         let fallback_policy = effective
             .string_parameter("routing.fallback_policy")

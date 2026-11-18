@@ -213,6 +213,13 @@ impl ApiState {
         }
     }
 
+    pub(super) fn for_inference_principal(mut self, principal: &str) -> Self {
+        let manager = self.job_manager.for_principal(principal);
+        self.inference_service = Arc::new(manager.service().clone());
+        self.job_manager = Arc::new(manager);
+        self
+    }
+
     pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Self {
         crate::logging::register_secrets(api_keys.iter().cloned());
         self.api_keys = Arc::new(api_keys);

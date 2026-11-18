@@ -7,7 +7,7 @@ use std::{
 
 use super::{
     backend::BackendOutput,
-    helpers::validate_safe_name,
+    helpers::{InferenceScope, validate_safe_name},
     types::{InferenceResult, OutputMetadata},
 };
 use crate::{inference::EffectiveInferenceRequest, model_store::ModelManifest};
@@ -17,6 +17,7 @@ const DEFAULT_OUTPUT_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct OutputStore {
+    pub(super) scope: InferenceScope,
     pub(super) root: PathBuf,
     pub(super) max_bytes: u64,
     max_age_seconds: u64,
@@ -33,6 +34,7 @@ impl OutputStore {
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_OUTPUT_RETENTION_SECONDS);
         Self {
+            scope: InferenceScope::default(),
             root: home.join("outputs"),
             max_bytes,
             max_age_seconds,
@@ -41,6 +43,7 @@ impl OutputStore {
 
     pub fn with_limits(home: &Path, max_bytes: u64, max_age_seconds: u64) -> Self {
         Self {
+            scope: InferenceScope::default(),
             root: home.join("outputs"),
             max_bytes,
             max_age_seconds,
@@ -67,6 +70,9 @@ impl OutputStore {
 
     pub fn get_output(&self, output_id: &str) -> Result<OutputMetadata> {
         validate_safe_name(output_id)?;
+        if !self.scope.permits("out", output_id) {
+            bail!("output not found");
+        }
         let (result_id, _) = output_id
             .rsplit_once('-')
             .ok_or_else(|| anyhow!("invalid output id '{output_id}'"))?;

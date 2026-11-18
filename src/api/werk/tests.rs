@@ -711,3 +711,120 @@ async fn incompatible_state_exposes_only_allow_listed_mismatch_fields() {
     assert!(body["error"].get("details").is_none());
     assert!(!body.to_string().contains("/private/path"));
 }
+
+#[tokio::test]
+async fn versioned_inference_discovery_and_authorization_precede_dispatch() {
+    let app = app(FakeControl::default(), vec!["secret".into()]);
+    let key = Some(("authorization", "Bearer secret"));
+    let response = request(&app, Method::GET, "/werk/v1/capabilities", None, key).await;
+    let catalog = json_body(response).await;
+    for (id, ops) in [
+        ("api.models.list", json!(["list"])),
+        ("api.chat.completions", json!(["complete", "stream"])),
+        ("api.tools", json!(["list", "tasks", "call"])),
+        ("api.jobs", json!(["get", "cancel"])),
+        ("api.outputs", json!(["read"])),
+    ] {
+        let cap = catalog["data"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap();
+        assert_eq!(cap["status"], "supported");
+        assert_eq!(cap["operations"], ops);
+    }
+    for (method, uri) in [
+        (Method::GET, "/werk/v1/models"),
+        (Method::GET, "/werk/v1/tasks"),
+        (Method::GET, "/werk/v1/tools"),
+        (Method::POST, "/werk/v1/tools/call"),
+        (Method::GET, "/werk/v1/jobs/no_job"),
+        (Method::DELETE, "/werk/v1/jobs/no_job"),
+        (Method::GET, "/werk/v1/outputs/no_output"),
+        (Method::POST, "/werk/v1/chat/completions"),
+    ] {
+        let response = request(&app, method.clone(), uri, None, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(json_body(response).await["error"]["code"], "unauthorized");
+        let response = request(
+            &app,
+            method,
+            uri,
+            None,
+            Some((PROTOCOL_VERSION_HEADER, "2.0")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE, "{uri}");
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "incompatible_protocol"
+        );
+    }
+    let models = json_body(request(&app, Method::GET, "/werk/v1/models", None, key).await).await;
+    assert_eq!(models["data"]["object"], "list");
+    let tools = json_body(request(&app, Method::GET, "/werk/v1/tools", None, key).await).await;
+    assert_eq!(tools["data"]["call_url"], "/werk/v1/tools/call");
+    let schema = tools["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "speech_to_text")
+        .unwrap();
+    let sources = schema
+        .pointer("/function/parameters/properties/inputs/items/properties/source/oneOf")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let kinds: Vec<_> = sources
+        .iter()
+        .map(|source| source["properties"]["kind"]["const"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["base64", "text", "file_id", "output_id"]);
+}
+
+#[tokio::test]
+async fn chat_representation_mismatch_rejects_before_generation() {
+    let app = app(FakeControl::default(), Vec::new());
+    for (stream, accept) in [
+        (true, "application/json"),
+        (false, "text/event-stream"),
+        (true, "text/event-stream;q=0"),
+    ] {
+        let response = request(
+            &app,
+            Method::POST,
+            "/werk/v1/chat/completions",
+            Some(json!({"model":"missing","messages":[],"stream":stream}).to_string()),
+            Some(("accept", accept)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "incompatible_protocol"
+        );
+    }
+}
+
+#[tokio::test]
+async fn portable_chat_images_exclude_server_paths_before_model_dispatch() {
+    let app = app(FakeControl::default(), Vec::new());
+    for (url, expected) in [
+        ("file:///example.png", StatusCode::BAD_REQUEST),
+        ("example.png", StatusCode::BAD_REQUEST),
+        ("https://example.invalid/example.png", StatusCode::NOT_FOUND),
+        ("data:image/png;base64,AAEC", StatusCode::NOT_FOUND),
+    ] {
+        let body = json!({"model":"uninstalled","messages":[{"role":"user","content":[{"type":"image_url","image_url":url}]}]});
+        let response = request(
+            &app,
+            Method::POST,
+            "/werk/v1/chat/completions",
+            Some(body.to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), expected);
+    }
+}

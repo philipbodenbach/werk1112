@@ -379,24 +379,33 @@ async fn tool_calling_nonstream_preserves_request_history_and_nullable_response(
         "parallel_tool_calls": false
     });
 
-    let response = post_json(&app, "/v1/chat/completions", payload.clone(), None).await;
+    for route in ["/v1/chat/completions", "/werk/v1/chat/completions"] {
+        let response = post_json(&app, route, payload.clone(), None).await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let value = response_json(response).await;
-    assert_eq!(value["choices"][0]["message"]["content"], Value::Null);
-    assert_eq!(
-        value["choices"][0]["message"]["tool_calls"][0],
-        json!({
-            "id": "call_next",
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "arguments": "{\"city\":\"Hamburg\"}"
-            }
-        })
-    );
-    assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        let value = if route.starts_with("/werk/") {
+            assert_eq!(value["protocol"], json!({"major":1,"minor":0}));
+            assert!(value["request_id"].is_string());
+            &value["data"]
+        } else {
+            &value
+        };
+        assert_eq!(value["choices"][0]["message"]["content"], Value::Null);
+        assert_eq!(
+            value["choices"][0]["message"]["tool_calls"][0],
+            json!({
+                "id": "call_next",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Hamburg\"}"
+                }
+            })
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(session_calls.load(Ordering::SeqCst), 0);
 
     let request = recorded.lock().unwrap().clone().unwrap();
@@ -434,63 +443,76 @@ async fn tool_calling_stream_preserves_indexes_fragments_finish_and_done() {
         }),
     ));
 
-    let response = post_json(
-        &app,
-        "/v1/chat/completions",
-        json!({
-            "model": "tool-model",
-            "stream": true,
-            "messages": [{"role": "user", "content": "Weather and time?"}],
-            "tools": [{
-                "type": "function",
-                "function": {"name": "get_weather", "parameters": {"type": "object"}}
-            }],
-            "tool_choice": "auto",
-            "parallel_tool_calls": true
-        }),
-        None,
-    )
-    .await;
+    for route in ["/v1/chat/completions", "/werk/v1/chat/completions"] {
+        let response = post_json(
+            &app,
+            route,
+            json!({
+                "model": "tool-model",
+                "stream": true,
+                "messages": [{"role": "user", "content": "Weather and time?"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "auto",
+                "parallel_tool_calls": true
+            }),
+            None,
+        )
+        .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let stream = String::from_utf8(bytes.to_vec()).unwrap();
-    let data = stream
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .collect::<Vec<_>>();
-    assert_eq!(data.last().copied(), Some("[DONE]"));
-    let chunks = data[..data.len() - 1]
-        .iter()
-        .map(|value| serde_json::from_str::<Value>(value).unwrap())
-        .collect::<Vec<_>>();
+        assert_eq!(response.status(), StatusCode::OK);
+        if route.starts_with("/werk/") {
+            assert_eq!(response.headers()["x-werk-protocol-version"], "1.0");
+            assert!(response.headers().contains_key("x-werk-request-id"));
+            assert!(
+                response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/event-stream")
+            );
+        }
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stream = String::from_utf8(bytes.to_vec()).unwrap();
+        let data = stream
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect::<Vec<_>>();
+        assert_eq!(data.last().copied(), Some("[DONE]"));
+        let chunks = data[..data.len() - 1]
+            .iter()
+            .map(|value| serde_json::from_str::<Value>(value).unwrap())
+            .collect::<Vec<_>>();
 
-    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
-    assert_eq!(
-        chunks[1]["choices"][0]["delta"]["tool_calls"][0]["index"],
-        0
-    );
-    assert_eq!(
-        chunks[1]["choices"][0]["delta"]["tool_calls"][1]["index"],
-        1
-    );
-    assert_eq!(
-        chunks[1]["choices"][0]["delta"]["tool_calls"][0]["id"],
-        "call_weather"
-    );
-    assert_eq!(
-        chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
-        r#"{"city":"#
-    );
-    assert_eq!(
-        chunks[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
-        r#"Berlin"}"#
-    );
-    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "tool_calls");
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["tool_calls"][0]["index"],
+            0
+        );
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["tool_calls"][1]["index"],
+            1
+        );
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "call_weather"
+        );
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"#
+        );
+        assert_eq!(
+            chunks[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            r#"Berlin"}"#
+        );
+        assert_eq!(chunks[3]["choices"][0]["finish_reason"], "tool_calls");
+
+        assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

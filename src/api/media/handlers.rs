@@ -375,9 +375,14 @@ pub(in crate::api) async fn create_job_handler(
 
 pub(in crate::api) async fn get_job_handler(
     State(state): State<ApiState>,
+    context: Option<axum::Extension<crate::werk_protocol::ControlContext>>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    let state = match context {
+        Some(axum::Extension(context)) => state.for_inference_principal(context.principal_id()),
+        None => state,
+    };
     if let Err(response) = state.authorize(&headers) {
         return response;
     }
@@ -393,9 +398,14 @@ pub(in crate::api) async fn get_job_handler(
 
 pub(in crate::api) async fn cancel_job_handler(
     State(state): State<ApiState>,
+    context: Option<axum::Extension<crate::werk_protocol::ControlContext>>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    let state = match context {
+        Some(axum::Extension(context)) => state.for_inference_principal(context.principal_id()),
+        None => state,
+    };
     if let Err(response) = state.authorize(&headers) {
         return response;
     }

@@ -19,6 +19,32 @@ pub(super) fn validate_safe_name(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Scoped IDs persist with the existing records, indexes and global output-retention budget.
+/// The namespace comes only from the authenticated server principal. IDs remain opaque to clients.
+#[derive(Clone, Debug, Default)]
+pub(super) struct InferenceScope(Option<String>);
+
+impl InferenceScope {
+    pub fn for_principal(principal: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(Some(format!("{:x}", Sha256::digest(principal.as_bytes()))))
+    }
+
+    pub fn new_id(&self, kind: &str) -> Result<String> {
+        match &self.0 {
+            Some(scope) => new_id(&format!("{kind}-w1-{scope}")),
+            None => new_id(kind),
+        }
+    }
+
+    pub fn permits(&self, kind: &str, id: &str) -> bool {
+        match &self.0 {
+            Some(scope) => id.starts_with(&format!("{kind}-w1-{scope}-")),
+            None => !id.to_ascii_lowercase().starts_with(&format!("{kind}-w1-")),
+        }
+    }
+}
+
 pub(super) fn new_id(prefix: &str) -> Result<String> {
     let mut random = [0_u8; 8];
     getrandom(&mut random).map_err(|error| anyhow!("failed to generate id: {error}"))?;
