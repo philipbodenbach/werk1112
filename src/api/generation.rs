@@ -668,26 +668,39 @@ pub(super) async fn generate(
     explicit_runtime_options: bool,
 ) -> anyhow::Result<GenerateResponse> {
     let mut guard = state.telemetry.begin(&manifest.id);
-    crate::logging::spawn_blocking(move || {
+    let (client, lifetime) = tokio::sync::oneshot::channel::<()>();
+    let task = crate::logging::spawn_blocking(move || {
+        anyhow::ensure!(!client.is_closed(), "generation cancelled");
         let session = match select_session(&state, &manifest, &request, explicit_runtime_options) {
             Ok(session) => session,
             Err(error) => {
-                guard.error();
+                if !client.is_closed() {
+                    guard.error();
+                }
                 return Err(error);
             }
         };
+        anyhow::ensure!(!client.is_closed(), "generation cancelled");
         let result = match session {
             Some(session) => session.generate(request),
-            None => state.backend.generate(&manifest, request),
+            None => state
+                .backend
+                .generate_cancellable(&manifest, request, &|| client.is_closed()),
         };
+        // The waiter's drop closes the receiver. Its disconnected request must
+        // stay cancelled in telemetry even if a synchronous adapter ran to completion.
+        anyhow::ensure!(!client.is_closed(), "generation cancelled");
         match &result {
             Ok(response) => guard.complete(response),
             Err(_) => guard.error(),
         }
         result
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("generation task failed: {e}"))?
+    });
+    let result = task
+        .await
+        .map_err(|e| anyhow::anyhow!("generation task failed: {e}"))?;
+    drop(lifetime);
+    result
 }
 
 pub(super) async fn generate_stream(

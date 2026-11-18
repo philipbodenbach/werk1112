@@ -161,7 +161,7 @@ pub(in crate::api) fn router_with_body_limit(state: ApiState, body_limit_bytes: 
             get(get_options_handler).post(set_options_handler),
         )
         .route("/sdapi/v1/progress", get(progress_handler))
-        .merge(werk::routes())
+        .merge(werk::routes(&state, body_limit_bytes))
         .with_state(state);
 
     let router = if cors_origins.is_empty() {

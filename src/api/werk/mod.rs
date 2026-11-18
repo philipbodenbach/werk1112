@@ -1,3 +1,5 @@
+mod inference;
+
 use axum::{
     Json, Router,
     body::Body,
@@ -26,7 +28,7 @@ const MAX_WERK_BODY_BYTES: usize = 1024 * 1024;
 const MAX_WERK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 static FALLBACK_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-pub(super) fn routes() -> Router<ApiState> {
+pub(super) fn routes(state: &ApiState, body_limit: usize) -> Router<ApiState> {
     let reads = Router::new()
         .route("/werk/v1/info", get(info_handler))
         .route("/werk/v1/capabilities", get(capabilities_handler))
@@ -49,7 +51,9 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/werk/v1/decode", post(decode_handler))
         .layer(DefaultBodyLimit::max(MAX_WERK_BODY_BYTES));
 
-    reads.merge(writes)
+    reads
+        .merge(writes)
+        .merge(inference::routes(state, body_limit))
 }
 
 #[derive(Deserialize)]
@@ -435,7 +439,10 @@ async fn capabilities_handler(State(state): State<ApiState>, headers: HeaderMap)
         Err(response) => return response,
     };
     match state.werk_control.capabilities(context).await {
-        Ok(data) => success(request_id, data),
+        Ok(mut data) => {
+            inference::advertise(&mut data.capabilities);
+            success(request_id, data)
+        }
         Err(error) => protocol_error(request_id, error),
     }
 }
@@ -706,10 +713,19 @@ pub(super) async fn request_context(
     state: &ApiState,
     headers: &HeaderMap,
 ) -> Result<(String, ControlContext), Response> {
+    request_context_for(state, headers, &["application/json"]).await
+}
+
+async fn request_context_for(
+    state: &ApiState,
+    headers: &HeaderMap,
+    media_types: &[&str],
+) -> Result<(String, ControlContext), Response> {
     let request_id = crate::logging::capture()
         .request_id
         .unwrap_or_else(new_request_id);
-    negotiate_protocol(headers).map_err(|error| protocol_error(request_id.clone(), error))?;
+    negotiate_protocol(headers, media_types)
+        .map_err(|error| protocol_error(request_id.clone(), error))?;
     let principal = state
         .werk_principal(headers)
         .await
@@ -720,7 +736,7 @@ pub(super) async fn request_context(
     ))
 }
 
-fn negotiate_protocol(headers: &HeaderMap) -> Result<(), ProtocolError> {
+fn negotiate_protocol(headers: &HeaderMap, media_types: &[&str]) -> Result<(), ProtocolError> {
     for value in headers.get_all(PROTOCOL_VERSION_HEADER) {
         let requested = value
             .to_str()
@@ -731,27 +747,33 @@ fn negotiate_protocol(headers: &HeaderMap) -> Result<(), ProtocolError> {
             return Err(incompatible_protocol());
         }
     }
-    if !accepts_protocol_response(headers) {
+    if !media_types
+        .iter()
+        .any(|media| accepts_protocol_response(headers, media))
+    {
         return Err(incompatible_protocol());
     }
     Ok(())
 }
 
-fn accepts_protocol_response(headers: &HeaderMap) -> bool {
+fn accepts_protocol_response(headers: &HeaderMap, media_type: &str) -> bool {
     let mut supplied = false;
     for value in headers.get_all(header::ACCEPT) {
         supplied = true;
         let Ok(value) = value.to_str() else {
             continue;
         };
-        if value.split(',').any(acceptable_media_range) {
+        if value
+            .split(',')
+            .any(|range| acceptable_media_range(range, media_type))
+        {
             return true;
         }
     }
     !supplied
 }
 
-fn acceptable_media_range(value: &str) -> bool {
+fn acceptable_media_range(value: &str, expected: &str) -> bool {
     let mut parts = value.split(';');
     let media_type = parts.next().unwrap_or_default().trim();
     let mut quality = 1.0_f32;
@@ -775,8 +797,12 @@ fn acceptable_media_range(value: &str) -> bool {
         }
     }
     quality > 0.0
-        && (media_type.eq_ignore_ascii_case("application/json")
-            || media_type.eq_ignore_ascii_case("application/*")
+        && (media_type.eq_ignore_ascii_case(expected)
+            || media_type.strip_suffix("/*").is_some_and(|prefix| {
+                expected
+                    .split_once('/')
+                    .is_some_and(|(ty, _)| ty.eq_ignore_ascii_case(prefix))
+            })
             || media_type == "*/*")
 }
 
@@ -969,19 +995,26 @@ fn json_response<T: Serialize>(status: StatusCode, request_id: String, body: T) 
             )
         }
     };
-    let mut builder = Response::builder()
+    let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CACHE_CONTROL, "no-store")
-        .header(header::VARY, header::ACCEPT.as_str())
-        .header(PROTOCOL_VERSION_HEADER, ProtocolVersion::V1.to_string())
-        .header("x-content-type-options", "nosniff");
-    if let Ok(value) = HeaderValue::from_str(&request_id) {
-        builder = builder.header("x-werk-request-id", value);
-    }
-    builder
         .body(Body::from(payload))
-        .expect("Werk Protocol response headers are valid")
+        .expect("valid Werk JSON response");
+    set_protocol_headers(response.headers_mut(), &request_id);
+    response
+}
+
+fn set_protocol_headers(headers: &mut HeaderMap, request_id: &str) {
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::VARY, HeaderValue::from_static("accept"));
+    headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("1.0"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert("x-werk-request-id", value);
+    }
 }
 
 #[cfg(test)]

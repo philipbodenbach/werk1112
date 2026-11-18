@@ -1,0 +1,39 @@
+{
+  "timestamp_utc": "2026-11-18T16:12:24.094545+00:00",
+  "host": "Windows-10-10.0.26200-SP0",
+  "transport": "authenticated Werk Protocol 1.0 over loopback",
+  "inference": "built-in Candle CPU, generated one-layer deterministic Llama F32 Safetensors",
+  "server_sha256": "139a8e4b6ecf7870b4bc52f0ed85ef9591c04f57a2a112464c1e10e0ced30187",
+  "worker_sha256": "7e1f10b21bc179a0754dd3ff785ea654e9d5b288d940d1bf0bcff133abedab93",
+  "fixture_weight_sha256": {
+    "cpu-once": "bf3222ac4c31aa033a4989582e1dc3b6d63ef2ea1277eae8c3b74710757e182c",
+    "cpu-repeat": "c8150572c01bcbf8247f7fd072d8d7b015f3829edba0a453462fb70a42cbd19b"
+  },
+  "missing_key": "unauthorized",
+  "bad_version": "incompatible_protocol",
+  "invalid_chat": "invalid_request",
+  "json_usage": {
+    "completion_tokens": 1,
+    "prompt_tokens": 4,
+    "total_tokens": 5
+  },
+  "sse_request_id": "req_werk_4c317a3c1e3081a4_8",
+  "sse_usage": {
+    "completion_tokens": 1,
+    "prompt_tokens": 4,
+    "total_tokens": 5
+  },
+  "worker_json": "OK",
+  "worker_sse": "OK",
+  "cancelled_sse": "cancelled",
+  "cancelled_json": "cancelled",
+  "worker_run_cancel_json": {
+    "local_run": "cancelled",
+    "inference": "cancelled"
+  },
+  "worker_run_cancel_sse": {
+    "local_run": "cancelled",
+    "inference": "cancelled"
+  },
+  "same_model_after_cancel": "OK OK"
+}

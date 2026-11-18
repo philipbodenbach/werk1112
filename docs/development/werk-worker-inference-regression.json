@@ -1,0 +1,408 @@
+{
+  "command": "cargo test --locked --offline --no-default-features --lib -- --test-threads=4",
+  "compared": "Full panic sites and message chains per failed Rust test, including assertions, OS errors, nested task/fixture failures and Python tracebacks.",
+  "normalization": [
+    "Rust thread names and OS thread IDs are excluded from panic sites.",
+    "Only src/cli.rs panic line numbers changed in the patch; source path and column are preserved.",
+    "User profile paths, random tempfile names, test-generated temp directory PID/time suffixes, Tokio task IDs and nested Python suite duration are normalized.",
+    "The checkout prefix of the Python companion traceback is normalized; its filename, line and exception are preserved."
+  ],
+  "logs": {
+    "main_3d33f7c": {
+      "file": "baseline-tests.log",
+      "sha256": "7e6319f16c83a769f746e310a4d3c1e7e396a0e78bedc0858b6b832d1c12b36e",
+      "test_result": "FAILED. 1166 passed; 63 failed; 4 ignored; 0 measured; 0 filtered out; finished in 27.03s"
+    },
+    "prior_pr_working_tree": {
+      "file": "final-cargo-lib.log",
+      "sha256": "67eae9626ba6e25579b195a4f9d5f0ab9151f0fa319951e5033069c0a8d37ef5",
+      "test_result": "FAILED. 1170 passed; 64 failed; 4 ignored; 0 measured; 0 filtered out; finished in 25.86s"
+    },
+    "prior_main_socket_rerun": {
+      "file": "baseline-sockets.log",
+      "sha256": "e4532ac6cf07eb6b5d25f0cebe87bac901a6200e7ae4eeb8bbf420594f0e0dd2",
+      "test_result": "FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1231 filtered out; finished in 0.06s"
+    },
+    "current_a9888e0_plus_local_patch": {
+      "file": "sovereign-lib.log",
+      "sha256": "b3821c69a0e6fd346b37bb03287c26a21417f67277983e32e74f27b35502c297",
+      "test_result": "FAILED. 1171 passed; 63 failed; 4 ignored; 0 measured; 0 filtered out; finished in 25.42s"
+    }
+  },
+  "new_failure_identities": [],
+  "changed_failure_signatures": [],
+  "shared_failure_signatures_sha256": {
+    "922d24de424d29b59e63600ccd8af4c9eb8cb17706f99f04a5674187ce9562c7": {
+      "panic_sites_and_messages": [
+        [
+          "src\\backend\\llama_server\\runtime_state.rs:2379:18",
+          "fake state server failed: \"Ein nicht blockierender Socketvorgang konnte nicht sofort ausgeführt werden. (os error 10035)\""
+        ]
+      ],
+      "tests": [
+        "backend::llama_server::runtime_state::tests::chat_probe_accepts_continuation_without_weakening_named_state_probe",
+        "backend::llama_server::runtime_state::tests::functional_probe_fails_closed_on_untruthful_slot_save_metadata",
+        "backend::llama_server::runtime_state::tests::functional_probe_validates_the_full_private_slot_round_trip"
+      ]
+    },
+    "c829fb06d6758043e81d178d736ad8559eb174c84597235b61da67864938bb58": {
+      "panic_sites_and_messages": [
+        [
+          "src\\backend\\llama_server\\runtime_state.rs:3014:17",
+          "assertion `left == right` failed\n  left: true\n right: false"
+        ]
+      ],
+      "tests": [
+        "backend::llama_server::runtime_state::tests::chat_requests_validate_restore_without_synthetic_inference"
+      ]
+    },
+    "710814c76d85e89abf9fbf99667448cd4cc6d2680cc83ad5b5c327e474015752": {
+      "panic_sites_and_messages": [
+        [
+          "src\\backend\\llama_server\\runtime_state.rs:2913:18",
+          "called `Result::unwrap()` on an `Err` value: truncated HTTP headers from llama.cpp state endpoint"
+        ]
+      ],
+      "tests": [
+        "backend::llama_server::runtime_state::tests::chat_snapshot_survives_process_replacement_and_rejects_corruption"
+      ]
+    },
+    "cca866449ff2cb9fae68a51e5db2a23c3ba401b98948fb9620597f393ff72679": {
+      "panic_sites_and_messages": [
+        [
+          "src\\backend\\omlx\\tests.rs:176:65",
+          "called `Result::unwrap()` on an `Err` value: configured program is not on PATH"
+        ]
+      ],
+      "tests": [
+        "backend::omlx::tests::api_options_validate_without_starting_an_omlx_worker",
+        "backend::omlx::tests::api_reasoning_effort_toggles_each_request_without_changing_worker_defaults",
+        "backend::omlx::tests::cache_reuses_worker_recreates_dead_child_and_never_reuses_changed_manifest",
+        "backend::omlx::tests::captured_environment_identity_is_opaque_and_command_uses_snapshot",
+        "backend::omlx::tests::changing_selected_launcher_is_detected_before_execution",
+        "backend::omlx::tests::chat_options_inherit_defaults_without_mutation_and_bound_expert_budget",
+        "backend::omlx::tests::closing_parent_lifetime_pipe_stops_child_without_dropping_owner",
+        "backend::omlx::tests::configured_expert_budget_selects_its_exact_worker_and_registry_is_bounded",
+        "backend::omlx::tests::console_bootstrap_excludes_caller_directory_before_stdlib_imports",
+        "backend::omlx::tests::disconnect_cancels_request_while_waiting_for_headers",
+        "backend::omlx::tests::expert_execution_mode_is_explicit_and_part_of_cache_identity",
+        "backend::omlx::tests::failed_load_preserves_http_cause_and_cleans_worker_directory",
+        "backend::omlx::tests::generic_api_never_promotes_interrupted_tool_calls_including_streaming",
+        "backend::omlx::tests::generic_tools_cover_missing_native_parser_options_sessions_and_token_counting",
+        "backend::omlx::tests::generic_tools_preserve_extended_options_and_native_auto_requests",
+        "backend::omlx::tests::generic_tools_preserve_runtime_errors_and_reject_malformed_native_envelopes",
+        "backend::omlx::tests::health_deadline_bounds_stalled_http_server",
+        "backend::omlx::tests::invalid_tool_options_fail_before_any_worker_or_chat_starts",
+        "backend::omlx::tests::malformed_model_status_and_virtual_models_cannot_select_a_model",
+        "backend::omlx::tests::model_controls_require_unique_worker_when_chat_cache_namespaces_differ",
+        "backend::omlx::tests::model_python_environment_is_rejected_before_probe_or_worker_startup",
+        "backend::omlx::tests::ngram_auto_request_overrides_fixed_server_budget_without_mutating_it",
+        "backend::omlx::tests::ngram_budget_is_independent_and_changes_worker_and_persistence_identity",
+        "backend::omlx::tests::nonstream_preserves_nullable_tool_response_and_separates_reasoning",
+        "backend::omlx::tests::partial_stream_failures_never_emit_done",
+        "backend::omlx::tests::persistent_cache_namespace_survives_restart_but_separates_model_and_runtime_settings",
+        "backend::omlx::tests::reasoning_effort_controls_native_payload_and_preserves_worker_reuse",
+        "backend::omlx::tests::startup_rejects_server_version_mismatch_and_duplicate_physical_ids",
+        "backend::omlx::tests::stream_preserves_tool_fragments_and_usage_without_reasoning",
+        "backend::omlx::tests::thinking_chat_options_are_preserved_for_streaming",
+        "backend::omlx::tests::thinking_chat_options_reuse_one_worker_and_do_not_leak_into_defaults",
+        "backend::omlx::tests::unverified_native_cache_version_returns_normal_fallback_without_starting_worker",
+        "backend::omlx::tests::worker_loads_exact_physical_model_and_tears_down_owned_process"
+      ]
+    },
+    "b99d58d511cd45f184bb7df6c14ce6c8c1cf730609faf4a37f8982d6b7c88c36": {
+      "panic_sites_and_messages": [
+        [
+          "src\\backend\\omlx\\tests.rs:5:61",
+          "called `Result::unwrap()` on an `Err` value: configured program is not on PATH"
+        ]
+      ],
+      "tests": [
+        "backend::omlx::tests::text_worker_helpers_bootstrap_without_model_directory_imports"
+      ]
+    },
+    "eca28e647a611960ca9508dbaa59af3eb276317e9207af09ec54a229004f4d42": {
+      "panic_sites_and_messages": [
+        [
+          "src\\backend\\omlx\\tests.rs:176:65",
+          "called `Result::unwrap()` on an `Err` value: configured program is not on PATH"
+        ],
+        [
+          "src\\backend\\omlx\\tests.rs:536:6",
+          "called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(<task>), \"called `Result::unwrap()` on an `Err` value: configured program is not on PATH\", ...)"
+        ]
+      ],
+      "tests": [
+        "backend::omlx::tests::thinking_override_is_captured_by_worker_and_changes_cache_identity"
+      ]
+    },
+    "fd488f763fe87602211c35ba399fd08c6a9e8988285bf7e1d79550541a8b7c39": {
+      "panic_sites_and_messages": [
+        [
+          "src\\backend\\text_analysis.rs:751:14",
+          "called `Result::unwrap()` on an `Err` value: No compatible runtime could execute 'another-organization/custom-finetune': transformers/cpu failed: failed to start media companion resident worker using python3 -c \nimport json,sys\nlog=sys.argv[1]\ndef call(op,p):\n if op=='probe-model': return {'ok':True,'cuda':True,'vllm':False}\n if op=='transport-handshake': return {'ok':True}\n with open(log,'a') as f: f.write(p['runtime']+'/'+p['device']+'\\n')\n if p['device']=='cuda': return {'ok':False,'error':{'code':'oom','message':'CUDA out of memory'}}\n return {'ok':True,'results':[], 'werk':{'runtime':p['runtime'],'device':p['device']}}\nif sys.argv[-1]=='serve':\n for line in sys.stdin:\n  f=json.loads(line)\n  print(json.dumps({'transport_version':1,'request_id':f['request_id'],'response':call(f['operation'],f['payload'])}),flush=True)\nelse: print(json.dumps(call(sys.argv[-1],json.load(sys.stdin))))\n <user-profile>\\AppData\\Local\\Temp\\.tmp<RANDOM>\\calls (explicit command): program not found; transformers-eager/cpu failed: failed to start media companion resident worker using python3 -c \nimport json,sys\nlog=sys.argv[1]\ndef call(op,p):\n if op=='probe-model': return {'ok':True,'cuda':True,'vllm':False}\n if op=='transport-handshake': return {'ok':True}\n with open(log,'a') as f: f.write(p['runtime']+'/'+p['device']+'\\n')\n if p['device']=='cuda': return {'ok':False,'error':{'code':'oom','message':'CUDA out of memory'}}\n return {'ok':True,'results':[], 'werk':{'runtime':p['runtime'],'device':p['device']}}\nif sys.argv[-1]=='serve':\n for line in sys.stdin:\n  f=json.loads(line)\n  print(json.dumps({'transport_version':1,'request_id':f['request_id'],'response':call(f['operation'],f['payload'])}),flush=True)\nelse: print(json.dumps(call(sys.argv[-1],json.load(sys.stdin))))\n <user-profile>\\AppData\\Local\\Temp\\.tmp<RANDOM>\\calls (explicit command): program not found. Mitigation: install the required packages in WERK_TEXT_PYTHON; for CUDA OOM reduce werk.batch_size/max_length or free GPU memory. Use werk.device=cpu (slower) or auto to permit CPU fallback. Candle fallback is limited to XLM-RoBERTa sequence classifiers; other architectures require their Python runtime."
+        ]
+      ],
+      "tests": [
+        "backend::text_analysis::tests::failed_cuda_workers_are_replaced_and_successful_fallback_is_reused"
+      ]
+    },
+    "babcebffded3e6f1a737b8719151f9667d5cd7bfb9ef5e8333b6945535b47bf9": {
+      "panic_sites_and_messages": [
+        [
+          "src\\cache.rs:868:9",
+          "assertion failed: entries.iter().all(|entry| entry.active)"
+        ]
+      ],
+      "tests": [
+        "cache::tests::active_chat_lock_blocks_both_data_types_and_releases_after_exit"
+      ]
+    },
+    "6ea44f3cfe60fd55af68a6038384e1f4c8bb711c96b902fb52815ec43e4ae632": {
+      "panic_sites_and_messages": [
+        [
+          "src\\cli.rs:<line>:10",
+          "called `Result::unwrap()` on an `Err` value: no available runtime for model 'test-model' (Gguf, architecture: llama); tried: llama.cpp server CUDA: No CUDA llama-server found. Tried: - WERK_LLAMA_SERVER_CUDA (missing) - WERK_LLAMA_SERVER (missing) - PATH: llama-server.exe (missing) - managed cache: <user-profile>\\AppData\\Local\\Temp\\werk1112-cli-gguf-cuda-<PID>-<time>\\backends\\llama-cuda (missing) Fix: - set WERK_LLAMA_SERVER_CUDA=/path/to/llama-server - or run: werk backend install llama-cuda - or use: werk --backend cpu ..."
+        ]
+      ],
+      "tests": [
+        "cli::tests::backend_selection_routes_gguf_cuda_to_llama_server"
+      ]
+    },
+    "f1947c52a724f6d61d1861f263c35b7f65bdaa97b2728bd72694367c233ea435": {
+      "panic_sites_and_messages": [
+        [
+          "src\\cli.rs:<line>:10",
+          "called `Result::unwrap()` on an `Err` value: no available runtime for model 'test-model' (Gguf, architecture: llama); tried: llama.cpp server Vulkan: No Vulkan llama-server found. Tried: - WERK_LLAMA_SERVER_VULKAN (missing) - WERK_LLAMA_SERVER (missing) - PATH: llama-server.exe (missing) - managed cache: <user-profile>\\AppData\\Local\\Temp\\werk1112-cli-gguf-vulkan-<PID>-<time>\\backends\\llama-vulkan (missing) Fix: - set WERK_LLAMA_SERVER_VULKAN=/path/to/llama-server - or run: werk backend install llama-vulkan - or use: werk --backend cpu ..."
+        ]
+      ],
+      "tests": [
+        "cli::tests::backend_selection_routes_gguf_vulkan_to_llama_server"
+      ]
+    },
+    "a946adef0fd5dfd307beb8cadf338409b671ac0af2f79c4f734f4bfb3ad0308e": {
+      "panic_sites_and_messages": [
+        [
+          "src\\cli.rs:<line>:10",
+          "called `Result::unwrap()` on an `Err` value: no available runtime for model 'test-model' (Gguf, architecture: llama); tried: llama.cpp server CUDA: No CUDA llama-server found. Tried: - WERK_LLAMA_SERVER_CUDA (missing) - WERK_LLAMA_SERVER (missing) - PATH: llama-server.exe (missing) - managed cache: <user-profile>\\AppData\\Local\\Temp\\werk1112-cli-explicit-cuda-<PID>-<time>\\backends\\llama-cuda (missing) Fix: - set WERK_LLAMA_SERVER_CUDA=/path/to/llama-server - or run: werk backend install llama-cuda - or use: werk --backend cpu ..."
+        ]
+      ],
+      "tests": [
+        "cli::tests::explicit_cuda_selection_never_selects_cpu_fallback"
+      ]
+    },
+    "ec1c0d932e0ce26af9946f199c553c9db083d28191d8721c8d1e86ef28e1ee2a": {
+      "panic_sites_and_messages": [
+        [
+          "src\\cli.rs:<line>:10",
+          "called `Result::unwrap()` on an `Err` value: no available runtime for model 'test-model' (Gguf, architecture: llama); tried: llama.cpp server ROCm/HIP: No ROCm/HIP llama-server found. Tried: - WERK_LLAMA_SERVER_ROCM (missing) - WERK_LLAMA_SERVER (missing) - PATH: llama-server.exe (missing) - managed cache: <user-profile>\\AppData\\Local\\Temp\\werk1112-cli-gguf-rocm-<PID>-<time>\\backends\\llama-rocm (missing) Fix: - set WERK_LLAMA_SERVER_ROCM=/path/to/llama-server - or run: werk backend install llama-rocm - or use: werk --backend cpu ..."
+        ]
+      ],
+      "tests": [
+        "cli::tests::explicit_gguf_rocm_can_select_managed_rocm_server"
+      ]
+    },
+    "f80d6d47980237bd6dd982b5a30dd47b8cec3a1d5b50d335adbde7b2a6e3ad07": {
+      "panic_sites_and_messages": [
+        [
+          "src\\cli.rs:<line>:9",
+          "assertion `left == right` failed\n  left: Unavailable\n right: Available"
+        ]
+      ],
+      "tests": [
+        "cli::tests::gguf_vision_readiness_requires_mmproj_and_a_multimodal_llama_server"
+      ]
+    },
+    "6a9f52511b18ea4d9f28714026c5b8c86ecee98695252c9fe26bb12bba1b91c4": {
+      "panic_sites_and_messages": [
+        [
+          "src\\media_companion.rs:2598:9",
+          "media companion offload tests failed\nstdout:\n\nstderr:\n..................................................................F............s.....\n======================================================================\nFAIL: test_native_fd1_output_is_separated_from_protocol_stdout (__main__.ResidentTransportTests)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"<repo>/runtime/test_werk_media_companion.py\", line 890, in test_native_fd1_output_is_separated_from_protocol_stdout\n    self.assertEqual(completed.stdout, b'{\"ok\":true}\\n')\nAssertionError: b'{\"ok\":true}\\r\\n' != b'{\"ok\":true}\\n'\n\n----------------------------------------------------------------------\nRan 85 tests in <time>s\n\nFAILED (failures=1, skipped=1)"
+        ]
+      ],
+      "tests": [
+        "media_companion::tests::real_companion_offload_contract_tests_pass"
+      ]
+    },
+    "0450f9a5294b7e430789427d7fea41e967816080b9327871a512de52bc478b1a": {
+      "panic_sites_and_messages": [
+        [
+          "src\\media_companion.rs:2336:9",
+          "assertion `left == right` failed\n  left: \"execute\\r\\n\"\n right: \"execute\\n\""
+        ]
+      ],
+      "tests": [
+        "media_companion::tests::resident_execute_crash_is_not_replayed_and_next_request_restarts"
+      ]
+    },
+    "9133fa5691fc001c76edcd1e2fef8bf20c16910bd6feec3127d7462445940b07": {
+      "panic_sites_and_messages": [
+        [
+          "src\\media_companion.rs:2361:9",
+          "assertion `left == right` failed\n  left: \"serve\\r\\ncapabilities\\r\\ncapabilities\\r\\n\"\n right: \"serve\\ncapabilities\\ncapabilities\\n\""
+        ]
+      ],
+      "tests": [
+        "media_companion::tests::resident_negotiation_falls_back_once_for_legacy_companion"
+      ]
+    },
+    "f8ff98f45466b77a9def34fa73e03a8dcc571eb3af8c47de6dec09a4619256da": {
+      "panic_sites_and_messages": [
+        [
+          "src\\media_companion.rs:2385:9",
+          "assertion `left == right` failed\n  left: \"serve\\r\\n\"\n right: \"serve\\n\""
+        ]
+      ],
+      "tests": [
+        "media_companion::tests::resident_negotiation_surfaces_invalid_preflight_without_one_shot"
+      ]
+    },
+    "a70d085b366d18d0d05932413d9f473f33a9cc2511bf6186ab51cee8e0bd1367": {
+      "panic_sites_and_messages": [
+        [
+          "src\\media_companion.rs:2406:9",
+          "assertion `left == right` failed\n  left: \"serve\\r\\n\"\n right: \"serve\\n\""
+        ]
+      ],
+      "tests": [
+        "media_companion::tests::resident_startup_envelope_error_is_not_downgraded_to_one_shot"
+      ]
+    },
+    "83a1dfccd721c7fa98b070c827855dc1104a069e29463143aa053cc7330c4896": {
+      "panic_sites_and_messages": [
+        [
+          "src\\media_companion.rs:2425:9",
+          "assertion `left == right` failed\n  left: \"serve\\r\\nexecute\\r\\n\"\n right: \"serve\\nexecute\\n\""
+        ]
+      ],
+      "tests": [
+        "media_companion::tests::resident_unknown_serve_nonzero_runs_first_execute_exactly_once"
+      ]
+    },
+    "fa034e71228804b86eb4a54d51309d94fc304bdc935f1e150ab6cfc179cb6592": {
+      "panic_sites_and_messages": [
+        [
+          "src\\model_store\\gguf_conversion.rs:675:67",
+          "called `Result::unwrap()` on an `Err` value: cannot start converter using python3; supply --python with the converter's dependencies installed\n\nCaused by:\n    program not found"
+        ]
+      ],
+      "tests": [
+        "model_store::gguf_conversion::tests::conversion_keeps_nvfp4_and_source_and_refuses_overwrite"
+      ]
+    },
+    "0e4be72bd287a853fcf5e22005cf5c0e5939b953b7e880c755bac9fbca9144a1": {
+      "panic_sites_and_messages": [
+        [
+          "src\\model_store\\gguf_conversion.rs:718:9",
+          "assertion failed: f.store.convert_gguf(\"source\",\n                &f.options).unwrap_err().to_string().contains(\"no native NVFP4\")"
+        ]
+      ],
+      "tests": [
+        "model_store::gguf_conversion::tests::conversion_rejects_dequantized_output_and_unknown_source"
+      ]
+    },
+    "cb1e8ff98101dac998df197af9cccf42c79446e05f729927eda7588b61a9bde7": {
+      "panic_sites_and_messages": [
+        [
+          "src\\model_store\\gguf_conversion.rs:710:9",
+          "cannot start converter using python3; supply --python with the converter's dependencies installed"
+        ]
+      ],
+      "tests": [
+        "model_store::gguf_conversion::tests::converter_failure_removes_partial_output_without_registering"
+      ]
+    },
+    "54fcd2d1de59e3b0df42149652643c00971f002d3f1d8d8151309a9465bc6f22": {
+      "panic_sites_and_messages": [
+        [
+          "src\\model_store\\gguf_conversion.rs:828:9",
+          "assertion `left == right` failed\n  left: \"\\\\\\\\?\\\\<user-profile>\\\\AppData\\\\Local\\\\Temp\\\\.tmp<RANDOM>\\\\store\\\\backends\\\\llama-cuda\\\\nvfp4-fc343a84bbd925b37dde3219de35ea0bed50d630-0123456789ab\\\\llama.cpp\\\\convert_hf_to_gguf.py\"\n right: \"<user-profile>\\\\AppData\\\\Local\\\\Temp\\\\.tmp<RANDOM>\\\\store\\\\backends/llama-cuda\\\\nvfp4-fc343a84bbd925b37dde3219de35ea0bed50d630-0123456789ab/llama.cpp\\\\convert_hf_to_gguf.py\""
+        ]
+      ],
+      "tests": [
+        "model_store::gguf_conversion::tests::managed_converter_discovery_selects_pinned_nvfp4_profile"
+      ]
+    },
+    "2be4b78887ccff4f2fae8eb72df596204bea9e328a208be1f9bddf8de970cfba": {
+      "panic_sites_and_messages": [
+        [
+          "src\\model_store\\gguf_conversion.rs:809:9",
+          "cannot start converter using python3; supply --python with the converter's dependencies installed"
+        ]
+      ],
+      "tests": [
+        "model_store::gguf_conversion::tests::missing_projector_fails_without_registering_language_only_output"
+      ]
+    },
+    "5a94c3e13e481fa188bbb6f57184b9901a19fc6c8b3d70a410f38e27c62f2187": {
+      "panic_sites_and_messages": [
+        [
+          "src\\model_store\\gguf_conversion.rs:732:67",
+          "called `Result::unwrap()` on an `Err` value: cannot start converter using python3; supply --python with the converter's dependencies installed\n\nCaused by:\n    program not found"
+        ]
+      ],
+      "tests": [
+        "model_store::gguf_conversion::tests::vision_conversion_requires_and_registers_projector"
+      ]
+    },
+    "14d0a87b2239a73b3bf360e9d79f3e193b8176612c238661295bd9db871b4710": {
+      "panic_sites_and_messages": [
+        [
+          "src\\model_store\\import_collection.rs:566:13",
+          "assertion failed: error.contains(\"old-home/models\")"
+        ]
+      ],
+      "tests": [
+        "model_store::import_collection::tests::collection_rejects_whole_werk_home_as_root_or_child"
+      ]
+    },
+    "c3c982fb3d635162b29245701026ba90ebaa3eae4ac2401c5bd325a76d7d21ad": {
+      "panic_sites_and_messages": [
+        [
+          "src\\runtime_control\\security.rs:611:13",
+          "could not create test directory reparse point: Dem Client fehlt ein erforderliches Recht. (os error 1314)"
+        ]
+      ],
+      "tests": [
+        "runtime_control::security::tests::reparse_auth_directory_is_rejected_without_touching_target"
+      ]
+    },
+    "6c0a23c824409c172dab45ff684e5655d81074cc6c21852883dc6c16bcb92230": {
+      "panic_sites_and_messages": [
+        [
+          "src\\runtime_control\\store.rs:2391:46",
+          "called `Result::unwrap()` on an `Err` value: ProtocolError { code: Unavailable, message: \"cannot lock runtime state cache usage\", retryable: true, details: None, internal: None }"
+        ]
+      ],
+      "tests": [
+        "runtime_control::store::tests::cache_inventory_lists_namespaces_and_protects_live_catalogs_and_pins"
+      ]
+    },
+    "0978fe817f680e7fa28a650fcc802c67fbcdccc0c589e9f81aff249ba883d40e": {
+      "panic_sites_and_messages": [
+        [
+          "src\\runtime_control\\store.rs:2464:41",
+          "called `Result::unwrap()` on an `Err` value: ProtocolError { code: Unavailable, message: \"cannot lock runtime state cache usage\", retryable: true, details: None, internal: None }"
+        ]
+      ],
+      "tests": [
+        "runtime_control::store::tests::read_only_runtime_access_retains_usage_lease_until_store_is_dropped"
+      ]
+    }
+  },
+  "previous_extra_intermittent": {
+    "name": "backend::llama_server::runtime_state::tests::ordinary_inference_overlaps_but_excludes_slot_state_mutation",
+    "panic_sites_and_messages": [
+      [
+        "src\\backend\\llama_server\\runtime_state.rs:3698:52",
+        "called `Result::unwrap()` on an `Err` value: Ein nicht blockierender Socketvorgang konnte nicht sofort ausgeführt werden. (os error 10035)"
+      ],
+      [
+        "src\\backend\\llama_server\\runtime_state.rs:3748:29",
+        "called `Result::unwrap()` on an `Err` value: SendError { .. }"
+      ]
+    ],
+    "baseline_socket_rerun_equals_prior": true,
+    "current_suite_state": "passed"
+  }
+}

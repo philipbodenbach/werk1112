@@ -461,3 +461,248 @@ async fn inpainting_catalog_and_execution_require_distinct_source_and_mask_roles
         assert!(completed, "{name} job did not complete");
     }
 }
+
+#[tokio::test]
+async fn werk_media_job_urls_and_output_bytes_stay_within_the_protocol() {
+    let store = test_store();
+    install_media_model(&store);
+    let media = InferenceService::with_backend(store.clone(), Arc::new(MockMediaBackend));
+    let state = ApiState::new(store, Arc::new(MockBackend))
+        .with_inference_service(media)
+        .with_api_keys(vec!["alice".into(), "bob".into()]);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("authorization", "Bearer alice".parse().unwrap());
+    let owner = state.werk_principal(&headers).await.unwrap();
+    let upload = state
+        .files
+        .put(
+            &owner,
+            "speech.wav".into(),
+            "audio/wav".into(),
+            "user_data".into(),
+            None,
+            b"fixture sound",
+        )
+        .unwrap();
+    let legacy_job = state
+        .job_manager
+        .store()
+        .create(crate::inference::InferenceRequest::new(
+            "media",
+            InferenceTask::AudioGeneration,
+        ))
+        .unwrap();
+    let pending = state
+        .clone()
+        .for_inference_principal(&owner)
+        .job_manager
+        .store()
+        .create(crate::inference::InferenceRequest::new(
+            "media",
+            InferenceTask::AudioGeneration,
+        ))
+        .unwrap();
+    let app = router(state);
+    let pending_url = format!("/werk/v1/jobs/{}", pending.id);
+    let cancelled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&pending_url)
+                .header("authorization", "Bearer alice")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(cancelled).await["data"]["status"],
+        "cancelled"
+    );
+    let call_url = "/werk/v1/tools/call";
+    let arguments = json!({
+        "model": "media", "prompt": "fixture",
+        "parameters": {"routing.backend": "mock-media"}
+    });
+    let response = post_json(
+        &app,
+        call_url,
+        call("audio_generation", arguments),
+        Some("alice"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let media_input = |source: Value| {
+        call(
+            "speech_to_text",
+            json!({
+                "model":"media","inputs":[{"modality":"audio","role":"input_audio","source":source,"mime_type":"audio/wav"}],
+                "parameters":{"routing.backend":"mock-media"}
+            }),
+        )
+    };
+    let file = json!({"kind":"file_id","file_id":upload.id});
+    assert_eq!(
+        post_json(&app, call_url, media_input(file.clone()), Some("bob"))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post_json(&app, call_url, media_input(file), Some("alice"))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    for source in [
+        json!({"kind":"path","path":"untrusted.wav"}),
+        json!({"kind":"url","url":"file:untrusted.wav"}),
+    ] {
+        assert_eq!(
+            post_json(&app, call_url, media_input(source), Some("alice"))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert!(
+        post_json(
+            &app,
+            call_url,
+            call("get_job", json!({"id":legacy_job.id})),
+            Some("alice")
+        )
+        .await
+        .status()
+        .is_client_error()
+    );
+    let accepted = response_json(response).await;
+    let id = accepted["data"]["result"]["id"].as_str().unwrap();
+    let job_url = format!("/werk/v1/jobs/{id}");
+    assert_eq!(accepted["data"]["result"]["url"], job_url);
+    for (uri, method) in [(&job_url, "GET"), (&job_url, "DELETE")] {
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", "Bearer bob")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    }
+    for name in ["get_job", "cancel_job"] {
+        let denied = post_json(&app, call_url, call(name, json!({"id":id})), Some("bob")).await;
+        assert!(denied.status().is_client_error());
+    }
+    let legacy = job_url.strip_prefix("/werk").unwrap();
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(legacy)
+                .header("authorization", "Bearer alice")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    for _ in 0..200 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&job_url)
+                    .header("authorization", "Bearer alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let job = response_json(response).await;
+        assert_ne!(job["data"]["status"], "failed", "{job}");
+        if job["data"]["status"] == "completed" {
+            let snapshot = response_json(
+                post_json(
+                    &app,
+                    call_url,
+                    call("get_job", json!({"id":id})),
+                    Some("alice"),
+                )
+                .await,
+            )
+            .await;
+            let result = &snapshot["data"]["result"];
+            let message: Value =
+                serde_json::from_str(snapshot["data"]["message"]["content"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(result, &message);
+            let artifact = &result["outputs"][0];
+            let path = format!("/werk/v1/outputs/{}", artifact["id"].as_str().unwrap());
+            assert_eq!(artifact["url"], path);
+            let source = json!({"kind":"output_id","output_id":artifact["id"]});
+            assert_eq!(
+                post_json(&app, call_url, media_input(source.clone()), Some("bob"))
+                    .await
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                post_json(&app, call_url, media_input(source), Some("alice"))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            for (uri, key) in [
+                (&path[..], "bob"),
+                (path.strip_prefix("/werk").unwrap(), "alice"),
+            ] {
+                let denied = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("authorization", format!("Bearer {key}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+            }
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("authorization", "Bearer alice")
+                        .header("accept", "application/octet-stream, application/json")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-werk-protocol-version"], "1.0");
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/octet-stream"
+            );
+            let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(!bytes.is_empty());
+            assert_eq!(Some(bytes.len() as u64), artifact["size_bytes"].as_u64());
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("The image fixture did not complete");
+}

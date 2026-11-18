@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::{
-    helpers::{validate_safe_name, write_json_atomic},
+    helpers::{InferenceScope, validate_safe_name, write_json_atomic},
     service::InferenceService,
     types::InferenceResult,
 };
@@ -44,6 +44,7 @@ pub struct JobRecord {
 
 #[derive(Debug, Clone)]
 pub struct JobStore {
+    scope: InferenceScope,
     root: PathBuf,
     mutation_lock: Arc<Mutex<()>>,
 }
@@ -64,6 +65,7 @@ fn log_state(record: &JobRecord) {
 impl JobStore {
     pub fn new(home: &Path) -> Self {
         Self {
+            scope: InferenceScope::default(),
             root: home.join("jobs"),
             mutation_lock: Arc::new(Mutex::new(())),
         }
@@ -78,7 +80,7 @@ impl JobStore {
         self.ensure()?;
         let now = unix_ts();
         let record = JobRecord {
-            id: super::helpers::new_id("job")?,
+            id: self.scope.new_id("job")?,
             status: JobStatus::Queued,
             request,
             result: None,
@@ -92,14 +94,34 @@ impl JobStore {
     }
 
     pub fn get(&self, id: &str) -> Result<JobRecord> {
+        if !self.scope.permits("job", id) {
+            bail!("job not found");
+        }
+        self.read(id)
+    }
+
+    fn read(&self, id: &str) -> Result<JobRecord> {
         validate_safe_name(id)?;
         let path = self.root.join(format!("{id}.json"));
         let data = fs::read(&path).with_context(|| format!("job '{id}' was not found"))?;
-        serde_json::from_slice(&data)
-            .with_context(|| format!("invalid persisted job {}", path.display()))
+        let record: JobRecord = serde_json::from_slice(&data)
+            .with_context(|| format!("invalid persisted job {}", path.display()))?;
+        // Filesystem aliases (including case folding) must not substitute another job ID.
+        if record.id != id {
+            bail!("job not found");
+        }
+        Ok(record)
     }
 
     pub fn list(&self) -> Result<Vec<JobRecord>> {
+        Ok(self
+            .records()?
+            .into_iter()
+            .filter(|record| self.scope.permits("job", &record.id))
+            .collect())
+    }
+
+    fn records(&self) -> Result<Vec<JobRecord>> {
         self.ensure()?;
         let mut records = fs::read_dir(&self.root)?
             .filter_map(std::result::Result::ok)
@@ -124,11 +146,24 @@ impl JobStore {
         result: Option<InferenceResult>,
         error: Option<String>,
     ) -> Result<JobRecord> {
+        if !self.scope.permits("job", id) {
+            bail!("job not found");
+        }
+        self.transition_persisted(id, status, result, error)
+    }
+
+    fn transition_persisted(
+        &self,
+        id: &str,
+        status: JobStatus,
+        result: Option<InferenceResult>,
+        error: Option<String>,
+    ) -> Result<JobRecord> {
         let _guard = self
             .mutation_lock
             .lock()
             .map_err(|_| anyhow!("job store mutation lock is poisoned"))?;
-        let mut record = self.get(id)?;
+        let mut record = self.read(id)?;
         if record.status.terminal() {
             if record.status == status {
                 return Ok(record);
@@ -177,13 +212,13 @@ impl JobStore {
     }
 
     pub fn recover_interrupted(&self) -> Result<usize> {
-        let records = self.list()?;
+        let records = self.records()?;
         let mut recovered = 0;
         for record in records
             .into_iter()
             .filter(|record| !record.status.terminal())
         {
-            self.transition(
+            self.transition_persisted(
                 &record.id,
                 JobStatus::Failed,
                 None,
@@ -225,6 +260,21 @@ impl JobManager {
             crate::ui_eprintln!("warning: failed to recover persisted media jobs: {error:#}");
         }
         Self { service, store }
+    }
+
+    pub(crate) fn for_principal(&self, principal: &str) -> Self {
+        let scope = InferenceScope::for_principal(principal);
+        Self {
+            service: self.service.scoped(scope.clone()),
+            store: JobStore {
+                scope,
+                ..self.store.clone()
+            },
+        }
+    }
+
+    pub(crate) fn service(&self) -> &InferenceService {
+        &self.service
     }
 
     pub fn store(&self) -> &JobStore {

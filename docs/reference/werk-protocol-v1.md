@@ -1,6 +1,6 @@
 ---
 title: Werk Protocol 1.0 HTTP reference
-description: Versioned HTTP/JSON contract for Werk1112 runtime residency, persistence, memory, expert discovery and prefill/decode.
+description: Versioned HTTP contract for Werk1112 model discovery, chat, inference tools and runtime control.
 ---
 
 # Werk Protocol 1.0 HTTP reference
@@ -14,9 +14,7 @@ replace existing protocol envelopes. See [profiles](../concepts/single-host-depl
 
 [Back to the documentation index](../documentation.md)
 
-Werk Protocol 1.0 is the versioned runtime-control API under `/werk/v1`. It is
-separate from the OpenAI-compatible and Werk-native inference routes under
-`/v1`; adding it does not change those established contracts.
+Werk Protocol 1.0 exposes runtime control and inference under `/werk/v1`. Its model, chat and inference-tool routes share the implementation behind the established `/v1` endpoints.
 
 The architecture, backend matrix and persistence guarantees are documented in
 [Runtime persistence and memory architecture](../concepts/runtime-persistence-and-memory.md).
@@ -61,13 +59,12 @@ X-Werk-Protocol-Version: 1.0
 ~~~
 
 For compatibility with initial 1.0 clients, either request header may be
-omitted. If `Accept` is present, it must allow `application/json`,
-`application/*` or `*/*` with a non-zero quality value. Every supplied
+omitted. If `Accept` is present, it must permit the selected representation with a nonzero quality value. JSON routes accept `application/json`, `application/*` or `*/*`. Chat streams use `text/event-stream` and artifact downloads use `application/octet-stream`. Every supplied
 `X-Werk-Protocol-Version` value must be able to consume the server's 1.0
 response. Otherwise the server returns HTTP 406 with the typed
 `incompatible_protocol` error.
 
-Every success response has this envelope:
+JSON success responses use this envelope:
 
 ~~~json
 {
@@ -92,8 +89,8 @@ Every protocol error has this envelope:
 ~~~
 
 `X-Werk-Request-Id` repeats the response request ID. Every protocol response,
-including an error, declares `X-Werk-Protocol-Version: 1.0`,
-`Content-Type: application/json`, `Cache-Control: no-store`, `Vary: accept`
+including errors, declares `X-Werk-Protocol-Version: 1.0`,
+the selected content type, `Cache-Control: no-store`, `Vary: accept`
 and `X-Content-Type-Options: nosniff`.
 
 Compatibility requires the same major version. The bundled 1.x client accepts
@@ -101,7 +98,7 @@ a producer minor version no newer than the client's minor version and rejects
 an incompatible envelope before returning its payload. It also verifies a
 response version header when present and rejects disagreement with the JSON
 envelope. A missing response version header remains accepted for compatibility
-with an earlier 1.0 server; the envelope itself is always required.
+with an earlier 1.0 server. JSON clients must always validate the envelope. Successful event streams and binary artifacts carry their version and request ID in required HTTP response headers.
 
 ## Discovery
 
@@ -205,6 +202,62 @@ It sends no launch setting to remote vLLM.
 All listed POST routes have a fixed 1 MiB HTTP body limit. Individual DTOs have
 tighter semantic limits where described below. Unknown fields are rejected on
 the mutation, prefill and decode request DTOs.
+
+## Model, chat and inference tools
+
+Clients discover the following HTTP capabilities through `/werk/v1/capabilities`. A supported route describes the transport. The selected model and runtime determine which inputs and tools they can serve.
+
+| Capability | Operation | Route | Success representation |
+| --- | --- | --- | --- |
+| `api.models.list` | `list` | GET `/werk/v1/models` | Model list in `data` with `object: "list"` and a `data` array of model objects |
+| `api.chat.completions` | `complete` | POST `/werk/v1/chat/completions` | Chat completion in `data` |
+| `api.chat.completions` | `stream` | POST `/werk/v1/chat/completions` with `stream: true` | SSE chat completion chunks |
+| `api.tools` | `list` | GET `/werk/v1/tools` | Tool catalogue, including the versioned `call_url` |
+| `api.tools` | `tasks` | GET `/werk/v1/tasks` | Model and inference task availability |
+| `api.tools` | `call` | POST `/werk/v1/tools/call` | Correlated tool result, HTTP 202 for accepted asynchronous jobs |
+| `api.jobs` | `get`, `cancel` | GET or DELETE `/werk/v1/jobs/{id}` | Inference job record |
+| `api.outputs` | `read` | GET `/werk/v1/outputs/{id}` | Raw bytes with `Content-Type: application/octet-stream` |
+
+Chat accepts the documented [chat request](../api.md), including tool schemas, prior assistant calls, tool results and image parts. A streamed request uses `Accept: text/event-stream, application/json`. Each SSE data event contains an ordinary chat chunk or a stream error. The stream preserves tool-call IDs, argument fragments, usage, finish reasons and the terminal `[DONE]` event. The HTTP headers carry the Werk version and request ID throughout the stream. Clients use `Accept: application/octet-stream, application/json` for output downloads. The tool result identifies each artifact's original MIME type.
+
+Chat image parts accept inline image data URLs and HTTP(S) URLs subject to the chosen backend's existing validation. Chat document parts support inline `file_data` or an uploaded `file_id` owned by the same principal. Native media tool inputs accept `text`, `base64`, `{"kind":"file_id","file_id":"file_opaque_id"}` for a principal-owned upload, and `{"kind":"output_id","output_id":"out_opaque_id"}` for a principal-owned result. The server resolves IDs before dispatch. The aggregate size of referenced uploads is limited to 50 MiB. Clients with local files send their contents or an owned ID.
+
+Werk assigns persistent job and output IDs in the authenticated principal's namespace. Job status, cancellation and artifact downloads require the same principal that submitted the job. This also applies to the built-in `get_job` and `cancel_job` functions. A server without configured keys uses its shared `local` principal. Versioned routes accept only Werk-owned IDs. The legacy job and output endpoints reject these IDs and continue to serve older resources with their existing authorization. This access control applies to ID-based lookups. Legacy media interfaces that accept operator-authorized local paths retain their own filesystem access policy. The namespaces share the server's artifact storage and retention limits.
+
+For a synchronous chat request, the client cancels by aborting the pending HTTP
+connection or closing the SSE response. A client that only half-closes its TCP
+write side can still receive a normal response. Once the server observes disconnection, the
+built-in Candle decoder checks for cancellation between model operations. An
+already executing model load or inference kernel can finish. Other adapters
+may finish a blocking upstream call before releasing resources. The server
+records an abandoned request as `cancelled` in inference telemetry. Durable
+jobs use their advertised `cancel` operation and job ID.
+
+Model inventory reports the registered provider through `owned_by`. Operators
+can configure downstream providers or external runtimes on a loopback server.
+Clients deciding whether a prompt or tool result may leave the host must take
+that downstream route into account before submitting chat content. Tool-call
+IDs correlate intents and results. Authorization, host execution receipts,
+handles, credentials and sandbox evidence belong to the calling supervisor.
+
+The interoperability test runs both native binaries with an authenticated
+loopback endpoint and locally generated, deterministic one-layer Llama
+Safetensors weights. It requires Python's standard library and a CPU-enabled
+Werk build.
+
+```powershell
+python scripts/smoke-werk-worker.py --werk target/debug/werk.exe --worker F:/werkWorker/target/debug/ww.exe --evidence target/werk-worker-interop.json
+```
+
+The Windows run records executable and fixture hashes, token usage, error
+codes and cancellation observations. The regression report compares named
+failures and normalized panic chains with the native baselines.
+[CPU interoperability evidence](../development/werk-worker-cpu-interop.json) ·
+[Regression signatures](../development/werk-worker-inference-regression.json)
+
+Errors before a stream starts use the JSON error envelope. Inference routes retain the HTTP status and any `Retry-After` header. Model-specific rejections may carry `error.details.inference_code`. For `context_length_exceeded`, the details can also include `context_length`, `prompt_tokens`, `max_tokens` and `token_count_method`.
+
+Chat and explicit tool calls use the server's configured inference request-body limit. JSON response envelopes are limited to 8 MiB. Built-in tool schemas and result formats are documented in [Tool calling](../tool-calling.md).
 
 ## Native chat token count
 

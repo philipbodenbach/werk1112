@@ -134,11 +134,30 @@ pub(super) async fn chat_completions_handler(
             );
         }
     };
+    complete(state, headers, request, "/v1/chat/completions").await
+}
+
+pub(super) fn portable_image_inputs(request: &ChatCompletionRequest) -> bool {
+    crate::openai::image_urls_from_messages(&request.messages)
+        .iter()
+        .all(|url| {
+            url.starts_with("data:image/")
+                || reqwest::Url::parse(url)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+        })
+}
+
+pub(super) async fn complete(
+    state: ApiState,
+    headers: HeaderMap,
+    request: ChatCompletionRequest,
+    endpoint: &'static str,
+) -> Response {
     let prepared = match super::generation::prepare(
         state,
         request,
         super::generation::ContextPolicy::Trim,
-        "/v1/chat/completions",
+        endpoint,
         &headers,
     )
     .await

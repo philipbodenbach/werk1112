@@ -66,15 +66,6 @@ impl CandleBackend {
         })
     }
 
-    fn generate_inner(
-        &self,
-        manifest: &ModelManifest,
-        request: GenerateRequest,
-        on_token: Option<TokenCallback>,
-    ) -> Result<GenerateResponse> {
-        generate_with_candle(self, manifest, request, on_token)
-    }
-
     fn cached_model(&self, manifest: &ModelManifest) -> Result<(Arc<Mutex<CachedModel>>, f64)> {
         let cache_key = ModelRuntimeIdentity::from_manifest(manifest)?;
         let (model, _, seconds) = self.cache.get_or_try_init(
@@ -151,8 +142,17 @@ impl GenerationBackend for CandleBackend {
         manifest: &ModelManifest,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
+        self.generate_cancellable(manifest, request, &|| false)
+    }
+
+    fn generate_cancellable(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<GenerateResponse> {
         crate::backend::tool_calling::generate(manifest, request, |request| {
-            self.generate_inner(manifest, request, None)
+            generate_with_candle(self, manifest, request, None, cancelled)
         })
     }
 
@@ -164,16 +164,11 @@ impl GenerationBackend for CandleBackend {
             let stream_granularity = request.stream_granularity;
 
             tokio::task::spawn_blocking(move || {
-                let emitter = StreamEmitter::new(tx.clone(), stream_granularity);
-                let callback_emitter = emitter.clone();
-                let result = generate_with_candle(
-                    &backend,
-                    &manifest,
-                    request,
-                    Some(Box::new(move |text| {
-                        callback_emitter.push(text);
-                    })),
-                );
+                let mut emitter = StreamEmitter::new(tx.clone(), stream_granularity);
+                let result =
+                    generate_with_candle(&backend, &manifest, request, Some(&mut emitter), &|| {
+                        tx.is_closed()
+                    });
 
                 match result {
                     Ok(response) => {
@@ -240,14 +235,14 @@ fn candle_accelerator_family(device: &Device) -> &'static str {
     }
 }
 
-type TokenCallback = Box<dyn FnMut(String) + Send>;
-
 fn generate_with_candle(
     backend: &CandleBackend,
     manifest: &ModelManifest,
     request: GenerateRequest,
-    mut on_token: Option<TokenCallback>,
+    emitter: Option<&mut StreamEmitter>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<GenerateResponse> {
+    anyhow::ensure!(!cancelled(), "generation cancelled");
     if request.has_images() {
         bail!(
             "this Candle backend is text-only for now; use a VLM-capable backend/model for image inputs"
@@ -259,6 +254,7 @@ fn generate_with_candle(
     let mut cached = cached
         .lock()
         .map_err(|_| anyhow!("cached model mutex poisoned"))?;
+    anyhow::ensure!(!cancelled(), "generation cancelled");
     let tokenizer = cached.tokenizer.clone();
     cached.model.clear_kv_cache()?;
     let mut response = generate_with_loaded_model(
@@ -266,7 +262,8 @@ fn generate_with_candle(
         &tokenizer,
         &backend.device,
         request,
-        on_token.take(),
+        emitter,
+        cancelled,
     )?;
     response.timings.load_seconds = load_seconds;
     response.timings.total_seconds = started.elapsed().as_secs_f64();
@@ -344,7 +341,8 @@ fn generate_with_loaded_model(
     tokenizer: &Tokenizer,
     device: &Device,
     request: GenerateRequest,
-    mut on_token: Option<TokenCallback>,
+    mut emitter: Option<&mut StreamEmitter>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<GenerateResponse> {
     let tokenize_started = Instant::now();
     let mut tokens = tokenizer
@@ -375,12 +373,14 @@ fn generate_with_loaded_model(
     let prompt_started = Instant::now();
     let mut input = Tensor::new(tokens.as_slice(), device)?.unsqueeze(0)?;
     let mut index_pos = 0usize;
+    anyhow::ensure!(!cancelled(), "generation cancelled");
     let mut logits = model.forward(&input, index_pos)?;
     index_pos += tokens.len();
     let prompt_seconds = prompt_started.elapsed().as_secs_f64();
 
     let decode_started = Instant::now();
     for _ in 0..request.max_tokens {
+        anyhow::ensure!(!cancelled(), "generation cancelled");
         let next_logits = last_logits(&logits)?;
         let next_token =
             select_next_token(&mut token_selector, &next_logits, device, &mut profile)?;
@@ -415,11 +415,11 @@ fn generate_with_loaded_model(
         }
 
         let callback_started = profile.as_ref().map(|_| Instant::now());
-        if let Some(callback) = on_token.as_mut()
+        if let Some(output) = emitter.as_deref_mut()
             && safe_len > streamed_len
         {
             let safe_piece = generated_text[streamed_len..safe_len].to_string();
-            callback(safe_piece);
+            output.push(safe_piece);
             streamed_len = safe_len;
         }
         if let (Some(profile), Some(started)) = (profile.as_mut(), callback_started) {
@@ -445,11 +445,11 @@ fn generate_with_loaded_model(
     }
     let decode_seconds = decode_started.elapsed().as_secs_f64();
     if !matched_stop_string
-        && let Some(callback) = on_token.as_mut()
+        && let Some(output) = emitter
         && generated_text.len() > streamed_len
     {
         let callback_started = profile.as_ref().map(|_| Instant::now());
-        callback(generated_text[streamed_len..].to_string());
+        output.push(generated_text[streamed_len..].to_string());
         if let (Some(profile), Some(started)) = (profile.as_mut(), callback_started) {
             profile.callback += started.elapsed();
         }
@@ -1182,10 +1182,9 @@ fn read_config<T: DeserializeOwned>(path: &PathBuf) -> Result<T> {
     serde_json::from_str(&data).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-#[derive(Clone)]
 struct StreamEmitter {
     tx: Sender<Result<GenerateStreamEvent, String>>,
-    buffer: Arc<Mutex<String>>,
+    buffer: String,
     granularity: StreamGranularity,
 }
 
@@ -1196,12 +1195,12 @@ impl StreamEmitter {
     ) -> Self {
         Self {
             tx,
-            buffer: Arc::new(Mutex::new(String::new())),
+            buffer: String::new(),
             granularity,
         }
     }
 
-    fn push(&self, text: String) {
+    fn push(&mut self, text: String) {
         if text.is_empty() {
             return;
         }
@@ -1213,28 +1212,17 @@ impl StreamEmitter {
             return;
         }
 
-        let mut buffer = self.buffer.lock().expect("chunk buffer poisoned");
-        buffer.push_str(&text);
-        if should_flush_chunk(&buffer, &text) {
-            let chunk = std::mem::take(&mut *buffer);
-            drop(buffer);
-            let _ = self
-                .tx
-                .blocking_send(Ok(GenerateStreamEvent::TextChunk(chunk)));
+        self.buffer.push_str(&text);
+        if should_flush_chunk(&self.buffer, &text) {
+            self.flush();
         }
     }
 
-    fn flush(&self) {
-        if self.granularity == StreamGranularity::Token {
+    fn flush(&mut self) {
+        if self.buffer.is_empty() {
             return;
         }
-
-        let mut buffer = self.buffer.lock().expect("chunk buffer poisoned");
-        if buffer.is_empty() {
-            return;
-        }
-        let chunk = std::mem::take(&mut *buffer);
-        drop(buffer);
+        let chunk = std::mem::take(&mut self.buffer);
         let _ = self
             .tx
             .blocking_send(Ok(GenerateStreamEvent::TextChunk(chunk)));
